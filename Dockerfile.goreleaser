@@ -1,0 +1,6 @@
+FROM alpine:3.21
+RUN apk --no-cache add ca-certificates \
+	&& adduser -D -u 65532 nonroot
+USER 65532:65532
+COPY gitlab-mcp /
+ENTRYPOINT ["/gitlab-mcp"]

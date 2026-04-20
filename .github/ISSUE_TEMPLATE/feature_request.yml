@@ -1,0 +1,39 @@
+name: Feature request
+description: Suggest an enhancement or new capability
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Large surface-area changes are easier to review when scoped to a clear use case.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to accomplish with gitlab-mcp today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Preferred behavior, API shape, or configuration knobs.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other ways to solve the problem and trade-offs.
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Links, GitLab edition/version notes, related issues, or constraints.
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: I am willing to help validate the change (unit/integration/manual).
+          required: false

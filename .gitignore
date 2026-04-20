@@ -1,0 +1,12 @@
+/.env
+/.env.*
+/dist/
+/bin/
+*.exe
+*.out
+*.test
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+.cursor/
