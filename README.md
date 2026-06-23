@@ -123,9 +123,11 @@ win when explicitly passed.
 | `GITLAB_ALLOWED_PROJECT_IDS` | — | — | Comma-separated allowlist of project ids/paths. |
 | `GITLAB_CA_CERT_PATH` | `--ca-cert` | — | Extra PEM CA bundle for the API client. |
 | `GITLAB_INSECURE` | `--insecure` | `false` | Skip TLS verify (**dev only**). |
-| `HTTP_PROXY` / `HTTPS_PROXY` | — | — | Standard proxy variables. |
+| `HTTP_PROXY` / `HTTPS_PROXY` | — | inherited | Outbound proxy for GitLab API calls. |
+| `NO_PROXY` / `no_proxy` | — | inherited | Bypass proxy for listed hosts (include your GitLab API hostname). |
 
-See [`docs/configuration.md`](docs/configuration.md) for examples and trade-offs.
+See [`docs/configuration.md`](docs/configuration.md) for examples, corporate-proxy
+setup, and `503` troubleshooting.
 
 ### PAT scopes
 
@@ -163,6 +165,11 @@ project / group permissions.
   }
 }
 ```
+
+Behind a corporate proxy, add `NO_PROXY` for your GitLab host and clear inherited
+`HTTP(S)_PROXY` / `ALL_PROXY` in the same `env` block — see
+[`docs/configuration.md`](docs/configuration.md#corporate-proxy--503-service-unavailable).
+Restart the MCP server after changing `mcp.json`.
 
 ### Streamable HTTP client
 
