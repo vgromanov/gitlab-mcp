@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Optional `ref` and `search_type` (`basic`|`advanced`|`zoekt`) on `search_code`,
+  `search_project_code`, and `search_group_code` for Zoekt/blob Search API parity;
+  tool descriptions note `filename:`/`path:`/`extension:` query filters.
 - GitHub Actions **release** workflow (GoReleaser v2, QEMU/Buildx, GHCR login).
 - `Dockerfile.goreleaser` for release images; expanded `.goreleaser.yaml` with
   ldflags version injection, documentation bundled into archives, `SHA256SUMS`,
