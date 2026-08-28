@@ -1,11 +1,11 @@
 # syntax=docker/dockerfile:1
 FROM golang:1.25-alpine AS build
-RUN apk add --no-cache ca-certificates git
+RUN apk add --no-cache ca-certificates
 WORKDIR /src
 COPY go.mod go.sum ./
-RUN go mod download
+COPY vendor/ vendor/
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/gitlab-mcp ./cmd/gitlab-mcp
+RUN CGO_ENABLED=0 go build -mod=vendor -trimpath -ldflags="-s -w" -o /out/gitlab-mcp ./cmd/gitlab-mcp
 
 FROM alpine:3.21
 RUN apk --no-cache add ca-certificates \
