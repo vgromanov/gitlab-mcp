@@ -10,9 +10,9 @@ import (
 
 // RegisterWebhooks registers webhook listing tools.
 func RegisterWebhooks(s *mcp.Server, d Deps) {
-	AddTool(s, d, false, "", &mcp.Tool{Name: "list_webhooks", Description: "List webhooks for a project or group"}, listWebhooks)
-	AddTool(s, d, false, "", &mcp.Tool{Name: "list_webhook_events", Description: "List recent webhook deliveries (not available in client-go; use GitLab UI or REST)"}, listWebhookEvents)
-	AddTool(s, d, false, "", &mcp.Tool{Name: "get_webhook_event", Description: "Get webhook delivery details (not available in client-go; use REST)"}, getWebhookEvent)
+	AddTool(s, d, false, "webhooks", &mcp.Tool{Name: "list_webhooks", Description: "List webhooks for a project or group"}, listWebhooks)
+	AddTool(s, d, false, "webhooks", &mcp.Tool{Name: "list_webhook_events", Description: "List recent webhook deliveries (not available in client-go; use GitLab UI or REST)"}, listWebhookEvents)
+	AddTool(s, d, false, "webhooks", &mcp.Tool{Name: "get_webhook_event", Description: "Get webhook delivery details (not available in client-go; use REST)"}, getWebhookEvent)
 }
 
 type listWebhooksIn struct {

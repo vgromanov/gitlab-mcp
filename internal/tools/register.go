@@ -6,6 +6,7 @@ import (
 
 // RegisterAll wires every tool group onto the MCP server.
 func RegisterAll(s *mcp.Server, d Deps) {
+	resetNotedToolNames()
 	RegisterProjects(s, d)
 	RegisterRepository(s, d)
 	RegisterMergeRequests(s, d)

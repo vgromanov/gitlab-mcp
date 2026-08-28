@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Additive tool selection gates: `USE_DAILY_TOOLS`, family flags
+  (`USE_ISSUES`, `USE_WORK_ITEMS`, `USE_LABELS`, `USE_DRAFTS`, `USE_WEBHOOKS`,
+  `USE_TIMELINE`), and `GITLAB_ENABLED_TOOLS` / `GITLAB_DISABLED_TOOLS`
+  (SW-145). Unset flags keep today's legacy catalog.
 - Optional `ref` and `search_type` (`basic`|`advanced`|`zoekt`) on `search_code`,
   `search_project_code`, and `search_group_code` for Zoekt/blob Search API parity;
   tool descriptions note `filename:`/`path:`/`extension:` query filters.

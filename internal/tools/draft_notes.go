@@ -9,13 +9,13 @@ import (
 
 // RegisterDraftNotes registers MR draft note tools.
 func RegisterDraftNotes(s *mcp.Server, d Deps) {
-	AddTool(s, d, false, "", &mcp.Tool{Name: "get_draft_note", Description: "Get a single draft note on an MR"}, getDraftNote)
-	AddTool(s, d, false, "", &mcp.Tool{Name: "list_draft_notes", Description: "List draft notes on an MR"}, listDraftNotes)
-	AddTool(s, d, true, "", &mcp.Tool{Name: "create_draft_note", Description: "Create a draft note"}, createDraftNote)
-	AddTool(s, d, true, "", &mcp.Tool{Name: "update_draft_note", Description: "Update a draft note"}, updateDraftNote)
-	AddTool(s, d, true, "", &mcp.Tool{Name: "delete_draft_note", Description: "Delete a draft note"}, deleteDraftNote)
-	AddTool(s, d, true, "", &mcp.Tool{Name: "publish_draft_note", Description: "Publish one draft note"}, publishDraftNote)
-	AddTool(s, d, true, "", &mcp.Tool{Name: "bulk_publish_draft_notes", Description: "Publish all draft notes on an MR"}, bulkPublishDraftNotes)
+	AddTool(s, d, false, "drafts", &mcp.Tool{Name: "get_draft_note", Description: "Get a single draft note on an MR"}, getDraftNote)
+	AddTool(s, d, false, "drafts", &mcp.Tool{Name: "list_draft_notes", Description: "List draft notes on an MR"}, listDraftNotes)
+	AddTool(s, d, true, "drafts", &mcp.Tool{Name: "create_draft_note", Description: "Create a draft note"}, createDraftNote)
+	AddTool(s, d, true, "drafts", &mcp.Tool{Name: "update_draft_note", Description: "Update a draft note"}, updateDraftNote)
+	AddTool(s, d, true, "drafts", &mcp.Tool{Name: "delete_draft_note", Description: "Delete a draft note"}, deleteDraftNote)
+	AddTool(s, d, true, "drafts", &mcp.Tool{Name: "publish_draft_note", Description: "Publish one draft note"}, publishDraftNote)
+	AddTool(s, d, true, "drafts", &mcp.Tool{Name: "bulk_publish_draft_notes", Description: "Publish all draft notes on an MR"}, bulkPublishDraftNotes)
 }
 
 type getDraftNoteIn struct {
