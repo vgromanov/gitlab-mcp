@@ -5,12 +5,19 @@ This document describes the tool surface currently registered by
 
 ## Registration rules
 
-- Tools are registered by group in `internal/tools/*.go`.
-- Mutating tools are disabled when `GITLAB_READ_ONLY_MODE=true`.
-- Some groups are feature-gated:
-  - `pipeline` (enable with `USE_PIPELINE=true`)
-  - `milestone` (enable with `USE_MILESTONE=true`)
-  - `wiki` (enable with `USE_GITLAB_WIKI=true`)
+- Tools are registered by group in `internal/tools/*.go` via `AddTool`.
+- Mutating tools are skipped when `GITLAB_READ_ONLY_MODE=true`.
+- Catalog membership uses additive selection (SW-145). See
+  [`docs/configuration.md`](configuration.md#tool-selection-gates) for the
+  restricted vs unrestricted matrix and `mcp.json` profiles.
+- Legacy opt-in families (unrestricted mode only; still default **off**):
+  - `pipeline` — `USE_PIPELINE=true`
+  - `milestone` — `USE_MILESTONE=true`
+  - `wiki` — `USE_GITLAB_WIKI=true`
+- Restricted-mode family flags (also enter restricted mode): `USE_ISSUES`,
+  `USE_WORK_ITEMS`, `USE_LABELS`, `USE_DRAFTS`, `USE_WEBHOOKS`, `USE_TIMELINE`.
+- `USE_DAILY_TOOLS=true` registers the pinned 41-tool daily census set
+  (includes all four search tools below).
 
 ## Projects / namespaces / users
 
@@ -163,35 +170,55 @@ This document describes the tool surface currently registered by
 
 ## Search / events / markdown / webhooks
 
-- `search_code`
-- `search_project_code`
-- `search_group_code`
+Blob / code search (Search API `scope=blobs`; Zoekt when exact code search is
+enabled on the instance):
+
+| Tool | Scope |
+|---|---|
+| `search_code` | Instance-wide |
+| `search_project_code` | One project (`project_id`) |
+| `search_group_code` | One group (`group_id`) |
+
+Optional inputs on the three `*_code` tools:
+
+| Input | Values / notes |
+|---|---|
+| `search_type` | `basic` \| `advanced` \| `zoekt` |
+| `ref` | Branch or tag name |
+| `query` | May embed filters: `filename:*.go`, `path:internal/`, `extension:go` |
+
+Also:
+
+- `search_repositories` (project search; part of the daily set with the three
+  blob tools)
 - `list_group_iterations`
 - `list_events`
 - `get_project_events`
 - `upload_markdown`
 - `download_attachment`
-- `list_webhooks`
-- `list_webhook_events`
-- `get_webhook_event`
+- `list_webhooks` / `list_webhook_events` / `get_webhook_event` (family
+  `webhooks`; restricted-mode flag `USE_WEBHOOKS`)
 
 ## GraphQL / work items
 
-- `execute_graphql`
-- `get_work_item`
-- `list_work_items`
-- `create_work_item`
-- `update_work_item`
-- `convert_work_item_type`
-- `list_work_item_statuses`
-- `list_custom_field_definitions`
-- `move_work_item`
-- `list_work_item_notes`
-- `create_work_item_note`
-- `get_timeline_events`
-- `create_timeline_event`
+- `execute_graphql` — arbitrary GraphQL query/mutation (in the daily set)
+- `get_work_item` / `list_work_items` / `create_work_item` / `update_work_item`
+- `convert_work_item_type` / `list_work_item_statuses` /
+  `list_custom_field_definitions` / `move_work_item`
+- `list_work_item_notes` / `create_work_item_note`
+- `get_timeline_events` / `create_timeline_event` (family `timeline`)
+
+### GraphQL census caveat
+
+REST tool call counts alone understate capability: agents often route through
+`execute_graphql` for work items, widgets, and APIs without a dedicated REST
+wrapper. A REST family that looks “unused” in a census may still be covered
+indirectly via GraphQL. Prefer interpreting usage bands with that in mind when
+trimming the daily set.
 
 ## Notes
 
 - The definitive source is code registration in `internal/tools`.
 - If a tool is added or renamed, update this doc in the same change.
+- Selection logic lives in `internal/tools/selection.go`
+  (`DailyTools`, `FamilyTools`, `ShouldRegister`).

@@ -15,7 +15,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (SW-145). Unset flags keep today's legacy catalog.
 - Optional `ref` and `search_type` (`basic`|`advanced`|`zoekt`) on `search_code`,
   `search_project_code`, and `search_group_code` for Zoekt/blob Search API parity;
-  tool descriptions note `filename:`/`path:`/`extension:` query filters.
+  tool descriptions note `filename:`/`path:`/`extension:` query filters
+  (SW-146).
+- Docs for tool-gate semantics, env/flag matrix, Zoekt/search inputs, GraphQL
+  census caveat, and `mcp.json` profiles (daily-only, daily+issues, disable
+  list, full legacy) in README + `docs/configuration.md` / `tools.md` /
+  `architecture.md` (SW-147).
 - GitHub Actions **release** workflow (GoReleaser v2, QEMU/Buildx, GHCR login).
 - `Dockerfile.goreleaser` for release images; expanded `.goreleaser.yaml` with
   ldflags version injection, documentation bundled into archives, `SHA256SUMS`,

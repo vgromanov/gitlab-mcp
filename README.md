@@ -28,8 +28,13 @@ Built on:
   and Markdown rendering.
 - **Read-only mode** (`GITLAB_READ_ONLY_MODE=true`) for safe agent workflows;
   every mutating tool is gated and not registered when read-only is on.
-- **Feature gates** for heavy or rarely-used surfaces: `USE_PIPELINE`, `USE_MILESTONE`,
-  `USE_GITLAB_WIKI`.
+- **Additive tool selection**: `USE_DAILY_TOOLS` (41-tool daily census), family
+  flags (`USE_ISSUES`, …), and `GITLAB_ENABLED_TOOLS` / `GITLAB_DISABLED_TOOLS`.
+  Unset flags keep the legacy full catalog; legacy `USE_PIPELINE` /
+  `USE_MILESTONE` / `USE_GITLAB_WIKI` still default off.
+- **Blob / Zoekt search**: `search_*_code` tools support optional `search_type`
+  (`basic`\|`advanced`\|`zoekt`) and `ref`, plus `filename:`/`path:`/`extension:`
+  filters inside `query`.
 - **Project allowlist** (`GITLAB_ALLOWED_PROJECT_IDS`) to restrict which projects an
   agent can act on.
 - **Self-managed friendly**: custom CA bundle (`GITLAB_CA_CERT_PATH`),
@@ -113,9 +118,13 @@ win when explicitly passed.
 | `GITLAB_PERSONAL_ACCESS_TOKEN` | `--token` | — | **Required.** GitLab PAT. |
 | `GITLAB_API_URL` | `--api-url` | `https://gitlab.com/api/v4` | API base URL. |
 | `GITLAB_READ_ONLY_MODE` | `--read-only` | `false` | Hide all mutating tools. |
-| `USE_GITLAB_WIKI` | `--use-wiki` | `false` | Register wiki tools. |
-| `USE_MILESTONE` | `--use-milestone` | `false` | Register milestone tools. |
-| `USE_PIPELINE` | `--use-pipeline` | `false` | Register pipeline / job / deployment / artifact tools. |
+| `USE_DAILY_TOOLS` | `--use-daily-tools` | `false` | Restricted mode: register the 41-tool daily census set (includes search). |
+| `USE_ISSUES` / `USE_WORK_ITEMS` / `USE_LABELS` / `USE_DRAFTS` / `USE_WEBHOOKS` / `USE_TIMELINE` | `--use-issues` etc. | `false` | Restricted-mode family enables (also enter restricted mode). |
+| `GITLAB_ENABLED_TOOLS` | `--enabled-tools` | — | CSV tool names to add (enters restricted mode when set). |
+| `GITLAB_DISABLED_TOOLS` | `--disabled-tools` | — | CSV tool names to remove (both modes). |
+| `USE_GITLAB_WIKI` | `--use-wiki` | `false` | Register wiki tools (legacy; alone stays unrestricted). |
+| `USE_MILESTONE` | `--use-milestone` | `false` | Register milestone tools (legacy; alone stays unrestricted). |
+| `USE_PIPELINE` | `--use-pipeline` | `false` | Register pipeline / job / deployment / artifact tools (legacy). |
 | `STREAMABLE_HTTP` | `--streamable-http` | `false` | Serve HTTP transport instead of stdio. |
 | `HOST` | `--host` | `127.0.0.1` | HTTP listen host. |
 | `PORT` | `--port` | `3002` | HTTP listen port. |
@@ -126,8 +135,10 @@ win when explicitly passed.
 | `HTTP_PROXY` / `HTTPS_PROXY` | — | inherited | Outbound proxy for GitLab API calls. |
 | `NO_PROXY` / `no_proxy` | — | inherited | Bypass proxy for listed hosts (include your GitLab API hostname). |
 
-See [`docs/configuration.md`](docs/configuration.md) for examples, corporate-proxy
-setup, and `503` troubleshooting.
+See [`docs/configuration.md`](docs/configuration.md) for the full gate semantics
+table, Zoekt/`search_type` notes, corporate-proxy / `503` troubleshooting, and
+ready-to-paste `mcp.json` profiles (daily-only, daily+issues, disable list,
+full legacy).
 
 ### PAT scopes
 
@@ -159,12 +170,16 @@ project / group permissions.
       "env": {
         "GITLAB_PERSONAL_ACCESS_TOKEN": "${env:GITLAB_PERSONAL_ACCESS_TOKEN}",
         "GITLAB_API_URL": "https://gitlab.com/api/v4",
-        "GITLAB_READ_ONLY_MODE": "true"
+        "USE_DAILY_TOOLS": "true"
       }
     }
   }
 }
 ```
+
+For read-only agents, also set `GITLAB_READ_ONLY_MODE=true`. More profiles
+(daily+issues, disable list, full legacy) live in
+[`docs/configuration.md`](docs/configuration.md#example-mcpjson-profiles).
 
 Behind a corporate proxy, add `NO_PROXY` for your GitLab host and clear inherited
 `HTTP(S)_PROXY` / `ALL_PROXY` in the same `env` block — see
@@ -191,13 +206,19 @@ TLS-terminating reverse proxy in front.
 | CI/CD | `list_pipelines`, `get_pipeline_job_output`, `play_pipeline_job`, `list_deployments`, `list_environments`, `*_job_artifacts` (gated by `USE_PIPELINE`) |
 | Releases | `list_releases`, `create_release`, `download_release_asset` |
 | Wiki | `list_wiki_pages`, `create_wiki_page` (gated by `USE_GITLAB_WIKI`) |
-| Search | `search_code`, `search_project_code`, `search_group_code`, `search_repositories` |
+| Search | `search_code`, `search_project_code`, `search_group_code` (`search_type`, `ref`, query filters), `search_repositories` |
 | Markdown | `upload_markdown`, `download_attachment` |
 | Webhooks | `list_webhooks`, `list_webhook_events`, `get_webhook_event` |
 | GraphQL / work items | `execute_graphql`, `list_work_items`, `get_work_item`, `create_work_item` |
 
 The full machine-readable list is in [`docs/tools.md`](docs/tools.md). Mutating
-tools are suppressed when `GITLAB_READ_ONLY_MODE=true`.
+tools are suppressed when `GITLAB_READ_ONLY_MODE=true`. Tool **selection** gates
+(daily set, families, enable/disable lists) are documented in
+[`docs/configuration.md`](docs/configuration.md#tool-selection-gates).
+
+> **Census caveat:** REST call counts understate usage when agents prefer
+> `execute_graphql` for the same GitLab surface — see
+> [`docs/tools.md`](docs/tools.md#graphql-census-caveat).
 
 ---
 
