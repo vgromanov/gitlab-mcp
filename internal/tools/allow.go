@@ -3,7 +3,7 @@ package tools
 import (
 	"fmt"
 
-	"github.com/vgromanov/gitlab-mcp/internal/config"
+	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/config"
 )
 
 func checkAllowedProject(cfg *config.Config, projectID string) error {

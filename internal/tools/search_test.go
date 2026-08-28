@@ -7,8 +7,8 @@ import (
 	"net/url"
 	"testing"
 
-	"github.com/vgromanov/gitlab-mcp/internal/config"
-	"github.com/vgromanov/gitlab-mcp/internal/testutil"
+	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/config"
+	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/testutil"
 )
 
 func TestSearchCode_queryParams(t *testing.T) {

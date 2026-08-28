@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	glclient "github.com/vgromanov/gitlab-mcp/internal/gitlab"
+	glclient "gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/gitlab"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	gitlab "gitlab.com/gitlab-org/api/client-go/v2"

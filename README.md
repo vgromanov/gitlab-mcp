@@ -46,6 +46,27 @@ See [`docs/tools.md`](docs/tools.md) for the full tool catalog.
 
 ---
 
+## Corporate GitLab
+
+```text
+https://gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp
+ssh://git@gitlabci.raiffeisen.ru:7999/skunk-works/tools/gitlab-mcp.git
+```
+
+| Remote | URL |
+| --- | --- |
+| `origin` | `ssh://git@gitlabci.raiffeisen.ru:7999/skunk-works/tools/gitlab-mcp.git` |
+| `github` | `https://github.com/vgromanov/gitlab-mcp.git` (private OSS mirror) |
+
+Shared CI: `skunk-works/tools/ci-pipelines` → `/pipelines/golang.yml` (lint, test,
+Sonar, AppSec). GitHub Actions remain optional on the `github` remote.
+
+- **`APPSEC_SEMGREP_EXCLUDE: vendor`** — Semgrep on `vendor/` floods HIGH SAST
+  noise; vendored deps are covered by go.mod + Trivy (same pattern as
+  `owa-mcp` / `mattermost-mcp`, RVG-79).
+
+---
+
 ## Install
 
 ### Pre-built binaries
@@ -54,15 +75,20 @@ Download from the [Releases](https://github.com/vgromanov/gitlab-mcp/releases) p
 
 ### From source
 
-Requires Go **1.25+**.
+Requires Go **1.25+**. CI and local builds use `-mod=vendor` — run `make tidy`
+(or `go mod vendor`) after dependency changes.
 
 ```bash
-git clone https://github.com/vgromanov/gitlab-mcp.git
+# Corp (preferred)
+git clone ssh://git@gitlabci.raiffeisen.ru:7999/skunk-works/tools/gitlab-mcp.git
 cd gitlab-mcp
 make build              # binary at ./bin/gitlab-mcp
-# or:
-go install github.com/vgromanov/gitlab-mcp/cmd/gitlab-mcp@latest
+
+# GitHub mirror (optional OSS)
+git clone https://github.com/vgromanov/gitlab-mcp.git
 ```
+
+Module path: `gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp`
 
 ### Docker
 

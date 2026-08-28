@@ -2,6 +2,7 @@
 
 BINARY := gitlab-mcp
 PKG := ./cmd/gitlab-mcp
+MODULE := gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp
 DIST_DIR := dist
 OUT_DIR := bin
 
@@ -18,7 +19,7 @@ prep-dist:
 	mkdir -p $(DIST_DIR)
 
 build: $(OUT_DIR)
-	CGO_ENABLED=0 go build -trimpath -o $(OUT_DIR)/$(BINARY) $(PKG)
+	CGO_ENABLED=0 go build -mod=vendor -trimpath -o $(OUT_DIR)/$(BINARY) $(PKG)
 
 build-all: prep-dist
 	@set -e; \
@@ -30,7 +31,7 @@ build-all: prep-dist
 			out="$(DIST_DIR)/$(BINARY)-$$os-$$arch"; \
 			if [ "$$os" = "windows" ]; then out="$$out.exe"; fi; \
 			echo "==> $$os/$$arch -> $$out"; \
-			GOOS=$$os GOARCH=$$arch CGO_ENABLED=0 go build -trimpath -o $$out $(PKG); \
+			GOOS=$$os GOARCH=$$arch CGO_ENABLED=0 go build -mod=vendor -trimpath -o $$out $(PKG); \
 		done; \
 	done
 
@@ -40,26 +41,27 @@ dist: prep-dist
 		for arch in amd64 arm64; do \
 			out="$(DIST_DIR)/$(BINARY)-$$os-$$arch"; \
 			echo "==> $$os/$$arch -> $$out"; \
-			GOOS=$$os GOARCH=$$arch CGO_ENABLED=0 go build -trimpath -o $$out $(PKG); \
+			GOOS=$$os GOARCH=$$arch CGO_ENABLED=0 go build -mod=vendor -trimpath -o $$out $(PKG); \
 		done; \
 	done
 
 test:
-	go test ./...
+	go test -mod=vendor ./...
 
 test-integration:
-	go test -tags=integration -timeout=10m ./...
+	go test -mod=vendor -tags=integration -timeout=10m ./...
 
 test-all: test test-integration
 
 cover:
-	go test ./... -coverprofile=coverage.out
+	go test -mod=vendor ./... -coverprofile=coverage.out -covermode=atomic
+	go tool cover -func=coverage.out | tail -8
 
 race:
-	go test -race -count=1 ./...
+	go test -mod=vendor -race -count=1 ./...
 
 vet:
-	go vet ./...
+	go vet -mod=vendor ./...
 
 fmt:
 	gofmt -w .
@@ -67,10 +69,12 @@ fmt:
 fmt-check:
 	@test -z "$$(gofmt -l .)" || (echo "Run 'make fmt' to format files"; gofmt -l .; exit 1)
 
-lint: fmt-check vet
+lint:
+	golangci-lint run ./...
 
 tidy:
 	go mod tidy
+	go mod vendor
 
 run-stdio: build
 	./$(OUT_DIR)/$(BINARY)
@@ -82,10 +86,11 @@ docker:
 	docker build -t $(BINARY):local .
 
 install:
-	go install $(PKG)
+	CGO_ENABLED=0 go install -mod=vendor $(PKG)
 
 clean:
 	rm -rf $(OUT_DIR) $(DIST_DIR) coverage.out
 
 help:
 	@echo "Targets: all build build-all dist install clean test test-integration test-all cover race fmt fmt-check vet lint tidy docker run-stdio run-http help"
+	@echo "Module: $(MODULE)"

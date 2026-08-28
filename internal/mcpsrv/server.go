@@ -6,11 +6,11 @@ import (
 	"os"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
-	"github.com/vgromanov/gitlab-mcp/internal/config"
-	"github.com/vgromanov/gitlab-mcp/internal/tools"
-	"github.com/vgromanov/gitlab-mcp/internal/version"
-
 	gitlab "gitlab.com/gitlab-org/api/client-go/v2"
+
+	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/config"
+	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/tools"
+	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/version"
 )
 
 // NewServer builds the MCP server with all GitLab tools registered.
