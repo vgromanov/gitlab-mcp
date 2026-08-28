@@ -6,12 +6,33 @@ import (
 )
 
 func TestFeatureEnabled(t *testing.T) {
-	c := &Config{Wiki: true, Milestone: false, Pipeline: true}
+	c := &Config{Wiki: true, Milestone: false, Pipeline: true, Issues: true, Drafts: false}
 	if !c.FeatureEnabled("wiki") || c.FeatureEnabled("milestone") || !c.FeatureEnabled("pipeline") {
 		t.Fatal("feature flags mismatch")
 	}
+	if !c.FeatureEnabled("issues") || c.FeatureEnabled("drafts") {
+		t.Fatal("new family flags mismatch")
+	}
 	if !c.FeatureEnabled("unknown_should_default_true") {
 		t.Fatal("unknown feature should default true")
+	}
+}
+
+func TestRestrictedMode(t *testing.T) {
+	if (&Config{Pipeline: true}).RestrictedMode() {
+		t.Fatal("USE_PIPELINE alone must not enter restricted mode")
+	}
+	if !(&Config{UseDailyTools: true}).RestrictedMode() {
+		t.Fatal("USE_DAILY_TOOLS must enter restricted mode")
+	}
+	if !(&Config{Issues: true}).RestrictedMode() {
+		t.Fatal("USE_ISSUES must enter restricted mode")
+	}
+	if !(&Config{EnabledTools: []string{"list_projects"}}).RestrictedMode() {
+		t.Fatal("GITLAB_ENABLED_TOOLS must enter restricted mode")
+	}
+	if (&Config{DisabledTools: []string{"list_projects"}}).RestrictedMode() {
+		t.Fatal("disable-only must stay unrestricted")
 	}
 }
 

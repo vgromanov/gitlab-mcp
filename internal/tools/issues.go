@@ -10,17 +10,17 @@ import (
 
 // RegisterIssues registers issue and issue-link tools.
 func RegisterIssues(s *mcp.Server, d Deps) {
-	AddTool(s, d, false, "", &mcp.Tool{Name: "list_issues", Description: "List issues (global); use scope=all for all visible"}, listIssues)
-	AddTool(s, d, false, "", &mcp.Tool{Name: "my_issues", Description: "List issues assigned to the current user"}, myIssues)
-	AddTool(s, d, false, "", &mcp.Tool{Name: "list_project_issues", Description: "List issues in a project"}, listProjectIssues)
-	AddTool(s, d, false, "", &mcp.Tool{Name: "get_issue", Description: "Get issue by IID in a project"}, getIssue)
-	AddTool(s, d, true, "", &mcp.Tool{Name: "create_issue", Description: "Create an issue"}, createIssue)
-	AddTool(s, d, true, "", &mcp.Tool{Name: "update_issue", Description: "Update an issue"}, updateIssue)
-	AddTool(s, d, true, "", &mcp.Tool{Name: "delete_issue", Description: "Delete an issue"}, deleteIssue)
-	AddTool(s, d, false, "", &mcp.Tool{Name: "list_issue_links", Description: "List issue relations/links"}, listIssueLinks)
-	AddTool(s, d, false, "", &mcp.Tool{Name: "get_issue_link", Description: "Get a single issue link"}, getIssueLink)
-	AddTool(s, d, true, "", &mcp.Tool{Name: "create_issue_link", Description: "Link two issues"}, createIssueLink)
-	AddTool(s, d, true, "", &mcp.Tool{Name: "delete_issue_link", Description: "Delete an issue link"}, deleteIssueLink)
+	AddTool(s, d, false, "issues", &mcp.Tool{Name: "list_issues", Description: "List issues (global); use scope=all for all visible"}, listIssues)
+	AddTool(s, d, false, "issues", &mcp.Tool{Name: "my_issues", Description: "List issues assigned to the current user"}, myIssues)
+	AddTool(s, d, false, "issues", &mcp.Tool{Name: "list_project_issues", Description: "List issues in a project"}, listProjectIssues)
+	AddTool(s, d, false, "issues", &mcp.Tool{Name: "get_issue", Description: "Get issue by IID in a project"}, getIssue)
+	AddTool(s, d, true, "issues", &mcp.Tool{Name: "create_issue", Description: "Create an issue"}, createIssue)
+	AddTool(s, d, true, "issues", &mcp.Tool{Name: "update_issue", Description: "Update an issue"}, updateIssue)
+	AddTool(s, d, true, "issues", &mcp.Tool{Name: "delete_issue", Description: "Delete an issue"}, deleteIssue)
+	AddTool(s, d, false, "issues", &mcp.Tool{Name: "list_issue_links", Description: "List issue relations/links"}, listIssueLinks)
+	AddTool(s, d, false, "issues", &mcp.Tool{Name: "get_issue_link", Description: "Get a single issue link"}, getIssueLink)
+	AddTool(s, d, true, "issues", &mcp.Tool{Name: "create_issue_link", Description: "Link two issues"}, createIssueLink)
+	AddTool(s, d, true, "issues", &mcp.Tool{Name: "delete_issue_link", Description: "Delete an issue link"}, deleteIssueLink)
 }
 
 type pidIssue struct {

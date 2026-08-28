@@ -24,11 +24,11 @@ func labelIDForAPI(s string) any {
 
 // RegisterLabels registers project label tools.
 func RegisterLabels(s *mcp.Server, d Deps) {
-	AddTool(s, d, false, "", &mcp.Tool{Name: "list_labels", Description: "List labels in a project"}, listLabels)
-	AddTool(s, d, false, "", &mcp.Tool{Name: "get_label", Description: "Get a single project label"}, getLabel)
-	AddTool(s, d, true, "", &mcp.Tool{Name: "create_label", Description: "Create a project label"}, createLabel)
-	AddTool(s, d, true, "", &mcp.Tool{Name: "update_label", Description: "Update a project label"}, updateLabel)
-	AddTool(s, d, true, "", &mcp.Tool{Name: "delete_label", Description: "Delete a project label"}, deleteLabel)
+	AddTool(s, d, false, "labels", &mcp.Tool{Name: "list_labels", Description: "List labels in a project"}, listLabels)
+	AddTool(s, d, false, "labels", &mcp.Tool{Name: "get_label", Description: "Get a single project label"}, getLabel)
+	AddTool(s, d, true, "labels", &mcp.Tool{Name: "create_label", Description: "Create a project label"}, createLabel)
+	AddTool(s, d, true, "labels", &mcp.Tool{Name: "update_label", Description: "Update a project label"}, updateLabel)
+	AddTool(s, d, true, "labels", &mcp.Tool{Name: "delete_label", Description: "Delete a project label"}, deleteLabel)
 }
 
 type listLabelsIn struct {

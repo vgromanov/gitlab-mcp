@@ -23,5 +23,6 @@ func NewServer(cfg *config.Config, client *gitlab.Client, logger *slog.Logger) *
 		Instructions: "GitLab MCP: PAT-authenticated tools for projects, MRs, issues, CI, wiki, releases, and GraphQL.",
 	})
 	tools.RegisterAll(s, tools.Deps{Config: cfg, Client: client})
+	tools.WarnUnknownSelectionTools(cfg, logger)
 	return s
 }

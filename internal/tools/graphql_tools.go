@@ -13,18 +13,18 @@ import (
 // RegisterGraphQLTools registers GraphQL-based work item and utility tools.
 func RegisterGraphQLTools(s *mcp.Server, d Deps) {
 	AddTool(s, d, false, "", &mcp.Tool{Name: "execute_graphql", Description: "Run an arbitrary GitLab GraphQL query or mutation"}, executeGraphQL)
-	AddTool(s, d, false, "", &mcp.Tool{Name: "get_work_item", Description: "Get a work item by global id"}, getWorkItem)
-	AddTool(s, d, false, "", &mcp.Tool{Name: "list_work_items", Description: "List work items for a project"}, listWorkItems)
-	AddTool(s, d, true, "", &mcp.Tool{Name: "create_work_item", Description: "Create a work item (requires work_item_type_id gid)"}, createWorkItem)
-	AddTool(s, d, true, "", &mcp.Tool{Name: "update_work_item", Description: "Update a work item"}, updateWorkItem)
-	AddTool(s, d, true, "", &mcp.Tool{Name: "convert_work_item_type", Description: "Convert work item to another type"}, convertWorkItemType)
-	AddTool(s, d, false, "", &mcp.Tool{Name: "list_work_item_statuses", Description: "List statuses for a work item type"}, listWorkItemStatuses)
-	AddTool(s, d, false, "", &mcp.Tool{Name: "list_custom_field_definitions", Description: "List custom field definitions for a work item type"}, listCustomFieldDefinitions)
-	AddTool(s, d, true, "", &mcp.Tool{Name: "move_work_item", Description: "Move work item to another project"}, moveWorkItem)
-	AddTool(s, d, false, "", &mcp.Tool{Name: "list_work_item_notes", Description: "List notes on a work item"}, listWorkItemNotes)
-	AddTool(s, d, true, "", &mcp.Tool{Name: "create_work_item_note", Description: "Add a note to a work item"}, createWorkItemNote)
-	AddTool(s, d, false, "", &mcp.Tool{Name: "get_timeline_events", Description: "List timeline events for an incident work item"}, getTimelineEvents)
-	AddTool(s, d, true, "", &mcp.Tool{Name: "create_timeline_event", Description: "Create a timeline event on an incident"}, createTimelineEvent)
+	AddTool(s, d, false, "work_items", &mcp.Tool{Name: "get_work_item", Description: "Get a work item by global id"}, getWorkItem)
+	AddTool(s, d, false, "work_items", &mcp.Tool{Name: "list_work_items", Description: "List work items for a project"}, listWorkItems)
+	AddTool(s, d, true, "work_items", &mcp.Tool{Name: "create_work_item", Description: "Create a work item (requires work_item_type_id gid)"}, createWorkItem)
+	AddTool(s, d, true, "work_items", &mcp.Tool{Name: "update_work_item", Description: "Update a work item"}, updateWorkItem)
+	AddTool(s, d, true, "work_items", &mcp.Tool{Name: "convert_work_item_type", Description: "Convert work item to another type"}, convertWorkItemType)
+	AddTool(s, d, false, "work_items", &mcp.Tool{Name: "list_work_item_statuses", Description: "List statuses for a work item type"}, listWorkItemStatuses)
+	AddTool(s, d, false, "work_items", &mcp.Tool{Name: "list_custom_field_definitions", Description: "List custom field definitions for a work item type"}, listCustomFieldDefinitions)
+	AddTool(s, d, true, "work_items", &mcp.Tool{Name: "move_work_item", Description: "Move work item to another project"}, moveWorkItem)
+	AddTool(s, d, false, "work_items", &mcp.Tool{Name: "list_work_item_notes", Description: "List notes on a work item"}, listWorkItemNotes)
+	AddTool(s, d, true, "work_items", &mcp.Tool{Name: "create_work_item_note", Description: "Add a note to a work item"}, createWorkItemNote)
+	AddTool(s, d, false, "timeline", &mcp.Tool{Name: "get_timeline_events", Description: "List timeline events for an incident work item"}, getTimelineEvents)
+	AddTool(s, d, true, "timeline", &mcp.Tool{Name: "create_timeline_event", Description: "Create a timeline event on an incident"}, createTimelineEvent)
 }
 
 func runGQL(ctx context.Context, d Deps, query string, variables map[string]any) (any, error) {

@@ -16,6 +16,15 @@ type Config struct {
 	Wiki               bool
 	Milestone          bool
 	Pipeline           bool
+	UseDailyTools      bool
+	Issues             bool
+	WorkItems          bool
+	Labels             bool
+	Drafts             bool
+	Webhooks           bool
+	Timeline           bool
+	EnabledTools       []string
+	DisabledTools      []string
 	StreamableHTTP     bool
 	Host               string
 	Port               string
@@ -46,6 +55,20 @@ func envString(key, def string) string {
 	return def
 }
 
+func parseCSV(raw string) []string {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	var out []string
+	for _, p := range strings.Split(raw, ",") {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 // Load parses flags then merges environment. Call from main after flag.Parse().
 func Load() *Config {
 	c := &Config{
@@ -55,6 +78,15 @@ func Load() *Config {
 		Wiki:               envBool("USE_GITLAB_WIKI", false),
 		Milestone:          envBool("USE_MILESTONE", false),
 		Pipeline:           envBool("USE_PIPELINE", false),
+		UseDailyTools:      envBool("USE_DAILY_TOOLS", false),
+		Issues:             envBool("USE_ISSUES", false),
+		WorkItems:          envBool("USE_WORK_ITEMS", false),
+		Labels:             envBool("USE_LABELS", false),
+		Drafts:             envBool("USE_DRAFTS", false),
+		Webhooks:           envBool("USE_WEBHOOKS", false),
+		Timeline:           envBool("USE_TIMELINE", false),
+		EnabledTools:       parseCSV(envString("GITLAB_ENABLED_TOOLS", "")),
+		DisabledTools:      parseCSV(envString("GITLAB_DISABLED_TOOLS", "")),
 		StreamableHTTP:     envBool("STREAMABLE_HTTP", false),
 		Host:               envString("HOST", "127.0.0.1"),
 		Port:               envString("PORT", "3002"),
@@ -65,12 +97,7 @@ func Load() *Config {
 		HTTPSProxy:         envString("HTTPS_PROXY", ""),
 	}
 	if raw := envString("GITLAB_ALLOWED_PROJECT_IDS", ""); raw != "" {
-		for _, p := range strings.Split(raw, ",") {
-			p = strings.TrimSpace(p)
-			if p != "" {
-				c.AllowedProjectIDs = append(c.AllowedProjectIDs, p)
-			}
-		}
+		c.AllowedProjectIDs = parseCSV(raw)
 	}
 
 	var (
@@ -80,6 +107,15 @@ func Load() *Config {
 		flagWiki       = flag.Bool("use-wiki", false, "Enable wiki tools")
 		flagMilestone  = flag.Bool("use-milestone", false, "Enable milestone tools")
 		flagPipeline   = flag.Bool("use-pipeline", false, "Enable pipeline tools")
+		flagDaily      = flag.Bool("use-daily-tools", false, "Restricted mode: register Aug-2026 daily census tools")
+		flagIssues     = flag.Bool("use-issues", false, "Restricted mode: enable issues family (also enters restricted mode)")
+		flagWorkItems  = flag.Bool("use-work-items", false, "Restricted mode: enable work items family")
+		flagLabels     = flag.Bool("use-labels", false, "Restricted mode: enable labels family")
+		flagDrafts     = flag.Bool("use-drafts", false, "Restricted mode: enable MR drafts family")
+		flagWebhooks   = flag.Bool("use-webhooks", false, "Restricted mode: enable webhooks family")
+		flagTimeline   = flag.Bool("use-timeline", false, "Restricted mode: enable timeline family")
+		flagEnabled    = flag.String("enabled-tools", "", "Comma-separated extra tools (enters restricted mode when non-empty)")
+		flagDisabled   = flag.String("disabled-tools", "", "Comma-separated tools to exclude")
 		flagStreamHTTP = flag.Bool("streamable-http", false, "Serve streamable HTTP instead of stdio")
 		flagHost       = flag.String("host", "", "HTTP listen host")
 		flagPort       = flag.String("port", "", "HTTP listen port")
@@ -106,6 +142,33 @@ func Load() *Config {
 	}
 	if flagVisited("use-pipeline") {
 		c.Pipeline = *flagPipeline
+	}
+	if flagVisited("use-daily-tools") {
+		c.UseDailyTools = *flagDaily
+	}
+	if flagVisited("use-issues") {
+		c.Issues = *flagIssues
+	}
+	if flagVisited("use-work-items") {
+		c.WorkItems = *flagWorkItems
+	}
+	if flagVisited("use-labels") {
+		c.Labels = *flagLabels
+	}
+	if flagVisited("use-drafts") {
+		c.Drafts = *flagDrafts
+	}
+	if flagVisited("use-webhooks") {
+		c.Webhooks = *flagWebhooks
+	}
+	if flagVisited("use-timeline") {
+		c.Timeline = *flagTimeline
+	}
+	if flagVisited("enabled-tools") {
+		c.EnabledTools = parseCSV(*flagEnabled)
+	}
+	if flagVisited("disabled-tools") {
+		c.DisabledTools = parseCSV(*flagDisabled)
 	}
 	if flagVisited("streamable-http") {
 		c.StreamableHTTP = *flagStreamHTTP
@@ -142,7 +205,20 @@ func flagVisited(name string) bool {
 	return visited
 }
 
-// FeatureEnabled reports gated feature flags.
+// RestrictedMode is on when USE_DAILY_TOOLS, any new family flag, or a non-empty
+// GITLAB_ENABLED_TOOLS list is set. Legacy USE_PIPELINE / USE_MILESTONE /
+// USE_GITLAB_WIKI alone do not enter restricted mode.
+func (c *Config) RestrictedMode() bool {
+	if c == nil {
+		return false
+	}
+	return c.UseDailyTools ||
+		len(c.EnabledTools) > 0 ||
+		c.Issues || c.WorkItems || c.Labels ||
+		c.Drafts || c.Webhooks || c.Timeline
+}
+
+// FeatureEnabled reports gated feature flags (legacy + new families).
 func (c *Config) FeatureEnabled(name string) bool {
 	switch name {
 	case "wiki":
@@ -151,6 +227,18 @@ func (c *Config) FeatureEnabled(name string) bool {
 		return c.Milestone
 	case "pipeline":
 		return c.Pipeline
+	case "issues":
+		return c.Issues
+	case "work_items":
+		return c.WorkItems
+	case "labels":
+		return c.Labels
+	case "drafts":
+		return c.Drafts
+	case "webhooks":
+		return c.Webhooks
+	case "timeline":
+		return c.Timeline
 	default:
 		return true
 	}

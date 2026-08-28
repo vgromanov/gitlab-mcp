@@ -9,9 +9,9 @@ import (
 
 // RegisterIssueNotes registers issue discussion / note tools.
 func RegisterIssueNotes(s *mcp.Server, d Deps) {
-	AddTool(s, d, false, "", &mcp.Tool{Name: "list_issue_discussions", Description: "List discussions on an issue"}, listIssueDiscussions)
-	AddTool(s, d, true, "", &mcp.Tool{Name: "create_issue_note", Description: "Reply in an issue discussion thread"}, createIssueNote)
-	AddTool(s, d, true, "", &mcp.Tool{Name: "update_issue_note", Description: "Edit a note in an issue discussion"}, updateIssueNote)
+	AddTool(s, d, false, "issues", &mcp.Tool{Name: "list_issue_discussions", Description: "List discussions on an issue"}, listIssueDiscussions)
+	AddTool(s, d, true, "issues", &mcp.Tool{Name: "create_issue_note", Description: "Reply in an issue discussion thread"}, createIssueNote)
+	AddTool(s, d, true, "issues", &mcp.Tool{Name: "update_issue_note", Description: "Edit a note in an issue discussion"}, updateIssueNote)
 }
 
 type listIssueDiscussionsIn struct {
