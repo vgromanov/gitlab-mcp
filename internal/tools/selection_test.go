@@ -6,7 +6,7 @@ import (
 	"slices"
 	"testing"
 
-	"github.com/vgromanov/gitlab-mcp/internal/config"
+	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/config"
 )
 
 func TestDailyTools_countAndSearchMembership(t *testing.T) {

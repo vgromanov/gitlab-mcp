@@ -1,4 +1,4 @@
-module github.com/vgromanov/gitlab-mcp
+module gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp
 
 go 1.25.0
 

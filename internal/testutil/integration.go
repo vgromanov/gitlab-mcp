@@ -10,8 +10,8 @@ import (
 	"testing"
 
 	"github.com/joho/godotenv"
-	"github.com/vgromanov/gitlab-mcp/internal/config"
-	glclient "github.com/vgromanov/gitlab-mcp/internal/gitlab"
+	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/config"
+	glclient "gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/gitlab"
 
 	gitlab "gitlab.com/gitlab-org/api/client-go/v2"
 )

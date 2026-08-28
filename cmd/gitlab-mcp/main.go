@@ -10,10 +10,10 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/vgromanov/gitlab-mcp/internal/config"
-	glclient "github.com/vgromanov/gitlab-mcp/internal/gitlab"
-	"github.com/vgromanov/gitlab-mcp/internal/mcpsrv"
-	"github.com/vgromanov/gitlab-mcp/internal/version"
+	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/config"
+	glclient "gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/gitlab"
+	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/mcpsrv"
+	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/version"
 )
 
 func main() {

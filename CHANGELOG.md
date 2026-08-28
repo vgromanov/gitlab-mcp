@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Corp GitLab home `skunk-works/tools/gitlab-mcp` with shared
+  `ci-pipelines` `/pipelines/golang.yml`, committed `vendor/`, and
+  `.golangci.yml` vendor mode (SW-148).
 - Additive tool selection gates: `USE_DAILY_TOOLS`, family flags
   (`USE_ISSUES`, `USE_WORK_ITEMS`, `USE_LABELS`, `USE_DRAFTS`, `USE_WEBHOOKS`,
   `USE_TIMELINE`), and `GITLAB_ENABLED_TOOLS` / `GITLAB_DISABLED_TOOLS`
@@ -34,8 +37,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- Go module and imports are now **`github.com/vgromanov/gitlab-mcp`**, matching
-  the canonical GitHub remote; badges, docs, issue template links, GoReleaser
+- Go module and imports moved to
+  **`gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp`** (corp home);
+  GitHub remains a secondary mirror with optional Actions/GHCR (SW-148).
+- Go module and imports were previously **`github.com/vgromanov/gitlab-mcp`**,
+  matching the GitHub remote; badges, docs, issue template links, GoReleaser
   ldflags/OCI metadata, and **`ghcr.io/vgromanov/gitlab-mcp`** image names were
   updated together.
 - CI runs on **ubuntu-latest** and **macos-latest**, uses `go-version-file`,

@@ -1,7 +1,7 @@
 package tools
 
 import (
-	"github.com/vgromanov/gitlab-mcp/internal/config"
+	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/config"
 
 	gitlab "gitlab.com/gitlab-org/api/client-go/v2"
 )

@@ -6,8 +6,9 @@ import (
 	"testing"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
-	"github.com/vgromanov/gitlab-mcp/internal/config"
-	"github.com/vgromanov/gitlab-mcp/internal/testutil"
+
+	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/config"
+	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/testutil"
 )
 
 func stubGitLabAPI() http.Handler {

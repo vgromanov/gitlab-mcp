@@ -4,7 +4,7 @@ import (
 	"log/slog"
 	"slices"
 
-	"github.com/vgromanov/gitlab-mcp/internal/config"
+	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/config"
 )
 
 // RequiredDailySearchTools must always appear in the USE_DAILY_TOOLS set.
