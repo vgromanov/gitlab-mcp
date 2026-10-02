@@ -3,6 +3,7 @@ package readmeta
 import (
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -21,6 +22,26 @@ const (
 	CoveragePartial         = "partial"
 	CoverageUnknown         = "unknown"
 )
+
+// ObservedHeadSHA returns a valid 40-char hex git SHA observation, or ("", false).
+// Locked contract: section.head_sha is JSON null unless a real 40-hex observation is known.
+func ObservedHeadSHA(raw string) (string, bool) {
+	s := strings.TrimSpace(raw)
+	if len(s) != 40 {
+		return "", false
+	}
+	for i := 0; i < 40; i++ {
+		c := s[i]
+		switch {
+		case c >= '0' && c <= '9':
+		case c >= 'a' && c <= 'f':
+		case c >= 'A' && c <= 'F':
+		default:
+			return "", false
+		}
+	}
+	return strings.ToLower(s), true
+}
 
 // Limitation is a safe per-section limitation entry.
 type Limitation struct {

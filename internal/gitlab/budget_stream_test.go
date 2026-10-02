@@ -42,6 +42,18 @@ func TestPresenceHelpers(t *testing.T) {
 	}
 }
 
+func TestBudget_CancelReleasesDeadline(t *testing.T) {
+	b := DefaultBudget()
+	b.MaxElapsed = time.Minute
+	ctx := WithBudget(context.Background(), b)
+	b.Cancel()
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("budget.Cancel must cancel WithBudget-derived context (release deadline timer)")
+	}
+}
+
 func TestBudget_RemainingBytes(t *testing.T) {
 	if RemainingBytes := (*Budget)(nil).RemainingBytes(); RemainingBytes != -1 {
 		t.Fatalf("nil RemainingBytes=%d", RemainingBytes)
