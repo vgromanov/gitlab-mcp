@@ -676,6 +676,37 @@ func TestListMergeRequestDiffs_legacySDKProjectionCompat(t *testing.T) {
 	}
 }
 
+func TestListMergeRequestDiffs_truncatedStreamPartialNotHTTP(t *testing.T) {
+	// One full object then truncated (no closing ']').
+	body := `[{"old_path":"a.go","new_path":"a.go","diff":"+x\n","collapsed":false,"too_large":false}`
+	d := newMRDiffsDeps(t, mrHandler(42, 42, body, "", true))
+	_, out, err := listMergeRequestDiffs(context.Background(), nil, listMergeRequestDiffsIn{
+		pidMR: pidMR{ProjectID: "42", MergeRequestIID: 1},
+	}, d)
+	if err != nil {
+		t.Fatalf("partial retain must not be fatal err: %v", err)
+	}
+	if len(out.Diffs) < 1 {
+		t.Fatal("expected retained item")
+	}
+	var codes []string
+	for _, lim := range out.Section.Limitations {
+		codes = append(codes, lim.Code)
+		if lim.Code == readmeta.CodeHTTPError {
+			t.Fatalf("stream framing must not use http_error: %+v", out.Section.Limitations)
+		}
+	}
+	found := false
+	for _, c := range codes {
+		if c == readmeta.CodePartial {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected partial limitation, got %v", codes)
+	}
+}
+
 func TestReadmetaInformationalHelpers(t *testing.T) {
 	if c := readmeta.InformationalNextCursor(0); c != nil {
 		t.Fatal("expected nil cursor")

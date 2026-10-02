@@ -364,3 +364,33 @@ func TestStreamJSONArray_cancelJoins(t *testing.T) {
 		t.Fatal("expected cancel-related stop")
 	}
 }
+
+func TestStreamJSONArray_elapsedMapsToBudgetElapsed(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		flusher, _ := w.(http.Flusher)
+		_, _ = io.WriteString(w, `[{"old_path":"a","new_path":"a","diff":"","collapsed":false,"too_large":false}`)
+		if flusher != nil {
+			flusher.Flush()
+		}
+		time.Sleep(3 * time.Second)
+		_, _ = io.WriteString(w, `]`)
+	}))
+	t.Cleanup(ts.Close)
+	c, err := gitlab.NewClient("t",
+		gitlab.WithBaseURL(ts.URL+"/api/v4"),
+		gitlab.WithoutRetries(),
+		gitlab.WithInterceptor(BudgetInterceptor()),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := &Budget{MaxItems: 100, MaxBytes: 1 << 20, MaxElapsed: 200 * time.Millisecond, MaxRequests: 16, start: time.Now()}
+	ctx := WithBudget(context.Background(), b)
+	_, err = StreamJSONArray(ctx, c, http.MethodGet, "projects/1/merge_requests/1/diffs", nil, func(json.RawMessage) error {
+		return nil
+	})
+	if !errors.Is(err, ErrBudgetElapsed) {
+		t.Fatalf("want ErrBudgetElapsed, got %v", err)
+	}
+}

@@ -45,14 +45,14 @@ func StreamJSONArray(ctx context.Context, client *gitlab.Client, method, path st
 	)
 	stopUpstream := func(cause error) {
 		stopOnce.Do(func() {
-			decodeErr = cause
+			decodeErr = mapBudgetContextErr(ctx, cause)
 			cancel()
 			if b := BudgetFromContext(ctx); b != nil {
 				b.Cancel()
 			}
 			// Closing the reader fails subsequent pipe writes (ErrClosedPipe),
 			// stopping Client.Do Copy and limiting deferred Discard drain.
-			_ = pr.CloseWithError(cause)
+			_ = pr.CloseWithError(decodeErr)
 		})
 	}
 
@@ -124,10 +124,24 @@ func StreamJSONArray(ctx context.Context, client *gitlab.Client, method, path st
 	}
 	wg.Wait()
 
-	return resp, preferStreamError(doErr, decodeErr)
+	return resp, preferStreamError(ctx, doErr, decodeErr)
 }
 
-func preferStreamError(doErr, decodeErr error) error {
+// mapBudgetContextErr normalizes context deadline from WithBudget into ErrBudgetElapsed
+// so adapters see a typed budget cause (not raw DeadlineExceeded → http_error).
+func mapBudgetContextErr(ctx context.Context, err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, context.DeadlineExceeded) && BudgetFromContext(ctx) != nil {
+		return ErrBudgetElapsed
+	}
+	return err
+}
+
+func preferStreamError(ctx context.Context, doErr, decodeErr error) error {
+	decodeErr = mapBudgetContextErr(ctx, decodeErr)
+	doErr = mapBudgetContextErr(ctx, doErr)
 	if decodeErr != nil {
 		if doErr == nil || isClosedPipe(doErr) {
 			return decodeErr

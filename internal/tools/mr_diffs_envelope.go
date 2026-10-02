@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -219,7 +220,8 @@ func listMergeRequestDiffs(ctx context.Context, _ *mcp.CallToolRequest, in listM
 		setContentComplete(&section, readmeta.ContentCompleteFalse, unknownLatched)
 		section.ManifestCoverage = readmeta.CoveragePartial
 		section.PatchCoverage = readmeta.CoveragePartial
-	case errors.Is(err, igl.ErrBudgetElapsed) || errors.Is(streamStop, igl.ErrBudgetElapsed):
+	case errors.Is(err, igl.ErrBudgetElapsed) || errors.Is(streamStop, igl.ErrBudgetElapsed) ||
+		errors.Is(err, context.DeadlineExceeded) || errors.Is(streamStop, context.DeadlineExceeded):
 		section.AddLimitation(readmeta.CodeBudgetElapsed, "elapsed budget exhausted")
 		setContentComplete(&section, readmeta.ContentCompleteFalse, unknownLatched)
 		section.ManifestCoverage = readmeta.CoveragePartial
@@ -228,8 +230,13 @@ func listMergeRequestDiffs(ctx context.Context, _ *mcp.CallToolRequest, in listM
 		// Fatal with nothing retained — safe fixed code/message only (no raw SDK/API body).
 		return nil, listMergeRequestDiffsOut{}, fmt.Errorf("%s: backend request failed", readmeta.CodeHTTPError)
 	case err != nil:
-		section.AddLimitation(readmeta.CodeHTTPError, "backend error after partial decode")
-		section.AddLimitation(readmeta.CodePartial, "partial results retained")
+		// Stream/JSON integrity failures are partial, not HTTP backend failures.
+		if isStreamFramingError(err) {
+			section.AddLimitation(readmeta.CodePartial, "incomplete JSON stream; partial results retained")
+		} else {
+			section.AddLimitation(readmeta.CodeHTTPError, "backend error after partial decode")
+			section.AddLimitation(readmeta.CodePartial, "partial results retained")
+		}
 		setContentComplete(&section, readmeta.ContentCompleteFalse, unknownLatched)
 		section.ManifestCoverage = readmeta.CoveragePartial
 		section.PatchCoverage = readmeta.CoveragePartial
@@ -309,4 +316,12 @@ func applySuccessHonesty(s *readmeta.Section, page int, obs readmeta.PagingObser
 	default:
 		setContentComplete(s, readmeta.ContentCompleteUnknown, unknownLatched)
 	}
+}
+
+func isStreamFramingError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "stream array:") || strings.Contains(msg, "stream array element:")
 }
