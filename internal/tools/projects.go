@@ -2,10 +2,13 @@ package tools
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	gitlab "gitlab.com/gitlab-org/api/client-go/v2"
+
+	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/tools/readmeta"
 )
 
 // RegisterProjects registers project/namespace/user tools.
@@ -91,16 +94,19 @@ type getProjectIn struct {
 	ProjectID string `json:"project_id" jsonschema:"Numeric id or URL-encoded path"`
 }
 
-func getProject(ctx context.Context, _ *mcp.CallToolRequest, in getProjectIn, d Deps) (*mcp.CallToolResult, any, error) {
+func getProject(ctx context.Context, _ *mcp.CallToolRequest, in getProjectIn, d Deps) (*mcp.CallToolResult, getProjectOut, error) {
 	pid, err := resolveProjectAuthz(ctx, d, in.ProjectID)
 	if err != nil {
-		return nil, nil, err
+		return nil, getProjectOut{}, err
 	}
 	p, _, err := d.Client.Projects.GetProject(pid, nil, gitlab.WithContext(ctx))
 	if err != nil {
-		return nil, nil, err
+		return nil, getProjectOut{}, fmt.Errorf("%s: backend request failed", readmeta.CodeHTTPError)
 	}
-	return nil, Out(p), nil
+	if err := usableGetProjectResponse(p, pid); err != nil {
+		return nil, getProjectOut{}, err
+	}
+	return nil, projectMetadataFromSDK(p), nil
 }
 
 type listProjectMembersIn struct {
