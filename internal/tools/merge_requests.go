@@ -3,10 +3,13 @@ package tools
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	glclient "gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/gitlab"
 	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/tools/readmeta"
 
 	gitlab "gitlab.com/gitlab-org/api/client-go/v2"
@@ -461,34 +464,165 @@ func updateMergeRequest(ctx context.Context, _ *mcp.CallToolRequest, in updateMe
 }
 
 type listMergeRequestsIn struct {
-	ProjectID *string `json:"project_id,omitempty"`
-	GroupID   *string `json:"group_id,omitempty"`
-	State     *string `json:"state,omitempty"`
-	AuthorID  *int64  `json:"author_id,omitempty"`
+	ProjectID     *string `json:"project_id,omitempty" jsonschema:"Project id or path; mutually exclusive with group_id"`
+	GroupID       *string `json:"group_id,omitempty" jsonschema:"Group id or path; mutually exclusive with project_id"`
+	State         *string `json:"state,omitempty" jsonschema:"MR state filter (opened, closed, locked, merged, all)"`
+	AuthorID      *int64  `json:"author_id,omitempty" jsonschema:"Positive GitLab user id of the author; omit when unused"`
+	ReviewerID    *int64  `json:"reviewer_id,omitempty" jsonschema:"Positive GitLab user id of a reviewer; use with scope=all for discovery"`
+	Scope         *string `json:"scope,omitempty" jsonschema:"created_by_me, assigned_to_me, reviews_for_me, or all; omit for legacy GitLab default"`
+	UpdatedAfter  *string `json:"updated_after,omitempty" jsonschema:"Strict RFC3339/RFC3339Nano instant (2-digit hour, dot fractions only, legal offset); at most 9 fractional digits (nanosecond); lossless on the wire within that limit"`
+	UpdatedBefore *string `json:"updated_before,omitempty" jsonschema:"Strict RFC3339/RFC3339Nano instant (2-digit hour, dot fractions only, legal offset); at most 9 fractional digits (nanosecond); lossless on the wire within that limit"`
+	OrderBy       *string `json:"order_by,omitempty" jsonschema:"created_at, updated_at, label_priority, priority, milestone_due, popularity, or title"`
+	Sort          *string `json:"sort,omitempty" jsonschema:"asc or desc"`
 	Pagination
 }
 
+var listMRScopes = map[string]struct{}{
+	"created_by_me":  {},
+	"assigned_to_me": {},
+	"reviews_for_me": {},
+	"all":            {},
+}
+
+var listMROrderBy = map[string]struct{}{
+	"created_at":     {},
+	"updated_at":     {},
+	"label_priority": {},
+	"priority":       {},
+	"milestone_due":  {},
+	"popularity":     {},
+	"title":          {},
+}
+
+type listMRParsedBounds struct {
+	after  *time.Time
+	before *time.Time
+}
+
+func validateListMergeRequestsIn(in listMergeRequestsIn) (listMRParsedBounds, error) {
+	var bounds listMRParsedBounds
+	proj := in.ProjectID != nil && strings.TrimSpace(*in.ProjectID) != ""
+	grp := in.GroupID != nil && strings.TrimSpace(*in.GroupID) != ""
+	if proj && grp {
+		return bounds, fmt.Errorf("project_id and group_id are mutually exclusive")
+	}
+	if err := requirePositiveUserID("author_id", in.AuthorID); err != nil {
+		return bounds, err
+	}
+	if err := requirePositiveUserID("reviewer_id", in.ReviewerID); err != nil {
+		return bounds, err
+	}
+	if in.Scope != nil {
+		s := strings.TrimSpace(*in.Scope)
+		if _, ok := listMRScopes[s]; !ok {
+			return bounds, fmt.Errorf("scope must be created_by_me, assigned_to_me, reviews_for_me, or all; got %q", *in.Scope)
+		}
+	}
+	if in.OrderBy != nil {
+		o := strings.TrimSpace(*in.OrderBy)
+		if _, ok := listMROrderBy[o]; !ok {
+			return bounds, fmt.Errorf("order_by must be one of created_at, updated_at, label_priority, priority, milestone_due, popularity, title; got %q", *in.OrderBy)
+		}
+	}
+	if in.Sort != nil {
+		s := strings.TrimSpace(*in.Sort)
+		if s != "asc" && s != "desc" {
+			return bounds, fmt.Errorf("sort must be asc or desc; got %q", *in.Sort)
+		}
+	}
+	after, err := parseListMRTime("updated_after", in.UpdatedAfter)
+	if err != nil {
+		return bounds, err
+	}
+	before, err := parseListMRTime("updated_before", in.UpdatedBefore)
+	if err != nil {
+		return bounds, err
+	}
+	if after != nil && before != nil && after.After(*before) {
+		return bounds, fmt.Errorf("updated_after must be <= updated_before")
+	}
+	bounds.after = after
+	bounds.before = before
+	return bounds, nil
+}
+
+func requirePositiveUserID(name string, id *int64) error {
+	if id == nil {
+		return nil
+	}
+	if *id <= 0 {
+		return fmt.Errorf("%s must be a positive integer", name)
+	}
+	return nil
+}
+
+// Strict RFC3339 / RFC3339Nano (Z or ±HH:MM). Rejects Go time.Parse leniency
+// (1-digit hour, comma fractions, illegal offsets) and >9 fractional digits
+// so we never accept then silently truncate sub-nanosecond precision.
+var listMRTimeRe = regexp.MustCompile(`^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?(Z|[+-](\d{2}):(\d{2}))$`)
+
+func parseListMRTime(name string, raw *string) (*time.Time, error) {
+	if raw == nil {
+		return nil, nil
+	}
+	s := strings.TrimSpace(*raw)
+	if s == "" {
+		return nil, fmt.Errorf("%s must be a non-empty RFC3339 timestamp", name)
+	}
+	m := listMRTimeRe.FindStringSubmatch(s)
+	if m == nil {
+		return nil, fmt.Errorf("%s must be strict RFC3339/RFC3339Nano (2-digit hour, '.' fractional seconds with at most 9 digits, zone Z or ±HH:MM with HH 00-23 and MM 00-59)", name)
+	}
+	hour, _ := strconv.Atoi(m[4])
+	min, _ := strconv.Atoi(m[5])
+	sec, _ := strconv.Atoi(m[6])
+	if hour > 23 || min > 59 || sec > 60 {
+		return nil, fmt.Errorf("%s has out-of-range clock fields", name)
+	}
+	if m[9] != "" { // numeric ±HH:MM offset (empty when zone is Z)
+		zh, _ := strconv.Atoi(m[9])
+		zm, _ := strconv.Atoi(m[10])
+		if zh > 23 || zm > 59 {
+			return nil, fmt.Errorf("%s has out-of-range timezone offset", name)
+		}
+	}
+	t, err := time.Parse(time.RFC3339Nano, s)
+	if err != nil {
+		return nil, fmt.Errorf("%s must be a valid calendar RFC3339/RFC3339Nano instant: %w", name, err)
+	}
+	return &t, nil
+}
+
+func listMRRequestOpts(ctx context.Context, bounds listMRParsedBounds) []gitlab.RequestOptionFunc {
+	opts := []gitlab.RequestOptionFunc{gitlab.WithContext(ctx)}
+	if bounds.after != nil || bounds.before != nil {
+		opts = append(opts, glclient.WithUpdatedBounds(bounds.after, bounds.before))
+	}
+	return opts
+}
+
 func listMergeRequests(ctx context.Context, _ *mcp.CallToolRequest, in listMergeRequestsIn, d Deps) (*mcp.CallToolResult, any, error) {
+	bounds, err := validateListMergeRequestsIn(in)
+	if err != nil {
+		return nil, nil, err
+	}
 	page, perPage := in.ListOpts()
-	if in.ProjectID != nil && *in.ProjectID != "" {
+	reqOpts := listMRRequestOpts(ctx, bounds)
+
+	if in.ProjectID != nil && strings.TrimSpace(*in.ProjectID) != "" {
 		pid, err := resolveProjectAuthz(ctx, d, *in.ProjectID)
 		if err != nil {
 			return nil, nil, err
 		}
 		opt := &gitlab.ListProjectMergeRequestsOptions{ListOptions: gitlab.ListOptions{Page: int64(page), PerPage: int64(perPage)}}
-		if in.State != nil {
-			opt.State = in.State
-		}
-		if in.AuthorID != nil {
-			opt.AuthorID = in.AuthorID
-		}
-		mrs, resp, err := d.Client.MergeRequests.ListProjectMergeRequests(pid, opt, gitlab.WithContext(ctx))
+		applyListMRCommon(in, &opt.State, &opt.AuthorID, &opt.ReviewerID, &opt.Scope, &opt.OrderBy, &opt.Sort)
+		mrs, resp, err := d.Client.MergeRequests.ListProjectMergeRequests(pid, opt, reqOpts...)
 		if err != nil {
 			return nil, nil, err
 		}
 		return nil, Out(map[string]any{"merge_requests": mrs, "pagination": map[string]any{"next_page": resp.NextPage}}), nil
 	}
-	if in.GroupID != nil && *in.GroupID != "" {
+	if in.GroupID != nil && strings.TrimSpace(*in.GroupID) != "" {
 		gid := *in.GroupID
 		if d.Config != nil && len(d.Config.AllowedGroupIDs) > 0 {
 			g, err := AuthorizeCanonicalGroup(ctx, d, *in.GroupID)
@@ -498,10 +632,8 @@ func listMergeRequests(ctx context.Context, _ *mcp.CallToolRequest, in listMerge
 			gid = strconv.FormatInt(g.ID, 10)
 		}
 		opt := &gitlab.ListGroupMergeRequestsOptions{ListOptions: gitlab.ListOptions{Page: int64(page), PerPage: int64(perPage)}}
-		if in.State != nil {
-			opt.State = in.State
-		}
-		mrs, resp, err := d.Client.MergeRequests.ListGroupMergeRequests(gid, opt, gitlab.WithContext(ctx))
+		applyListMRCommon(in, &opt.State, &opt.AuthorID, &opt.ReviewerID, &opt.Scope, &opt.OrderBy, &opt.Sort)
+		mrs, resp, err := d.Client.MergeRequests.ListGroupMergeRequests(gid, opt, reqOpts...)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -512,13 +644,8 @@ func listMergeRequests(ctx context.Context, _ *mcp.CallToolRequest, in listMerge
 		return nil, Out(map[string]any{"merge_requests": mrs, "pagination": map[string]any{"next_page": resp.NextPage}}), nil
 	}
 	opt := &gitlab.ListMergeRequestsOptions{ListOptions: gitlab.ListOptions{Page: int64(page), PerPage: int64(perPage)}}
-	if in.State != nil {
-		opt.State = in.State
-	}
-	if in.AuthorID != nil {
-		opt.AuthorID = in.AuthorID
-	}
-	mrs, resp, err := d.Client.MergeRequests.ListMergeRequests(opt, gitlab.WithContext(ctx))
+	applyListMRCommon(in, &opt.State, &opt.AuthorID, &opt.ReviewerID, &opt.Scope, &opt.OrderBy, &opt.Sort)
+	mrs, resp, err := d.Client.MergeRequests.ListMergeRequests(opt, reqOpts...)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -527,6 +654,38 @@ func listMergeRequests(ctx context.Context, _ *mcp.CallToolRequest, in listMerge
 		return nil, nil, err
 	}
 	return nil, Out(map[string]any{"merge_requests": mrs, "pagination": map[string]any{"next_page": resp.NextPage}}), nil
+}
+
+func applyListMRCommon(
+	in listMergeRequestsIn,
+	state **string,
+	authorID **int64,
+	reviewerID **gitlab.ReviewerIDValue,
+	scope **string,
+	orderBy **string,
+	sort **string,
+) {
+	if in.State != nil {
+		*state = in.State
+	}
+	if in.AuthorID != nil {
+		*authorID = in.AuthorID
+	}
+	if in.ReviewerID != nil {
+		*reviewerID = gitlab.ReviewerID(*in.ReviewerID)
+	}
+	if in.Scope != nil {
+		s := strings.TrimSpace(*in.Scope)
+		*scope = &s
+	}
+	if in.OrderBy != nil {
+		o := strings.TrimSpace(*in.OrderBy)
+		*orderBy = &o
+	}
+	if in.Sort != nil {
+		s := strings.TrimSpace(*in.Sort)
+		*sort = &s
+	}
 }
 
 type approveMergeRequestIn struct {
