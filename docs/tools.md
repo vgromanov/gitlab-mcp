@@ -56,7 +56,7 @@ This document describes the tool surface currently registered by
 - `unapprove_merge_request`
 - `get_merge_request_approval_state`
 - `get_merge_request_diffs`
-- `list_merge_request_diffs`
+- `list_merge_request_diffs` — lists MR diffs with pagination; additive `section` completeness envelope (see [`read-envelopes.md`](read-envelopes.md))
 - `get_merge_request_conflicts`
 - `list_merge_request_changed_files`
 - `get_merge_request_file_diff`
