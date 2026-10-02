@@ -71,6 +71,10 @@ func TestSafeProjectWebURL(t *testing.T) {
 		{"https://gitlab.example.com:443/g/p", true},
 		{"https://[::1]/g/p", true},
 		{"https://[2001:db8::1]:8443/g/p", true},
+		// net/url.Parse lowercases scheme (GOROOT src/net/url/url.go ~ToLower); mixed-case
+		// HTTPS/Http are accepted and returned unchanged (raw preserved).
+		{"HTTPS://gitlab.example.com/g/p", true},
+		{"Http://gitlab.example.com/g/p", true},
 		{"", false},
 		{"/relative/path", false},
 		{"gitlab.example.com/g/p", false},
@@ -101,7 +105,12 @@ func TestSafeProjectWebURL(t *testing.T) {
 		// Strict percent-encoding: incomplete / invalid sequences.
 		{"https://gitlab.example.com/g/%ZZ", false},
 		{"https://gitlab.example.com/g/%A", false},
+		{"https://gitlab.example.com/g/%%", false},
 		{"https://gitlab.example.com/g/%", false},
+		// Host percent-escapes: net/url.Parse rejects invalid escapes (e.g. %0a) with
+		// "invalid URL escape" — not an open gap for safeProjectWebURL.
+		{"https://%0a.evil.example/g/p", false},
+		{"https://%0A.evil.example/g/p", false},
 	}
 	for _, tc := range cases {
 		got, ok := safeProjectWebURL(tc.in)
@@ -492,6 +501,20 @@ func TestGetProject_CallToolAuthzPathsTable(t *testing.T) {
 				exactHitsID: map[string]int32{"2": 1},
 			},
 		},
+		{
+			// Project id is allowlisted but namespace is not under allowed group tree.
+			// Hits=2: request identity + allowlist resolve of "99"; no post-authz content GET.
+			name: "intersection_deny_group_side",
+			cfg: &config.Config{
+				AllowedProjectIDs: []string{"99"},
+				AllowedGroupIDs:   []string{"10"},
+			},
+			reqPID: "99",
+			want: want{
+				allow: false, errSubstr: readmeta.CodeAuthzDenied,
+				exactHitsID: map[string]int32{"99": 2},
+			},
+		},
 	}
 
 	for _, tc := range cases {
@@ -731,6 +754,43 @@ func TestGetProject_CallToolContentIDMismatchSafeError(t *testing.T) {
 	assertNoPlantedLeaks(t, toolResultText(t, res))
 	if atomic.LoadInt32(&hits42) < 3 {
 		t.Fatalf("hits42=%d want ≥3 (identity+allowlist then content)", hits42)
+	}
+}
+
+func TestGetProject_CallToolPolicyOffNumericIDMismatch(t *testing.T) {
+	// No policy: resolveProjectAuthz returns numeric "42" without identity GetProject;
+	// single content GetProject returning id 99 must still fail usable binding.
+	var hits int32
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		tok, ok := projectGetRouteToken(r)
+		if r.Method != http.MethodGet || !ok || tok != "42" {
+			http.NotFound(w, r)
+			return
+		}
+		atomic.AddInt32(&hits, 1)
+		_, _ = io.WriteString(w, richPlantedProjectJSON(99, safeWebURL))
+	})
+	d := getProjectDeps(t, h, &config.Config{}) // policy inactive
+	res, err := callGetProject(t, d, "42")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res == nil || !res.IsError {
+		t.Fatal("want IsError on policy-off numeric content id mismatch")
+	}
+	msg := toolErrorText(t, res)
+	if !strings.Contains(msg, readmeta.CodeHTTPError) {
+		t.Fatalf("want http_error, got %q", msg)
+	}
+	assertNoPlantedLeaks(t, msg)
+	if res.StructuredContent != nil {
+		raw, _ := json.Marshal(res.StructuredContent)
+		t.Fatalf("mismatch must not return StructuredContent: %s", raw)
+	}
+	assertNoPlantedLeaks(t, toolResultText(t, res))
+	if atomic.LoadInt32(&hits) != 1 {
+		t.Fatalf("policy-off content hits=%d want 1", hits)
 	}
 }
 
