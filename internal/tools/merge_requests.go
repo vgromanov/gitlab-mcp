@@ -3,9 +3,12 @@ package tools
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/tools/readmeta"
+
 	gitlab "gitlab.com/gitlab-org/api/client-go/v2"
 )
 
@@ -33,18 +36,55 @@ type pidMR struct {
 	MergeRequestIID int64  `json:"merge_request_iid"`
 }
 
-func (p pidMR) resolve(d Deps) (string, error) {
-	pid, err := ResolveProjectID(p.ProjectID, d.Config.DefaultProjectID)
-	if err != nil {
-		return "", err
-	}
-	if err := checkAllowedProject(d.Config, pid); err != nil {
-		return "", err
-	}
+func (p pidMR) resolve(ctx context.Context, d Deps) (string, error) {
 	if p.MergeRequestIID < 1 {
 		return "", fmt.Errorf("merge_request_iid must be >= 1")
 	}
+	def := ""
+	if d.Config != nil {
+		def = d.Config.DefaultProjectID
+	}
+	if policyActive(d.Config) {
+		c, err := AuthorizeCanonicalProject(ctx, d, p.ProjectID)
+		if err != nil {
+			return "", err
+		}
+		return strconv.FormatInt(c.ID, 10), nil
+	}
+	pid, err := ResolveProjectID(p.ProjectID, def)
+	if err != nil {
+		return "", err
+	}
 	return pid, nil
+}
+
+// authorizeMROwnerAndForks authorizes the owner project, loads MR metadata, then
+// independently authorizes source/downstream project IDs before content reads.
+func authorizeMROwnerAndForks(ctx context.Context, d Deps, projectID string, mrIID int64) (CanonicalProject, error) {
+	owner, err := AuthorizeCanonicalProject(ctx, d, projectID)
+	if err != nil {
+		return CanonicalProject{}, err
+	}
+	if mrIID < 1 {
+		return CanonicalProject{}, fmt.Errorf("merge_request_iid must be >= 1")
+	}
+	mr, _, err := d.Client.MergeRequests.GetMergeRequest(owner.ID, mrIID, nil, gitlab.WithContext(ctx))
+	if err != nil {
+		return CanonicalProject{}, fmt.Errorf("%s: merge request metadata", readmeta.CodeHTTPError)
+	}
+	var extra []string
+	if mr != nil {
+		if mr.SourceProjectID != 0 && mr.SourceProjectID != owner.ID {
+			extra = append(extra, strconv.FormatInt(mr.SourceProjectID, 10))
+		}
+		if mr.ProjectID != 0 && mr.ProjectID != owner.ID {
+			extra = append(extra, strconv.FormatInt(mr.ProjectID, 10))
+		}
+	}
+	if _, err := AuthorizeAdditionalProjects(ctx, d, extra...); err != nil {
+		return CanonicalProject{}, err
+	}
+	return owner, nil
 }
 
 type mergeMergeRequestIn struct {
@@ -54,7 +94,7 @@ type mergeMergeRequestIn struct {
 }
 
 func mergeMergeRequest(ctx context.Context, _ *mcp.CallToolRequest, in mergeMergeRequestIn, d Deps) (*mcp.CallToolResult, any, error) {
-	pid, err := in.resolve(d)
+	pid, err := in.resolve(ctx, d)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -82,11 +122,8 @@ type createMergeRequestIn struct {
 }
 
 func createMergeRequest(ctx context.Context, _ *mcp.CallToolRequest, in createMergeRequestIn, d Deps) (*mcp.CallToolResult, any, error) {
-	pid, err := ResolveProjectID(in.ProjectID, d.Config.DefaultProjectID)
+	pid, err := resolveProjectAuthz(ctx, d, in.ProjectID)
 	if err != nil {
-		return nil, nil, err
-	}
-	if err := checkAllowedProject(d.Config, pid); err != nil {
 		return nil, nil, err
 	}
 	opt := &gitlab.CreateMergeRequestOptions{
@@ -113,7 +150,7 @@ type getMergeRequestIn struct {
 }
 
 func getMergeRequest(ctx context.Context, _ *mcp.CallToolRequest, in getMergeRequestIn, d Deps) (*mcp.CallToolResult, any, error) {
-	pid, err := in.resolve(d)
+	pid, err := in.resolve(ctx, d)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -134,10 +171,11 @@ type getMergeRequestDiffsIn struct {
 }
 
 func getMergeRequestDiffs(ctx context.Context, _ *mcp.CallToolRequest, in getMergeRequestDiffsIn, d Deps) (*mcp.CallToolResult, any, error) {
-	pid, err := in.resolve(d)
+	owner, err := authorizeMROwnerAndForks(ctx, d, in.ProjectID, in.MergeRequestIID)
 	if err != nil {
 		return nil, nil, err
 	}
+	pid := strconv.FormatInt(owner.ID, 10)
 	diffs, _, err := d.Client.MergeRequests.ListMergeRequestDiffs(pid, in.MergeRequestIID, &gitlab.ListMergeRequestDiffsOptions{
 		ListOptions: gitlab.ListOptions{PerPage: 100},
 	}, gitlab.WithContext(ctx))
@@ -167,10 +205,11 @@ type getMergeRequestConflictsIn struct {
 }
 
 func getMergeRequestConflicts(ctx context.Context, _ *mcp.CallToolRequest, in getMergeRequestConflictsIn, d Deps) (*mcp.CallToolResult, any, error) {
-	pid, err := in.resolve(d)
+	owner, err := authorizeMROwnerAndForks(ctx, d, in.ProjectID, in.MergeRequestIID)
 	if err != nil {
 		return nil, nil, err
 	}
+	pid := strconv.FormatInt(owner.ID, 10)
 	mr, _, err := d.Client.MergeRequests.GetMergeRequest(pid, in.MergeRequestIID, nil, gitlab.WithContext(ctx))
 	if err != nil {
 		return nil, nil, err
@@ -205,10 +244,11 @@ type listMergeRequestChangedFilesIn struct {
 }
 
 func listMergeRequestChangedFiles(ctx context.Context, _ *mcp.CallToolRequest, in listMergeRequestChangedFilesIn, d Deps) (*mcp.CallToolResult, any, error) {
-	pid, err := in.resolve(d)
+	owner, err := authorizeMROwnerAndForks(ctx, d, in.ProjectID, in.MergeRequestIID)
 	if err != nil {
 		return nil, nil, err
 	}
+	pid := strconv.FormatInt(owner.ID, 10)
 	page, perPage := in.ListOpts()
 	diffs, resp, err := d.Client.MergeRequests.ListMergeRequestDiffs(pid, in.MergeRequestIID, &gitlab.ListMergeRequestDiffsOptions{
 		ListOptions: gitlab.ListOptions{Page: int64(page), PerPage: int64(perPage)},
@@ -255,10 +295,11 @@ type getMergeRequestFileDiffIn struct {
 }
 
 func getMergeRequestFileDiff(ctx context.Context, _ *mcp.CallToolRequest, in getMergeRequestFileDiffIn, d Deps) (*mcp.CallToolResult, any, error) {
-	pid, err := in.resolve(d)
+	owner, err := authorizeMROwnerAndForks(ctx, d, in.ProjectID, in.MergeRequestIID)
 	if err != nil {
 		return nil, nil, err
 	}
+	pid := strconv.FormatInt(owner.ID, 10)
 	diffs, _, err := d.Client.MergeRequests.ListMergeRequestDiffs(pid, in.MergeRequestIID, &gitlab.ListMergeRequestDiffsOptions{
 		ListOptions: gitlab.ListOptions{PerPage: 200},
 	}, gitlab.WithContext(ctx))
@@ -292,10 +333,11 @@ type listMergeRequestVersionsIn struct {
 }
 
 func listMergeRequestVersions(ctx context.Context, _ *mcp.CallToolRequest, in listMergeRequestVersionsIn, d Deps) (*mcp.CallToolResult, any, error) {
-	pid, err := in.resolve(d)
+	owner, err := authorizeMROwnerAndForks(ctx, d, in.ProjectID, in.MergeRequestIID)
 	if err != nil {
 		return nil, nil, err
 	}
+	pid := strconv.FormatInt(owner.ID, 10)
 	page, perPage := in.ListOpts()
 	vers, resp, err := d.Client.MergeRequests.GetMergeRequestDiffVersions(pid, in.MergeRequestIID, &gitlab.GetMergeRequestDiffVersionsOptions{
 		ListOptions: gitlab.ListOptions{Page: int64(page), PerPage: int64(perPage)},
@@ -312,10 +354,11 @@ type getMergeRequestVersionIn struct {
 }
 
 func getMergeRequestVersion(ctx context.Context, _ *mcp.CallToolRequest, in getMergeRequestVersionIn, d Deps) (*mcp.CallToolResult, any, error) {
-	pid, err := in.resolve(d)
+	owner, err := authorizeMROwnerAndForks(ctx, d, in.ProjectID, in.MergeRequestIID)
 	if err != nil {
 		return nil, nil, err
 	}
+	pid := strconv.FormatInt(owner.ID, 10)
 	v, _, err := d.Client.MergeRequests.GetSingleMergeRequestDiffVersion(pid, in.MergeRequestIID, in.VersionID, nil, gitlab.WithContext(ctx))
 	if err != nil {
 		return nil, nil, err
@@ -332,7 +375,7 @@ type updateMergeRequestIn struct {
 }
 
 func updateMergeRequest(ctx context.Context, _ *mcp.CallToolRequest, in updateMergeRequestIn, d Deps) (*mcp.CallToolResult, any, error) {
-	pid, err := in.resolve(d)
+	pid, err := in.resolve(ctx, d)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -367,11 +410,8 @@ type listMergeRequestsIn struct {
 func listMergeRequests(ctx context.Context, _ *mcp.CallToolRequest, in listMergeRequestsIn, d Deps) (*mcp.CallToolResult, any, error) {
 	page, perPage := in.ListOpts()
 	if in.ProjectID != nil && *in.ProjectID != "" {
-		pid, err := ResolveProjectID(*in.ProjectID, d.Config.DefaultProjectID)
+		pid, err := resolveProjectAuthz(ctx, d, *in.ProjectID)
 		if err != nil {
-			return nil, nil, err
-		}
-		if err := checkAllowedProject(d.Config, pid); err != nil {
 			return nil, nil, err
 		}
 		opt := &gitlab.ListProjectMergeRequestsOptions{ListOptions: gitlab.ListOptions{Page: int64(page), PerPage: int64(perPage)}}
@@ -388,11 +428,18 @@ func listMergeRequests(ctx context.Context, _ *mcp.CallToolRequest, in listMerge
 		return nil, Out(map[string]any{"merge_requests": mrs, "pagination": map[string]any{"next_page": resp.NextPage}}), nil
 	}
 	if in.GroupID != nil && *in.GroupID != "" {
+		if _, err := AuthorizeCanonicalGroup(ctx, d, *in.GroupID); err != nil {
+			return nil, nil, err
+		}
 		opt := &gitlab.ListGroupMergeRequestsOptions{ListOptions: gitlab.ListOptions{Page: int64(page), PerPage: int64(perPage)}}
 		if in.State != nil {
 			opt.State = in.State
 		}
 		mrs, resp, err := d.Client.MergeRequests.ListGroupMergeRequests(*in.GroupID, opt, gitlab.WithContext(ctx))
+		if err != nil {
+			return nil, nil, err
+		}
+		mrs, err = filterMergeRequestsByPolicy(ctx, d, mrs)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -409,6 +456,10 @@ func listMergeRequests(ctx context.Context, _ *mcp.CallToolRequest, in listMerge
 	if err != nil {
 		return nil, nil, err
 	}
+	mrs, err = filterMergeRequestsByPolicy(ctx, d, mrs)
+	if err != nil {
+		return nil, nil, err
+	}
 	return nil, Out(map[string]any{"merge_requests": mrs, "pagination": map[string]any{"next_page": resp.NextPage}}), nil
 }
 
@@ -418,7 +469,7 @@ type approveMergeRequestIn struct {
 }
 
 func approveMergeRequest(ctx context.Context, _ *mcp.CallToolRequest, in approveMergeRequestIn, d Deps) (*mcp.CallToolResult, any, error) {
-	pid, err := in.resolve(d)
+	pid, err := in.resolve(ctx, d)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -438,7 +489,7 @@ type unapproveMergeRequestIn struct {
 }
 
 func unapproveMergeRequest(ctx context.Context, _ *mcp.CallToolRequest, in unapproveMergeRequestIn, d Deps) (*mcp.CallToolResult, any, error) {
-	pid, err := in.resolve(d)
+	pid, err := in.resolve(ctx, d)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -454,7 +505,7 @@ type getMergeRequestApprovalStateIn struct {
 }
 
 func getMergeRequestApprovalState(ctx context.Context, _ *mcp.CallToolRequest, in getMergeRequestApprovalStateIn, d Deps) (*mcp.CallToolResult, any, error) {
-	pid, err := in.resolve(d)
+	pid, err := in.resolve(ctx, d)
 	if err != nil {
 		return nil, nil, err
 	}

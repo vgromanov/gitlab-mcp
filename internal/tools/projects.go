@@ -72,6 +72,10 @@ func listProjects(ctx context.Context, _ *mcp.CallToolRequest, in listProjectsIn
 	if err != nil {
 		return nil, nil, err
 	}
+	projects, err = FilterProjectsByPolicy(ctx, d, projects)
+	if err != nil {
+		return nil, nil, err
+	}
 	out, err := ToJSONTree(map[string]any{
 		"projects":   projects,
 		"pagination": map[string]any{"page": page, "per_page": perPage, "next_page": resp.NextPage},
@@ -87,11 +91,8 @@ type getProjectIn struct {
 }
 
 func getProject(ctx context.Context, _ *mcp.CallToolRequest, in getProjectIn, d Deps) (*mcp.CallToolResult, any, error) {
-	pid, err := ResolveProjectID(in.ProjectID, d.Config.DefaultProjectID)
+	pid, err := resolveProjectAuthz(ctx, d, in.ProjectID)
 	if err != nil {
-		return nil, nil, err
-	}
-	if err := checkAllowedProject(d.Config, pid); err != nil {
 		return nil, nil, err
 	}
 	p, _, err := d.Client.Projects.GetProject(pid, nil, gitlab.WithContext(ctx))
@@ -145,6 +146,9 @@ type listGroupProjectsIn struct {
 }
 
 func listGroupProjects(ctx context.Context, _ *mcp.CallToolRequest, in listGroupProjectsIn, d Deps) (*mcp.CallToolResult, any, error) {
+	if _, err := AuthorizeCanonicalGroup(ctx, d, in.GroupID); err != nil {
+		return nil, nil, err
+	}
 	page, perPage := in.ListOpts()
 	opt := &gitlab.ListGroupProjectsOptions{
 		ListOptions: gitlab.ListOptions{Page: int64(page), PerPage: int64(perPage)},
@@ -159,6 +163,10 @@ func listGroupProjects(ctx context.Context, _ *mcp.CallToolRequest, in listGroup
 		opt.Archived = gitlab.Ptr(*in.Archived)
 	}
 	projects, resp, err := d.Client.Groups.ListGroupProjects(in.GroupID, opt, gitlab.WithContext(ctx))
+	if err != nil {
+		return nil, nil, err
+	}
+	projects, err = FilterProjectsByPolicy(ctx, d, projects)
 	if err != nil {
 		return nil, nil, err
 	}

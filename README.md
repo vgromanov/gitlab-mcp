@@ -36,7 +36,8 @@ Built on:
   (`basic`\|`advanced`\|`zoekt`) and `ref`, plus `filename:`/`path:`/`extension:`
   filters inside `query`.
 - **Project allowlist** (`GITLAB_ALLOWED_PROJECT_IDS`) to restrict which projects an
-  agent can act on.
+  agent can act on. Optional `GITLAB_ALLOWED_GROUP_IDS` scopes by canonical group
+  ancestry; empty both = legacy allow-all (not a security boundary).
 - **Self-managed friendly**: custom CA bundle (`GITLAB_CA_CERT_PATH`),
   proxy support, optional TLS skip for dev.
 - **Container image** (multi-stage Go + Alpine runtime) and cross-platform release
@@ -156,6 +157,7 @@ win when explicitly passed.
 | `PORT` | `--port` | `3002` | HTTP listen port. |
 | `GITLAB_PROJECT_ID` | `--default-project` | — | Default project id or path used when a tool omits it. |
 | `GITLAB_ALLOWED_PROJECT_IDS` | — | — | Comma-separated allowlist of project ids/paths. |
+| `GITLAB_ALLOWED_GROUP_IDS` | — | — | Comma-separated group id/path roots (canonical ancestry). Empty with empty project list = legacy allow-all, not a security boundary. |
 | `GITLAB_CA_CERT_PATH` | `--ca-cert` | — | Extra PEM CA bundle for the API client. |
 | `GITLAB_INSECURE` | `--insecure` | `false` | Skip TLS verify (**dev only**). |
 | `HTTP_PROXY` / `HTTPS_PROXY` | — | inherited | Outbound proxy for GitLab API calls. |
@@ -275,7 +277,8 @@ Operational guidance:
 
 - Treat the PAT as a secret; never commit `.env`.
 - Prefer `GITLAB_READ_ONLY_MODE=true` for any agent that doesn't need to write.
-- Use `GITLAB_ALLOWED_PROJECT_IDS` to scope agent reach.
+- Use `GITLAB_ALLOWED_PROJECT_IDS` / `GITLAB_ALLOWED_GROUP_IDS` to scope agent reach
+  (empty both lists remain legacy allow-all, not a security boundary).
 - Bind streamable HTTP to loopback unless you front it with TLS + auth.
 
 ---

@@ -3,9 +3,12 @@ package tools
 import (
 	"context"
 	"io"
+	"strconv"
+	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	gitlab "gitlab.com/gitlab-org/api/client-go/v2"
+	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/tools/readmeta"
 )
 
 // RegisterPipelines registers CI pipeline and job tools (gated by USE_PIPELINE).
@@ -24,15 +27,8 @@ func RegisterPipelines(s *mcp.Server, d Deps) {
 	AddTool(s, d, true, "pipeline", &mcp.Tool{Name: "cancel_pipeline_job", Description: "Cancel a running job"}, cancelPipelineJob)
 }
 
-func pidOnly(_ context.Context, projectID string, d Deps) (string, error) {
-	pid, err := ResolveProjectID(projectID, d.Config.DefaultProjectID)
-	if err != nil {
-		return "", err
-	}
-	if err := checkAllowedProject(d.Config, pid); err != nil {
-		return "", err
-	}
-	return pid, nil
+func pidOnly(ctx context.Context, projectID string, d Deps) (string, error) {
+	return resolveProjectAuthz(ctx, d, projectID)
 }
 
 type listPipelinesIn struct {
@@ -119,7 +115,33 @@ func listPipelineTriggerJobs(ctx context.Context, _ *mcp.CallToolRequest, in lis
 	if err != nil {
 		return nil, nil, err
 	}
+	if err := redactOutOfPolicyDownstreamBridges(ctx, d, bridges); err != nil {
+		return nil, nil, err
+	}
 	return nil, Out(map[string]any{"bridges": bridges, "pagination": map[string]any{"next_page": resp.NextPage}}), nil
+}
+
+// redactOutOfPolicyDownstreamBridges nulls DownstreamPipeline when its ProjectID is out of policy.
+func redactOutOfPolicyDownstreamBridges(ctx context.Context, d Deps, bridges []*gitlab.Bridge) error {
+	if !policyActive(d.Config) || len(bridges) == 0 {
+		return nil
+	}
+	for _, b := range bridges {
+		if b == nil || b.DownstreamPipeline == nil || b.DownstreamPipeline.ProjectID == 0 {
+			continue
+		}
+		_, err := AuthorizeCanonicalProject(ctx, d, strconv.FormatInt(b.DownstreamPipeline.ProjectID, 10))
+		if err == nil {
+			continue
+		}
+		msg := err.Error()
+		if strings.HasPrefix(msg, readmeta.CodeAuthzDenied) || strings.HasPrefix(msg, readmeta.CodeIdentityUnresolved) {
+			b.DownstreamPipeline = nil
+			continue
+		}
+		return err
+	}
+	return nil
 }
 
 type getPipelineJobIn struct {

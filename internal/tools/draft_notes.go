@@ -24,7 +24,7 @@ type getDraftNoteIn struct {
 }
 
 func getDraftNote(ctx context.Context, _ *mcp.CallToolRequest, in getDraftNoteIn, d Deps) (*mcp.CallToolResult, any, error) {
-	pid, err := in.resolve(d)
+	pid, err := in.resolve(ctx, d)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -41,7 +41,7 @@ type listDraftNotesIn struct {
 }
 
 func listDraftNotes(ctx context.Context, _ *mcp.CallToolRequest, in listDraftNotesIn, d Deps) (*mcp.CallToolResult, any, error) {
-	pid, err := in.resolve(d)
+	pid, err := in.resolve(ctx, d)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -65,7 +65,7 @@ type createDraftNoteIn struct {
 }
 
 func createDraftNote(ctx context.Context, _ *mcp.CallToolRequest, in createDraftNoteIn, d Deps) (*mcp.CallToolResult, any, error) {
-	pid, err := in.resolve(d)
+	pid, err := in.resolve(ctx, d)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -96,7 +96,7 @@ type updateDraftNoteIn struct {
 }
 
 func updateDraftNote(ctx context.Context, _ *mcp.CallToolRequest, in updateDraftNoteIn, d Deps) (*mcp.CallToolResult, any, error) {
-	pid, err := in.resolve(d)
+	pid, err := in.resolve(ctx, d)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -115,7 +115,7 @@ type deleteDraftNoteIn struct {
 }
 
 func deleteDraftNote(ctx context.Context, _ *mcp.CallToolRequest, in deleteDraftNoteIn, d Deps) (*mcp.CallToolResult, any, error) {
-	pid, err := in.resolve(d)
+	pid, err := in.resolve(ctx, d)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -132,7 +132,7 @@ type publishDraftNoteIn struct {
 }
 
 func publishDraftNote(ctx context.Context, _ *mcp.CallToolRequest, in publishDraftNoteIn, d Deps) (*mcp.CallToolResult, any, error) {
-	pid, err := in.resolve(d)
+	pid, err := in.resolve(ctx, d)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -148,7 +148,7 @@ type bulkPublishDraftNotesIn struct {
 }
 
 func bulkPublishDraftNotes(ctx context.Context, _ *mcp.CallToolRequest, in bulkPublishDraftNotesIn, d Deps) (*mcp.CallToolResult, any, error) {
-	pid, err := in.resolve(d)
+	pid, err := in.resolve(ctx, d)
 	if err != nil {
 		return nil, nil, err
 	}

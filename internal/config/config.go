@@ -2,8 +2,11 @@
 package config
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"flag"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -30,6 +33,7 @@ type Config struct {
 	Port               string
 	DefaultProjectID   string
 	AllowedProjectIDs  []string
+	AllowedGroupIDs    []string
 	CACertPath         string
 	InsecureSkipVerify bool
 	HTTPProxy          string
@@ -98,6 +102,9 @@ func Load() *Config {
 	}
 	if raw := envString("GITLAB_ALLOWED_PROJECT_IDS", ""); raw != "" {
 		c.AllowedProjectIDs = parseCSV(raw)
+	}
+	if raw := envString("GITLAB_ALLOWED_GROUP_IDS", ""); raw != "" {
+		c.AllowedGroupIDs = parseCSV(raw)
 	}
 
 	var (
@@ -203,6 +210,53 @@ func flagVisited(name string) bool {
 		}
 	})
 	return visited
+}
+
+// PolicyActive reports whether project and/or group allowlists are configured.
+// Empty both lists is legacy allow-all and is not a security boundary.
+func (c *Config) PolicyActive() bool {
+	if c == nil {
+		return false
+	}
+	return len(c.AllowedProjectIDs) > 0 || len(c.AllowedGroupIDs) > 0
+}
+
+// PolicyFingerprint returns hex(SHA256) of versioned raw allowlist config.
+// Tokens are trimmed, empty dropped, deduped, and sorted. Equivalent aliases that
+// differ as raw strings may produce different fingerprints (not semantic-canonical).
+// Format: gitlab-mcp-policy-v1\nprojects=<csv>\ngroups=<csv>\n
+func (c *Config) PolicyFingerprint() string {
+	projects, groups := []string(nil), []string(nil)
+	if c != nil {
+		projects = normalizeFingerprintList(c.AllowedProjectIDs)
+		groups = normalizeFingerprintList(c.AllowedGroupIDs)
+	}
+	var b strings.Builder
+	b.WriteString("gitlab-mcp-policy-v1\nprojects=")
+	b.WriteString(strings.Join(projects, ","))
+	b.WriteString("\ngroups=")
+	b.WriteString(strings.Join(groups, ","))
+	b.WriteString("\n")
+	sum := sha256.Sum256([]byte(b.String()))
+	return hex.EncodeToString(sum[:])
+}
+
+func normalizeFingerprintList(in []string) []string {
+	seen := map[string]struct{}{}
+	var out []string
+	for _, raw := range in {
+		s := strings.TrimSpace(raw)
+		if s == "" {
+			continue
+		}
+		if _, ok := seen[s]; ok {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // RestrictedMode is on when USE_DAILY_TOOLS, any new family flag, or a non-empty
