@@ -42,6 +42,10 @@ func searchRepositories(ctx context.Context, _ *mcp.CallToolRequest, in searchRe
 	if err != nil {
 		return nil, nil, err
 	}
+	projects, err = FilterProjectsByPolicy(ctx, d, projects)
+	if err != nil {
+		return nil, nil, err
+	}
 	return nil, Out(map[string]any{"projects": projects, "pagination": map[string]any{"next_page": resp.NextPage}}), nil
 }
 
@@ -88,19 +92,25 @@ type forkRepositoryIn struct {
 }
 
 func forkRepository(ctx context.Context, _ *mcp.CallToolRequest, in forkRepositoryIn, d Deps) (*mcp.CallToolResult, any, error) {
-	pid, err := ResolveProjectID(in.ProjectID, d.Config.DefaultProjectID)
+	pid, err := resolveProjectAuthz(ctx, d, in.ProjectID)
 	if err != nil {
 		return nil, nil, err
 	}
-	if err := checkAllowedProject(d.Config, pid); err != nil {
+	destID, err := authorizeForkDestination(ctx, d, in.NamespaceID, in.NamespacePath)
+	if err != nil {
 		return nil, nil, err
 	}
 	opt := &gitlab.ForkProjectOptions{}
-	if in.NamespaceID != nil {
-		opt.NamespaceID = in.NamespaceID
-	}
-	if in.NamespacePath != nil {
-		opt.NamespacePath = in.NamespacePath
+	if d.Config != nil && len(d.Config.AllowedGroupIDs) > 0 {
+		// Bind mutation to resolved canonical group ID only (no raw alias pass-through).
+		opt.NamespaceID = gitlab.Ptr(destID)
+	} else {
+		if in.NamespaceID != nil {
+			opt.NamespaceID = in.NamespaceID
+		}
+		if in.NamespacePath != nil {
+			opt.NamespacePath = in.NamespacePath
+		}
 	}
 	if in.Name != nil {
 		opt.Name = in.Name
@@ -122,11 +132,8 @@ type getFileContentsIn struct {
 }
 
 func getFileContents(ctx context.Context, _ *mcp.CallToolRequest, in getFileContentsIn, d Deps) (*mcp.CallToolResult, any, error) {
-	pid, err := ResolveProjectID(in.ProjectID, d.Config.DefaultProjectID)
+	pid, err := resolveProjectAuthz(ctx, d, in.ProjectID)
 	if err != nil {
-		return nil, nil, err
-	}
-	if err := checkAllowedProject(d.Config, pid); err != nil {
 		return nil, nil, err
 	}
 	ref := strings.TrimSpace(in.Ref)
@@ -168,11 +175,8 @@ type createOrUpdateFileIn struct {
 }
 
 func createOrUpdateFile(ctx context.Context, _ *mcp.CallToolRequest, in createOrUpdateFileIn, d Deps) (*mcp.CallToolResult, any, error) {
-	pid, err := ResolveProjectID(in.ProjectID, d.Config.DefaultProjectID)
+	pid, err := resolveProjectAuthz(ctx, d, in.ProjectID)
 	if err != nil {
-		return nil, nil, err
-	}
-	if err := checkAllowedProject(d.Config, pid); err != nil {
 		return nil, nil, err
 	}
 	mode := strings.ToLower(strings.TrimSpace(in.Mode))
@@ -221,11 +225,8 @@ type pushFilesIn struct {
 }
 
 func pushFiles(ctx context.Context, _ *mcp.CallToolRequest, in pushFilesIn, d Deps) (*mcp.CallToolResult, any, error) {
-	pid, err := ResolveProjectID(in.ProjectID, d.Config.DefaultProjectID)
+	pid, err := resolveProjectAuthz(ctx, d, in.ProjectID)
 	if err != nil {
-		return nil, nil, err
-	}
-	if err := checkAllowedProject(d.Config, pid); err != nil {
 		return nil, nil, err
 	}
 	var acts []*gitlab.CommitActionOptions
@@ -267,11 +268,8 @@ type getRepositoryTreeIn struct {
 }
 
 func getRepositoryTree(ctx context.Context, _ *mcp.CallToolRequest, in getRepositoryTreeIn, d Deps) (*mcp.CallToolResult, any, error) {
-	pid, err := ResolveProjectID(in.ProjectID, d.Config.DefaultProjectID)
+	pid, err := resolveProjectAuthz(ctx, d, in.ProjectID)
 	if err != nil {
-		return nil, nil, err
-	}
-	if err := checkAllowedProject(d.Config, pid); err != nil {
 		return nil, nil, err
 	}
 	page, perPage := in.ListOpts()
@@ -305,11 +303,8 @@ func createBranch(ctx context.Context, _ *mcp.CallToolRequest, in createBranchIn
 	if in.ProjectID != nil {
 		pidStr = *in.ProjectID
 	}
-	pid, err := ResolveProjectID(pidStr, d.Config.DefaultProjectID)
+	pid, err := resolveProjectAuthz(ctx, d, pidStr)
 	if err != nil {
-		return nil, nil, err
-	}
-	if err := checkAllowedProject(d.Config, pid); err != nil {
 		return nil, nil, err
 	}
 	opt := &gitlab.CreateBranchOptions{Branch: gitlab.Ptr(in.Branch)}
@@ -333,11 +328,8 @@ type listCommitsIn struct {
 }
 
 func listCommits(ctx context.Context, _ *mcp.CallToolRequest, in listCommitsIn, d Deps) (*mcp.CallToolResult, any, error) {
-	pid, err := ResolveProjectID(in.ProjectID, d.Config.DefaultProjectID)
+	pid, err := resolveProjectAuthz(ctx, d, in.ProjectID)
 	if err != nil {
-		return nil, nil, err
-	}
-	if err := checkAllowedProject(d.Config, pid); err != nil {
 		return nil, nil, err
 	}
 	page, perPage := in.ListOpts()
@@ -375,11 +367,8 @@ type getCommitIn struct {
 }
 
 func getCommit(ctx context.Context, _ *mcp.CallToolRequest, in getCommitIn, d Deps) (*mcp.CallToolResult, any, error) {
-	pid, err := ResolveProjectID(in.ProjectID, d.Config.DefaultProjectID)
+	pid, err := resolveProjectAuthz(ctx, d, in.ProjectID)
 	if err != nil {
-		return nil, nil, err
-	}
-	if err := checkAllowedProject(d.Config, pid); err != nil {
 		return nil, nil, err
 	}
 	c, _, err := d.Client.Commits.GetCommit(pid, in.Sha, nil, gitlab.WithContext(ctx))
@@ -396,11 +385,8 @@ type getCommitDiffIn struct {
 }
 
 func getCommitDiff(ctx context.Context, _ *mcp.CallToolRequest, in getCommitDiffIn, d Deps) (*mcp.CallToolResult, any, error) {
-	pid, err := ResolveProjectID(in.ProjectID, d.Config.DefaultProjectID)
+	pid, err := resolveProjectAuthz(ctx, d, in.ProjectID)
 	if err != nil {
-		return nil, nil, err
-	}
-	if err := checkAllowedProject(d.Config, pid); err != nil {
 		return nil, nil, err
 	}
 	diffs, _, err := d.Client.Commits.GetCommitDiff(pid, in.Sha, nil, gitlab.WithContext(ctx))
@@ -425,7 +411,12 @@ type getBranchDiffsIn struct {
 }
 
 func getBranchDiffs(ctx context.Context, _ *mcp.CallToolRequest, in getBranchDiffsIn, d Deps) (*mcp.CallToolResult, any, error) {
-	pid, err := ResolveProjectID(in.ProjectID, d.Config.DefaultProjectID)
+	// Out of finite RVG-121 matrix — preserve legacy allowlist string match.
+	def := ""
+	if d.Config != nil {
+		def = d.Config.DefaultProjectID
+	}
+	pid, err := ResolveProjectID(in.ProjectID, def)
 	if err != nil {
 		return nil, nil, err
 	}

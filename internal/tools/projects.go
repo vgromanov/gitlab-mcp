@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"strconv"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	gitlab "gitlab.com/gitlab-org/api/client-go/v2"
@@ -72,6 +73,10 @@ func listProjects(ctx context.Context, _ *mcp.CallToolRequest, in listProjectsIn
 	if err != nil {
 		return nil, nil, err
 	}
+	projects, err = FilterProjectsByPolicy(ctx, d, projects)
+	if err != nil {
+		return nil, nil, err
+	}
 	out, err := ToJSONTree(map[string]any{
 		"projects":   projects,
 		"pagination": map[string]any{"page": page, "per_page": perPage, "next_page": resp.NextPage},
@@ -87,11 +92,8 @@ type getProjectIn struct {
 }
 
 func getProject(ctx context.Context, _ *mcp.CallToolRequest, in getProjectIn, d Deps) (*mcp.CallToolResult, any, error) {
-	pid, err := ResolveProjectID(in.ProjectID, d.Config.DefaultProjectID)
+	pid, err := resolveProjectAuthz(ctx, d, in.ProjectID)
 	if err != nil {
-		return nil, nil, err
-	}
-	if err := checkAllowedProject(d.Config, pid); err != nil {
 		return nil, nil, err
 	}
 	p, _, err := d.Client.Projects.GetProject(pid, nil, gitlab.WithContext(ctx))
@@ -145,6 +147,16 @@ type listGroupProjectsIn struct {
 }
 
 func listGroupProjects(ctx context.Context, _ *mcp.CallToolRequest, in listGroupProjectsIn, d Deps) (*mcp.CallToolResult, any, error) {
+	gid := in.GroupID
+	// Canonical group resolve only when group policy is set; otherwise keep legacy
+	// path (no extra GetGroup) and rely on project-row filtering when project policy applies.
+	if d.Config != nil && len(d.Config.AllowedGroupIDs) > 0 {
+		g, err := AuthorizeCanonicalGroup(ctx, d, in.GroupID)
+		if err != nil {
+			return nil, nil, err
+		}
+		gid = strconv.FormatInt(g.ID, 10)
+	}
 	page, perPage := in.ListOpts()
 	opt := &gitlab.ListGroupProjectsOptions{
 		ListOptions: gitlab.ListOptions{Page: int64(page), PerPage: int64(perPage)},
@@ -158,7 +170,11 @@ func listGroupProjects(ctx context.Context, _ *mcp.CallToolRequest, in listGroup
 	if in.Archived != nil {
 		opt.Archived = gitlab.Ptr(*in.Archived)
 	}
-	projects, resp, err := d.Client.Groups.ListGroupProjects(in.GroupID, opt, gitlab.WithContext(ctx))
+	projects, resp, err := d.Client.Groups.ListGroupProjects(gid, opt, gitlab.WithContext(ctx))
+	if err != nil {
+		return nil, nil, err
+	}
+	projects, err = FilterProjectsByPolicy(ctx, d, projects)
 	if err != nil {
 		return nil, nil, err
 	}

@@ -35,11 +35,8 @@ type createNoteIn struct {
 }
 
 func createNote(ctx context.Context, _ *mcp.CallToolRequest, in createNoteIn, d Deps) (*mcp.CallToolResult, any, error) {
-	pid, err := ResolveProjectID(in.ProjectID, d.Config.DefaultProjectID)
+	pid, err := resolveProjectAuthz(ctx, d, in.ProjectID)
 	if err != nil {
-		return nil, nil, err
-	}
-	if err := checkAllowedProject(d.Config, pid); err != nil {
 		return nil, nil, err
 	}
 	switch in.NoteableType {
@@ -73,7 +70,7 @@ type createMergeRequestThreadIn struct {
 }
 
 func createMergeRequestThread(ctx context.Context, _ *mcp.CallToolRequest, in createMergeRequestThreadIn, d Deps) (*mcp.CallToolResult, any, error) {
-	pid, err := in.resolve(d)
+	pid, err := in.resolve(ctx, d)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -94,7 +91,7 @@ type mrDiscussionsIn struct {
 }
 
 func mrDiscussions(ctx context.Context, _ *mcp.CallToolRequest, in mrDiscussionsIn, d Deps) (*mcp.CallToolResult, any, error) {
-	pid, err := in.resolve(d)
+	pid, err := in.resolve(ctx, d)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -115,7 +112,7 @@ type resolveMergeRequestThreadIn struct {
 }
 
 func resolveMergeRequestThread(ctx context.Context, _ *mcp.CallToolRequest, in resolveMergeRequestThreadIn, d Deps) (*mcp.CallToolResult, any, error) {
-	pid, err := in.resolve(d)
+	pid, err := in.resolve(ctx, d)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -135,7 +132,7 @@ type updateMergeRequestNoteIn struct {
 }
 
 func updateMergeRequestNote(ctx context.Context, _ *mcp.CallToolRequest, in updateMergeRequestNoteIn, d Deps) (*mcp.CallToolResult, any, error) {
-	pid, err := in.resolve(d)
+	pid, err := in.resolve(ctx, d)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -154,7 +151,7 @@ type createMergeRequestNoteIn struct {
 }
 
 func createMergeRequestNote(ctx context.Context, _ *mcp.CallToolRequest, in createMergeRequestNoteIn, d Deps) (*mcp.CallToolResult, any, error) {
-	pid, err := in.resolve(d)
+	pid, err := in.resolve(ctx, d)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -174,7 +171,7 @@ type deleteMergeRequestDiscussionNoteIn struct {
 }
 
 func deleteMergeRequestDiscussionNote(ctx context.Context, _ *mcp.CallToolRequest, in deleteMergeRequestDiscussionNoteIn, d Deps) (*mcp.CallToolResult, any, error) {
-	pid, err := in.resolve(d)
+	pid, err := in.resolve(ctx, d)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -193,7 +190,7 @@ type updateMergeRequestDiscussionNoteIn struct {
 }
 
 func updateMergeRequestDiscussionNote(ctx context.Context, _ *mcp.CallToolRequest, in updateMergeRequestDiscussionNoteIn, d Deps) (*mcp.CallToolResult, any, error) {
-	pid, err := in.resolve(d)
+	pid, err := in.resolve(ctx, d)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -213,7 +210,7 @@ type createMergeRequestDiscussionNoteIn struct {
 }
 
 func createMergeRequestDiscussionNote(ctx context.Context, _ *mcp.CallToolRequest, in createMergeRequestDiscussionNoteIn, d Deps) (*mcp.CallToolResult, any, error) {
-	pid, err := in.resolve(d)
+	pid, err := in.resolve(ctx, d)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -232,7 +229,7 @@ type deleteMergeRequestNoteIn struct {
 }
 
 func deleteMergeRequestNote(ctx context.Context, _ *mcp.CallToolRequest, in deleteMergeRequestNoteIn, d Deps) (*mcp.CallToolResult, any, error) {
-	pid, err := in.resolve(d)
+	pid, err := in.resolve(ctx, d)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -249,7 +246,7 @@ type getMergeRequestNoteIn struct {
 }
 
 func getMergeRequestNote(ctx context.Context, _ *mcp.CallToolRequest, in getMergeRequestNoteIn, d Deps) (*mcp.CallToolResult, any, error) {
-	pid, err := in.resolve(d)
+	pid, err := in.resolve(ctx, d)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -267,7 +264,7 @@ type getMergeRequestNotesIn struct {
 }
 
 func getMergeRequestNotes(ctx context.Context, _ *mcp.CallToolRequest, in getMergeRequestNotesIn, d Deps) (*mcp.CallToolResult, any, error) {
-	pid, err := in.resolve(d)
+	pid, err := in.resolve(ctx, d)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -289,7 +286,7 @@ type getMergeRequestDiscussionIn struct {
 }
 
 func getMergeRequestDiscussion(ctx context.Context, _ *mcp.CallToolRequest, in getMergeRequestDiscussionIn, d Deps) (*mcp.CallToolResult, any, error) {
-	pid, err := in.resolve(d)
+	pid, err := in.resolve(ctx, d)
 	if err != nil {
 		return nil, nil, err
 	}

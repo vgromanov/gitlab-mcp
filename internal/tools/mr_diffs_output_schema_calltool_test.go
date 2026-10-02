@@ -155,7 +155,7 @@ func TestListMergeRequestDiffs_CallToolOutputSchemaRoundtrip(t *testing.T) {
 		{
 			name:    "fatal_authz",
 			handler: mrHandler(42, 42, `[]`, "", true),
-			cfg:     func(c *config.Config) { c.AllowedProjectIDs = []string{"999"} },
+			cfg:     func(c *config.Config) { c.AllowedProjectIDs = []string{"99"} },
 			args:    callArgs("42", 1),
 			want: want{
 				isError:   true,

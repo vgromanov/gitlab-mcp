@@ -434,7 +434,7 @@ func TestListMergeRequestDiffs_fatalHTTPNoRawBodyLeak(t *testing.T) {
 
 func TestListMergeRequestDiffs_authzDenied(t *testing.T) {
 	d := newMRDiffsDeps(t, mrHandler(42, 42, `[]`, "", true))
-	d.Config.AllowedProjectIDs = []string{"999"}
+	d.Config.AllowedProjectIDs = []string{"99"}
 	_, _, err := listMergeRequestDiffs(context.Background(), nil, listMergeRequestDiffsIn{
 		pidMR: pidMR{ProjectID: "42", MergeRequestIID: 1},
 	}, d)

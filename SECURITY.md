@@ -51,6 +51,10 @@ If you run `gitlab-mcp` in production / shared environments:
 - **Read-only mode**: set `GITLAB_READ_ONLY_MODE=true` for any agent that
   shouldn't mutate.
 - **Project allowlist**: set `GITLAB_ALLOWED_PROJECT_IDS` to limit blast radius.
+- **Group allowlist**: set `GITLAB_ALLOWED_GROUP_IDS` for canonical group-root
+  scope (descendants via `parent_id`, not path-prefix). Empty project and group
+  lists together mean legacy allow-all — a compatibility default, **not** a
+  security boundary.
 - **Transport**:
   - Prefer **stdio** with the client launching the binary as a subprocess.
   - For **streamable HTTP**, bind to `127.0.0.1` and front with a reverse

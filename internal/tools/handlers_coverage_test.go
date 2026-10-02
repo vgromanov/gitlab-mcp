@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -51,7 +52,8 @@ func gitlabAPIStub(t *testing.T) http.Handler {
 			!strings.Contains(path, "/notes") && !strings.Contains(path, "/discussions") &&
 			!strings.Contains(path, "/draft_notes") && !strings.Contains(path, "/versions") &&
 			!strings.Contains(path, "/diffs") && !strings.Contains(path, "/approvals"):
-			_, _ = io.WriteString(w, `{"id":1,"iid":1,"title":"t","has_conflicts":true,"detailed_merge_status":"conflict"}`)
+			// Include source_project_id matching owner so fork authz is a no-op under empty policy.
+			_, _ = io.WriteString(w, `{"id":1,"iid":1,"title":"t","project_id":42,"source_project_id":42,"has_conflicts":true,"detailed_merge_status":"conflict","diff_refs":{"base_sha":"a","head_sha":"b","start_sha":"a"}}`)
 		case strings.Contains(path, "/notes") || strings.Contains(path, "/draft_notes"):
 			_, _ = io.WriteString(w, `{"id":1,"body":"n","note":"n"}`)
 		case strings.Contains(path, "/discussions") && (r.Method == http.MethodPost || r.Method == http.MethodPut):
@@ -62,6 +64,12 @@ func gitlabAPIStub(t *testing.T) http.Handler {
 			_, _ = io.WriteString(w, `{"id":"abc","short_id":"abc","title":"t","message":"m"}`)
 		case strings.Contains(path, "/repository/branches"):
 			_, _ = io.WriteString(w, `{"name":"f","commit":{"id":"abc","short_id":"abc"}}`)
+		case r.Method == http.MethodGet && isProjectIdentityPath(path):
+			id := echoNumericID(path, 42)
+			_, _ = io.WriteString(w, `{"id":`+itoa(id)+`,"path_with_namespace":"g/p","namespace":{"id":7,"kind":"group","full_path":"g","parent_id":0}}`)
+		case r.Method == http.MethodGet && isGroupIdentityPath(path):
+			id := echoNumericID(path, 10)
+			_, _ = io.WriteString(w, `{"id":`+itoa(id)+`,"full_path":"g","parent_id":0}`)
 		default:
 			_, _ = io.WriteString(w, `{
 				"id":1,"iid":1,"title":"t","name":"n","username":"alice","sha":"abc",
@@ -73,6 +81,37 @@ func gitlabAPIStub(t *testing.T) http.Handler {
 			}`)
 		}
 	})
+}
+
+func itoa(id int64) string {
+	return strconv.FormatInt(id, 10)
+}
+
+func echoNumericID(path string, fallback int64) int64 {
+	seg := path[strings.LastIndex(path, "/")+1:]
+	if id, err := strconv.ParseInt(seg, 10, 64); err == nil && id > 0 {
+		return id
+	}
+	return fallback
+}
+
+func isProjectIdentityPath(path string) bool {
+	// /api/v4/projects/{id} with no further segments
+	const prefix = "/api/v4/projects/"
+	if !strings.HasPrefix(path, prefix) {
+		return false
+	}
+	rest := strings.TrimPrefix(path, prefix)
+	return rest != "" && !strings.Contains(rest, "/")
+}
+
+func isGroupIdentityPath(path string) bool {
+	const prefix = "/api/v4/groups/"
+	if !strings.HasPrefix(path, prefix) {
+		return false
+	}
+	rest := strings.TrimPrefix(path, prefix)
+	return rest != "" && !strings.Contains(rest, "/")
 }
 
 // looksLikeListAPI is true when the final path segment is a collection name.
