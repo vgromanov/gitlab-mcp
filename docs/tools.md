@@ -22,7 +22,18 @@ This document describes the tool surface currently registered by
 ## Projects / namespaces / users
 
 - `list_projects`
-- `get_project`
+- `get_project` — **allowlisted projection only** (intentional reduction / migration
+  from the previous full SDK object). Retained fields: `id`, `name`, `path`,
+  `path_with_namespace`, `default_branch`, `visibility`, `archived`; optional
+  `web_url` when it is a safe absolute HTTP(S) project page URL (usable host,
+  no userinfo, no query, no fragment, no control characters — otherwise
+  omitted); optional `namespace` with only `id`, `name`, `path`, `full_path`,
+  `kind` (omitted when null). Callers must not expect raw SDK fields
+  (`runners_token`, `import_url`, `http_url_to_repo`, nested namespace extras,
+  or future SDK keys). Rollback keeps this safe projection — it does not
+  restore the full SDK response. Backend failures on this path return fixed
+  safe error codes/messages (no raw SDK objects, response bodies, or
+  credentials).
 - `list_project_members`
 - `list_group_projects`
 - `list_namespaces`
