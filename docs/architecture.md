@@ -49,6 +49,8 @@ Details and `mcp.json` examples: [`docs/configuration.md`](configuration.md#tool
 - `internal/mcpsrv`: MCP transport/server setup.
 - `internal/tools`: tool registration, handlers, and `selection.go` catalog
   logic (`DailyTools`, `FamilyTools`, `ShouldRegister`).
+- `internal/tools/readmeta`: shared read-section completeness types/codes for
+  presence-aware envelopes (see [`docs/read-envelopes.md`](../docs/read-envelopes.md)).
 - `internal/testutil`: mock GitLab and integration helpers.
 
 ## Safety model

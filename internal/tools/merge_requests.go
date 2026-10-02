@@ -160,22 +160,7 @@ type listMergeRequestDiffsIn struct {
 	Unidiff *bool `json:"unidiff,omitempty"`
 }
 
-func listMergeRequestDiffs(ctx context.Context, _ *mcp.CallToolRequest, in listMergeRequestDiffsIn, d Deps) (*mcp.CallToolResult, any, error) {
-	pid, err := in.resolve(d)
-	if err != nil {
-		return nil, nil, err
-	}
-	page, perPage := in.ListOpts()
-	opt := &gitlab.ListMergeRequestDiffsOptions{
-		ListOptions: gitlab.ListOptions{Page: int64(page), PerPage: int64(perPage)},
-		Unidiff:     in.Unidiff,
-	}
-	diffs, resp, err := d.Client.MergeRequests.ListMergeRequestDiffs(pid, in.MergeRequestIID, opt, gitlab.WithContext(ctx))
-	if err != nil {
-		return nil, nil, err
-	}
-	return nil, Out(map[string]any{"diffs": diffs, "pagination": map[string]any{"next_page": resp.NextPage}}), nil
-}
+// listMergeRequestDiffs implementation lives in mr_diffs_envelope.go (envelope adapter).
 
 type getMergeRequestConflictsIn struct {
 	pidMR

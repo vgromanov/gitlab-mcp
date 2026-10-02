@@ -14,9 +14,11 @@ import (
 )
 
 // NewClient builds an authenticated GitLab REST/GraphQL client.
+// Always registers a budget interceptor (no-op unless context carries a Budget).
 func NewClient(cfg *config.Config) (*gitlab.Client, error) {
 	opts := []gitlab.ClientOptionFunc{
 		gitlab.WithBaseURL(cfg.APIURL),
+		gitlab.WithInterceptor(BudgetInterceptor()),
 	}
 
 	if cfg.HTTPProxy != "" || cfg.HTTPSProxy != "" || cfg.CACertPath != "" || cfg.InsecureSkipVerify {
