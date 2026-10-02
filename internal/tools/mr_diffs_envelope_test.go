@@ -55,7 +55,7 @@ func mrHandler(projectID, sourceID int64, diffsJSON, nextPage string, headerPres
 			}
 			_, _ = io.WriteString(w, diffsJSON)
 		case strings.Contains(path, "/merge_requests/"):
-			_, _ = io.WriteString(w, mrJSON(projectID, sourceID, "abcdeadbeef"))
+			_, _ = io.WriteString(w, mrJSON(projectID, sourceID, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"))
 		case strings.Contains(path, "/projects/"):
 			id := projectID
 			ns := "g/p"
@@ -218,6 +218,36 @@ func TestListMergeRequestDiffs_collapsedNotComplete(t *testing.T) {
 	}
 }
 
+func TestListMergeRequestDiffs_invalidHeadSHANotProjected(t *testing.T) {
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.Contains(r.URL.Path, "/diffs"):
+			w.Header().Set("X-Next-Page", "")
+			_, _ = io.WriteString(w, knownPresenceDiff)
+		case strings.Contains(r.URL.Path, "/merge_requests/"):
+			_, _ = io.WriteString(w, mrJSON(42, 42, "abcdeadbeef")) // invalid short SHA
+		case strings.Contains(r.URL.Path, "/projects/"):
+			_, _ = io.WriteString(w, `{"id":42,"path_with_namespace":"g/p"}`)
+		default:
+			_, _ = io.WriteString(w, `{}`)
+		}
+	})
+	d := newMRDiffsDeps(t, h)
+	_, out, err := listMergeRequestDiffs(context.Background(), nil, listMergeRequestDiffsIn{
+		pidMR: pidMR{ProjectID: "42", MergeRequestIID: 1},
+	}, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Section.HeadSHA != nil {
+		t.Fatalf("invalid head must project null, got %v", *out.Section.HeadSHA)
+	}
+	if out.Section.Consistency != readmeta.ConsistencyUnknown {
+		t.Fatalf("consistency=%q want unknown without valid head bracket", out.Section.Consistency)
+	}
+}
+
 func TestListMergeRequestDiffs_consistencyStaysUnknownWithoutBracket(t *testing.T) {
 	// No head_sha on MR ⇒ cannot verify consistency.
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -376,7 +406,7 @@ func TestListMergeRequestDiffs_fatalHTTPNoRawBodyLeak(t *testing.T) {
 			w.WriteHeader(http.StatusInternalServerError)
 			_, _ = io.WriteString(w, `{"message":"`+secret+`"}`)
 		case strings.Contains(r.URL.Path, "/merge_requests/"):
-			_, _ = io.WriteString(w, mrJSON(42, 42, "abcdeadbeef"))
+			_, _ = io.WriteString(w, mrJSON(42, 42, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"))
 		case strings.Contains(r.URL.Path, "/projects/"):
 			_, _ = io.WriteString(w, `{"id":42,"path_with_namespace":"g/p"}`)
 		default:

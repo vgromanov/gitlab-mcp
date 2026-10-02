@@ -50,6 +50,8 @@ type listMergeRequestDiffsOut struct {
 func listMergeRequestDiffs(ctx context.Context, _ *mcp.CallToolRequest, in listMergeRequestDiffsIn, d Deps) (*mcp.CallToolResult, listMergeRequestDiffsOut, error) {
 	budget := igl.DefaultBudget()
 	ctx = igl.WithBudget(ctx, budget)
+	// Release the WithBudget deadline timer on every return path (authz/error/success).
+	defer budget.Cancel()
 
 	owner, err := AuthorizeCanonicalProject(ctx, d, in.ProjectID)
 	if err != nil {
@@ -86,10 +88,12 @@ func listMergeRequestDiffs(ctx context.Context, _ *mcp.CallToolRequest, in listM
 
 	section := readmeta.NewMRDiffsSection(time.Now())
 	headBefore := ""
-	if mr != nil && mr.DiffRefs.HeadSha != "" {
-		headBefore = mr.DiffRefs.HeadSha
-		sha := headBefore
-		section.HeadSHA = &sha
+	if mr != nil {
+		if sha, ok := readmeta.ObservedHeadSHA(mr.DiffRefs.HeadSha); ok {
+			headBefore = sha
+			section.HeadSHA = &sha
+		}
+		// Invalid/non-40-hex observation stays null; consistency remains unknown.
 	}
 
 	// Non-nil empty slice so valid backend [] projects as JSON [] (not null), matching SDK.
@@ -182,16 +186,18 @@ func listMergeRequestDiffs(ctx context.Context, _ *mcp.CallToolRequest, in listM
 		section.AddLimitation(readmeta.CodeTooLarge, "one or more diffs too_large")
 	}
 
-	// Content-head bracketing: consistency stays unknown unless verified; drift ⇒ inconsistent.
+	// Content-head bracketing: only with valid 40-hex observations; never fabricate optimistic consistent.
 	section.Consistency = readmeta.ConsistencyUnknown
 	if headBefore != "" {
 		mrAfter, _, herr := d.Client.MergeRequests.GetMergeRequest(owner.ID, in.MergeRequestIID, nil, gitlab.WithContext(ctx))
-		if herr == nil && mrAfter != nil && mrAfter.DiffRefs.HeadSha != "" {
-			if mrAfter.DiffRefs.HeadSha == headBefore {
-				section.Consistency = readmeta.ConsistencyConsistent
-			} else {
-				section.Consistency = readmeta.ConsistencyInconsistent
-				section.AddLimitation(readmeta.CodeInconsistent, "head_sha drifted during read")
+		if herr == nil && mrAfter != nil {
+			if after, ok := readmeta.ObservedHeadSHA(mrAfter.DiffRefs.HeadSha); ok {
+				if after == headBefore {
+					section.Consistency = readmeta.ConsistencyConsistent
+				} else {
+					section.Consistency = readmeta.ConsistencyInconsistent
+					section.AddLimitation(readmeta.CodeInconsistent, "head_sha drifted during read")
+				}
 			}
 		}
 	}

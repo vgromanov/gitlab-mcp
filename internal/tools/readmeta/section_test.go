@@ -8,6 +8,19 @@ import (
 	"time"
 )
 
+func TestObservedHeadSHA(t *testing.T) {
+	ok40 := "AbcDef0123456789abcdef0123456789ABCDEF01"
+	got, ok := ObservedHeadSHA(ok40)
+	if !ok || got != strings.ToLower(ok40) {
+		t.Fatalf("got %q ok=%v", got, ok)
+	}
+	for _, bad := range []string{"", "abcdeadbeef", "gggggggggggggggggggggggggggggggggggggggg", strings.Repeat("a", 39), strings.Repeat("a", 41)} {
+		if _, ok := ObservedHeadSHA(bad); ok {
+			t.Fatalf("expected reject %q", bad)
+		}
+	}
+}
+
 func TestSectionJSON_lockedShape(t *testing.T) {
 	s := NewMRDiffsSection(time.Date(2026, 10, 2, 12, 0, 0, 0, time.UTC))
 	s.ApplyPaging(PagingObservation{SDKNextPage: 0, HeaderPresent: true, HeaderValue: "", ExhaustedObserved: true, PagingKnown: true})
