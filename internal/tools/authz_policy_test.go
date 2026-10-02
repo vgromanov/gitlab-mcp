@@ -370,7 +370,7 @@ func TestListPipelineTriggerJobs_redactsDownstream(t *testing.T) {
 		path := r.URL.Path
 		switch {
 		case strings.Contains(path, "/bridges"):
-			_, _ = io.WriteString(w, `[{"id":1,"name":"trigger","downstream_pipeline":{"id":9,"project_id":99,"status":"success"}},{"id":2,"name":"ok","downstream_pipeline":{"id":8,"project_id":42,"status":"success"}}]`)
+			_, _ = io.WriteString(w, `[{"id":1,"name":"trigger","downstream_pipeline":{"id":9,"project_id":99,"status":"success","web_url":"http://leak/99"}},{"id":2,"name":"ok","downstream_pipeline":{"id":8,"project_id":42,"status":"success"}},{"id":3,"name":"unknown","downstream_pipeline":{"id":7,"project_id":0,"status":"running","web_url":"http://leak/0"}},{"id":4,"name":"neg","downstream_pipeline":{"id":6,"project_id":-1,"status":"failed","web_url":"http://leak/neg"}}]`)
 		case strings.Contains(path, "/projects/42"):
 			_, _ = io.WriteString(w, `{"id":42,"path_with_namespace":"g/p","namespace":{"id":7,"kind":"group"}}`)
 		case strings.Contains(path, "/projects/99"):
@@ -387,12 +387,28 @@ func TestListPipelineTriggerJobs_redactsDownstream(t *testing.T) {
 		t.Fatal(err)
 	}
 	raw, _ := json.Marshal(out)
-	if strings.Contains(string(raw), `"project_id":99`) || strings.Contains(string(raw), `"project_id": 99`) {
-		t.Fatalf("leaked downstream project 99: %s", raw)
+	s := string(raw)
+	for _, leak := range []string{`"project_id":99`, `"project_id": 99`, `http://leak/`} {
+		if strings.Contains(s, leak) {
+			t.Fatalf("leaked downstream child payload (%s): %s", leak, s)
+		}
 	}
-	if !strings.Contains(string(raw), `"project_id":42`) && !strings.Contains(string(raw), `"project_id": 42`) {
-		// in-policy downstream may remain
-		t.Logf("payload=%s", raw)
+	// Zero/negative child identities must be nullled (not published with payload).
+	if strings.Contains(s, `"name":"unknown"`) && strings.Contains(s, `"downstream_pipeline":{"`) {
+		// Find unknown bridge — its downstream_pipeline must be null.
+		if !strings.Contains(s, `"name":"unknown","pipeline"`) && !strings.Contains(s, `"downstream_pipeline":null`) {
+			t.Fatalf("unknown child not redacted: %s", s)
+		}
+	}
+	if strings.Contains(s, `"web_url":"http://leak`) {
+		t.Fatalf("child web_url leaked: %s", s)
+	}
+	if !strings.Contains(s, `"project_id":42`) && !strings.Contains(s, `"project_id": 42`) {
+		t.Fatalf("in-policy downstream missing: %s", s)
+	}
+	// Explicit: redacted slots are null.
+	if !strings.Contains(s, `"downstream_pipeline":null`) {
+		t.Fatalf("expected null downstream_pipeline for OOS/unknown children: %s", s)
 	}
 }
 

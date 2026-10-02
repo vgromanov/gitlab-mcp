@@ -402,8 +402,16 @@ type getBranchDiffsIn struct {
 }
 
 func getBranchDiffs(ctx context.Context, _ *mcp.CallToolRequest, in getBranchDiffsIn, d Deps) (*mcp.CallToolResult, any, error) {
-	pid, err := resolveProjectAuthz(ctx, d, in.ProjectID)
+	// Out of finite RVG-121 matrix — preserve legacy allowlist string match.
+	def := ""
+	if d.Config != nil {
+		def = d.Config.DefaultProjectID
+	}
+	pid, err := ResolveProjectID(in.ProjectID, def)
 	if err != nil {
+		return nil, nil, err
+	}
+	if err := checkAllowedProject(d.Config, pid); err != nil {
 		return nil, nil, err
 	}
 	cmp, _, err := d.Client.Repositories.Compare(pid, &gitlab.CompareOptions{

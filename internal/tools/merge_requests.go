@@ -58,6 +58,26 @@ func (p pidMR) resolve(ctx context.Context, d Deps) (string, error) {
 	return pid, nil
 }
 
+// resolveLegacy keeps pre-policy ResolveProjectID + checkAllowedProject for
+// out-of-matrix callers (draft notes) that share the pidMR shape only.
+func (p pidMR) resolveLegacy(d Deps) (string, error) {
+	def := ""
+	if d.Config != nil {
+		def = d.Config.DefaultProjectID
+	}
+	pid, err := ResolveProjectID(p.ProjectID, def)
+	if err != nil {
+		return "", err
+	}
+	if err := checkAllowedProject(d.Config, pid); err != nil {
+		return "", err
+	}
+	if p.MergeRequestIID < 1 {
+		return "", fmt.Errorf("merge_request_iid must be >= 1")
+	}
+	return pid, nil
+}
+
 // authorizeMROwnerAndForks authorizes the owner project, loads MR metadata, then
 // independently authorizes source/downstream project IDs before content reads.
 func authorizeMROwnerAndForks(ctx context.Context, d Deps, projectID string, mrIID int64) (CanonicalProject, error) {
@@ -428,14 +448,19 @@ func listMergeRequests(ctx context.Context, _ *mcp.CallToolRequest, in listMerge
 		return nil, Out(map[string]any{"merge_requests": mrs, "pagination": map[string]any{"next_page": resp.NextPage}}), nil
 	}
 	if in.GroupID != nil && *in.GroupID != "" {
-		if _, err := AuthorizeCanonicalGroup(ctx, d, *in.GroupID); err != nil {
-			return nil, nil, err
+		gid := *in.GroupID
+		if d.Config != nil && len(d.Config.AllowedGroupIDs) > 0 {
+			g, err := AuthorizeCanonicalGroup(ctx, d, *in.GroupID)
+			if err != nil {
+				return nil, nil, err
+			}
+			gid = strconv.FormatInt(g.ID, 10)
 		}
 		opt := &gitlab.ListGroupMergeRequestsOptions{ListOptions: gitlab.ListOptions{Page: int64(page), PerPage: int64(perPage)}}
 		if in.State != nil {
 			opt.State = in.State
 		}
-		mrs, resp, err := d.Client.MergeRequests.ListGroupMergeRequests(*in.GroupID, opt, gitlab.WithContext(ctx))
+		mrs, resp, err := d.Client.MergeRequests.ListGroupMergeRequests(gid, opt, gitlab.WithContext(ctx))
 		if err != nil {
 			return nil, nil, err
 		}

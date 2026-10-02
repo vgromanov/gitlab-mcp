@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"strconv"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	gitlab "gitlab.com/gitlab-org/api/client-go/v2"
@@ -146,8 +147,15 @@ type listGroupProjectsIn struct {
 }
 
 func listGroupProjects(ctx context.Context, _ *mcp.CallToolRequest, in listGroupProjectsIn, d Deps) (*mcp.CallToolResult, any, error) {
-	if _, err := AuthorizeCanonicalGroup(ctx, d, in.GroupID); err != nil {
-		return nil, nil, err
+	gid := in.GroupID
+	// Canonical group resolve only when group policy is set; otherwise keep legacy
+	// path (no extra GetGroup) and rely on project-row filtering when project policy applies.
+	if d.Config != nil && len(d.Config.AllowedGroupIDs) > 0 {
+		g, err := AuthorizeCanonicalGroup(ctx, d, in.GroupID)
+		if err != nil {
+			return nil, nil, err
+		}
+		gid = strconv.FormatInt(g.ID, 10)
 	}
 	page, perPage := in.ListOpts()
 	opt := &gitlab.ListGroupProjectsOptions{
@@ -162,7 +170,7 @@ func listGroupProjects(ctx context.Context, _ *mcp.CallToolRequest, in listGroup
 	if in.Archived != nil {
 		opt.Archived = gitlab.Ptr(*in.Archived)
 	}
-	projects, resp, err := d.Client.Groups.ListGroupProjects(in.GroupID, opt, gitlab.WithContext(ctx))
+	projects, resp, err := d.Client.Groups.ListGroupProjects(gid, opt, gitlab.WithContext(ctx))
 	if err != nil {
 		return nil, nil, err
 	}
