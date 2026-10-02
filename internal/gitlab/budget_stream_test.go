@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -392,5 +393,22 @@ func TestStreamJSONArray_elapsedMapsToBudgetElapsed(t *testing.T) {
 	})
 	if !errors.Is(err, ErrBudgetElapsed) {
 		t.Fatalf("want ErrBudgetElapsed, got %v", err)
+	}
+}
+
+func TestPreferStreamError_budgetBeatsFraming(t *testing.T) {
+	ctx := WithBudget(context.Background(), DefaultBudget())
+	got := preferStreamError(ctx, ErrBudgetElapsed, fmt.Errorf("stream array: expected ']': unexpected EOF"))
+	if !errors.Is(got, ErrBudgetElapsed) {
+		t.Fatalf("got %v", got)
+	}
+	got = preferStreamError(ctx, ErrBudgetBytes, fmt.Errorf("stream array element: unexpected EOF"))
+	if !errors.Is(got, ErrBudgetBytes) {
+		t.Fatalf("got %v", got)
+	}
+	// Typed onItem budget still wins over closed pipe.
+	got = preferStreamError(ctx, io.ErrClosedPipe, ErrBudgetItems)
+	if !errors.Is(got, ErrBudgetItems) {
+		t.Fatalf("got %v", got)
 	}
 }

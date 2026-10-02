@@ -142,13 +142,34 @@ func mapBudgetContextErr(ctx context.Context, err error) error {
 func preferStreamError(ctx context.Context, doErr, decodeErr error) error {
 	decodeErr = mapBudgetContextErr(ctx, decodeErr)
 	doErr = mapBudgetContextErr(ctx, doErr)
+	// When budget kills the upstream copy, the decode side often fails first with a
+	// framing/partial-JSON error. Prefer the typed budget cause so adapters emit
+	// budget_* limitations instead of generic partial/http_error.
+	if isTypedBudgetErr(doErr) && (decodeErr == nil || isClosedPipe(decodeErr) || isStreamFramingErr(decodeErr)) {
+		return doErr
+	}
 	if decodeErr != nil {
-		if doErr == nil || isClosedPipe(doErr) {
+		if doErr == nil || isClosedPipe(doErr) || isTypedBudgetErr(decodeErr) {
 			return decodeErr
 		}
 		return decodeErr
 	}
 	return doErr
+}
+
+func isTypedBudgetErr(err error) bool {
+	return errors.Is(err, ErrBudgetBytes) ||
+		errors.Is(err, ErrBudgetItems) ||
+		errors.Is(err, ErrBudgetElapsed) ||
+		errors.Is(err, ErrBudgetRequests)
+}
+
+func isStreamFramingErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "stream array:") || strings.Contains(msg, "stream array element:")
 }
 
 func isClosedPipe(err error) bool {
