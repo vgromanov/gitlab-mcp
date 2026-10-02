@@ -147,9 +147,23 @@ func TestAuthzFamilyMatrix_denyZeroContentOrMutation(t *testing.T) {
 			},
 		},
 		{
+			name: "discussion_read_allow", deny: false, family: "discussion",
+			run: func(ctx context.Context, d Deps) error {
+				_, _, err := mrDiscussions(ctx, nil, mrDiscussionsIn{pidMR: pidMR{ProjectID: "42", MergeRequestIID: 1}}, d)
+				return err
+			},
+		},
+		{
 			name: "discussion_write_deny", deny: true, family: "discussion",
 			run: func(ctx context.Context, d Deps) error {
 				_, _, err := createMergeRequestNote(ctx, nil, createMergeRequestNoteIn{pidMR: pidMR{ProjectID: "99", MergeRequestIID: 1}, Body: "x"}, d)
+				return err
+			},
+		},
+		{
+			name: "discussion_write_allow", deny: false, family: "discussion",
+			run: func(ctx context.Context, d Deps) error {
+				_, _, err := createMergeRequestNote(ctx, nil, createMergeRequestNoteIn{pidMR: pidMR{ProjectID: "42", MergeRequestIID: 1}, Body: "x"}, d)
 				return err
 			},
 		},
@@ -161,9 +175,23 @@ func TestAuthzFamilyMatrix_denyZeroContentOrMutation(t *testing.T) {
 			},
 		},
 		{
+			name: "pipeline_read_allow", deny: false, family: "pipeline",
+			run: func(ctx context.Context, d Deps) error {
+				_, _, err := listPipelines(ctx, nil, listPipelinesIn{ProjectID: "42"}, d)
+				return err
+			},
+		},
+		{
 			name: "pipeline_trace_deny", deny: true, family: "pipeline",
 			run: func(ctx context.Context, d Deps) error {
 				_, _, err := getPipelineJobOutput(ctx, nil, getPipelineJobOutputIn{ProjectID: "99", JobID: 1}, d)
+				return err
+			},
+		},
+		{
+			name: "pipeline_trace_allow", deny: false, family: "pipeline",
+			run: func(ctx context.Context, d Deps) error {
+				_, _, err := getPipelineJobOutput(ctx, nil, getPipelineJobOutputIn{ProjectID: "42", JobID: 1}, d)
 				return err
 			},
 		},
@@ -175,9 +203,9 @@ func TestAuthzFamilyMatrix_denyZeroContentOrMutation(t *testing.T) {
 			},
 		},
 		{
-			name: "mr_versions_fork_path_deny", deny: true, family: "mr_fork",
+			name: "pipeline_write_allow", deny: false, family: "pipeline",
 			run: func(ctx context.Context, d Deps) error {
-				_, _, err := listMergeRequestVersions(ctx, nil, listMergeRequestVersionsIn{pidMR: pidMR{ProjectID: "99", MergeRequestIID: 1}}, d)
+				_, _, err := createPipeline(ctx, nil, createPipelineIn{ProjectID: "42", Ref: "main"}, d)
 				return err
 			},
 		},
@@ -190,9 +218,24 @@ func TestAuthzFamilyMatrix_denyZeroContentOrMutation(t *testing.T) {
 			},
 		},
 		{
+			name: "mr_mutation_update_allow", deny: false, family: "mr_mut",
+			run: func(ctx context.Context, d Deps) error {
+				title := "t"
+				_, _, err := updateMergeRequest(ctx, nil, updateMergeRequestIn{pidMR: pidMR{ProjectID: "42", MergeRequestIID: 1}, Title: &title}, d)
+				return err
+			},
+		},
+		{
 			name: "project_get_deny", deny: true, family: "project",
 			run: func(ctx context.Context, d Deps) error {
 				_, _, err := getProject(ctx, nil, getProjectIn{ProjectID: "99"}, d)
+				return err
+			},
+		},
+		{
+			name: "project_get_allow", deny: false, family: "project",
+			run: func(ctx context.Context, d Deps) error {
+				_, _, err := getProject(ctx, nil, getProjectIn{ProjectID: "42"}, d)
 				return err
 			},
 		},
@@ -234,8 +277,19 @@ func TestAuthzFamilyMatrix_denyZeroContentOrMutation(t *testing.T) {
 				if atomic.LoadInt32(&content) != 0 || atomic.LoadInt32(&mut) != 0 {
 					t.Fatalf("deny leaked content=%d mut=%d", content, mut)
 				}
-			} else if err != nil {
-				t.Fatal(err)
+			} else {
+				if err != nil {
+					t.Fatal(err)
+				}
+				switch tc.family {
+				case "discussion", "pipeline", "mr_mut", "repo":
+					if atomic.LoadInt32(&content)+atomic.LoadInt32(&mut) == 0 && tc.name != "project_get_allow" {
+						// project_get may only hit identity; others must touch content/mutation.
+						if !strings.Contains(tc.name, "project_get") {
+							t.Fatalf("allow expected content/mutation >0, content=%d mut=%d", content, mut)
+						}
+					}
+				}
 			}
 		})
 	}
@@ -296,6 +350,65 @@ func TestListGroupProjects_canonicalIDAfterAuthzAndDenyBeforeList(t *testing.T) 
 	}
 	if atomic.LoadInt32(&groupList) != 0 {
 		t.Fatalf("list must not run after deny, hits=%d", groupList)
+	}
+}
+
+func TestListMergeRequests_groupCanonicalIDAfterAuthz(t *testing.T) {
+	var mrList, groupGet int32
+	d := authzDeps(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		path := r.URL.Path
+		switch {
+		case strings.Contains(path, "/groups/") && strings.Contains(path, "/merge_requests"):
+			atomic.AddInt32(&mrList, 1)
+			if !strings.Contains(path, "/groups/10/") {
+				t.Errorf("group MR list used non-canonical path %s", path)
+			}
+			_, _ = io.WriteString(w, `[{"id":1,"iid":1,"project_id":42}]`)
+		case strings.Contains(path, "/groups/"):
+			atomic.AddInt32(&groupGet, 1)
+			_, _ = io.WriteString(w, `{"id":10,"full_path":"g","parent_id":0}`)
+		case isProjectIdentityPath(path):
+			id := echoNumericID(path, 42)
+			_, _ = io.WriteString(w, `{"id":`+itoa(id)+`,"path_with_namespace":"g/p","namespace":{"id":10,"kind":"group"}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	d.Config.AllowedGroupIDs = []string{"moved/old/group"}
+	gid := "moved/old/group"
+	_, _, err := listMergeRequests(context.Background(), nil, listMergeRequestsIn{GroupID: &gid}, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if atomic.LoadInt32(&groupGet) < 1 {
+		t.Fatal("expected GetGroup before group MR list")
+	}
+	if atomic.LoadInt32(&mrList) != 1 {
+		t.Fatalf("mr list hits=%d", mrList)
+	}
+
+	atomic.StoreInt32(&mrList, 0)
+	d2 := authzDeps(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(r.URL.Path, "/merge_requests") {
+			atomic.AddInt32(&mrList, 1)
+		}
+		if strings.Contains(r.URL.Path, "/groups/") {
+			id := echoNumericID(r.URL.Path, 99)
+			_, _ = io.WriteString(w, `{"id":`+itoa(id)+`,"full_path":"x","parent_id":0}`)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	d2.Config.AllowedGroupIDs = []string{"10"}
+	bad := "99"
+	_, _, err = listMergeRequests(context.Background(), nil, listMergeRequestsIn{GroupID: &bad}, d2)
+	if err == nil || !strings.Contains(err.Error(), readmeta.CodeAuthzDenied) {
+		t.Fatalf("want group deny before MR list, got %v", err)
+	}
+	if atomic.LoadInt32(&mrList) != 0 {
+		t.Fatalf("MR list must not run after deny, hits=%d", mrList)
 	}
 }
 
@@ -472,5 +585,354 @@ func TestListPipelineTriggerJobs_unknownChildRedactedInHandlerOutput(t *testing.
 	}
 	if strings.Contains(string(raw), "http://secret") {
 		t.Fatalf("leaked: %s", raw)
+	}
+}
+
+func TestForkRepository_destinationGroupAuthz(t *testing.T) {
+	var mut int32
+	var lastForkBody string
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		path := r.URL.Path
+		switch {
+		case r.Method == http.MethodPost && strings.Contains(path, "/fork"):
+			atomic.AddInt32(&mut, 1)
+			b, _ := io.ReadAll(r.Body)
+			lastForkBody = string(b)
+			if lastForkBody == "" {
+				lastForkBody = r.URL.RawQuery
+			}
+			_, _ = io.WriteString(w, `{"id":100,"path_with_namespace":"g/forked"}`)
+		case strings.Contains(path, "/groups/"):
+			seg := path[strings.LastIndex(path, "/")+1:]
+			switch {
+			case seg == "10" || seg == "g" || strings.HasSuffix(path, "/groups/g"):
+				_, _ = io.WriteString(w, `{"id":10,"full_path":"g","parent_id":0}`)
+			case seg == "11":
+				_, _ = io.WriteString(w, `{"id":11,"full_path":"g/sub","parent_id":10}`)
+			case seg == "99" || strings.Contains(path, "/groups/other"):
+				_, _ = io.WriteString(w, `{"id":99,"full_path":"other","parent_id":0}`)
+			default:
+				http.NotFound(w, r)
+			}
+		case isProjectIdentityPath(path):
+			id := echoNumericID(path, 42)
+			_, _ = io.WriteString(w, `{"id":`+itoa(id)+`,"path_with_namespace":"g/p","namespace":{"id":10,"kind":"group"}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	})
+
+	assertBoundID := func(t *testing.T, want string) {
+		t.Helper()
+		if !strings.Contains(lastForkBody, "namespace_id") || !strings.Contains(lastForkBody, want) {
+			t.Fatalf("fork body/query missing bound namespace_id=%s: %q", want, lastForkBody)
+		}
+		if strings.Contains(lastForkBody, "namespace_path") {
+			t.Fatalf("group-policy fork must not pass namespace_path: %q", lastForkBody)
+		}
+	}
+
+	t.Run("allow_dest_id", func(t *testing.T) {
+		atomic.StoreInt32(&mut, 0)
+		lastForkBody = ""
+		d := authzDeps(t, handler)
+		d.Config.AllowedProjectIDs = []string{"42"}
+		d.Config.AllowedGroupIDs = []string{"10"}
+		ns := int64(10)
+		_, _, err := forkRepository(context.Background(), nil, forkRepositoryIn{
+			ProjectID: "42", NamespaceID: &ns, Name: ptr("f"),
+		}, d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if atomic.LoadInt32(&mut) != 1 {
+			t.Fatalf("mut=%d", mut)
+		}
+		assertBoundID(t, "10")
+	})
+
+	t.Run("allow_dest_path_bound_to_id", func(t *testing.T) {
+		atomic.StoreInt32(&mut, 0)
+		lastForkBody = ""
+		d := authzDeps(t, handler)
+		d.Config.AllowedProjectIDs = []string{"42"}
+		d.Config.AllowedGroupIDs = []string{"10"}
+		path := "g"
+		_, _, err := forkRepository(context.Background(), nil, forkRepositoryIn{
+			ProjectID: "42", NamespacePath: &path, Name: ptr("f"),
+		}, d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if atomic.LoadInt32(&mut) != 1 {
+			t.Fatalf("mut=%d", mut)
+		}
+		assertBoundID(t, "10")
+	})
+
+	t.Run("allow_descendant_dest", func(t *testing.T) {
+		atomic.StoreInt32(&mut, 0)
+		lastForkBody = ""
+		d := authzDeps(t, handler)
+		d.Config.AllowedProjectIDs = []string{"42"}
+		d.Config.AllowedGroupIDs = []string{"10"}
+		ns := int64(11)
+		_, _, err := forkRepository(context.Background(), nil, forkRepositoryIn{
+			ProjectID: "42", NamespaceID: &ns, Name: ptr("f"),
+		}, d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if atomic.LoadInt32(&mut) != 1 {
+			t.Fatalf("mut=%d", mut)
+		}
+		assertBoundID(t, "11")
+	})
+
+	t.Run("deny_disallowed_dest_zero_mutation", func(t *testing.T) {
+		atomic.StoreInt32(&mut, 0)
+		d := authzDeps(t, handler)
+		d.Config.AllowedProjectIDs = []string{"42"}
+		d.Config.AllowedGroupIDs = []string{"10"}
+		ns := int64(99)
+		_, _, err := forkRepository(context.Background(), nil, forkRepositoryIn{
+			ProjectID: "42", NamespaceID: &ns, Name: ptr("f"),
+		}, d)
+		if err == nil || !strings.Contains(err.Error(), readmeta.CodeAuthzDenied) {
+			t.Fatalf("want deny, got %v", err)
+		}
+		if atomic.LoadInt32(&mut) != 0 {
+			t.Fatalf("mut=%d", mut)
+		}
+	})
+
+	t.Run("deny_missing_dest_zero_mutation", func(t *testing.T) {
+		atomic.StoreInt32(&mut, 0)
+		d := authzDeps(t, handler)
+		d.Config.AllowedProjectIDs = []string{"42"}
+		d.Config.AllowedGroupIDs = []string{"10"}
+		_, _, err := forkRepository(context.Background(), nil, forkRepositoryIn{
+			ProjectID: "42", Name: ptr("f"),
+		}, d)
+		if err == nil || !strings.Contains(err.Error(), readmeta.CodeAuthzDenied) {
+			t.Fatalf("want deny missing dest, got %v", err)
+		}
+		if atomic.LoadInt32(&mut) != 0 {
+			t.Fatalf("mut=%d", mut)
+		}
+	})
+
+	t.Run("deny_unknown_dest_zero_mutation", func(t *testing.T) {
+		atomic.StoreInt32(&mut, 0)
+		d := authzDeps(t, handler)
+		d.Config.AllowedProjectIDs = []string{"42"}
+		d.Config.AllowedGroupIDs = []string{"10"}
+		path := "missing/ns"
+		_, _, err := forkRepository(context.Background(), nil, forkRepositoryIn{
+			ProjectID: "42", NamespacePath: &path, Name: ptr("f"),
+		}, d)
+		if err == nil || !strings.Contains(err.Error(), readmeta.CodeIdentityUnresolved) {
+			t.Fatalf("want identity_unresolved, got %v", err)
+		}
+		if atomic.LoadInt32(&mut) != 0 {
+			t.Fatalf("mut=%d", mut)
+		}
+	})
+
+	t.Run("deny_conflicting_id_and_path", func(t *testing.T) {
+		atomic.StoreInt32(&mut, 0)
+		d := authzDeps(t, handler)
+		d.Config.AllowedProjectIDs = []string{"42"}
+		d.Config.AllowedGroupIDs = []string{"10", "99"}
+		ns := int64(10)
+		path := "other"
+		_, _, err := forkRepository(context.Background(), nil, forkRepositoryIn{
+			ProjectID: "42", NamespaceID: &ns, NamespacePath: &path, Name: ptr("f"),
+		}, d)
+		if err == nil || !strings.Contains(err.Error(), readmeta.CodeAuthzDenied) {
+			t.Fatalf("want conflict deny, got %v", err)
+		}
+		if atomic.LoadInt32(&mut) != 0 {
+			t.Fatalf("mut=%d", mut)
+		}
+	})
+
+	t.Run("project_only_policy_keeps_legacy_dest_passthrough", func(t *testing.T) {
+		atomic.StoreInt32(&mut, 0)
+		lastForkBody = ""
+		d := authzDeps(t, handler)
+		d.Config.AllowedProjectIDs = []string{"42"}
+		d.Config.AllowedGroupIDs = nil
+		path := "g"
+		_, _, err := forkRepository(context.Background(), nil, forkRepositoryIn{
+			ProjectID: "42", NamespacePath: &path, Name: ptr("f"),
+		}, d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if atomic.LoadInt32(&mut) != 1 {
+			t.Fatalf("mut=%d", mut)
+		}
+		if !strings.Contains(lastForkBody, "namespace_path") && !strings.Contains(lastForkBody, "g") {
+			t.Fatalf("expected legacy namespace_path passthrough: %q", lastForkBody)
+		}
+	})
+}
+
+// owner42 + source99 from MR metadata — not owner99 denial. All seven fork-sensitive handlers.
+func TestForkSensitiveHandlers_sourceDenyZeroContent(t *testing.T) {
+	type tc struct {
+		name string
+		run  func(ctx context.Context, d Deps) error
+	}
+	cases := []tc{
+		{"get_merge_request_diffs", func(ctx context.Context, d Deps) error {
+			_, _, err := getMergeRequestDiffs(ctx, nil, getMergeRequestDiffsIn{pidMR: pidMR{ProjectID: "42", MergeRequestIID: 1}}, d)
+			return err
+		}},
+		{"list_merge_request_diffs", func(ctx context.Context, d Deps) error {
+			_, _, err := listMergeRequestDiffs(ctx, nil, listMergeRequestDiffsIn{pidMR: pidMR{ProjectID: "42", MergeRequestIID: 1}}, d)
+			return err
+		}},
+		{"get_merge_request_conflicts", func(ctx context.Context, d Deps) error {
+			_, _, err := getMergeRequestConflicts(ctx, nil, getMergeRequestConflictsIn{pidMR: pidMR{ProjectID: "42", MergeRequestIID: 1}}, d)
+			return err
+		}},
+		{"list_merge_request_changed_files", func(ctx context.Context, d Deps) error {
+			_, _, err := listMergeRequestChangedFiles(ctx, nil, listMergeRequestChangedFilesIn{pidMR: pidMR{ProjectID: "42", MergeRequestIID: 1}}, d)
+			return err
+		}},
+		{"get_merge_request_file_diff", func(ctx context.Context, d Deps) error {
+			_, _, err := getMergeRequestFileDiff(ctx, nil, getMergeRequestFileDiffIn{pidMR: pidMR{ProjectID: "42", MergeRequestIID: 1}, Files: []string{"a.go"}}, d)
+			return err
+		}},
+		{"list_merge_request_versions", func(ctx context.Context, d Deps) error {
+			_, _, err := listMergeRequestVersions(ctx, nil, listMergeRequestVersionsIn{pidMR: pidMR{ProjectID: "42", MergeRequestIID: 1}}, d)
+			return err
+		}},
+		{"get_merge_request_version", func(ctx context.Context, d Deps) error {
+			_, _, err := getMergeRequestVersion(ctx, nil, getMergeRequestVersionIn{pidMR: pidMR{ProjectID: "42", MergeRequestIID: 1}, VersionID: 5}, d)
+			return err
+		}},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			var content, identity int32
+			d := authzDeps(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				path := r.URL.Path
+				switch {
+				case strings.HasSuffix(path, "/diffs") || strings.Contains(path, "/versions") || strings.Contains(path, "/compare"):
+					atomic.AddInt32(&content, 1)
+					_, _ = io.WriteString(w, `[]`)
+				case strings.Contains(path, "/merge_requests/") && r.Method == http.MethodGet:
+					// Owner 42 allowed; fork source 99 denied from metadata.
+					_, _ = io.WriteString(w, `{"id":1,"iid":1,"project_id":42,"source_project_id":99,"diff_refs":{"base_sha":"a","head_sha":"b","start_sha":"a"},"has_conflicts":false}`)
+				case isProjectIdentityPath(path):
+					atomic.AddInt32(&identity, 1)
+					id := echoNumericID(path, 42)
+					ns := `{"id":7,"kind":"group"}`
+					if id == 99 {
+						ns = `{"id":8,"kind":"group"}`
+					}
+					_, _ = io.WriteString(w, `{"id":`+itoa(id)+`,"path_with_namespace":"g/p","namespace":`+ns+`}`)
+				default:
+					_, _ = io.WriteString(w, `{}`)
+				}
+			}))
+			d.Config.AllowedProjectIDs = []string{"42"}
+			err := tc.run(context.Background(), d)
+			if err == nil || !strings.Contains(err.Error(), readmeta.CodeAuthzDenied) {
+				t.Fatalf("want source-fork authz_denied, got %v", err)
+			}
+			if atomic.LoadInt32(&content) != 0 {
+				t.Fatalf("content hits=%d want 0 (no diffs/versions/compare after deny)", content)
+			}
+		})
+	}
+}
+
+func TestAuthorizeMROwnerAndForks_unprovenSourceFailClosed(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{"nil_mr_empty_object_zero_source", `{"id":1,"iid":1,"project_id":42,"source_project_id":0}`},
+		{"negative_source", `{"id":1,"iid":1,"project_id":42,"source_project_id":-3}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var content int32
+			d := authzDeps(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				if strings.HasSuffix(r.URL.Path, "/diffs") || strings.Contains(r.URL.Path, "/versions") {
+					atomic.AddInt32(&content, 1)
+					_, _ = io.WriteString(w, `[]`)
+					return
+				}
+				if strings.Contains(r.URL.Path, "/merge_requests/") {
+					_, _ = io.WriteString(w, tc.body)
+					return
+				}
+				if isProjectIdentityPath(r.URL.Path) {
+					id := echoNumericID(r.URL.Path, 42)
+					_, _ = io.WriteString(w, `{"id":`+itoa(id)+`,"path_with_namespace":"g/p","namespace":{"id":7,"kind":"group"}}`)
+					return
+				}
+				_, _ = io.WriteString(w, `{}`)
+			}))
+			d.Config.AllowedProjectIDs = []string{"42"}
+			_, err := authorizeMROwnerAndForks(context.Background(), d, "42", 1)
+			if err == nil || !strings.Contains(err.Error(), readmeta.CodeIdentityUnresolved) {
+				t.Fatalf("want identity_unresolved, got %v", err)
+			}
+			_, _, err = listMergeRequestDiffs(context.Background(), nil, listMergeRequestDiffsIn{
+				pidMR: pidMR{ProjectID: "42", MergeRequestIID: 1},
+			}, d)
+			if err == nil || !strings.Contains(err.Error(), readmeta.CodeIdentityUnresolved) {
+				t.Fatalf("list_merge_request_diffs want identity_unresolved, got %v", err)
+			}
+			if atomic.LoadInt32(&content) != 0 {
+				t.Fatalf("content=%d", content)
+			}
+		})
+	}
+}
+
+func TestForkSensitiveHandlers_emptyPolicyNoExtraIdentity(t *testing.T) {
+	var identity, content int32
+	d := authzDeps(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		path := r.URL.Path
+		if isProjectIdentityPath(path) || isGroupIdentityPath(path) {
+			atomic.AddInt32(&identity, 1)
+			_, _ = io.WriteString(w, `{"id":42,"path_with_namespace":"g/p","namespace":{"id":7,"kind":"group"}}`)
+			return
+		}
+		if strings.HasSuffix(path, "/diffs") || strings.Contains(path, "/versions") {
+			atomic.AddInt32(&content, 1)
+			_, _ = io.WriteString(w, `[{"old_path":"a.go","new_path":"a.go","diff":""}]`)
+			return
+		}
+		if strings.Contains(path, "/merge_requests/") {
+			_, _ = io.WriteString(w, `{"id":1,"iid":1,"project_id":42,"source_project_id":0,"has_conflicts":false,"diff_refs":{}}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{}`)
+	}))
+	// Empty both allowlists — six non-020 handlers must not GetProject before content.
+	_, _, err := getMergeRequestDiffs(context.Background(), nil, getMergeRequestDiffsIn{
+		pidMR: pidMR{ProjectID: "42", MergeRequestIID: 1},
+	}, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if atomic.LoadInt32(&identity) != 0 {
+		t.Fatalf("empty policy get_merge_request_diffs must not GetProject, identity=%d", identity)
+	}
+	if atomic.LoadInt32(&content) == 0 {
+		t.Fatal("expected content")
 	}
 }

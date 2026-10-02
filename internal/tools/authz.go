@@ -294,6 +294,49 @@ func AuthorizeCanonicalGroup(ctx context.Context, d Deps, groupID string) (Canon
 	return canon, nil
 }
 
+// authorizeForkDestination resolves fork target namespace under group policy to a
+// safe positive canonical group ID (allowed root or descendant). When group policy
+// is unset, returns (0, nil) so callers keep legacy NamespaceID/Path pass-through.
+// Missing, unknown, user, or conflicting id/path destinations fail closed.
+func authorizeForkDestination(ctx context.Context, d Deps, nsID *int64, nsPath *string) (int64, error) {
+	if d.Config == nil || len(d.Config.AllowedGroupIDs) == 0 {
+		return 0, nil
+	}
+	hasID := nsID != nil && *nsID > 0
+	hasPath := nsPath != nil && strings.TrimSpace(*nsPath) != ""
+	if !hasID && !hasPath {
+		return 0, authzDenied("fork destination namespace required under group policy")
+	}
+	var fromID, fromPath CanonicalGroup
+	if hasID {
+		c, err := AuthorizeCanonicalGroup(ctx, d, strconv.FormatInt(*nsID, 10))
+		if err != nil {
+			return 0, err
+		}
+		fromID = c
+	}
+	if hasPath {
+		c, err := AuthorizeCanonicalGroup(ctx, d, strings.TrimSpace(*nsPath))
+		if err != nil {
+			return 0, err
+		}
+		fromPath = c
+	}
+	if hasID && hasPath && fromID.ID != fromPath.ID {
+		return 0, authzDenied("fork destination namespace_id and namespace_path conflict")
+	}
+	if hasID {
+		if fromID.ID <= 0 {
+			return 0, identityErr("malformed fork destination group identity")
+		}
+		return fromID.ID, nil
+	}
+	if fromPath.ID <= 0 {
+		return 0, identityErr("malformed fork destination group identity")
+	}
+	return fromPath.ID, nil
+}
+
 // ProjectAllowedByPolicy reports whether a known project identity is in policy
 // without returning raw API objects. Used for discovery filtering.
 func ProjectAllowedByPolicy(ctx context.Context, d Deps, id int64, pathWithNamespace string, namespaceID int64, namespaceKind string) (bool, error) {

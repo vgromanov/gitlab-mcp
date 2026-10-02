@@ -96,12 +96,21 @@ func forkRepository(ctx context.Context, _ *mcp.CallToolRequest, in forkReposito
 	if err != nil {
 		return nil, nil, err
 	}
-	opt := &gitlab.ForkProjectOptions{}
-	if in.NamespaceID != nil {
-		opt.NamespaceID = in.NamespaceID
+	destID, err := authorizeForkDestination(ctx, d, in.NamespaceID, in.NamespacePath)
+	if err != nil {
+		return nil, nil, err
 	}
-	if in.NamespacePath != nil {
-		opt.NamespacePath = in.NamespacePath
+	opt := &gitlab.ForkProjectOptions{}
+	if d.Config != nil && len(d.Config.AllowedGroupIDs) > 0 {
+		// Bind mutation to resolved canonical group ID only (no raw alias pass-through).
+		opt.NamespaceID = gitlab.Ptr(destID)
+	} else {
+		if in.NamespaceID != nil {
+			opt.NamespaceID = in.NamespaceID
+		}
+		if in.NamespacePath != nil {
+			opt.NamespacePath = in.NamespacePath
+		}
 	}
 	if in.Name != nil {
 		opt.Name = in.Name

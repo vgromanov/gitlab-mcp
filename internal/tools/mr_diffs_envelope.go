@@ -66,17 +66,22 @@ func listMergeRequestDiffs(ctx context.Context, _ *mcp.CallToolRequest, in listM
 	if err != nil {
 		return nil, listMergeRequestDiffsOut{}, fmt.Errorf("%s: merge request metadata", readmeta.CodeHTTPError)
 	}
-	var extra []string
-	if mr != nil {
-		if mr.SourceProjectID != 0 && mr.SourceProjectID != owner.ID {
+	if policyActive(d.Config) {
+		if err := requireProvenMRForkProjects(ctx, d, owner, mr); err != nil {
+			return nil, listMergeRequestDiffsOut{}, err
+		}
+	} else if mr != nil {
+		// Empty-policy compatibility: optional additional resolve when source differs (no fail-closed).
+		var extra []string
+		if mr.SourceProjectID > 0 && mr.SourceProjectID != owner.ID {
 			extra = append(extra, strconv.FormatInt(mr.SourceProjectID, 10))
 		}
-		if mr.ProjectID != 0 && mr.ProjectID != owner.ID {
+		if mr.ProjectID > 0 && mr.ProjectID != owner.ID {
 			extra = append(extra, strconv.FormatInt(mr.ProjectID, 10))
 		}
-	}
-	if _, err := AuthorizeAdditionalProjects(ctx, d, extra...); err != nil {
-		return nil, listMergeRequestDiffsOut{}, err
+		if _, err := AuthorizeAdditionalProjects(ctx, d, extra...); err != nil {
+			return nil, listMergeRequestDiffsOut{}, err
+		}
 	}
 
 	page, perPage := in.ListOpts()

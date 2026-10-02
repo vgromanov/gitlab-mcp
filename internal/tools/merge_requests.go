@@ -80,31 +80,72 @@ func (p pidMR) resolveLegacy(d Deps) (string, error) {
 
 // authorizeMROwnerAndForks authorizes the owner project, loads MR metadata, then
 // independently authorizes source/downstream project IDs before content reads.
+// When policy is inactive, preserves legacy ResolveProjectID + checkAllowedProject
+// without extra GetProject/GetMR (empty-both allow-all compatibility).
 func authorizeMROwnerAndForks(ctx context.Context, d Deps, projectID string, mrIID int64) (CanonicalProject, error) {
+	if mrIID < 1 {
+		return CanonicalProject{}, fmt.Errorf("merge_request_iid must be >= 1")
+	}
+	if !policyActive(d.Config) {
+		return legacyOwnerProjection(d, projectID)
+	}
 	owner, err := AuthorizeCanonicalProject(ctx, d, projectID)
 	if err != nil {
 		return CanonicalProject{}, err
-	}
-	if mrIID < 1 {
-		return CanonicalProject{}, fmt.Errorf("merge_request_iid must be >= 1")
 	}
 	mr, _, err := d.Client.MergeRequests.GetMergeRequest(owner.ID, mrIID, nil, gitlab.WithContext(ctx))
 	if err != nil {
 		return CanonicalProject{}, fmt.Errorf("%s: merge request metadata", readmeta.CodeHTTPError)
 	}
-	var extra []string
-	if mr != nil {
-		if mr.SourceProjectID != 0 && mr.SourceProjectID != owner.ID {
-			extra = append(extra, strconv.FormatInt(mr.SourceProjectID, 10))
-		}
-		if mr.ProjectID != 0 && mr.ProjectID != owner.ID {
-			extra = append(extra, strconv.FormatInt(mr.ProjectID, 10))
-		}
-	}
-	if _, err := AuthorizeAdditionalProjects(ctx, d, extra...); err != nil {
+	if err := requireProvenMRForkProjects(ctx, d, owner, mr); err != nil {
 		return CanonicalProject{}, err
 	}
 	return owner, nil
+}
+
+func legacyOwnerProjection(d Deps, projectID string) (CanonicalProject, error) {
+	def := ""
+	if d.Config != nil {
+		def = d.Config.DefaultProjectID
+	}
+	pid, err := ResolveProjectID(projectID, def)
+	if err != nil {
+		return CanonicalProject{}, err
+	}
+	if err := checkAllowedProject(d.Config, pid); err != nil {
+		return CanonicalProject{}, err
+	}
+	if id, ok := parseStrictPositiveID(pid); ok {
+		return CanonicalProject{ID: id, PathWithNamespace: pid}, nil
+	}
+	return CanonicalProject{PathWithNamespace: pid}, nil
+}
+
+func projectAPIID(c CanonicalProject) string {
+	if c.ID > 0 {
+		return strconv.FormatInt(c.ID, 10)
+	}
+	return c.PathWithNamespace
+}
+
+// requireProvenMRForkProjects fail-closes when MR metadata is missing or the source
+// project identity is unproven (nil MR / SourceProjectID <= 0) under active policy.
+func requireProvenMRForkProjects(ctx context.Context, d Deps, owner CanonicalProject, mr *gitlab.MergeRequest) error {
+	if mr == nil {
+		return identityErr("merge request metadata missing")
+	}
+	if mr.SourceProjectID <= 0 {
+		return identityErr("unproven merge request source project")
+	}
+	var extra []string
+	if mr.SourceProjectID != owner.ID {
+		extra = append(extra, strconv.FormatInt(mr.SourceProjectID, 10))
+	}
+	if mr.ProjectID > 0 && mr.ProjectID != owner.ID {
+		extra = append(extra, strconv.FormatInt(mr.ProjectID, 10))
+	}
+	_, err := AuthorizeAdditionalProjects(ctx, d, extra...)
+	return err
 }
 
 type mergeMergeRequestIn struct {
@@ -195,7 +236,7 @@ func getMergeRequestDiffs(ctx context.Context, _ *mcp.CallToolRequest, in getMer
 	if err != nil {
 		return nil, nil, err
 	}
-	pid := strconv.FormatInt(owner.ID, 10)
+	pid := projectAPIID(owner)
 	diffs, _, err := d.Client.MergeRequests.ListMergeRequestDiffs(pid, in.MergeRequestIID, &gitlab.ListMergeRequestDiffsOptions{
 		ListOptions: gitlab.ListOptions{PerPage: 100},
 	}, gitlab.WithContext(ctx))
@@ -229,7 +270,7 @@ func getMergeRequestConflicts(ctx context.Context, _ *mcp.CallToolRequest, in ge
 	if err != nil {
 		return nil, nil, err
 	}
-	pid := strconv.FormatInt(owner.ID, 10)
+	pid := projectAPIID(owner)
 	mr, _, err := d.Client.MergeRequests.GetMergeRequest(pid, in.MergeRequestIID, nil, gitlab.WithContext(ctx))
 	if err != nil {
 		return nil, nil, err
@@ -268,7 +309,7 @@ func listMergeRequestChangedFiles(ctx context.Context, _ *mcp.CallToolRequest, i
 	if err != nil {
 		return nil, nil, err
 	}
-	pid := strconv.FormatInt(owner.ID, 10)
+	pid := projectAPIID(owner)
 	page, perPage := in.ListOpts()
 	diffs, resp, err := d.Client.MergeRequests.ListMergeRequestDiffs(pid, in.MergeRequestIID, &gitlab.ListMergeRequestDiffsOptions{
 		ListOptions: gitlab.ListOptions{Page: int64(page), PerPage: int64(perPage)},
@@ -319,7 +360,7 @@ func getMergeRequestFileDiff(ctx context.Context, _ *mcp.CallToolRequest, in get
 	if err != nil {
 		return nil, nil, err
 	}
-	pid := strconv.FormatInt(owner.ID, 10)
+	pid := projectAPIID(owner)
 	diffs, _, err := d.Client.MergeRequests.ListMergeRequestDiffs(pid, in.MergeRequestIID, &gitlab.ListMergeRequestDiffsOptions{
 		ListOptions: gitlab.ListOptions{PerPage: 200},
 	}, gitlab.WithContext(ctx))
@@ -357,7 +398,7 @@ func listMergeRequestVersions(ctx context.Context, _ *mcp.CallToolRequest, in li
 	if err != nil {
 		return nil, nil, err
 	}
-	pid := strconv.FormatInt(owner.ID, 10)
+	pid := projectAPIID(owner)
 	page, perPage := in.ListOpts()
 	vers, resp, err := d.Client.MergeRequests.GetMergeRequestDiffVersions(pid, in.MergeRequestIID, &gitlab.GetMergeRequestDiffVersionsOptions{
 		ListOptions: gitlab.ListOptions{Page: int64(page), PerPage: int64(perPage)},
@@ -378,7 +419,7 @@ func getMergeRequestVersion(ctx context.Context, _ *mcp.CallToolRequest, in getM
 	if err != nil {
 		return nil, nil, err
 	}
-	pid := strconv.FormatInt(owner.ID, 10)
+	pid := projectAPIID(owner)
 	v, _, err := d.Client.MergeRequests.GetSingleMergeRequestDiffVersion(pid, in.MergeRequestIID, in.VersionID, nil, gitlab.WithContext(ctx))
 	if err != nil {
 		return nil, nil, err
