@@ -365,10 +365,28 @@ func finalizeRawObservation(out *RawStreamResult, reqStart int64, reqEndExcl *in
 			return
 		}
 		retained := int64(len(out.Data))
+		if providerEndExcl < crStart {
+			clearObservedWindow(out)
+			out.Err = fmt.Errorf("Content-Range length mismatch")
+			return
+		}
 		providerSpan := providerEndExcl - crStart
 		// Intentional local max_bytes truncation: report the retained interval,
-		// not the provider's larger Content-Range extent.
+		// not the provider's larger Content-Range extent — but only when the
+		// retained prefix fits inside the attested provider span and start+len
+		// cannot overflow. Retained > providerSpan (or overflow) is framing,
+		// not a valid local-cap window.
 		if out.WriterTruncated {
+			if retained > providerSpan {
+				clearObservedWindow(out)
+				out.Err = fmt.Errorf("Content-Range length mismatch")
+				return
+			}
+			if retained > 0 && crStart > math.MaxInt64-retained {
+				clearObservedWindow(out)
+				out.Err = fmt.Errorf("Content-Range length mismatch")
+				return
+			}
 			endRetained := crStart + retained
 			out.ObservedStart = &crStart
 			out.ObservedEndExcl = &endRetained

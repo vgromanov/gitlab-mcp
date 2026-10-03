@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -451,6 +452,34 @@ func TestStreamRawFile_206LocalCapReportsRetainedWindow(t *testing.T) {
 	}
 	if res.ReturnedRangeSHA == "" {
 		t.Fatal("returned hash required for retained bytes")
+	}
+}
+
+func TestStreamRawFile_206TruncatedMalformedProviderSpanRejectsOffsets(t *testing.T) {
+	// Provider claims a 1-byte span while the body/cap retains 100 — ambiguous;
+	// must not attest [start, start+100). Covers ordinary and near-MaxInt64 starts.
+	for _, start := range []int64{10, math.MaxInt64 - 2} {
+		start := start
+		t.Run(fmt.Sprintf("start-%d", start), func(t *testing.T) {
+			client := clientWithServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/*", start, start))
+				w.WriteHeader(http.StatusPartialContent)
+				_, _ = io.WriteString(w, strings.Repeat("A", 1000))
+			}))
+			res := StreamRawFile(WithBudget(context.Background(), DefaultBudget()), client, RawStreamRequest{
+				ProjectID: "42", FilePath: "a.txt", Ref: strings.Repeat("b", 40),
+				RangeStart: &start, MaxReturnBytes: 100,
+			})
+			if res.Err == nil {
+				t.Fatalf("want framing error, got nil truncated=%v retained=%d", res.WriterTruncated, len(res.Data))
+			}
+			if res.ObservedStart != nil || res.ObservedEndExcl != nil {
+				t.Fatalf("offsets must be unknown on malformed span: start=%v end=%v", res.ObservedStart, res.ObservedEndExcl)
+			}
+			if res.WindowComplete || res.FullContentKnown {
+				t.Fatalf("must not attest completeness: win=%v full=%v", res.WindowComplete, res.FullContentKnown)
+			}
+		})
 	}
 }
 
