@@ -32,6 +32,12 @@ func run(args []string) int {
 }
 
 func runWithConfig(parent context.Context, cfg *config.Config) int {
+	// Validate before token/client/server/listener so unknown profiles fail closed
+	// without network use (even when a fake token is present).
+	if err := cfg.Validate(); err != nil {
+		slog.Error("config", "err", err)
+		return 1
+	}
 	if cfg.Token == "" {
 		slog.Error("GITLAB_PERSONAL_ACCESS_TOKEN or --token is required")
 		return 1

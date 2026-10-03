@@ -19,24 +19,31 @@ selection (restricted vs legacy catalog).
      and maps responses to MCP results
 4. `internal/tools/registry.go` `AddTool(...)` + `selection.go`
    - mutating tools are blocked when `GITLAB_READ_ONLY_MODE=true`
-   - `ShouldRegister` applies restricted vs unrestricted catalog rules, then
+   - optional `GITLAB_TOOL_PROFILE` is a named ceiling (family/enable cannot expand)
+   - when profile unset: `ShouldRegister` applies restricted vs unrestricted catalog rules, then
      subtracts `GITLAB_DISABLED_TOOLS`
-   - family tags (`issues`, `pipeline`, `wiki`, …) feed the enable union
+   - family tags (`issues`, `pipeline`, `wiki`, …) feed the enable union (unset profile only)
+   - MCP `ToolAnnotations` (readOnly/destructive/idempotent hints) are attached on a
+     **copy** of each tool descriptor
 
 ```text
 Register tool name
   → GITLAB_READ_ONLY and mutating? → skip
-  → Restricted mode?
-       no  → legacy catalog (pipeline/milestone/wiki only if USE_*=true)
-       yes → empty base ∪ daily ∪ families ∪ GITLAB_ENABLED_TOOLS
-  → subtract GITLAB_DISABLED_TOOLS
-  → mcp.AddTool
+  → ToolProfile set?
+       yes → in profile ceiling? (disable may narrow) → annotate copy → mcp.AddTool
+       no  → Restricted mode?
+              no  → legacy catalog (pipeline/milestone/wiki only if USE_*=true)
+              yes → empty base ∪ daily ∪ families ∪ GITLAB_ENABLED_TOOLS
+         → subtract GITLAB_DISABLED_TOOLS
+         → annotate copy → mcp.AddTool
 ```
 
-Restricted mode turns on for `USE_DAILY_TOOLS`, any new family flag
+Restricted mode (profile unset) turns on for `USE_DAILY_TOOLS`, any new family flag
 (`USE_ISSUES`, `USE_WORK_ITEMS`, `USE_LABELS`, `USE_DRAFTS`, `USE_WEBHOOKS`,
 `USE_TIMELINE`), or non-empty `GITLAB_ENABLED_TOOLS`. Legacy
 `USE_PIPELINE` / `USE_MILESTONE` / `USE_GITLAB_WIKI` alone stay unrestricted.
+`GITLAB_TOOL_PROFILE=review_write` currently exposes the same reads as
+`review_read` — no guarded writes are available yet.
 Details and `mcp.json` examples: [`docs/configuration.md`](configuration.md#tool-selection-gates).
 
 ## Package layout

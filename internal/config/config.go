@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"flag"
+	"fmt"
 	"os"
 	"sort"
 	"strconv"
@@ -28,6 +29,7 @@ type Config struct {
 	Timeline           bool
 	EnabledTools       []string
 	DisabledTools      []string
+	ToolProfile        string // GITLAB_TOOL_PROFILE: "", daily, review_read, review_write
 	StreamableHTTP     bool
 	Host               string
 	Port               string
@@ -91,6 +93,7 @@ func Load() *Config {
 		Timeline:           envBool("USE_TIMELINE", false),
 		EnabledTools:       parseCSV(envString("GITLAB_ENABLED_TOOLS", "")),
 		DisabledTools:      parseCSV(envString("GITLAB_DISABLED_TOOLS", "")),
+		ToolProfile:        NormalizeToolProfile(envString("GITLAB_TOOL_PROFILE", "")),
 		StreamableHTTP:     envBool("STREAMABLE_HTTP", false),
 		Host:               envString("HOST", "127.0.0.1"),
 		Port:               envString("PORT", "3002"),
@@ -123,6 +126,7 @@ func Load() *Config {
 		flagTimeline   = flag.Bool("use-timeline", false, "Restricted mode: enable timeline family")
 		flagEnabled    = flag.String("enabled-tools", "", "Comma-separated extra tools (enters restricted mode when non-empty)")
 		flagDisabled   = flag.String("disabled-tools", "", "Comma-separated tools to exclude")
+		flagProfile    = flag.String("tool-profile", "", "Tool profile ceiling: daily|review_read|review_write (empty clears env)")
 		flagStreamHTTP = flag.Bool("streamable-http", false, "Serve streamable HTTP instead of stdio")
 		flagHost       = flag.String("host", "", "HTTP listen host")
 		flagPort       = flag.String("port", "", "HTTP listen port")
@@ -176,6 +180,10 @@ func Load() *Config {
 	}
 	if flagVisited("disabled-tools") {
 		c.DisabledTools = parseCSV(*flagDisabled)
+	}
+	if flagVisited("tool-profile") {
+		// Visited empty string clears an env-derived profile.
+		applyToolProfileFlag(c, true, *flagProfile)
 	}
 	if flagVisited("streamable-http") {
 		c.StreamableHTTP = *flagStreamHTTP
@@ -259,9 +267,38 @@ func normalizeFingerprintList(in []string) []string {
 	return out
 }
 
+// NormalizeToolProfile trims and lowercases a GITLAB_TOOL_PROFILE value.
+func NormalizeToolProfile(s string) string {
+	return strings.ToLower(strings.TrimSpace(s))
+}
+
+// applyToolProfileFlag applies CLI --tool-profile when visited (empty clears).
+func applyToolProfileFlag(c *Config, visited bool, raw string) {
+	if c == nil || !visited {
+		return
+	}
+	c.ToolProfile = NormalizeToolProfile(raw)
+}
+
+// Validate reports configuration errors that must fail closed at startup.
+// Unknown ToolProfile values are rejected; empty profile is legacy behavior.
+func (c *Config) Validate() error {
+	if c == nil {
+		return fmt.Errorf("config is nil")
+	}
+	switch c.ToolProfile {
+	case "", "daily", "review_read", "review_write":
+		return nil
+	default:
+		return fmt.Errorf("unknown GITLAB_TOOL_PROFILE %q; allowed: unset, daily, review_read, review_write", c.ToolProfile)
+	}
+}
+
 // RestrictedMode is on when USE_DAILY_TOOLS, any new family flag, or a non-empty
 // GITLAB_ENABLED_TOOLS list is set. Legacy USE_PIPELINE / USE_MILESTONE /
 // USE_GITLAB_WIKI alone do not enter restricted mode.
+// Named ToolProfile selection is handled separately in tools.ShouldRegister and
+// does not redefine this predicate for unset-profile legacy paths.
 func (c *Config) RestrictedMode() bool {
 	if c == nil {
 		return false

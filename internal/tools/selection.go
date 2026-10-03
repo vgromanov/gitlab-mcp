@@ -62,6 +62,36 @@ var dailyTools = []string{
 	"push_files",
 }
 
+// reviewReadTools is the initial GITLAB_TOOL_PROFILE=review_read|review_write
+// ceiling (exact 25 safe reads). review_write adds no guarded writes in this PR.
+var reviewReadTools = []string{
+	"get_project",
+	"get_merge_request",
+	"list_merge_requests",
+	"get_merge_request_approval_state",
+	"get_merge_request_conflicts",
+	"get_merge_request_diffs",
+	"get_merge_request_file_diff",
+	"list_merge_request_changed_files",
+	"list_merge_request_versions",
+	"get_merge_request_version",
+	"list_merge_request_diffs",
+	"mr_discussions",
+	"get_merge_request_notes",
+	"get_merge_request_discussion",
+	"get_file_contents",
+	"get_repository_tree",
+	"list_commits",
+	"get_commit",
+	"get_commit_diff",
+	"list_pipelines",
+	"get_pipeline",
+	"list_pipeline_jobs",
+	"list_pipeline_trigger_jobs",
+	"get_pipeline_job",
+	"get_pipeline_job_output",
+}
+
 // familyTools maps gated family ids to their tool names (mirrors AddTool tags).
 var familyTools = map[string][]string{
 	"issues": {
@@ -133,6 +163,23 @@ func DailyTools() []string {
 	return slices.Clone(dailyTools)
 }
 
+// ReviewReadTools returns the exact initial review_read / review_write ceiling.
+func ReviewReadTools() []string {
+	return slices.Clone(reviewReadTools)
+}
+
+// ProfileTools returns the named profile ceiling, or nil for unset/unknown.
+func ProfileTools(profile string) []string {
+	switch config.NormalizeToolProfile(profile) {
+	case "daily":
+		return DailyTools()
+	case "review_read", "review_write":
+		return ReviewReadTools()
+	default:
+		return nil
+	}
+}
+
 // FamilyTools returns tool names tagged with the given family id.
 func FamilyTools(name string) []string {
 	if tools, ok := familyTools[name]; ok {
@@ -151,7 +198,10 @@ func NormalizeFamily(family string) string {
 
 // ShouldRegister reports whether toolName should be added to the MCP catalog.
 //
-// Gate order (after read-only): restricted vs legacy → enable union → disable subtract.
+// Gate order (after read-only in AddTool):
+//  1. disabled always subtracts
+//  2. named ToolProfile ceiling (family/enable cannot expand; ignored for membership)
+//  3. else restricted vs legacy → enable union
 func ShouldRegister(cfg *config.Config, toolName, family string) bool {
 	if cfg == nil {
 		return false
@@ -160,6 +210,15 @@ func ShouldRegister(cfg *config.Config, toolName, family string) bool {
 
 	if toolNameInList(cfg.DisabledTools, toolName) {
 		return false
+	}
+
+	if cfg.ToolProfile != "" {
+		ceiling := ProfileTools(cfg.ToolProfile)
+		if ceiling == nil {
+			// Unknown profiles must fail Validate at startup; refuse registration.
+			return false
+		}
+		return toolNameInList(ceiling, toolName)
 	}
 
 	if !cfg.RestrictedMode() {

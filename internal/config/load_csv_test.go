@@ -13,6 +13,7 @@ func TestParseCSV(t *testing.T) {
 }
 
 func TestLoad_fromEnv(t *testing.T) {
+	clearKnownConfigEnv(t)
 	t.Setenv("GITLAB_PERSONAL_ACCESS_TOKEN", "tok")
 	t.Setenv("GITLAB_API_URL", "https://example.test/api/v4")
 	t.Setenv("GITLAB_READ_ONLY_MODE", "true")
@@ -28,27 +29,27 @@ func TestLoad_fromEnv(t *testing.T) {
 	t.Setenv("USE_TIMELINE", "true")
 	t.Setenv("GITLAB_ENABLED_TOOLS", "a,b")
 	t.Setenv("GITLAB_DISABLED_TOOLS", "c")
+	t.Setenv("GITLAB_TOOL_PROFILE", "")
 	t.Setenv("STREAMABLE_HTTP", "true")
 	t.Setenv("HOST", "0.0.0.0")
 	t.Setenv("PORT", "9999")
 	t.Setenv("GITLAB_PROJECT_ID", "99")
 	t.Setenv("GITLAB_ALLOWED_PROJECT_IDS", "1,2")
+	t.Setenv("GITLAB_ALLOWED_GROUP_IDS", "")
 	t.Setenv("GITLAB_CA_CERT_PATH", "/tmp/nope.pem")
 	t.Setenv("GITLAB_INSECURE", "true")
 	t.Setenv("HTTP_PROXY", "http://proxy:1")
 	t.Setenv("HTTPS_PROXY", "http://proxy:2")
-	// flag.Parse may only run once; if flags already registered this panics.
-	defer func() {
-		if r := recover(); r != nil {
-			t.Skipf("Load re-register flags: %v", r)
-		}
-	}()
+	withIsolatedFlagCommandLine(t, nil)
 	c := Load()
 	if c.Token != "tok" || c.APIURL != "https://example.test/api/v4" {
 		t.Fatalf("token/url: %#v %#v", c.Token, c.APIURL)
 	}
 	if !c.ReadOnly || !c.Wiki || !c.RestrictedMode() {
 		t.Fatalf("flags not loaded: %#v", c)
+	}
+	if c.ToolProfile != "" {
+		t.Fatalf("ToolProfile want empty, got %q", c.ToolProfile)
 	}
 	if len(c.AllowedProjectIDs) != 2 {
 		t.Fatalf("allowed: %#v", c.AllowedProjectIDs)

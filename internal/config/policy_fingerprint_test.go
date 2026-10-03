@@ -17,20 +17,40 @@ func TestPolicyFingerprint_stableUnderPermutation(t *testing.T) {
 	}
 }
 
+// TestLoad_allowedGroupIDs asserts legacy Load/parseCSV preserves duplicate raw
+// CSV tokens. Pre-RVG-126 this fixture expected len==2 and was masked by
+// panic-to-Skip on flag.CommandLine re-registration; primary race suite under
+// isolated Load hygiene exposed the stale expectation (coordinator log
+// coordinator-primary-suite-failure-v1.log). Production parseCSV must NOT
+// globally dedupe — PolicyFingerprint normalization dedupes for policy identity.
 func TestLoad_allowedGroupIDs(t *testing.T) {
+	clearKnownConfigEnv(t)
 	t.Setenv("GITLAB_PERSONAL_ACCESS_TOKEN", "tok")
 	t.Setenv("GITLAB_ALLOWED_GROUP_IDS", "10, 20 ,10")
 	t.Setenv("GITLAB_ALLOWED_PROJECT_IDS", "")
-	defer func() {
-		if r := recover(); r != nil {
-			t.Skipf("Load re-register flags: %v", r)
-		}
-	}()
+	withIsolatedFlagCommandLine(t, nil)
 	c := Load()
-	if len(c.AllowedGroupIDs) != 2 {
-		t.Fatalf("groups: %#v", c.AllowedGroupIDs)
+
+	wantRaw := []string{"10", "20", "10"}
+	if len(c.AllowedGroupIDs) != len(wantRaw) {
+		t.Fatalf("raw groups len=%d want %d; got %#v", len(c.AllowedGroupIDs), len(wantRaw), c.AllowedGroupIDs)
+	}
+	for i, w := range wantRaw {
+		if c.AllowedGroupIDs[i] != w {
+			t.Fatalf("raw groups[%d]=%q want %q; full %#v", i, c.AllowedGroupIDs[i], w, c.AllowedGroupIDs)
+		}
 	}
 	if !c.PolicyActive() {
 		t.Fatal("expected group policy active")
+	}
+
+	// Canonical policy identity matches deduped [10,20] (order-normalized).
+	canonical := &Config{AllowedGroupIDs: []string{"10", "20"}}
+	if c.PolicyFingerprint() != canonical.PolicyFingerprint() {
+		t.Fatalf("fingerprint after raw duplicates must equal canonical [10,20]: got %s want %s",
+			c.PolicyFingerprint(), canonical.PolicyFingerprint())
+	}
+	if c.PolicyFingerprint() == (&Config{}).PolicyFingerprint() {
+		t.Fatal("group allowlist must change fingerprint vs empty")
 	}
 }

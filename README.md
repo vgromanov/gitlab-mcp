@@ -28,8 +28,11 @@ Built on:
   and Markdown rendering.
 - **Read-only mode** (`GITLAB_READ_ONLY_MODE=true`) for safe agent workflows;
   every mutating tool is gated and not registered when read-only is on.
-- **Additive tool selection**: `USE_DAILY_TOOLS` (41-tool daily census), family
-  flags (`USE_ISSUES`, …), and `GITLAB_ENABLED_TOOLS` / `GITLAB_DISABLED_TOOLS`.
+- **Additive tool selection**: optional `GITLAB_TOOL_PROFILE` ceilings (`daily` /
+  `review_read` / `review_write`), plus `USE_DAILY_TOOLS` (41-tool daily census),
+  family flags (`USE_ISSUES`, …), and `GITLAB_ENABLED_TOOLS` / `GITLAB_DISABLED_TOOLS`.
+  Named profiles cannot be expanded by family/enable; `review_write` currently
+  exposes the same reads as `review_read` (no guarded writes yet).
   Unset flags keep the legacy full catalog; legacy `USE_PIPELINE` /
   `USE_MILESTONE` / `USE_GITLAB_WIKI` still default off.
 - **Blob / Zoekt search**: `search_*_code` tools support optional `search_type`
@@ -146,6 +149,7 @@ win when explicitly passed.
 | `GITLAB_API_URL` | `--api-url` | `https://gitlab.com/api/v4` | API base URL. |
 | `GITLAB_READ_ONLY_MODE` | `--read-only` | `false` | Hide all mutating tools. |
 | `USE_DAILY_TOOLS` | `--use-daily-tools` | `false` | Restricted mode: register the 41-tool daily census set (includes search). |
+| `GITLAB_TOOL_PROFILE` | `--tool-profile` | — | Opt-in ceiling: `daily` \| `review_read` \| `review_write` (unknown fails startup). |
 | `USE_ISSUES` / `USE_WORK_ITEMS` / `USE_LABELS` / `USE_DRAFTS` / `USE_WEBHOOKS` / `USE_TIMELINE` | `--use-issues` etc. | `false` | Restricted-mode family enables (also enter restricted mode). |
 | `GITLAB_ENABLED_TOOLS` | `--enabled-tools` | — | CSV tool names to add (enters restricted mode when set). |
 | `GITLAB_DISABLED_TOOLS` | `--disabled-tools` | — | CSV tool names to remove (both modes). |

@@ -153,6 +153,73 @@ func TestShouldRegister_behaviorMatrix(t *testing.T) {
 			want:       true,
 			restricted: true,
 		},
+		{
+			name:       "profile daily blocks issues even with USE_ISSUES",
+			cfg:        &config.Config{ToolProfile: "daily", Issues: true},
+			tool:       "list_issues",
+			family:     "issues",
+			want:       false,
+			restricted: true,
+		},
+		{
+			name:       "profile daily includes search_code",
+			cfg:        &config.Config{ToolProfile: "daily", Issues: true},
+			tool:       "search_code",
+			family:     "",
+			want:       true,
+			restricted: true,
+		},
+		{
+			name:       "profile daily ignores EnabledTools expansion",
+			cfg:        &config.Config{ToolProfile: "daily", EnabledTools: []string{"list_issues"}},
+			tool:       "list_issues",
+			family:     "issues",
+			want:       false,
+			restricted: true,
+		},
+		{
+			name:   "profile daily disable narrows",
+			cfg:    &config.Config{ToolProfile: "daily", DisabledTools: []string{"search_code"}},
+			tool:   "search_code",
+			family: "",
+			want:   false,
+		},
+		{
+			name:   "profile review_read includes list_pipelines without USE_PIPELINE",
+			cfg:    &config.Config{ToolProfile: "review_read"},
+			tool:   "list_pipelines",
+			family: "pipeline",
+			want:   true,
+		},
+		{
+			name:       "profile review_read ignores EnabledTools graphql",
+			cfg:        &config.Config{ToolProfile: "review_read", EnabledTools: []string{"execute_graphql"}, Pipeline: true},
+			tool:       "execute_graphql",
+			family:     "",
+			want:       false,
+			restricted: true,
+		},
+		{
+			name:   "profile review_write same ceiling as review_read",
+			cfg:    &config.Config{ToolProfile: "review_write"},
+			tool:   "get_project",
+			family: "",
+			want:   true,
+		},
+		{
+			name:   "profile review_write excludes create_merge_request_note",
+			cfg:    &config.Config{ToolProfile: "review_write"},
+			tool:   "create_merge_request_note",
+			family: "",
+			want:   false,
+		},
+		{
+			name:   "profile review_read disable narrows",
+			cfg:    &config.Config{ToolProfile: "review_read", DisabledTools: []string{"list_pipelines"}},
+			tool:   "list_pipelines",
+			family: "pipeline",
+			want:   false,
+		},
 	}
 
 	for _, tc := range tests {
@@ -165,6 +232,26 @@ func TestShouldRegister_behaviorMatrix(t *testing.T) {
 				t.Fatalf("ShouldRegister(%q,%q) = %v, want %v", tc.tool, tc.family, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestReviewReadTools_exact25(t *testing.T) {
+	got := ReviewReadTools()
+	if len(got) != 25 {
+		t.Fatalf("len=%d want 25", len(got))
+	}
+	seen := map[string]struct{}{}
+	for _, n := range got {
+		if _, ok := seen[n]; ok {
+			t.Fatalf("duplicate %q", n)
+		}
+		seen[n] = struct{}{}
+	}
+	if len(ProfileTools("review_write")) != 25 {
+		t.Fatal("review_write must share 25 ceiling")
+	}
+	if ProfileTools("nope") != nil {
+		t.Fatal("unknown profile ceiling must be nil")
 	}
 }
 
