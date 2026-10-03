@@ -7,6 +7,7 @@ require (
 	github.com/hashicorp/go-retryablehttp v0.7.8
 	github.com/joho/godotenv v1.5.1
 	github.com/modelcontextprotocol/go-sdk v1.5.0
+	github.com/vektah/gqlparser/v2 v2.5.60
 	gitlab.com/gitlab-org/api/client-go/v2 v2.20.0
 )
 

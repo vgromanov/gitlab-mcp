@@ -7,7 +7,7 @@ import (
 	"fmt"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
-	gitlab "gitlab.com/gitlab-org/api/client-go/v2"
+	"github.com/vektah/gqlparser/v2/ast"
 )
 
 // RegisterGraphQLTools registers GraphQL-based work item and utility tools.
@@ -17,7 +17,11 @@ func RegisterGraphQLTools(s *mcp.Server, d Deps) {
 	if d.Guarded != nil {
 		d.Client = d.Guarded
 	}
-	AddTool(s, d, false, "", &mcp.Tool{Name: "execute_graphql", Description: "Run an arbitrary GitLab GraphQL query or mutation"}, executeGraphQL)
+	// PolicyActive allowlists disable arbitrary GraphQL at registration time.
+	// The handler also fails closed if somehow invoked.
+	if d.Config == nil || !d.Config.PolicyActive() {
+		AddTool(s, d, false, "", &mcp.Tool{Name: "execute_graphql", Description: "Run a selected GitLab GraphQL query or mutation"}, executeGraphQL)
+	}
 	AddTool(s, d, false, "work_items", &mcp.Tool{Name: "get_work_item", Description: "Get a work item by global id"}, getWorkItem)
 	AddTool(s, d, false, "work_items", &mcp.Tool{Name: "list_work_items", Description: "List work items for a project"}, listWorkItems)
 	AddTool(s, d, true, "work_items", &mcp.Tool{Name: "create_work_item", Description: "Create a work item (requires work_item_type_id gid)"}, createWorkItem)
@@ -33,34 +37,90 @@ func RegisterGraphQLTools(s *mcp.Server, d Deps) {
 }
 
 func runGQL(ctx context.Context, d Deps, query string, variables map[string]any) (any, error) {
-	var out any
-	_, err := d.Client.GraphQL.Do(gitlab.GraphQLQuery{
+	if variables == nil {
+		variables = map[string]any{}
+	}
+	out, err := doGraphQL(ctx, d.Client, graphqlRequestDTO{
 		Query:     query,
 		Variables: variables,
-	}, &out, gitlab.WithContext(ctx))
+	})
 	if err != nil {
+		return nil, err
+	}
+	if err := topLevelGraphQLErrors(out); err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
+// graphqlVariablesObject is the MCP object schema for execute_graphql variables.
+// Null/omit become an empty map; scalars and arrays are rejected.
+type graphqlVariablesObject map[string]any
+
+func (v *graphqlVariablesObject) UnmarshalJSON(b []byte) error {
+	b = bytes.TrimSpace(b)
+	if len(b) == 0 || bytes.Equal(b, []byte("null")) {
+		*v = graphqlVariablesObject{}
+		return nil
+	}
+	if b[0] != '{' {
+		return fmt.Errorf("variables must be a JSON object")
+	}
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		return fmt.Errorf("variables must be a JSON object: %w", err)
+	}
+	if m == nil {
+		m = map[string]any{}
+	}
+	*v = graphqlVariablesObject(m)
+	return nil
+}
+
+func (v graphqlVariablesObject) asMap() map[string]any {
+	if v == nil {
+		return map[string]any{}
+	}
+	return map[string]any(v)
+}
+
+func graphqlVariablesAsMap(v *graphqlVariablesObject) map[string]any {
+	if v == nil {
+		return map[string]any{}
+	}
+	return v.asMap()
+}
+
+// executeGraphQLIn is the MCP input for execute_graphql.
+// Variables is a nullable JSON object (repo convention *T → [null, object]);
+// omit/null map to {}.
 type executeGraphQLIn struct {
-	Query     string          `json:"query"`
-	Variables json.RawMessage `json:"variables,omitempty" jsonschema:"JSON object of GraphQL variables; omit or use {}"`
+	Query         string                  `json:"query" jsonschema:"GraphQL document"`
+	Variables     *graphqlVariablesObject `json:"variables,omitempty" jsonschema:"JSON object of GraphQL variables; omit or null for empty"`
+	OperationName string                  `json:"operation_name,omitempty" jsonschema:"Operation name when the document defines multiple operations"`
 }
 
 func executeGraphQL(ctx context.Context, _ *mcp.CallToolRequest, in executeGraphQLIn, d Deps) (*mcp.CallToolResult, any, error) {
-	var vars map[string]any
-	if len(bytes.TrimSpace(in.Variables)) > 0 {
-		if err := json.Unmarshal(in.Variables, &vars); err != nil {
-			return nil, nil, fmt.Errorf("variables must be a JSON object: %w", err)
-		}
+	if d.Config != nil && d.Config.PolicyActive() {
+		return nil, nil, fmt.Errorf("execute_graphql is disabled when project or group allowlists are configured")
 	}
-	if vars == nil {
-		vars = map[string]any{}
-	}
-	out, err := runGQL(ctx, d, in.Query, vars)
+	vars := graphqlVariablesAsMap(in.Variables)
+	selected, err := selectGraphQLOperation(in.Query, in.OperationName)
 	if err != nil {
+		return nil, nil, err
+	}
+	if d.Config != nil && d.Config.ReadOnly && selected.Kind != ast.Query {
+		return nil, nil, fmt.Errorf("read-only mode permits only GraphQL queries; selected %s is denied", selected.Kind)
+	}
+	out, err := doGraphQL(ctx, d.Client, graphqlRequestDTO{
+		Query:         in.Query,
+		Variables:     vars,
+		OperationName: selected.Name,
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := topLevelGraphQLErrors(out); err != nil {
 		return nil, nil, err
 	}
 	return nil, out, nil
@@ -147,6 +207,9 @@ func createWorkItem(ctx context.Context, _ *mcp.CallToolRequest, in createWorkIt
 	if err != nil {
 		return nil, nil, err
 	}
+	if err := knownMutationPayloadErrors(out, "createWorkItem"); err != nil {
+		return nil, nil, err
+	}
 	return nil, out, nil
 }
 
@@ -173,6 +236,9 @@ func updateWorkItem(ctx context.Context, _ *mcp.CallToolRequest, in updateWorkIt
 	if err != nil {
 		return nil, nil, err
 	}
+	if err := knownMutationPayloadErrors(out, "workItemUpdate"); err != nil {
+		return nil, nil, err
+	}
 	return nil, out, nil
 }
 
@@ -190,6 +256,9 @@ func convertWorkItemType(ctx context.Context, _ *mcp.CallToolRequest, in convert
 }`
 	out, err := runGQL(ctx, d, q, map[string]any{"input": map[string]any{"id": in.ID, "workItemTypeId": in.WorkItemTypeID}})
 	if err != nil {
+		return nil, nil, err
+	}
+	if err := knownMutationPayloadErrors(out, "workItemConvert"); err != nil {
 		return nil, nil, err
 	}
 	return nil, out, nil
@@ -249,6 +318,9 @@ func moveWorkItem(ctx context.Context, _ *mcp.CallToolRequest, in moveWorkItemIn
 	if err != nil {
 		return nil, nil, err
 	}
+	if err := knownMutationPayloadErrors(out, "workItemMove"); err != nil {
+		return nil, nil, err
+	}
 	return nil, out, nil
 }
 
@@ -292,6 +364,9 @@ func createWorkItemNote(ctx context.Context, _ *mcp.CallToolRequest, in createWo
 }`
 	out, err := runGQL(ctx, d, q, map[string]any{"input": input})
 	if err != nil {
+		return nil, nil, err
+	}
+	if err := knownMutationPayloadErrors(out, "workItemNoteCreate"); err != nil {
 		return nil, nil, err
 	}
 	return nil, out, nil
@@ -342,6 +417,9 @@ func createTimelineEvent(ctx context.Context, _ *mcp.CallToolRequest, in createT
 }`
 	out, err := runGQL(ctx, d, q, map[string]any{"input": input})
 	if err != nil {
+		return nil, nil, err
+	}
+	if err := knownMutationPayloadErrors(out, "timelineEventCreate"); err != nil {
 		return nil, nil, err
 	}
 	return nil, out, nil
