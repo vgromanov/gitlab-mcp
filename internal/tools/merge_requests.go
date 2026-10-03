@@ -235,25 +235,27 @@ type getMergeRequestDiffsIn struct {
 }
 
 func getMergeRequestDiffs(ctx context.Context, _ *mcp.CallToolRequest, in getMergeRequestDiffsIn, d Deps) (*mcp.CallToolResult, any, error) {
+	ctx, release := ensureLegacyInvocationBudget(ctx, 100)
+	defer release()
 	owner, err := authorizeMROwnerAndForks(ctx, d, in.ProjectID, in.MergeRequestIID)
 	if err != nil {
 		return nil, nil, err
 	}
-	pid := projectAPIID(owner)
-	diffs, _, err := d.Client.MergeRequests.ListMergeRequestDiffs(pid, in.MergeRequestIID, &gitlab.ListMergeRequestDiffsOptions{
-		ListOptions: gitlab.ListOptions{PerPage: 100},
-	}, gitlab.WithContext(ctx))
+	page, err := fetchLegacyMRDiffPage(ctx, d, legacyMRDiffFetchOpts{
+		Owner:           owner,
+		MergeRequestIID: in.MergeRequestIID,
+		PerPage:         100,
+		TruncateLines:   in.TruncateLines,
+	})
 	if err != nil {
 		return nil, nil, err
 	}
-	if in.TruncateLines > 0 {
-		for _, df := range diffs {
-			if df != nil {
-				df.Diff = TruncateLines(df.Diff, in.TruncateLines)
-			}
-		}
-	}
-	return nil, Out(map[string]any{"diffs": diffs}), nil
+	// Preserve existing object field "diffs"; add honesty pagination + section.
+	return nil, Out(map[string]any{
+		"diffs":      page.Diffs,
+		"pagination": map[string]any{"next_page": page.Pagination.NextPage},
+		"section":    page.Section,
+	}), nil
 }
 
 type listMergeRequestDiffsIn struct {
@@ -269,35 +271,39 @@ type getMergeRequestConflictsIn struct {
 }
 
 func getMergeRequestConflicts(ctx context.Context, _ *mcp.CallToolRequest, in getMergeRequestConflictsIn, d Deps) (*mcp.CallToolResult, any, error) {
+	ctx, release := ensureLegacyInvocationBudget(ctx, 200)
+	defer release()
 	owner, err := authorizeMROwnerAndForks(ctx, d, in.ProjectID, in.MergeRequestIID)
 	if err != nil {
 		return nil, nil, err
 	}
-	pid := projectAPIID(owner)
-	mr, _, err := d.Client.MergeRequests.GetMergeRequest(pid, in.MergeRequestIID, nil, gitlab.WithContext(ctx))
+	page, err := fetchLegacyMRDiffPage(ctx, d, legacyMRDiffFetchOpts{
+		Owner:           owner,
+		MergeRequestIID: in.MergeRequestIID,
+		PerPage:         200,
+	})
 	if err != nil {
 		return nil, nil, err
 	}
-	diffs, _, err := d.Client.MergeRequests.ListMergeRequestDiffs(pid, in.MergeRequestIID, &gitlab.ListMergeRequestDiffsOptions{
-		ListOptions: gitlab.ListOptions{PerPage: 200},
-	}, gitlab.WithContext(ctx))
-	if err != nil {
-		return nil, nil, err
+	annotateConflictScanCoverage(&page.Section)
+	conflictFiles := scanConflictFiles(page.Diffs)
+	mr := page.MR
+	var hasConflicts bool
+	var detailedStatus string
+	var iid int64
+	if mr != nil {
+		hasConflicts = mr.HasConflicts
+		detailedStatus = mr.DetailedMergeStatus
+		iid = mr.IID
 	}
-	var conflictFiles []string
-	for _, df := range diffs {
-		if df == nil {
-			continue
-		}
-		if strings.Contains(df.Diff, "<<<<<<<") || strings.Contains(df.Diff, ">>>>>>>") {
-			conflictFiles = append(conflictFiles, df.NewPath)
-		}
-	}
+	// Preserve authoritative mergeability fields; heuristic scan never overrides them.
 	return nil, Out(map[string]any{
-		"has_conflicts":         mr.HasConflicts,
-		"detailed_merge_status": mr.DetailedMergeStatus,
+		"has_conflicts":         hasConflicts,
+		"detailed_merge_status": detailedStatus,
 		"conflict_files":        conflictFiles,
-		"merge_request_iid":     mr.IID,
+		"merge_request_iid":     iid,
+		"pagination":            map[string]any{"next_page": page.Pagination.NextPage},
+		"section":               page.Section,
 	}), nil
 }
 
@@ -359,36 +365,29 @@ type getMergeRequestFileDiffIn struct {
 }
 
 func getMergeRequestFileDiff(ctx context.Context, _ *mcp.CallToolRequest, in getMergeRequestFileDiffIn, d Deps) (*mcp.CallToolResult, any, error) {
+	ctx, release := ensureLegacyInvocationBudget(ctx, 200)
+	defer release()
 	owner, err := authorizeMROwnerAndForks(ctx, d, in.ProjectID, in.MergeRequestIID)
 	if err != nil {
 		return nil, nil, err
 	}
-	pid := projectAPIID(owner)
-	diffs, _, err := d.Client.MergeRequests.ListMergeRequestDiffs(pid, in.MergeRequestIID, &gitlab.ListMergeRequestDiffsOptions{
-		ListOptions: gitlab.ListOptions{PerPage: 200},
-	}, gitlab.WithContext(ctx))
+	page, err := fetchLegacyMRDiffPage(ctx, d, legacyMRDiffFetchOpts{
+		Owner:           owner,
+		MergeRequestIID: in.MergeRequestIID,
+		PerPage:         200,
+		TruncateLines:   in.TruncateLines,
+		FilterFiles:     true,
+		WantFiles:       in.Files,
+	})
 	if err != nil {
 		return nil, nil, err
 	}
-	want := map[string]struct{}{}
-	for _, f := range in.Files {
-		want[f] = struct{}{}
-	}
-	var out []*gitlab.MergeRequestDiff
-	for _, df := range diffs {
-		if df == nil {
-			continue
-		}
-		_, wantNew := want[df.NewPath]
-		_, wantOld := want[df.OldPath]
-		if wantNew || (df.OldPath != "" && wantOld) {
-			if in.TruncateLines > 0 {
-				df.Diff = TruncateLines(df.Diff, in.TruncateLines)
-			}
-			out = append(out, df)
-		}
-	}
-	return nil, Out(map[string]any{"diffs": out}), nil
+	// Preserve existing object field "diffs"; missing requested paths are unobserved.
+	return nil, Out(map[string]any{
+		"diffs":      page.Diffs,
+		"pagination": map[string]any{"next_page": page.Pagination.NextPage},
+		"section":    page.Section,
+	}), nil
 }
 
 type listMergeRequestVersionsIn struct {
