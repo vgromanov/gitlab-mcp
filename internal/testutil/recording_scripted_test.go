@@ -136,6 +136,60 @@ func TestRecordingRoundTripper_exactCounts(t *testing.T) {
 	}
 }
 
+func TestRecordingRoundTripper_nilRequestAndNilNext(t *testing.T) {
+	rec := &RecordingRoundTripper{Next: &FailIfCalledRoundTripper{}}
+	_, err := rec.RoundTrip(nil)
+	if err == nil {
+		t.Fatal("nil request must error")
+	}
+	if rec.Attempts() != 0 {
+		t.Fatalf("nil request must not count attempts, got %d", rec.Attempts())
+	}
+
+	rec = &RecordingRoundTripper{}
+	req, _ := http.NewRequest(http.MethodGet, "http://127.0.0.1/api/v4/projects/1", nil)
+	_, err = rec.RoundTrip(req)
+	if err == nil {
+		t.Fatal("nil Next must fail closed")
+	}
+	if rec.Attempts() != 0 {
+		t.Fatalf("nil Next must not count attempts, got %d", rec.Attempts())
+	}
+}
+
+func TestRetryMax_HTTP500_exactAttempts(t *testing.T) {
+	const retryMax = 2
+	rec := &RecordingHandler{Next: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, `{"message":"boom"}`)
+	})}
+	ts := httptest.NewServer(rec)
+	t.Cleanup(ts.Close)
+
+	cli, err := gitlab.NewClient("fake-token-not-live",
+		gitlab.WithBaseURL(ts.URL+"/api/v4"),
+		gitlab.WithCustomRetryMax(retryMax),
+		gitlab.WithCustomRetryWaitMinMax(0, 0),
+		gitlab.WithCustomBackoff(func(min, max time.Duration, attemptNum int, resp *http.Response) time.Duration {
+			return 0
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = cli.Projects.ListProjects(&gitlab.ListProjectsOptions{}, gitlab.WithContext(context.Background()))
+	if err == nil {
+		t.Fatal("expected 500 error")
+	}
+	want := int64(1 + retryMax)
+	if got := rec.Attempts(); got != want {
+		t.Fatalf("attempts=%d want %d (1+RetryMax)", got, want)
+	}
+	if got := rec.MethodCount(http.MethodGet); got != int(want) {
+		t.Fatalf("GET=%d want %d", got, want)
+	}
+}
+
 func TestFailIfCalledRoundTripper(t *testing.T) {
 	f := &FailIfCalledRoundTripper{}
 	req, _ := http.NewRequest(http.MethodGet, "http://127.0.0.1/api/v4/projects/1", nil)

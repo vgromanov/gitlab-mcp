@@ -1,6 +1,7 @@
 package testutil
 
 import (
+	"errors"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -56,6 +57,7 @@ func (r *RecordingHandler) Snapshot() map[string]int {
 }
 
 // RecordingRoundTripper wraps a RoundTripper and records method/attempt counts.
+// Next must be set explicitly; nil Next fails closed (does not dial DefaultTransport).
 type RecordingRoundTripper struct {
 	Next http.RoundTripper
 
@@ -64,8 +66,14 @@ type RecordingRoundTripper struct {
 	attempts atomic.Int64
 }
 
-// RoundTrip increments counters then delegates.
+// RoundTrip increments counters then delegates. Nil req or nil Next returns an error.
 func (r *RecordingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req == nil {
+		return nil, errors.New("testutil: RecordingRoundTripper nil request")
+	}
+	if r.Next == nil {
+		return nil, errors.New("testutil: RecordingRoundTripper nil Next (pass http.DefaultTransport explicitly if needed)")
+	}
 	r.attempts.Add(1)
 	r.mu.Lock()
 	if r.methods == nil {
@@ -73,11 +81,7 @@ func (r *RecordingRoundTripper) RoundTrip(req *http.Request) (*http.Response, er
 	}
 	r.methods[req.Method]++
 	r.mu.Unlock()
-	next := r.Next
-	if next == nil {
-		next = http.DefaultTransport
-	}
-	return next.RoundTrip(req)
+	return r.Next.RoundTrip(req)
 }
 
 // Attempts returns total RoundTrip calls.

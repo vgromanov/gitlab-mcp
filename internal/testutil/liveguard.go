@@ -451,18 +451,11 @@ func validateProjectSegment(seg, canonical string) error {
 	if err := validateProjectPathForm(unesc); err != nil {
 		return fmt.Errorf("%w: %v", ErrLiveScopeDenied, err)
 	}
-	re := url.PathEscape(canonical)
-	if !equalEscaped(re, seg) && seg != canonical {
+	// Allow only the unescaped canonical form or the exact PathEscape spelling.
+	// Do not re-unescape both sides — that would accept alternate encodings.
+	canonEscaped := url.PathEscape(canonical)
+	if seg != canonical && seg != canonEscaped {
 		return fmt.Errorf("%w: non-canonical project segment encoding", ErrLiveScopeDenied)
 	}
 	return nil
-}
-
-func equalEscaped(a, b string) bool {
-	if a == b {
-		return true
-	}
-	ua, err1 := url.PathUnescape(a)
-	ub, err2 := url.PathUnescape(b)
-	return err1 == nil && err2 == nil && ua == ub
 }
