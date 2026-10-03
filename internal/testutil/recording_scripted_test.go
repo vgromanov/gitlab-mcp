@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"sync"
 	"testing"
 	"time"
@@ -33,7 +34,15 @@ func TestRecordingHandler_methodAndAttempts(t *testing.T) {
 func TestScriptAcceptedThenDrop_barrierThenCancel(t *testing.T) {
 	barrier := NewAcceptedBarrier()
 	rec := &RecordingHandler{Next: ScriptAcceptedThenDrop(barrier)}
-	cli, _ := NewGitLabClient(t, rec)
+	ts := httptest.NewServer(rec)
+	t.Cleanup(ts.Close)
+	cli, err := gitlab.NewClient("test-token",
+		gitlab.WithBaseURL(ts.URL+"/api/v4"),
+		gitlab.WithCustomRetryMax(0),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -51,26 +60,37 @@ func TestScriptAcceptedThenDrop_barrierThenCancel(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("accepted barrier not signaled")
 	}
-	if barrier.Count() < 1 {
-		t.Fatalf("barrier count=%d", barrier.Count())
+	if barrier.Count() != 1 {
+		t.Fatalf("barrier count=%d want 1", barrier.Count())
+	}
+	if got := rec.Attempts(); got != 1 {
+		t.Fatalf("attempts at accept=%d want exact 1", got)
+	}
+	if got := rec.MethodCount(http.MethodGet); got != 1 {
+		t.Fatalf("GET at accept=%d want exact 1 snapshot=%v", got, rec.Snapshot())
 	}
 	cancel()
 	wg.Wait()
 	if callErr == nil {
 		t.Fatal("expected error after drop/cancel")
 	}
-	if rec.Attempts() < 1 {
-		t.Fatalf("expected at least one attempt, got %d", rec.Attempts())
-	}
-	if rec.MethodCount(http.MethodGet) < 1 {
-		t.Fatalf("expected GET attempts, got %v", rec.Snapshot())
+	if got := rec.Attempts(); got != 1 {
+		t.Fatalf("attempts after cancel=%d want exact 1 (retries disabled)", got)
 	}
 }
 
 func TestScriptAcceptedThenHang_cancelAfterAccept(t *testing.T) {
 	barrier := NewAcceptedBarrier()
 	rec := &RecordingHandler{Next: ScriptAcceptedThenHang(barrier)}
-	cli, _ := NewGitLabClient(t, rec)
+	ts := httptest.NewServer(rec)
+	t.Cleanup(ts.Close)
+	cli, err := gitlab.NewClient("test-token",
+		gitlab.WithBaseURL(ts.URL+"/api/v4"),
+		gitlab.WithCustomRetryMax(0),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -86,6 +106,9 @@ func TestScriptAcceptedThenHang_cancelAfterAccept(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("accepted not signaled")
 	}
+	if got := rec.Attempts(); got != 1 {
+		t.Fatalf("attempts at accept=%d want 1", got)
+	}
 	cancel()
 	select {
 	case err := <-errCh:
@@ -95,8 +118,21 @@ func TestScriptAcceptedThenHang_cancelAfterAccept(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("call did not return after cancel")
 	}
-	if rec.MethodCount(http.MethodGet) < 1 {
-		t.Fatalf("methods=%v", rec.Snapshot())
+	if got := rec.MethodCount(http.MethodGet); got != 1 {
+		t.Fatalf("GET count=%d want 1 methods=%v", got, rec.Snapshot())
+	}
+}
+
+func TestRecordingRoundTripper_exactCounts(t *testing.T) {
+	fail := &FailIfCalledRoundTripper{}
+	rec := &RecordingRoundTripper{Next: fail}
+	req, _ := http.NewRequest(http.MethodPut, "http://127.0.0.1/api/v4/projects/1", nil)
+	_, _ = rec.RoundTrip(req)
+	if rec.Attempts() != 1 || rec.MethodCount(http.MethodPut) != 1 {
+		t.Fatalf("attempts=%d PUT=%d", rec.Attempts(), rec.MethodCount(http.MethodPut))
+	}
+	if !fail.Called.Load() {
+		t.Fatal("expected underlying call")
 	}
 }
 

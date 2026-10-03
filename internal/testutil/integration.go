@@ -63,8 +63,12 @@ func GitLabIntegrationClient(t *testing.T) (*gitlab.Client, *config.Config) {
 }
 
 // GitLabMutatingIntegrationClient returns a scoped mutating client only when
-// AuthorizeLiveWrite succeeds for the independently supplied target. It does
-// not LoadDotenv after validation and does not invent/default the target.
+// AuthorizeLiveWrite succeeds for the independently supplied target.
+// Callers must ensure claimed env vars (INTEGRATION_ALLOW_WRITE,
+// GITLAB_API_URL, GITLAB_TEST_PROJECT_ID) and GITLAB_PERSONAL_ACCESS_TOKEN are
+// already in the process environment before calling — this helper does not
+// LoadDotenv (so authorize cannot be silently satisfied from a local .env) and
+// does not invent/default the target (auth.APIURL/ProjectID win after match).
 func GitLabMutatingIntegrationClient(t *testing.T, auth AuthorizedLiveTarget) (*gitlab.Client, *config.Config) {
 	t.Helper()
 	if err := AuthorizeLiveWrite(auth); err != nil {

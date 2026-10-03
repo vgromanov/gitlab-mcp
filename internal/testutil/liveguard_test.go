@@ -254,6 +254,9 @@ func TestWrapAuthorizedScopedLive_success(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
+	if !ok.called {
+		t.Fatal("authorized scoped GET must reach underlying")
+	}
 }
 
 type captureRT struct {
