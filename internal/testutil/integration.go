@@ -34,6 +34,8 @@ func LoadDotenv(t *testing.T) {
 }
 
 // GitLabIntegrationClient returns a real GitLab client or skips the test.
+// The client always has a default deny-write transport: non-safe methods are
+// rejected before any RoundTrip. Read smokes remain usable.
 func GitLabIntegrationClient(t *testing.T) (*gitlab.Client, *config.Config) {
 	t.Helper()
 	LoadDotenv(t)
@@ -55,6 +57,40 @@ func GitLabIntegrationClient(t *testing.T) (*gitlab.Client, *config.Config) {
 	c, err := glclient.NewClient(cfg)
 	if err != nil {
 		t.Fatalf("gitlab client: %v", err)
+	}
+	InstallDenyWriteTransport(c.HTTPClient())
+	return c, cfg
+}
+
+// GitLabMutatingIntegrationClient returns a scoped mutating client only when
+// AuthorizeLiveWrite succeeds for the independently supplied target.
+// Callers must ensure claimed env vars (INTEGRATION_ALLOW_WRITE,
+// GITLAB_API_URL, GITLAB_TEST_PROJECT_ID) and GITLAB_PERSONAL_ACCESS_TOKEN are
+// already in the process environment before calling — this helper does not
+// LoadDotenv (so authorize cannot be silently satisfied from a local .env) and
+// does not invent/default the target (auth.APIURL/ProjectID win after match).
+func GitLabMutatingIntegrationClient(t *testing.T, auth AuthorizedLiveTarget) (*gitlab.Client, *config.Config) {
+	t.Helper()
+	if err := AuthorizeLiveWrite(auth); err != nil {
+		t.Fatalf("authorize live write: %v", err)
+	}
+	token := strings.TrimSpace(os.Getenv("GITLAB_PERSONAL_ACCESS_TOKEN"))
+	if token == "" {
+		t.Skip("GITLAB_PERSONAL_ACCESS_TOKEN not set")
+	}
+	cfg := &config.Config{
+		Token:     token,
+		APIURL:    auth.APIURL,
+		Wiki:      os.Getenv("USE_GITLAB_WIKI") == "true",
+		Milestone: os.Getenv("USE_MILESTONE") == "true",
+		Pipeline:  os.Getenv("USE_PIPELINE") == "true",
+	}
+	c, err := glclient.NewClient(cfg)
+	if err != nil {
+		t.Fatalf("gitlab client: %v", err)
+	}
+	if err := installScopedLiveTransport(c.HTTPClient(), auth); err != nil {
+		t.Fatalf("scoped transport: %v", err)
 	}
 	return c, cfg
 }

@@ -1,0 +1,433 @@
+package testutil
+
+import (
+	"context"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
+	"sync/atomic"
+	"testing"
+
+	gitlab "gitlab.com/gitlab-org/api/client-go/v2"
+)
+
+func TestCanonicalAPIIdentity(t *testing.T) {
+	got, err := CanonicalAPIIdentity("https://gitlab.example/api/v4")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "https://gitlab.example:443/api/v4" {
+		t.Fatalf("got %q", got)
+	}
+	for _, bad := range []string{
+		"",
+		"https://user:pass@gitlab.example/api/v4",
+		"https://gitlab.example/api/v4?x=1",
+		"https://gitlab.example/api/v4#frag",
+		"https://gitlab.example/api/v3",
+		"ftp://gitlab.example/api/v4",
+	} {
+		if _, err := CanonicalAPIIdentity(bad); err == nil {
+			t.Fatalf("expected error for %q", bad)
+		}
+	}
+}
+
+func TestCanonicalProjectID(t *testing.T) {
+	got, err := CanonicalProjectID("042")
+	if err != nil || got != "42" {
+		t.Fatalf("got=%q err=%v", got, err)
+	}
+	got, err = CanonicalProjectID("group%2Fproj")
+	if err != nil || got != "group/proj" {
+		t.Fatalf("got=%q err=%v", got, err)
+	}
+	for _, bad := range []string{
+		"",
+		"group%252Fproj",
+		"group//proj",
+		"/group/proj",
+		"group/proj/",
+		"group/./proj",
+		"group/../proj",
+		"group/\x00proj",
+		"a%2",
+	} {
+		if _, err := CanonicalProjectID(bad); err == nil {
+			t.Fatalf("expected error for %q", bad)
+		}
+	}
+}
+
+func TestAuthorizeLiveWrite_matrix(t *testing.T) {
+	auth := AuthorizedLiveTarget{APIURL: "https://gitlab.example/api/v4", ProjectID: "42"}
+	t.Setenv("INTEGRATION_ALLOW_WRITE", "")
+	t.Setenv("GITLAB_API_URL", "https://gitlab.example/api/v4")
+	t.Setenv("GITLAB_TEST_PROJECT_ID", "42")
+	if err := AuthorizeLiveWrite(auth); err == nil {
+		t.Fatal("expected deny without write flag")
+	}
+
+	t.Setenv("INTEGRATION_ALLOW_WRITE", "1")
+	if err := AuthorizeLiveWrite(auth); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("GITLAB_TEST_PROJECT_ID", "99")
+	if err := AuthorizeLiveWrite(auth); err == nil {
+		t.Fatal("expected project mismatch")
+	}
+
+	t.Setenv("GITLAB_TEST_PROJECT_ID", "42")
+	t.Setenv("GITLAB_API_URL", "https://other.example/api/v4")
+	if err := AuthorizeLiveWrite(auth); err == nil {
+		t.Fatal("expected instance mismatch")
+	}
+
+	if err := AuthorizeLiveWrite(AuthorizedLiveTarget{}); err == nil {
+		t.Fatal("empty authorized must fail closed")
+	}
+}
+
+func TestDenyWriteTransport_rejectsMutations(t *testing.T) {
+	fail := &FailIfCalledRoundTripper{}
+	rt := WrapDenyWrite(fail)
+	req, _ := http.NewRequest(http.MethodPost, "http://127.0.0.1/api/v4/projects", strings.NewReader("{}"))
+	_, err := rt.RoundTrip(req)
+	if !errors.Is(err, ErrLiveWriteDenied) {
+		t.Fatalf("err=%v", err)
+	}
+	if fail.Called.Load() {
+		t.Fatal("underlying RoundTrip must not be called")
+	}
+
+	okNext := &captureRT{status: 200, body: `[]`}
+	rt = WrapDenyWrite(okNext)
+	req, _ = http.NewRequest(http.MethodGet, "http://127.0.0.1/api/v4/projects", nil)
+	resp, err := rt.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if !okNext.called {
+		t.Fatal("GET should reach underlying")
+	}
+}
+
+func TestScopedLiveTransport_allowAndReject(t *testing.T) {
+	auth := AuthorizedLiveTarget{APIURL: "https://gitlab.example/api/v4", ProjectID: "42"}
+	fail := &FailIfCalledRoundTripper{}
+	rt, err := newScopedLiveTransport(fail, auth)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	allow, _ := http.NewRequest(http.MethodGet, "https://gitlab.example/api/v4/projects/42/merge_requests?state=opened", nil)
+	okNext := &captureRT{status: 200, body: `[]`}
+	rtOK, err := newScopedLiveTransport(okNext, auth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := rtOK.RoundTrip(allow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if !okNext.called {
+		t.Fatal("allowed project request must reach underlying (query preserved)")
+	}
+	if allow.URL.RawQuery != "state=opened" {
+		t.Fatalf("query mutated: %q", allow.URL.RawQuery)
+	}
+
+	rejects := []struct {
+		name    string
+		url     string
+		host    string
+		rawPath string // preserve ambiguous forms Go's Parse would otherwise clean
+		mut     func(*http.Request)
+	}{
+		{"cross-project", "https://gitlab.example/api/v4/projects/43/issues", "", "", nil},
+		{"global-projects", "https://gitlab.example/api/v4/projects", "", "", nil},
+		{"cross-instance", "https://evil.example/api/v4/projects/42/issues", "", "", nil},
+		{"traversal", "https://gitlab.example/api/v4/projects/42/issues", "", "/api/v4/projects/42/../../projects/43/issues", nil},
+		{"encoded-dotdot", "https://gitlab.example/api/v4/projects/42/issues", "", "/api/v4/projects/42/%2e%2e/projects/43/issues", nil},
+		{"encoded-slash-suffix", "https://gitlab.example/api/v4/projects/42/issues", "", "/api/v4/projects/42/a%2Fb", nil},
+		{"double-slash", "https://gitlab.example/api/v4/projects/42/issues", "", "/api/v4/projects/42//issues", nil},
+		{"double-encoded-project", "https://gitlab.example/api/v4/projects/42/issues", "", "/api/v4/projects/42%252Fxx/issues", nil},
+		{"host-override", "https://gitlab.example/api/v4/projects/42/issues", "evil.example", "", nil},
+		{"opaque", "https://gitlab.example/api/v4/projects/42/issues", "", "", func(r *http.Request) {
+			r.URL.Opaque = "//gitlab.example/api/v4/projects/43/issues"
+		}},
+	}
+	for _, tc := range rejects {
+		t.Run(tc.name, func(t *testing.T) {
+			fail.Called.Store(false)
+			req, err := http.NewRequest(http.MethodGet, tc.url, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.rawPath != "" {
+				req.URL.Path = tc.rawPath
+				req.URL.RawPath = tc.rawPath
+			}
+			if tc.host != "" {
+				req.Host = tc.host
+			}
+			if tc.mut != nil {
+				tc.mut(req)
+			}
+			_, err = rt.RoundTrip(req)
+			if err == nil {
+				t.Fatal("expected deny")
+			}
+			if !errors.Is(err, ErrLiveScopeDenied) {
+				t.Fatalf("expected ErrLiveScopeDenied, got %v", err)
+			}
+			if fail.Called.Load() {
+				t.Fatal("underlying RoundTrip must not be called")
+			}
+		})
+	}
+}
+
+func TestScopedLiveTransport_pathProject(t *testing.T) {
+	auth := AuthorizedLiveTarget{APIURL: "http://127.0.0.1:8080/api/v4", ProjectID: "group/proj"}
+	okNext := &captureRT{status: 200, body: `{}`}
+	rt, err := newScopedLiveTransport(okNext, auth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, _ := http.NewRequest(http.MethodGet, "http://127.0.0.1:8080/api/v4/projects/group%2Fproj/issues", nil)
+	resp, err := rt.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if !okNext.called {
+		t.Fatal("path project allow failed")
+	}
+
+	fail := &FailIfCalledRoundTripper{}
+	rt, err = newScopedLiveTransport(fail, auth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, _ = http.NewRequest(http.MethodGet, "http://127.0.0.1:8080/api/v4/projects/group%2Fother/issues", nil)
+	_, err = rt.RoundTrip(req)
+	if err == nil || fail.Called.Load() {
+		t.Fatalf("cross path project must deny without dial err=%v called=%v", err, fail.Called.Load())
+	}
+
+	// Canonical PathEscape spelling allowed; alternate encodings denied with zero dials.
+	for _, tc := range []struct {
+		name  string
+		seg   string
+		allow bool
+	}{
+		{"canonical-escaped", "group%2Fproj", true},
+		{"lowercase-hex", "group%2fproj", false},
+		{"partial-alternate", "%67roup%2Fproj", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fail.Called.Store(false)
+			ok := &captureRT{status: 200, body: `{}`}
+			var trip http.RoundTripper = fail
+			if tc.allow {
+				trip = ok
+			}
+			rt, err := newScopedLiveTransport(trip, auth)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req, _ := http.NewRequest(http.MethodGet, "http://127.0.0.1:8080/api/v4/projects/group/proj/issues", nil)
+			req.URL.Path = "/api/v4/projects/group/proj/issues"
+			req.URL.RawPath = "/api/v4/projects/" + tc.seg + "/issues"
+			_, err = rt.RoundTrip(req)
+			if tc.allow {
+				if err != nil || !ok.called {
+					t.Fatalf("canonical allow failed err=%v called=%v", err, ok.called)
+				}
+				return
+			}
+			if err == nil || !errors.Is(err, ErrLiveScopeDenied) || fail.Called.Load() {
+				t.Fatalf("noncanonical must deny with zero dials err=%v called=%v", err, fail.Called.Load())
+			}
+		})
+	}
+}
+
+func TestInstallDenyWriteTransport_redirectDenied(t *testing.T) {
+	var secondaryHits atomic.Int64
+	secondary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		secondaryHits.Add(1)
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	t.Cleanup(secondary.Close)
+
+	var primaryHits atomic.Int64
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		primaryHits.Add(1)
+		http.Redirect(w, r, secondary.URL+"/api/v4/projects", http.StatusFound)
+	}))
+	t.Cleanup(primary.Close)
+
+	cli, err := gitlab.NewClient("fake-token-not-live", gitlab.WithBaseURL(primary.URL+"/api/v4"), gitlab.WithCustomRetryMax(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	InstallDenyWriteTransport(cli.HTTPClient())
+
+	_, _, err = cli.Projects.ListProjects(&gitlab.ListProjectsOptions{}, gitlab.WithContext(context.Background()))
+	if !errors.Is(err, ErrLiveWriteDenied) {
+		t.Fatalf("redirect follow must be denied, err=%v", err)
+	}
+	if primaryHits.Load() != 1 {
+		t.Fatalf("primary hits=%d want 1", primaryHits.Load())
+	}
+	if secondaryHits.Load() != 0 {
+		t.Fatalf("secondary hits=%d want 0", secondaryHits.Load())
+	}
+
+	// Safe method without redirect still works after install.
+	okSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	t.Cleanup(okSrv.Close)
+	cliOK, err := gitlab.NewClient("fake-token-not-live", gitlab.WithBaseURL(okSrv.URL+"/api/v4"), gitlab.WithCustomRetryMax(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	InstallDenyWriteTransport(cliOK.HTTPClient())
+	_, _, err = cliOK.Projects.ListProjects(&gitlab.ListProjectsOptions{}, gitlab.WithContext(context.Background()))
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestInstallAuthorizedScopedLiveTransport_redirectDenied(t *testing.T) {
+	auth := AuthorizedLiveTarget{APIURL: "", ProjectID: "42"} // filled after servers start
+
+	var deniedHits atomic.Int64
+	denied := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		deniedHits.Add(1)
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	}))
+	t.Cleanup(denied.Close)
+
+	var allowedHits atomic.Int64
+	allowed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		allowedHits.Add(1)
+		if r.Method == http.MethodPost {
+			http.Redirect(w, r, denied.URL+"/api/v4/projects/99/issues", http.StatusTemporaryRedirect)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":42}`)
+	}))
+	t.Cleanup(allowed.Close)
+
+	auth.APIURL = allowed.URL + "/api/v4"
+	t.Setenv("INTEGRATION_ALLOW_WRITE", "1")
+	t.Setenv("GITLAB_API_URL", auth.APIURL)
+	t.Setenv("GITLAB_TEST_PROJECT_ID", auth.ProjectID)
+
+	cli, err := gitlab.NewClient("fake-token-not-live", gitlab.WithBaseURL(auth.APIURL), gitlab.WithCustomRetryMax(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := InstallAuthorizedScopedLiveTransport(cli.HTTPClient(), auth); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, err = cli.Projects.GetProject(42, nil, gitlab.WithContext(context.Background()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if allowedHits.Load() < 1 {
+		t.Fatal("authorized GET must hit localhost target")
+	}
+
+	allowedHits.Store(0)
+	_, _, err = cli.Issues.CreateIssue(42, &gitlab.CreateIssueOptions{Title: gitlab.Ptr("x")}, gitlab.WithContext(context.Background()))
+	if !errors.Is(err, ErrLiveScopeDenied) && !errors.Is(err, ErrLiveWriteDenied) {
+		// scoped CheckRedirect returns ErrLiveScopeDenied
+		if err == nil || deniedHits.Load() != 0 {
+			t.Fatalf("redirect to other project must deny; err=%v deniedHits=%d", err, deniedHits.Load())
+		}
+	}
+	if deniedHits.Load() != 0 {
+		t.Fatalf("denied host hits=%d want 0", deniedHits.Load())
+	}
+}
+
+func TestWrapAuthorizedScopedLive_requiresFlag(t *testing.T) {
+	auth := AuthorizedLiveTarget{APIURL: "https://gitlab.example/api/v4", ProjectID: "1"}
+	t.Setenv("INTEGRATION_ALLOW_WRITE", "")
+	t.Setenv("GITLAB_API_URL", auth.APIURL)
+	t.Setenv("GITLAB_TEST_PROJECT_ID", auth.ProjectID)
+	fail := &FailIfCalledRoundTripper{}
+	_, err := WrapAuthorizedScopedLive(fail, auth)
+	if err == nil {
+		t.Fatal("exported mutating wrap must require authorization")
+	}
+	if fail.Called.Load() {
+		t.Fatal("must not call underlying during authorize failure")
+	}
+
+	client := &http.Client{Transport: fail}
+	if err := InstallAuthorizedScopedLiveTransport(client, auth); err == nil {
+		t.Fatal("exported install must require authorization")
+	}
+}
+
+func TestWrapAuthorizedScopedLive_success(t *testing.T) {
+	auth := AuthorizedLiveTarget{APIURL: "https://gitlab.example/api/v4", ProjectID: "1"}
+	t.Setenv("INTEGRATION_ALLOW_WRITE", "1")
+	t.Setenv("GITLAB_API_URL", "https://gitlab.example/api/v4")
+	t.Setenv("GITLAB_TEST_PROJECT_ID", "1")
+	ok := &captureRT{status: 200, body: `{}`}
+	rt, err := WrapAuthorizedScopedLive(ok, auth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, _ := http.NewRequest(http.MethodGet, "https://gitlab.example/api/v4/projects/1", nil)
+	resp, err := rt.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if !ok.called {
+		t.Fatal("authorized scoped GET must reach underlying")
+	}
+}
+
+type captureRT struct {
+	called bool
+	status int
+	body   string
+}
+
+func (c *captureRT) RoundTrip(req *http.Request) (*http.Response, error) {
+	c.called = true
+	return &http.Response{
+		StatusCode: c.status,
+		Body:       io.NopCloser(strings.NewReader(c.body)),
+		Header:     make(http.Header),
+		Request:    req,
+	}, nil
+}
+
+func TestAuthorizeEscapedPath_direct(t *testing.T) {
+	if err := authorizeEscapedPath("/api/v4/projects/42/merge_requests", "42"); err != nil {
+		t.Fatal(err)
+	}
+	u, _ := url.Parse("https://gitlab.example/api/v4/projects/42/%2E%2E/%2E%2E/projects/43")
+	if err := authorizeEscapedPath(u.EscapedPath(), "42"); err == nil {
+		t.Fatal("encoded traversal must fail")
+	}
+}
