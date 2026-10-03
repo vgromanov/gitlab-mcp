@@ -289,7 +289,13 @@ Also:
 
 ## GraphQL / work items
 
-- `execute_graphql` — arbitrary GraphQL query/mutation (in the daily set)
+- `execute_graphql` — selected GraphQL query/mutation (in the daily set).
+  Variables are a JSON object (omit/null → `{}`). Optional `operation_name`
+  selects among multiple operations via AST parsing (subscriptions rejected).
+  Read-only mode allows only the selected query; configured project/group
+  allowlists disable the tool (registration + fail-closed handler). Review
+  profiles never expose raw GraphQL. Nonempty top-level GraphQL `errors`
+  (including HTTP 200 partial data) become tool errors; `errors: []` is success.
 - `get_work_item` / `list_work_items` / `create_work_item` / `update_work_item`
 - `convert_work_item_type` / `list_work_item_statuses` /
   `list_custom_field_definitions` / `move_work_item`
