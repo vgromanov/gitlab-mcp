@@ -16,6 +16,7 @@ When a CLI flag is explicitly provided, it overrides the environment value.
 | `GITLAB_PROJECT_ID` | `--default-project` | empty | Default project if a tool omits `project_id`. |
 | `GITLAB_ALLOWED_PROJECT_IDS` | — | empty | Comma-separated project id/path allowlist. |
 | `GITLAB_ALLOWED_GROUP_IDS` | — | empty | Comma-separated group id/path roots; descendants allowed via canonical `parent_id` ancestry (not path-prefix). |
+| `GITLAB_MCP_CURSOR_KEY` | — | empty | Raw operator secret (≥32 bytes) for signed opaque cursors. Missing key keeps legacy startup; cursor-mode tools fail closed with an actionable configuration error. No CLI flag. Fixed TTL **2h** (not configurable). See [cursors.md](cursors.md). |
 
 When **both** `GITLAB_ALLOWED_PROJECT_IDS` and `GITLAB_ALLOWED_GROUP_IDS` are empty, the
 server keeps legacy **allow-all** behavior. That empty policy is a compatibility
@@ -26,8 +27,9 @@ time (redirect-aware). Once-URL-encoded namespace paths (e.g. `group%2Fproj`) ar
 accepted equivalently to raw paths via a single PathUnescape at lookup; double-encoded
 forms (e.g. `%252F`) are not collapsed into the decoded path. Numeric ID lookups must
 return the same ID (path redirects may remap path→ID). `PolicyFingerprint` hashes the
-raw normalized env token lists (not semantic-canonical IDs) for future cursor/cache
-consumers.
+raw normalized env token lists (not semantic-canonical IDs) for cursor/cache
+consumers. Cursor-mode reads always bind the canonical numeric project id even when
+allowlists are empty (see [cursors.md](cursors.md)).
 
 ## Tool selection gates
 

@@ -324,10 +324,19 @@ type listCommitsIn struct {
 	Path      string `json:"path,omitempty"`
 	Since     string `json:"since,omitempty"`
 	Until     string `json:"until,omitempty"`
+	UseCursor bool   `json:"use_cursor,omitempty" jsonschema:"Opt in to signed cursor pagination"`
+	Cursor    string `json:"cursor,omitempty" jsonschema:"Opaque signed cursor from a prior cursor-mode page"`
 	Pagination
 }
 
 func listCommits(ctx context.Context, _ *mcp.CallToolRequest, in listCommitsIn, d Deps) (*mcp.CallToolResult, any, error) {
+	if in.UseCursor || strings.TrimSpace(in.Cursor) != "" {
+		return listCommitsCursor(ctx, in, d)
+	}
+	return listCommitsLegacy(ctx, in, d)
+}
+
+func listCommitsLegacy(ctx context.Context, in listCommitsIn, d Deps) (*mcp.CallToolResult, any, error) {
 	pid, err := resolveProjectAuthz(ctx, d, in.ProjectID)
 	if err != nil {
 		return nil, nil, err
