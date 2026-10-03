@@ -30,14 +30,25 @@ const (
 )
 
 func listCommitsCursor(ctx context.Context, in listCommitsIn, d Deps) (*mcp.CallToolResult, any, error) {
+	// Exactly empty cursor is absent. Nonempty whitespace-only or padded tokens are
+	// malformed — reject with resync_required before the signing-key gate so keyless
+	// malformed input never becomes an actionable key error or legacy fallback.
+	// Valid nonempty tokens stay byte-identical through Decode (no TrimSpace).
+	rawCursor := in.Cursor
+	if rawCursor != "" {
+		trimmed := strings.TrimSpace(rawCursor)
+		if trimmed == "" || trimmed != rawCursor {
+			return nil, nil, fmt.Errorf("%s: malformed cursor", codeResyncRequired)
+		}
+	}
 	if d.Config == nil || !d.Config.CursorSigningEnabled() {
 		return nil, nil, errors.New(errCursorKeyMissing)
 	}
-	cursorTok := strings.TrimSpace(in.Cursor)
-	if cursorTok != "" && in.Page > 1 {
+	pageExplicit := in.explicitPage()
+	if rawCursor != "" && pageExplicit > 1 {
 		return nil, nil, fmt.Errorf("ambiguous pagination: do not pass page>1 with cursor; resume uses the signed cursor page state")
 	}
-	if cursorTok == "" && in.Page > 1 {
+	if rawCursor == "" && pageExplicit > 1 {
 		return nil, nil, fmt.Errorf("cursor mode starts at page 1; omit page or use page=1 on the initial use_cursor request")
 	}
 
@@ -48,8 +59,8 @@ func listCommitsCursor(ctx context.Context, in listCommitsIn, d Deps) (*mcp.Call
 	now := d.now()
 	section := newListCommitsSection(now)
 
-	if cursorTok != "" {
-		return resumeListCommitsCursor(ctx, in, d, budget, section, now, cursorTok)
+	if rawCursor != "" {
+		return resumeListCommitsCursor(ctx, in, d, budget, section, now, rawCursor)
 	}
 	return initialListCommitsCursor(ctx, in, d, budget, section, now)
 }
@@ -85,7 +96,7 @@ func initialListCommitsCursor(ctx context.Context, in listCommitsIn, d Deps, bud
 
 	expiresAt := now.Add(d.Config.CursorTTL()).UTC().Format(time.RFC3339)
 	refs := []string{tipSHA}
-	page, result := streamCommitsPage(ctx, d, budget, pid, tipSHA, filters, 1)
+	page, result := streamCommitsPage(ctx, d, budget, pid, tipSHA, filters, 1, nil)
 	return emitListCommitsCursor(section, page, result, d, actorID, pid, refs, filters.Until, expiresAt, filters, 1)
 }
 
@@ -121,9 +132,10 @@ func resumeListCommitsCursor(ctx context.Context, in listCommitsIn, d Deps, budg
 	}
 
 	// Independently normalize request selection; strict repeat of bound originals.
+	// Resume mode projects normalize failures as static resync_required (no raw echo).
 	reqFilters, err := normalizeCommitSelection(in)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("%s: filter mismatch", codeResyncRequired)
 	}
 	if err := selectionMatchesBound(reqFilters, payload.Filters, payload.UpperBound); err != nil {
 		return nil, nil, err
@@ -150,7 +162,7 @@ func resumeListCommitsCursor(ctx context.Context, in listCommitsIn, d Deps, budg
 
 	// Guard: re-fetch signed previous page before requesting next. Charges budget; never returned.
 	prevPage := payload.PageState.Page
-	guardPage, guardRes := streamCommitsPage(ctx, d, budget, pid, tipSHA, payload.Filters, prevPage)
+	guardPage, guardRes := streamCommitsPage(ctx, d, budget, pid, tipSHA, payload.Filters, prevPage, nil)
 	if guardRes.stopErr != nil || guardRes.boundaryBroken || guardRes.partial {
 		return nil, nil, fmt.Errorf("%s: previous-page guard failed", codeResyncRequired)
 	}
@@ -166,17 +178,33 @@ func resumeListCommitsCursor(ctx context.Context, in listCommitsIn, d Deps, budg
 	if digest != payload.PageState.SequenceDigest || last != payload.PageState.LastSHA || len(shas) != payload.PageState.ItemsOnPage {
 		return nil, nil, fmt.Errorf("%s: previous-page boundary drift", codeResyncRequired)
 	}
-	if payload.PageState.ProviderNextPage <= 0 {
-		section.PaginationExhausted = true
-		section.ContentComplete = readmeta.ContentCompleteUnknown
-		section.Consistency = readmeta.ConsistencyUnknown
-		section.NextCursor = nil
-		section.AddLimitation(codeResyncRequired, "no further page in signed cursor state")
-		return nil, Out(map[string]any{"commits": []*gitlab.Commit{}, "section": section}), nil
+
+	// Replayed guard must prove safe, non-exhausted, sequential next equal to the
+	// signed ProviderNextPage before any next-page request.
+	var guardHdr http.Header
+	var guardSDKNext int64
+	if guardRes.resp != nil {
+		if guardRes.resp.Response != nil {
+			guardHdr = guardRes.resp.Response.Header
+		}
+		guardSDKNext = guardRes.resp.NextPage
+	}
+	guardObs := readmeta.ObservePaging(guardHdr, guardSDKNext)
+	guardCont, guardOK := safeProviderContinuation(prevPage, guardObs, guardSDKNext)
+	if !guardOK {
+		return nil, nil, fmt.Errorf("%s: guard paging metadata", codeResyncRequired)
+	}
+	if guardCont.exhausted {
+		return nil, nil, fmt.Errorf("%s: guard paging exhausted", codeResyncRequired)
+	}
+	if guardCont.next != payload.PageState.ProviderNextPage || payload.PageState.ProviderNextPage <= 0 {
+		return nil, nil, fmt.Errorf("%s: guard paging mismatch", codeResyncRequired)
 	}
 
 	nextPage := int(payload.PageState.ProviderNextPage)
-	page, result := streamCommitsPage(ctx, d, budget, pid, tipSHA, payload.Filters, nextPage)
+	// Carry guard SHAs into next-page validation; previous-page overlap stops before
+	// the offending item (retain safe prefix only; no silent dedupe).
+	page, result := streamCommitsPage(ctx, d, budget, pid, tipSHA, payload.Filters, nextPage, shas)
 	return emitListCommitsCursor(section, page, result, d, actorID, pid, payload.ImmutableRefs, payload.UpperBound, payload.ExpiresAt, payload.Filters, nextPage)
 }
 
@@ -187,7 +215,10 @@ type streamPageResult struct {
 	stopErr        error
 }
 
-func streamCommitsPage(ctx context.Context, d Deps, budget *igl.Budget, pid, tipSHA string, filters cursor.Filters, page int) ([]*gitlab.Commit, streamPageResult) {
+// streamCommitsPage streams one offset page. priorSHAs (guard page) must not
+// appear on the current page; on overlap, retain only the safe prefix before the
+// offending item (no append, no silent dedupe, budget charged only on append).
+func streamCommitsPage(ctx context.Context, d Deps, budget *igl.Budget, pid, tipSHA string, filters cursor.Filters, page int, priorSHAs []string) ([]*gitlab.Commit, streamPageResult) {
 	opt := &gitlab.ListCommitsOptions{
 		ListOptions: gitlab.ListOptions{Page: int64(page), PerPage: int64(filters.PerPage)},
 		RefName:     gitlab.Ptr(tipSHA), // always pin query to immutable SHA
@@ -208,6 +239,12 @@ func streamCommitsPage(ctx context.Context, d Deps, budget *igl.Budget, pid, tip
 	path := fmt.Sprintf("projects/%s/repository/commits", gitlab.PathEscape(pid))
 	commits := make([]*gitlab.Commit, 0, filters.PerPage)
 	seen := map[string]struct{}{}
+	prior := map[string]struct{}{}
+	for _, s := range priorSHAs {
+		if s != "" {
+			prior[s] = struct{}{}
+		}
+	}
 	var result streamPageResult
 
 	resp, err := igl.StreamJSONArray(ctx, d.Client, http.MethodGet, path, opt, func(raw json.RawMessage) error {
@@ -241,6 +278,13 @@ func streamCommitsPage(ctx context.Context, d Deps, budget *igl.Budget, pid, tip
 			result.boundaryBroken = true
 			result.partial = true
 			result.stopErr = fmt.Errorf("%s: duplicate commit SHA", codeResyncRequired)
+			return result.stopErr
+		}
+		if _, overlap := prior[sha]; overlap {
+			// Unsafe continuation vs previous page — do not append/charge.
+			result.boundaryBroken = true
+			result.partial = true
+			result.stopErr = fmt.Errorf("%s: previous-page overlap", codeResyncRequired)
 			return result.stopErr
 		}
 		// Charge before retain/append (single charge site; guard and content share this path).
@@ -324,6 +368,9 @@ func emitListCommitsCursor(
 		section.PaginationExhausted = false
 		section.NextCursor = nil
 		section.ContentComplete = readmeta.ContentCompleteFalse
+		if result.boundaryBroken {
+			section.Consistency = readmeta.ConsistencyInconsistent
+		}
 		section.AddLimitation(codeForBudget(result.stopErr), "partial page retained; continuation not safe")
 		section.AddLimitation(codeResyncRequired, "safe continuation boundary not proven")
 		return nil, Out(map[string]any{"commits": commits, "section": section}), nil

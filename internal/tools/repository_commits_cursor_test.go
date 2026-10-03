@@ -165,17 +165,11 @@ func listCommitsHandler(probe *commitProbe, mutate func(page string, body *strin
 	})
 }
 
-func callListCommitsMCP(t *testing.T, d Deps, args map[string]any) (map[string]any, error) {
+// callListCommitsMCPRaw performs registered CallTool with exact args (no page/per_page insertion).
+func callListCommitsMCPRaw(t *testing.T, d Deps, args map[string]any) (map[string]any, error) {
 	t.Helper()
 	if args == nil {
 		args = map[string]any{}
-	}
-	// Pagination fields are required by generated MCP input schema (non-pointer ints).
-	if _, ok := args["page"]; !ok {
-		args["page"] = 1
-	}
-	if _, ok := args["per_page"]; !ok {
-		args["per_page"] = 20
 	}
 	srv := mcp.NewServer(&mcp.Implementation{Name: "t", Version: "t"}, nil)
 	RegisterRepository(srv, d)
@@ -194,13 +188,12 @@ func callListCommitsMCP(t *testing.T, d Deps, args map[string]any) (map[string]a
 	if res.IsError {
 		var b strings.Builder
 		for _, c := range res.Content {
-			if t, ok := c.(*mcp.TextContent); ok {
-				b.WriteString(t.Text)
+			if tc, ok := c.(*mcp.TextContent); ok {
+				b.WriteString(tc.Text)
 			}
 		}
 		return nil, fmt.Errorf("%s", b.String())
 	}
-	// Structured content
 	raw, err := json.Marshal(res.StructuredContent)
 	if err != nil {
 		t.Fatal(err)
@@ -210,6 +203,21 @@ func callListCommitsMCP(t *testing.T, d Deps, args map[string]any) (map[string]a
 		t.Fatal(err)
 	}
 	return out, nil
+}
+
+func callListCommitsMCP(t *testing.T, d Deps, args map[string]any) (map[string]any, error) {
+	t.Helper()
+	if args == nil {
+		args = map[string]any{}
+	}
+	// Convenience defaults for older tests; F4 omission cases must use callListCommitsMCPRaw.
+	if _, ok := args["page"]; !ok {
+		args["page"] = 1
+	}
+	if _, ok := args["per_page"]; !ok {
+		args["per_page"] = 20
+	}
+	return callListCommitsMCPRaw(t, d, args)
 }
 
 func TestListCommits_legacyExactUnchanged(t *testing.T) {
@@ -361,6 +369,8 @@ func TestListCommits_threePageFakeClockRoundTrip(t *testing.T) {
 				t.Fatalf("page %d missing cursor", page)
 			}
 			cursors = append(cursors, nc)
+			// N1: advance wall clock between pages — absolute expiry/upper bound must not slide.
+			clk.T = clk.T.Add(30 * time.Minute)
 			args = map[string]any{"project_id": "42", "cursor": nc, "per_page": 2}
 		} else {
 			if sec["next_cursor"] != nil {
@@ -374,18 +384,48 @@ func TestListCommits_threePageFakeClockRoundTrip(t *testing.T) {
 			}
 		}
 	}
-	// Deadlines stable across pages
-	p0, _ := cursor.Decode([]byte(testCursorKey), cursors[0], clk.Now())
-	p1, _ := cursor.Decode([]byte(testCursorKey), cursors[1], clk.Now())
+	p0, err := cursor.Decode([]byte(testCursorKey), cursors[0], time.Date(2026, 10, 3, 12, 30, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p1, err := cursor.Decode([]byte(testCursorKey), cursors[1], time.Date(2026, 10, 3, 13, 30, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
 	if p0.ExpiresAt != p1.ExpiresAt || p0.UpperBound != p1.UpperBound || cursor.TipRef(p0.ImmutableRefs) != tipSHA {
 		t.Fatalf("pin/deadline drift: %+v %+v", p0, p1)
+	}
+	wantExpiry := time.Date(2026, 10, 3, 14, 0, 0, 0, time.UTC).Format(time.RFC3339)
+	if p0.ExpiresAt != wantExpiry {
+		t.Fatalf("exact expiry want %s got %s", wantExpiry, p0.ExpiresAt)
+	}
+	// Exact expiry: resume at expires_at must fail closed with zero list continuation.
+	listBefore := probe.listHits.Load()
+	clk.T = time.Date(2026, 10, 3, 14, 0, 0, 0, time.UTC)
+	_, err = callListCommitsMCP(t, d, map[string]any{"project_id": "42", "cursor": cursors[0], "per_page": 2})
+	if err == nil || !strings.Contains(err.Error(), cursor.ResyncRequired) {
+		t.Fatalf("exact expiry want resync, got %v", err)
+	}
+	if probe.listHits.Load() != listBefore {
+		t.Fatal("exact expiry must not list")
 	}
 }
 
 func TestListCommits_bindFailureZeroContinuation(t *testing.T) {
 	probe := &commitProbe{}
 	clk := &cursor.FakeClock{T: time.Date(2026, 10, 3, 12, 0, 0, 0, time.UTC)}
-	d := newCursorDeps(t, listCommitsHandler(probe, nil), &config.Config{CursorKey: []byte(testCursorKey)}, clk)
+	var actor atomic.Int64
+	actor.Store(7)
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		probe.note(r)
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/user") {
+			_, _ = io.WriteString(w, fmt.Sprintf(`{"id":%d,"username":"u"}`, actor.Load()))
+			return
+		}
+		listCommitsHandler(nil, nil).ServeHTTP(w, r)
+	})
+	d := newCursorDeps(t, h, &config.Config{CursorKey: []byte(testCursorKey)}, clk)
 	out, err := callListCommitsMCP(t, d, map[string]any{"project_id": "42", "use_cursor": true, "per_page": 2})
 	if err != nil {
 		t.Fatal(err)
@@ -403,29 +443,20 @@ func TestListCommits_bindFailureZeroContinuation(t *testing.T) {
 		t.Fatal("tamper must not continue ref/list")
 	}
 
-	// Actor mismatch via different /user on resume — swap handler user id
-	// Build a cursor then resume against handler that returns different actor.
-	probe2 := &commitProbe{}
-	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		probe2.note(r)
-		w.Header().Set("Content-Type", "application/json")
-		if strings.HasSuffix(r.URL.Path, "/user") {
-			_, _ = io.WriteString(w, `{"id":99,"username":"bob"}`)
-			return
-		}
-		listCommitsHandler(nil, nil).ServeHTTP(w, r)
-	})
-	d2 := newCursorDeps(t, h, &config.Config{CursorKey: []byte(testCursorKey)}, clk)
-	listBefore := probe2.listHits.Load()
-	getBefore := probe2.getCommit.Load()
-	_, err = callListCommitsMCP(t, d2, map[string]any{"project_id": "42", "cursor": nc, "per_page": 2})
+	// N1: same-instance actor mismatch — mutate /user on the same server/APIURL.
+	actor.Store(99)
+	userBefore := probe.userHits.Load()
+	listBefore := probe.listHits.Load()
+	getBefore := probe.getCommit.Load()
+	_, err = callListCommitsMCP(t, d, map[string]any{"project_id": "42", "cursor": nc, "per_page": 2})
 	if err == nil || !strings.Contains(err.Error(), cursor.ResyncRequired) {
 		t.Fatalf("actor mismatch: %v", err)
 	}
-	// May hit /user and /projects (identity/authz), but not getCommit pin or list continuation beyond guard...
-	// Actor mismatch happens after decode+actor+canonical, before guard — so list/getCommit must stay 0.
-	if probe2.listHits.Load() != listBefore || probe2.getCommit.Load() != getBefore {
-		t.Fatalf("actor mismatch must not list/ref: list=%d get=%d", probe2.listHits.Load(), probe2.getCommit.Load())
+	if probe.userHits.Load() <= userBefore {
+		t.Fatal("actor check must reach GET /user on same instance")
+	}
+	if probe.listHits.Load() != listBefore || probe.getCommit.Load() != getBefore {
+		t.Fatalf("actor mismatch must not list/ref: list=%d get=%d", probe.listHits.Load(), probe.getCommit.Load())
 	}
 }
 
@@ -555,8 +586,10 @@ func TestListCommits_instanceBindingStripsURLCredentials(t *testing.T) {
 }
 
 func TestListCommits_resumeFilterMismatchTable(t *testing.T) {
+	probe := &commitProbe{}
 	clk := &cursor.FakeClock{T: time.Date(2026, 10, 3, 12, 0, 0, 0, time.UTC)}
-	d := newCursorDeps(t, listCommitsHandler(&commitProbe{}, nil), &config.Config{CursorKey: []byte(testCursorKey)}, clk)
+	// N1: one instance for mint + resume so filter compare is reached (not masked by instance).
+	d := newCursorDeps(t, listCommitsHandler(probe, nil), &config.Config{CursorKey: []byte(testCursorKey)}, clk)
 	baseArgs := map[string]any{
 		"project_id": "42",
 		"use_cursor": true,
@@ -571,6 +604,8 @@ func TestListCommits_resumeFilterMismatchTable(t *testing.T) {
 		t.Fatal(err)
 	}
 	nc := out["section"].(map[string]any)["next_cursor"].(string)
+	listAfterInit := probe.listHits.Load()
+	getAfterInit := probe.getCommit.Load()
 	mutations := []struct {
 		name string
 		args map[string]any
@@ -583,14 +618,18 @@ func TestListCommits_resumeFilterMismatchTable(t *testing.T) {
 	}
 	for _, tc := range mutations {
 		t.Run(tc.name, func(t *testing.T) {
-			probe := &commitProbe{}
-			d2 := newCursorDeps(t, listCommitsHandler(probe, nil), &config.Config{CursorKey: []byte(testCursorKey)}, clk)
-			_, err := callListCommitsMCP(t, d2, tc.args)
+			listBefore := probe.listHits.Load()
+			getBefore := probe.getCommit.Load()
+			userBefore := probe.userHits.Load()
+			_, err := callListCommitsMCP(t, d, tc.args)
 			if err == nil || !strings.Contains(err.Error(), cursor.ResyncRequired) {
 				t.Fatalf("want resync on %s mismatch, got %v", tc.name, err)
 			}
-			if probe.listHits.Load() != 0 || probe.getCommit.Load() != 0 {
-				t.Fatalf("%s mismatch must not guard/list: list=%d get=%d", tc.name, probe.listHits.Load(), probe.getCommit.Load())
+			if probe.userHits.Load() <= userBefore {
+				t.Fatalf("%s: expected /user on same instance before filter reject", tc.name)
+			}
+			if probe.listHits.Load() != listBefore || probe.getCommit.Load() != getBefore {
+				t.Fatalf("%s mismatch must not guard/list: list=%d get=%d", tc.name, probe.listHits.Load()-listAfterInit, probe.getCommit.Load()-getAfterInit)
 			}
 		})
 	}
@@ -806,9 +845,10 @@ func TestListCommits_mcpActorUnresolvedAndProjectAuthzDenied(t *testing.T) {
 }
 
 func TestListCommits_invalidSinceUntilSafeProjection(t *testing.T) {
+	probe := &commitProbe{}
 	clk := &cursor.FakeClock{T: time.Date(2026, 10, 3, 12, 0, 0, 0, time.UTC)}
 	const sentinel = "raw-since-until-SECRET-echo-me"
-	d := newCursorDeps(t, listCommitsHandler(&commitProbe{}, nil), &config.Config{CursorKey: []byte(testCursorKey)}, clk)
+	d := newCursorDeps(t, listCommitsHandler(probe, nil), &config.Config{CursorKey: []byte(testCursorKey)}, clk)
 	_, err := callListCommitsMCP(t, d, map[string]any{
 		"project_id": "42",
 		"use_cursor": true,
@@ -823,7 +863,7 @@ func TestListCommits_invalidSinceUntilSafeProjection(t *testing.T) {
 		t.Fatalf("error echoed raw input: %v", err)
 	}
 	if !strings.Contains(msg, "invalid since") {
-		t.Fatalf("want static invalid since, got %v", err)
+		t.Fatalf("want static invalid since on initial, got %v", err)
 	}
 	_, err = callListCommitsMCP(t, d, map[string]any{
 		"project_id": "42",
@@ -833,6 +873,29 @@ func TestListCommits_invalidSinceUntilSafeProjection(t *testing.T) {
 	})
 	if err == nil || strings.Contains(err.Error(), sentinel) || !strings.Contains(err.Error(), "invalid until") {
 		t.Fatalf("want static invalid until without echo, got %v", err)
+	}
+
+	// N2: malformed resume filters → static resync_required (not "invalid since"), zero continuation.
+	out, err := callListCommitsMCP(t, d, map[string]any{"project_id": "42", "use_cursor": true, "per_page": 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	nc := out["section"].(map[string]any)["next_cursor"].(string)
+	listBefore := probe.listHits.Load()
+	_, err = callListCommitsMCP(t, d, map[string]any{
+		"project_id": "42",
+		"cursor":     nc,
+		"since":      sentinel,
+		"per_page":   2,
+	})
+	if err == nil || !strings.Contains(err.Error(), cursor.ResyncRequired) {
+		t.Fatalf("resume malformed filter want resync_required, got %v", err)
+	}
+	if strings.Contains(err.Error(), sentinel) || strings.Contains(err.Error(), "invalid since") {
+		t.Fatalf("resume must not echo raw or use initial invalid-since shape: %v", err)
+	}
+	if probe.listHits.Load() != listBefore {
+		t.Fatal("malformed resume filter must not continue list")
 	}
 }
 
@@ -974,7 +1037,7 @@ func TestStreamCommitsPage_boundaryFixturesRetainPrefix(t *testing.T) {
 			}
 			ctx := igl.WithBudget(context.Background(), b)
 			filters := testCommitFilters(10)
-			commits, res := streamCommitsPage(ctx, d, b, "42", tipSHA, filters, 1)
+			commits, res := streamCommitsPage(ctx, d, b, "42", tipSHA, filters, 1, nil)
 			if !res.partial || !res.boundaryBroken || res.stopErr == nil {
 				t.Fatalf("want partial+boundaryBroken+stopErr, got partial=%v broken=%v err=%v", res.partial, res.boundaryBroken, res.stopErr)
 			}
@@ -999,7 +1062,7 @@ func TestStreamCommitsPage_budgetCapsAndCancelClose(t *testing.T) {
 		d := newCursorDeps(t, streamCommitsPageBodyHandler(body3), &config.Config{CursorKey: []byte(testCursorKey)}, nil)
 		b := &igl.Budget{MaxItems: 1, MaxBytes: 1 << 20, MaxRequests: 8, MaxElapsed: time.Minute}
 		ctx := igl.WithBudget(context.Background(), b)
-		commits, res := streamCommitsPage(ctx, d, b, "42", tipSHA, filters, 1)
+		commits, res := streamCommitsPage(ctx, d, b, "42", tipSHA, filters, 1, nil)
 		if !errors.Is(res.stopErr, igl.ErrBudgetItems) || !res.partial {
 			t.Fatalf("want budget_items partial, got err=%v partial=%v", res.stopErr, res.partial)
 		}
@@ -1030,7 +1093,7 @@ func TestStreamCommitsPage_budgetCapsAndCancelClose(t *testing.T) {
 		// Tiny byte cap forces mid-stream stop while still allowing a prefix decode.
 		b := &igl.Budget{MaxItems: 50, MaxBytes: int64(len(commitJSON(sha1)) + 8), MaxRequests: 8, MaxElapsed: time.Minute}
 		ctx := igl.WithBudget(context.Background(), b)
-		commits, res := streamCommitsPage(ctx, d, b, "42", tipSHA, filters, 1)
+		commits, res := streamCommitsPage(ctx, d, b, "42", tipSHA, filters, 1, nil)
 		if !res.partial || res.stopErr == nil {
 			t.Fatalf("want partial byte stop, got partial=%v err=%v commits=%d", res.partial, res.stopErr, len(commits))
 		}
@@ -1064,7 +1127,7 @@ func TestStreamCommitsPage_budgetCapsAndCancelClose(t *testing.T) {
 			// user endpoint may 404 on streamCommitsPageBodyHandler — still charges request
 			_ = err
 		}
-		commits, res := streamCommitsPage(ctx, d, b, "42", tipSHA, filters, 1)
+		commits, res := streamCommitsPage(ctx, d, b, "42", tipSHA, filters, 1, nil)
 		if !errors.Is(res.stopErr, igl.ErrBudgetRequests) || !res.partial {
 			t.Fatalf("want budget_requests, got err=%v partial=%v", res.stopErr, res.partial)
 		}
@@ -1097,7 +1160,7 @@ func TestStreamCommitsPage_budgetCapsAndCancelClose(t *testing.T) {
 		d := newCursorDeps(t, h, &config.Config{CursorKey: []byte(testCursorKey)}, nil)
 		b := &igl.Budget{MaxItems: 50, MaxBytes: 1 << 20, MaxRequests: 8, MaxElapsed: 40 * time.Millisecond}
 		ctx := igl.WithBudget(context.Background(), b)
-		commits, res := streamCommitsPage(ctx, d, b, "42", tipSHA, filters, 1)
+		commits, res := streamCommitsPage(ctx, d, b, "42", tipSHA, filters, 1, nil)
 		<-started
 		if !res.partial || res.stopErr == nil {
 			t.Fatalf("want elapsed partial, got partial=%v err=%v", res.partial, res.stopErr)
@@ -1162,7 +1225,7 @@ func TestStreamCommitsPage_budgetCapsAndCancelClose(t *testing.T) {
 		d := newCursorDeps(t, h, &config.Config{CursorKey: []byte(testCursorKey)}, nil)
 		b := &igl.Budget{MaxItems: 1, MaxBytes: 1 << 20, MaxRequests: 8, MaxElapsed: time.Minute}
 		ctx := igl.WithBudget(context.Background(), b)
-		commits, res := streamCommitsPage(ctx, d, b, "42", tipSHA, filters, 1)
+		commits, res := streamCommitsPage(ctx, d, b, "42", tipSHA, filters, 1, nil)
 		if !errors.Is(res.stopErr, igl.ErrBudgetItems) {
 			t.Fatalf("want budget_items, got %v", res.stopErr)
 		}
@@ -1191,12 +1254,12 @@ func TestStreamCommitsPage_budgetCapsAndCancelClose(t *testing.T) {
 		// Shared invocation budget: guard page consumes MaxItems → next page must not run.
 		b := &igl.Budget{MaxItems: 2, MaxBytes: 1 << 20, MaxRequests: 16, MaxElapsed: time.Minute}
 		ctx := igl.WithBudget(context.Background(), b)
-		guard, gres := streamCommitsPage(ctx, d, b, "42", tipSHA, testCommitFilters(2), 1)
+		guard, gres := streamCommitsPage(ctx, d, b, "42", tipSHA, testCommitFilters(2), 1, nil)
 		if gres.partial || gres.stopErr != nil || len(guard) != 2 {
 			t.Fatalf("guard setup failed: partial=%v err=%v n=%d", gres.partial, gres.stopErr, len(guard))
 		}
 		listAfterGuard := probe.listHits.Load()
-		next, nres := streamCommitsPage(ctx, d, b, "42", tipSHA, testCommitFilters(2), 2)
+		next, nres := streamCommitsPage(ctx, d, b, "42", tipSHA, testCommitFilters(2), 2, nil)
 		if !errors.Is(nres.stopErr, igl.ErrBudgetItems) || !nres.partial {
 			t.Fatalf("next page must hit items budget, got err=%v partial=%v", nres.stopErr, nres.partial)
 		}
@@ -1308,4 +1371,301 @@ func TestListCommits_guardFailureNoNextPageZeroGuardData(t *testing.T) {
 	if page2After != page2Before {
 		t.Fatalf("next page must not run after guard failure: before=%d after=%d", page2Before, page2After)
 	}
+}
+
+func TestListCommits_guardPagingDriftResyncNoNextPage(t *testing.T) {
+	clk := &cursor.FakeClock{T: time.Date(2026, 10, 3, 12, 0, 0, 0, time.UTC)}
+	cases := []struct {
+		name string
+		next string // guard (page=1) X-Next-Page on resume
+	}{
+		{"exhausted", ""},
+		{"jump", "3"},
+		{"garbage", "nope"},
+		{"missing", "__missing__"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			probe := &commitProbe{}
+			var resume atomic.Bool
+			h := listCommitsHandler(probe, func(page string, body *string, next *string) {
+				if resume.Load() && page == "1" {
+					switch tc.next {
+					case "__missing__":
+						*next = "__missing__"
+					default:
+						*next = tc.next
+					}
+				}
+			})
+			// Specialize missing-header path: strip X-Next-Page entirely.
+			if tc.next == "__missing__" {
+				base := h
+				h = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if resume.Load() && strings.HasSuffix(r.URL.Path, "/repository/commits") && r.URL.Query().Get("page") == "1" {
+						probe.note(r)
+						w.Header().Set("Content-Type", "application/json")
+						// Intentionally omit X-Next-Page
+						_, _ = io.WriteString(w, pageCommits(sha1, sha2))
+						return
+					}
+					base.ServeHTTP(w, r)
+				})
+			}
+			d := newCursorDeps(t, h, &config.Config{CursorKey: []byte(testCursorKey)}, clk)
+			out, err := callListCommitsMCP(t, d, map[string]any{"project_id": "42", "use_cursor": true, "per_page": 2})
+			if err != nil {
+				t.Fatal(err)
+			}
+			nc := out["section"].(map[string]any)["next_cursor"].(string)
+			resume.Store(true)
+			probe.mu.Lock()
+			page2Before := probe.pages["2"]
+			probe.mu.Unlock()
+			_, err = callListCommitsMCP(t, d, map[string]any{"project_id": "42", "cursor": nc, "per_page": 2})
+			if err == nil || !strings.Contains(err.Error(), cursor.ResyncRequired) {
+				t.Fatalf("want resync_required, got %v", err)
+			}
+			probe.mu.Lock()
+			page2After := probe.pages["2"]
+			probe.mu.Unlock()
+			if page2After != page2Before {
+				t.Fatalf("next page must not run: before=%d after=%d", page2Before, page2After)
+			}
+		})
+	}
+}
+
+func TestListCommits_nextPageOverlapNullCursor(t *testing.T) {
+	clk := &cursor.FakeClock{T: time.Date(2026, 10, 3, 12, 0, 0, 0, time.UTC)}
+	t.Run("overlap_at_first", func(t *testing.T) {
+		probe := &commitProbe{}
+		h := listCommitsHandler(probe, func(page string, body *string, next *string) {
+			switch page {
+			case "1":
+				*body, *next = pageCommits(sha1, sha2), "2"
+			case "2":
+				// Entire previous page replayed as "next"
+				*body, *next = pageCommits(sha1, sha2), "3"
+			}
+		})
+		d := newCursorDeps(t, h, &config.Config{CursorKey: []byte(testCursorKey)}, clk)
+		out, err := callListCommitsMCP(t, d, map[string]any{"project_id": "42", "use_cursor": true, "per_page": 2})
+		if err != nil {
+			t.Fatal(err)
+		}
+		nc := out["section"].(map[string]any)["next_cursor"].(string)
+		out2, err := callListCommitsMCP(t, d, map[string]any{"project_id": "42", "cursor": nc, "per_page": 2})
+		if err != nil {
+			t.Fatal(err)
+		}
+		sec := out2["section"].(map[string]any)
+		if sec["next_cursor"] != nil {
+			t.Fatalf("next_cursor must be null on overlap: %#v", sec["next_cursor"])
+		}
+		if sec["pagination_exhausted"] == true {
+			t.Fatal("must not claim exhausted")
+		}
+		if sec["content_complete"] != readmeta.ContentCompleteFalse {
+			t.Fatalf("content_complete=%v", sec["content_complete"])
+		}
+		if sec["consistency"] != readmeta.ConsistencyInconsistent {
+			t.Fatalf("consistency=%v", sec["consistency"])
+		}
+		commits, _ := out2["commits"].([]any)
+		if len(commits) != 0 {
+			t.Fatalf("overlap at first retains empty prefix, got %d", len(commits))
+		}
+	})
+	t.Run("overlap_after_prefix", func(t *testing.T) {
+		probe := &commitProbe{}
+		h := listCommitsHandler(probe, func(page string, body *string, next *string) {
+			switch page {
+			case "1":
+				*body, *next = pageCommits(sha1, sha2), "2"
+			case "2":
+				// Safe prefix sha3 then overlap sha2 from previous page
+				*body, *next = pageCommits(sha3, sha2), "3"
+			}
+		})
+		d := newCursorDeps(t, h, &config.Config{CursorKey: []byte(testCursorKey)}, clk)
+		out, err := callListCommitsMCP(t, d, map[string]any{"project_id": "42", "use_cursor": true, "per_page": 2})
+		if err != nil {
+			t.Fatal(err)
+		}
+		nc := out["section"].(map[string]any)["next_cursor"].(string)
+		out2, err := callListCommitsMCP(t, d, map[string]any{"project_id": "42", "cursor": nc, "per_page": 2})
+		if err != nil {
+			t.Fatal(err)
+		}
+		sec := out2["section"].(map[string]any)
+		if sec["next_cursor"] != nil || sec["pagination_exhausted"] == true {
+			t.Fatalf("overlap must null cursor and not exhaust: %#v", sec)
+		}
+		if sec["consistency"] != readmeta.ConsistencyInconsistent {
+			t.Fatalf("consistency=%v", sec["consistency"])
+		}
+		commits, _ := out2["commits"].([]any)
+		if len(commits) != 1 {
+			t.Fatalf("retain safe prefix len=%d", len(commits))
+		}
+		if commits[0].(map[string]any)["id"] != sha3 {
+			t.Fatalf("prefix id=%v", commits[0].(map[string]any)["id"])
+		}
+		for _, sha := range []string{sha1, sha2} {
+			raw, _ := json.Marshal(out2)
+			if strings.Contains(string(raw), sha) && sha != sha3 {
+				// sha2 must not appear (not appended); sha1 is guard-only
+				if sha == sha2 || sha == sha1 {
+					t.Fatalf("guard/overlap sha %s must not appear in content: %s", sha, string(raw))
+				}
+			}
+		}
+	})
+}
+
+func TestListCommits_whitespaceCursorMalformedNoBackend(t *testing.T) {
+	clk := &cursor.FakeClock{T: time.Date(2026, 10, 3, 12, 0, 0, 0, time.UTC)}
+	ws := "  \t\n "
+	padded := " " + testCursorKey[:8] + "deadbeefdeadbeefdeadbeefdeadbeef " // padded garbage, nonempty after trim ≠ raw
+
+	t.Run("whitespace_use_cursor_false", func(t *testing.T) {
+		probe := &commitProbe{}
+		d := newCursorDeps(t, listCommitsHandler(probe, nil), &config.Config{CursorKey: []byte(testCursorKey)}, clk)
+		_, err := callListCommitsMCPRaw(t, d, map[string]any{"project_id": "42", "cursor": ws})
+		if err == nil || !strings.Contains(err.Error(), cursor.ResyncRequired) {
+			t.Fatalf("want resync_required, got %v", err)
+		}
+		if strings.Contains(err.Error(), "GITLAB_MCP_CURSOR_KEY") {
+			t.Fatalf("malformed must not be key error: %v", err)
+		}
+		if probe.listHits.Load() != 0 || probe.userHits.Load() != 0 || probe.projectHits.Load() != 0 {
+			t.Fatalf("zero backend required: user=%d proj=%d list=%d", probe.userHits.Load(), probe.projectHits.Load(), probe.listHits.Load())
+		}
+	})
+	t.Run("whitespace_use_cursor_true", func(t *testing.T) {
+		probe := &commitProbe{}
+		d := newCursorDeps(t, listCommitsHandler(probe, nil), &config.Config{CursorKey: []byte(testCursorKey)}, clk)
+		_, err := callListCommitsMCPRaw(t, d, map[string]any{"project_id": "42", "use_cursor": true, "cursor": ws})
+		if err == nil || !strings.Contains(err.Error(), cursor.ResyncRequired) {
+			t.Fatalf("want resync_required, got %v", err)
+		}
+		if probe.listHits.Load() != 0 || probe.userHits.Load() != 0 {
+			t.Fatal("zero backend")
+		}
+	})
+	t.Run("whitespace_keyless_resync_not_key_error", func(t *testing.T) {
+		probe := &commitProbe{}
+		cfg := &config.Config{CursorKey: nil}
+		d := newCursorDeps(t, listCommitsHandler(probe, nil), cfg, clk)
+		d.Config.CursorKey = nil
+		_, err := callListCommitsMCPRaw(t, d, map[string]any{"project_id": "42", "cursor": ws})
+		if err == nil || !strings.Contains(err.Error(), cursor.ResyncRequired) {
+			t.Fatalf("keyless malformed want resync_required, got %v", err)
+		}
+		if strings.Contains(err.Error(), "GITLAB_MCP_CURSOR_KEY") {
+			t.Fatalf("keyless malformed must not surface key error: %v", err)
+		}
+		if probe.listHits.Load() != 0 || probe.userHits.Load() != 0 || probe.projectHits.Load() != 0 {
+			t.Fatal("zero backend")
+		}
+	})
+	t.Run("padded_token_resync", func(t *testing.T) {
+		probe := &commitProbe{}
+		d := newCursorDeps(t, listCommitsHandler(probe, nil), &config.Config{CursorKey: []byte(testCursorKey)}, clk)
+		_, err := callListCommitsMCPRaw(t, d, map[string]any{"project_id": "42", "cursor": padded})
+		if err == nil || !strings.Contains(err.Error(), cursor.ResyncRequired) {
+			t.Fatalf("want resync_required, got %v", err)
+		}
+		if probe.listHits.Load() != 0 {
+			t.Fatal("zero backend")
+		}
+	})
+	t.Run("keyless_initial_actionable_key_error", func(t *testing.T) {
+		probe := &commitProbe{}
+		d := newCursorDeps(t, listCommitsHandler(probe, nil), &config.Config{CursorKey: nil}, clk)
+		d.Config.CursorKey = nil
+		_, err := callListCommitsMCPRaw(t, d, map[string]any{"project_id": "42", "use_cursor": true})
+		if err == nil || !strings.Contains(err.Error(), "GITLAB_MCP_CURSOR_KEY") {
+			t.Fatalf("want actionable key error, got %v", err)
+		}
+		if strings.Contains(err.Error(), cursor.ResyncRequired) {
+			t.Fatalf("initial keyless must not be resync: %v", err)
+		}
+		if probe.listHits.Load() != 0 || probe.userHits.Load() != 0 {
+			t.Fatal("zero backend")
+		}
+	})
+	t.Run("keyless_valid_looking_cursor_key_error", func(t *testing.T) {
+		probe := &commitProbe{}
+		d := newCursorDeps(t, listCommitsHandler(probe, nil), &config.Config{CursorKey: nil}, clk)
+		d.Config.CursorKey = nil
+		// Nonempty raw without surrounding whitespace — key gate, not malformed.
+		_, err := callListCommitsMCPRaw(t, d, map[string]any{"project_id": "42", "cursor": "v1.not-a-real-token-but-nonempty"})
+		if err == nil || !strings.Contains(err.Error(), "GITLAB_MCP_CURSOR_KEY") {
+			t.Fatalf("want key error, got %v", err)
+		}
+		if strings.Contains(err.Error(), "malformed cursor") {
+			t.Fatalf("valid-shaped nonempty must reach key gate: %v", err)
+		}
+		if probe.listHits.Load() != 0 {
+			t.Fatal("zero backend")
+		}
+	})
+}
+
+func TestListCommits_omittedPagePerPageMCP(t *testing.T) {
+	probe := &commitProbe{}
+	clk := &cursor.FakeClock{T: time.Date(2026, 10, 3, 12, 0, 0, 0, time.UTC)}
+	d := newCursorDeps(t, listCommitsHandler(probe, nil), &config.Config{CursorKey: []byte(testCursorKey)}, clk)
+
+	t.Run("omit_page_and_per_page_initial", func(t *testing.T) {
+		out, err := callListCommitsMCPRaw(t, d, map[string]any{"project_id": "42", "use_cursor": true})
+		if err != nil {
+			t.Fatalf("omitted page/per_page must be accepted: %v", err)
+		}
+		nc, _ := out["section"].(map[string]any)["next_cursor"].(string)
+		if nc == "" {
+			t.Fatal("expected next_cursor with default per_page")
+		}
+		p, err := cursor.Decode([]byte(testCursorKey), nc, clk.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p.Filters.PerPage != 20 {
+			t.Fatalf("default per_page want 20 got %d", p.Filters.PerPage)
+		}
+		if p.PageState.PerPage != 20 {
+			t.Fatalf("page state per_page=%d", p.PageState.PerPage)
+		}
+	})
+	t.Run("omit_page_explicit_per_page_resume", func(t *testing.T) {
+		out, err := callListCommitsMCPRaw(t, d, map[string]any{"project_id": "42", "use_cursor": true, "per_page": 2})
+		if err != nil {
+			t.Fatal(err)
+		}
+		nc := out["section"].(map[string]any)["next_cursor"].(string)
+		out2, err := callListCommitsMCPRaw(t, d, map[string]any{"project_id": "42", "cursor": nc, "per_page": 2})
+		if err != nil {
+			t.Fatalf("resume omitting page: %v", err)
+		}
+		if out2["section"].(map[string]any)["next_cursor"] == nil && out2["section"].(map[string]any)["pagination_exhausted"] != true {
+			// page 2 may have next or exhaust depending on fixture; just ensure CallTool succeeded
+		}
+	})
+	t.Run("invalid_page_with_use_cursor", func(t *testing.T) {
+		_, err := callListCommitsMCPRaw(t, d, map[string]any{"project_id": "42", "use_cursor": true, "page": 2, "per_page": 2})
+		if err == nil {
+			t.Fatal("page>1 with use_cursor must reject")
+		}
+	})
+	t.Run("legacy_omit_defaults", func(t *testing.T) {
+		out, err := callListCommitsMCPRaw(t, d, map[string]any{"project_id": "42"})
+		if err != nil {
+			t.Fatalf("legacy omit page/per_page: %v", err)
+		}
+		if _, ok := out["pagination"].(map[string]any); !ok {
+			t.Fatalf("legacy pagination missing: %#v", out)
+		}
+	})
 }

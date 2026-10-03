@@ -318,6 +318,9 @@ func createBranch(ctx context.Context, _ *mcp.CallToolRequest, in createBranchIn
 	return nil, Out(b), nil
 }
 
+// listCommitsIn uses list-commits-specific optional page/per_page (not shared
+// Pagination) so omitted fields are schema-optional for cursor-mode defaults
+// while ListOpts preserves legacy default/clamp semantics for provided values.
 type listCommitsIn struct {
 	ProjectID string `json:"project_id"`
 	RefName   string `json:"ref_name,omitempty"`
@@ -326,11 +329,43 @@ type listCommitsIn struct {
 	Until     string `json:"until,omitempty"`
 	UseCursor bool   `json:"use_cursor,omitempty" jsonschema:"Opt in to signed cursor pagination"`
 	Cursor    string `json:"cursor,omitempty" jsonschema:"Opaque signed cursor from a prior cursor-mode page"`
-	Pagination
+	Page      *int   `json:"page,omitempty" jsonschema:"Page number (1-based); omit for default 1"`
+	PerPage   *int   `json:"per_page,omitempty" jsonschema:"Items per page (max 100); omit for default 20"`
+}
+
+// ListOpts mirrors Pagination.ListOpts for list_commits: omit/nil → page=1,
+// per_page=20; clamp per_page to [1,100] after applying provided values.
+func (in listCommitsIn) ListOpts() (page, perPage int) {
+	page = 1
+	if in.Page != nil {
+		page = *in.Page
+	}
+	if page < 1 {
+		page = 1
+	}
+	perPage = 20
+	if in.PerPage != nil {
+		perPage = *in.PerPage
+	}
+	if perPage < 1 {
+		perPage = 20
+	}
+	if perPage > 100 {
+		perPage = 100
+	}
+	return page, perPage
+}
+
+func (in listCommitsIn) explicitPage() int {
+	if in.Page == nil {
+		return 0
+	}
+	return *in.Page
 }
 
 func listCommits(ctx context.Context, _ *mcp.CallToolRequest, in listCommitsIn, d Deps) (*mcp.CallToolResult, any, error) {
-	if in.UseCursor || strings.TrimSpace(in.Cursor) != "" {
+	// Dispatch on RAW nonempty cursor (no TrimSpace). Exactly "" is absent.
+	if in.UseCursor || in.Cursor != "" {
 		return listCommitsCursor(ctx, in, d)
 	}
 	return listCommitsLegacy(ctx, in, d)
