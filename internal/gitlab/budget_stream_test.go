@@ -72,6 +72,68 @@ func TestBudget_RemainingBytes(t *testing.T) {
 	}
 }
 
+// TestBudget_CapLimitsConcurrentWithRemainingStatsCharge exercises CapLimits
+// writers against RemainingBytes/Stats/reserveBytes/chargeRequest under -race.
+func TestBudget_CapLimitsConcurrentWithRemainingStatsCharge(t *testing.T) {
+	b := &Budget{
+		MaxItems:    1000,
+		MaxBytes:    8 << 20,
+		MaxRequests: 1000,
+		MaxElapsed:  time.Minute,
+		start:       time.Now(),
+	}
+	ctx := WithBudget(context.Background(), b)
+	defer b.Cancel()
+
+	const goroutines = 8
+	const iters = 200
+	done := make(chan struct{}, goroutines)
+	for g := 0; g < goroutines; g++ {
+		g := g
+		go func() {
+			defer func() { done <- struct{}{} }()
+			for i := 0; i < iters; i++ {
+				switch g % 4 {
+				case 0:
+					// Tighten toward batch local maxima (never relax).
+					b.CapLimits(20, 1<<20, 16)
+					b.CapLimits(20, 8<<20, 16)
+				case 1:
+					_ = b.RemainingBytes()
+					_, _, _ = b.Stats()
+					_, _, _, _ = b.LimitsSnapshot()
+				case 2:
+					_, _ = b.reserveBytes(64)
+					b.releaseBytes(32)
+				default:
+					_ = b.chargeRequest()
+					_ = b.AddItem()
+					if BudgetFromContext(ctx) != b {
+						t.Errorf("budget identity lost")
+					}
+				}
+			}
+		}()
+	}
+	for i := 0; i < goroutines; i++ {
+		<-done
+	}
+	items, bytes, reqs, _ := b.LimitsSnapshot()
+	if items != 20 {
+		t.Fatalf("MaxItems want 20 after CapLimits, got %d", items)
+	}
+	if bytes != 1<<20 {
+		t.Fatalf("MaxBytes want 1MiB (tightest CapLimits), got %d", bytes)
+	}
+	if reqs != 16 {
+		t.Fatalf("MaxRequests want 16, got %d", reqs)
+	}
+	rem := b.RemainingBytes()
+	if rem < 0 || rem > 1<<20 {
+		t.Fatalf("RemainingBytes=%d out of range after tighten", rem)
+	}
+}
+
 func TestBudgetInterceptor_errorBodyCap(t *testing.T) {
 	big := strings.Repeat("x", 64*1024)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
