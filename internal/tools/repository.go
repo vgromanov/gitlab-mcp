@@ -17,6 +17,7 @@ func RegisterRepository(s *mcp.Server, d Deps) {
 	AddTool(s, d, true, "", &mcp.Tool{Name: "create_repository", Description: "Create a new GitLab project"}, createRepository)
 	AddTool(s, d, true, "", &mcp.Tool{Name: "fork_repository", Description: "Fork a project"}, forkRepository)
 	AddTool(s, d, false, "", &mcp.Tool{Name: "get_file_contents", Description: "Get file or directory from a project repository"}, getFileContents)
+	AddTool(s, d, false, "", &mcp.Tool{Name: "batch_get_file_contents", Description: "Bounded batch read of repository files at an exact full commit SHA"}, batchGetFileContents)
 	AddTool(s, d, true, "", &mcp.Tool{Name: "create_or_update_file", Description: "Create or update a single file on a branch"}, createOrUpdateFile)
 	AddTool(s, d, true, "", &mcp.Tool{Name: "push_files", Description: "Create a commit with multiple file actions"}, pushFiles)
 	AddTool(s, d, false, "", &mcp.Tool{Name: "get_repository_tree", Description: "List files and directories in repository"}, getRepositoryTree)

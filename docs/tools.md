@@ -50,6 +50,10 @@ This document describes the tool surface currently registered by
 - `create_repository`
 - `fork_repository`
 - `get_file_contents`
+- `batch_get_file_contents` — bounded batch read of up to 20 paths at one full
+  40-hex commit SHA (independent per-path ranges/errors; 1 MiB returned raw
+  aggregate default; streaming/ranged raw provider; readmeta section envelope).
+  Does not change legacy `get_file_contents`.
 - `create_or_update_file`
 - `push_files`
 - `get_repository_tree`

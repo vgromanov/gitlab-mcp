@@ -62,8 +62,8 @@ var dailyTools = []string{
 	"push_files",
 }
 
-// reviewReadTools is the initial GITLAB_TOOL_PROFILE=review_read|review_write
-// ceiling (exact 25 safe reads). review_write adds no guarded writes in this PR.
+// reviewReadTools is the GITLAB_TOOL_PROFILE=review_read|review_write
+// ceiling (exact 26 safe reads). review_write adds no guarded writes here.
 var reviewReadTools = []string{
 	"get_project",
 	"get_merge_request",
@@ -80,6 +80,7 @@ var reviewReadTools = []string{
 	"get_merge_request_notes",
 	"get_merge_request_discussion",
 	"get_file_contents",
+	"batch_get_file_contents",
 	"get_repository_tree",
 	"list_commits",
 	"get_commit",

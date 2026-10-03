@@ -156,12 +156,17 @@ func (b *Budget) releaseBytes(n int64) {
 }
 
 // RemainingBytes returns bytes left before cap (-1 if unlimited/nil).
+// MaxBytes and bytesRead are observed under the budget mutex so concurrent
+// CapLimits tighten cannot race a pre-lock limit read.
 func (b *Budget) RemainingBytes() int64 {
-	if b == nil || b.MaxBytes <= 0 {
+	if b == nil {
 		return -1
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.MaxBytes <= 0 {
+		return -1
+	}
 	left := b.MaxBytes - b.bytesRead
 	if left < 0 {
 		return 0
@@ -191,6 +196,37 @@ func (b *Budget) Stats() (requests int, bytes int64, items int) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.requests, b.bytesRead, b.items
+}
+
+// CapLimits tightens MaxItems/MaxBytes/MaxRequests under the budget mutex.
+// Each positive argument is applied only when it is stricter than the current
+// cap (or when the current cap is unlimited/non-positive). Never relaxes.
+// Does not alter MaxElapsed, start time, cancel func, or counters.
+func (b *Budget) CapLimits(maxItems int, maxBytes int64, maxRequests int) {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if maxItems > 0 && (b.MaxItems <= 0 || b.MaxItems > maxItems) {
+		b.MaxItems = maxItems
+	}
+	if maxBytes > 0 && (b.MaxBytes <= 0 || b.MaxBytes > maxBytes) {
+		b.MaxBytes = maxBytes
+	}
+	if maxRequests > 0 && (b.MaxRequests <= 0 || b.MaxRequests > maxRequests) {
+		b.MaxRequests = maxRequests
+	}
+}
+
+// LimitsSnapshot returns current Max* caps under lock (for tests/diagnostics).
+func (b *Budget) LimitsSnapshot() (maxItems int, maxBytes int64, maxRequests int, maxElapsed time.Duration) {
+	if b == nil {
+		return 0, 0, 0, 0
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.MaxItems, b.MaxBytes, b.MaxRequests, b.MaxElapsed
 }
 
 // BudgetInterceptor returns a client-go Interceptor that counts requests and
