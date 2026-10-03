@@ -32,7 +32,41 @@ consumers.
 ## Tool selection gates
 
 Catalog membership is decided in `internal/tools/selection.go` after the
-read-only filter. **Restricted mode** turns on when any of these is set:
+read-only filter.
+
+### Opt-in `GITLAB_TOOL_PROFILE` / `--tool-profile`
+
+Named profiles are an **opt-in ceiling**. When set, family flags and
+`GITLAB_ENABLED_TOOLS` **cannot expand** membership; `GITLAB_DISABLED_TOOLS` and
+`GITLAB_READ_ONLY_MODE` may only **narrow**. Unknown values fail closed at
+startup (`Validate` before token/client/server). Values are trimmed and
+lowercased. A CLI flag visit with an empty string clears an env-derived profile.
+
+| Profile | Membership |
+|---|---|
+| unset / empty | Exact historical selection (below) — unset does **not** mean daily |
+| `daily` | Exact existing **41**-tool daily census maximum |
+| `review_read` | Exact **25** safe MR/project/repo/pipeline **reads** |
+| `review_write` | Same **25** reads initially; **no guarded writes available yet** |
+
+Initial `review_*` set: `get_project`, `get_merge_request`, `list_merge_requests`,
+`get_merge_request_approval_state`, `get_merge_request_conflicts`,
+`get_merge_request_diffs`, `get_merge_request_file_diff`,
+`list_merge_request_changed_files`, `list_merge_request_versions`,
+`get_merge_request_version`, `list_merge_request_diffs`, `mr_discussions`,
+`get_merge_request_notes`, `get_merge_request_discussion`, `get_file_contents`,
+`get_repository_tree`, `list_commits`, `get_commit`, `get_commit_diff`,
+`list_pipelines`, `get_pipeline`, `list_pipeline_jobs`,
+`list_pipeline_trigger_jobs`, `get_pipeline_job`, `get_pipeline_job_output`.
+
+Excluded from review profiles: broad search/discovery, `execute_graphql`, merge,
+approve, note/thread writes, artifacts/deployments/environments, pipeline writes.
+Rollback: leave `GITLAB_TOOL_PROFILE` unset. Do not switch production connectors
+to a new profile in this change alone.
+
+### Restricted vs unrestricted (when profile is unset)
+
+**Restricted mode** turns on when any of these is set:
 
 - `USE_DAILY_TOOLS=true`
 - any **new** family flag (`USE_ISSUES`, `USE_WORK_ITEMS`, `USE_LABELS`,
@@ -63,12 +97,14 @@ enable/disable lists log a startup warning and are ignored.
 `USE_PIPELINE=true` stays legacy (core + pipeline), not restricted-only-pipeline.
 
 Recommended Cursor profile for ship/MR work: `USE_DAILY_TOOLS=true` alone
-(MR tools + the four search tools).
+(MR tools + the four search tools), or opt into `GITLAB_TOOL_PROFILE=review_read`
+for a bounded review ceiling.
 
 ### Env / flag matrix
 
 | Variable | Flag | Default | Restricted? | Notes |
 |---|---|---|---|---|
+| `GITLAB_TOOL_PROFILE` | `--tool-profile` | empty | — | Opt-in ceiling: `daily`\|`review_read`\|`review_write`. Unknown fails startup. |
 | `USE_DAILY_TOOLS` | `--use-daily-tools` | `false` | Yes | 41-tool daily set. |
 | `USE_ISSUES` | `--use-issues` | `false` | Yes | Issues + issue notes/links. |
 | `USE_WORK_ITEMS` | `--use-work-items` | `false` | Yes | Work-item GraphQL tools (not `execute_graphql`). |

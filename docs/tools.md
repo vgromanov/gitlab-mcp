@@ -7,9 +7,12 @@ This document describes the tool surface currently registered by
 
 - Tools are registered by group in `internal/tools/*.go` via `AddTool`.
 - Mutating tools are skipped when `GITLAB_READ_ONLY_MODE=true`.
-- Catalog membership uses additive selection (SW-145). See
+- Catalog membership uses additive selection (SW-145) plus optional
+  `GITLAB_TOOL_PROFILE` ceilings. See
   [`docs/configuration.md`](configuration.md#tool-selection-gates) for the
-  restricted vs unrestricted matrix and `mcp.json` profiles.
+  restricted vs unrestricted matrix, named profiles (`daily` / `review_read` /
+  `review_write`), and `mcp.json` examples. `review_write` currently registers
+  the same reads as `review_read` — no guarded writes are available yet.
 - Legacy opt-in families (unrestricted mode only; still default **off**):
   - `pipeline` — `USE_PIPELINE=true`
   - `milestone` — `USE_MILESTONE=true`
