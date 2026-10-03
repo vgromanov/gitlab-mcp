@@ -728,19 +728,17 @@ type getMergeRequestApprovalStateIn struct {
 	pidMR
 }
 
-func getMergeRequestApprovalState(ctx context.Context, _ *mcp.CallToolRequest, in getMergeRequestApprovalStateIn, d Deps) (*mcp.CallToolResult, any, error) {
-	pid, err := in.resolve(ctx, d)
+func getMergeRequestApprovalState(ctx context.Context, _ *mcp.CallToolRequest, in getMergeRequestApprovalStateIn, d Deps) (*mcp.CallToolResult, mrApprovalReadResult, error) {
+	ctx, _, release := ensureApprovalInvocationBudget(ctx)
+	defer release()
+
+	owner, err := authorizeAndVerifyApprovalMR(ctx, d, in.ProjectID, in.MergeRequestIID)
 	if err != nil {
-		return nil, nil, err
+		return nil, mrApprovalReadResult{}, err
 	}
-	st, _, err := d.Client.MergeRequestApprovals.GetApprovalState(pid, in.MergeRequestIID, gitlab.WithContext(ctx))
+	out, err := readNormalizedApprovals(ctx, d, owner, in.MergeRequestIID)
 	if err != nil {
-		// Fallback for older GitLab
-		app, _, err2 := d.Client.MergeRequests.GetMergeRequestApprovals(pid, in.MergeRequestIID, gitlab.WithContext(ctx))
-		if err2 != nil {
-			return nil, nil, fmt.Errorf("approval_state: %w; approvals: %v", err, err2)
-		}
-		return nil, Out(app), nil
+		return nil, mrApprovalReadResult{}, err
 	}
-	return nil, Out(st), nil
+	return nil, out, nil
 }

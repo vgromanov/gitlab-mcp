@@ -40,8 +40,10 @@ func gitlabAPIStub(t *testing.T) http.Handler {
 			_, _ = io.WriteString(w, `{"id":"abc","short_id":"abc","title":"msg"}`)
 		case strings.Contains(path, "/merge_requests") && strings.Contains(path, "/diffs"):
 			_, _ = io.WriteString(w, `[{"old_path":"a.go","new_path":"a.go","diff":"<<<<<<< HEAD\nfoo\n=======\nbar\n>>>>>>> branch\n"}]`)
-		case strings.Contains(path, "/approvals") || strings.Contains(path, "/approval_state"):
-			_, _ = io.WriteString(w, `{"approved":true,"approvals_required":1}`)
+		case strings.Contains(path, "/approval_state"):
+			_, _ = io.WriteString(w, `{"approval_rules_overwritten":false,"rules":[{"id":1,"name":"default","approvals_required":1,"approved":true,"contains_hidden_groups":false}]}`)
+		case strings.Contains(path, "/approvals"):
+			_, _ = io.WriteString(w, `{"approved":true,"approvals_required":1,"user_has_approved":false,"user_can_approve":true,"approval_rules_left":[]}`)
 		case strings.Contains(path, "/users"):
 			_, _ = io.WriteString(w, `[{"id":1,"username":"alice"}]`)
 		case r.Method == http.MethodDelete:
