@@ -34,7 +34,6 @@ func TestSubprocessCrashRestart_acceptedPersists(t *testing.T) {
 	}
 
 	// Crash after synchronized accept acknowledgment: count=1, ack present, non-zero exit.
-	_ = os.Remove(ackPath)
 	if err := RunAcceptedCountChildExpectFailure(t, statePath, ackPath, ChildModeCrashAfterAccept); err != nil {
 		t.Fatal(err)
 	}
@@ -46,12 +45,11 @@ func TestSubprocessCrashRestart_acceptedPersists(t *testing.T) {
 		t.Fatalf("after crash-after-accept count=%d want 1", st.AcceptedCount)
 	}
 	ack, err := os.ReadFile(ackPath)
-	if err != nil || string(ack) != "accepted\n" {
+	if err != nil || string(ack) != acceptedAckPayload {
 		t.Fatalf("ack=%q err=%v", ack, err)
 	}
 
 	// Restart with ordinary accept: count persists and increments to 2.
-	_ = os.Remove(ackPath)
 	if err := RunAcceptedCountChild(t, statePath, ackPath, ChildModeAccept); err != nil {
 		t.Fatal(err)
 	}
@@ -61,6 +59,19 @@ func TestSubprocessCrashRestart_acceptedPersists(t *testing.T) {
 	}
 	if st.AcceptedCount != 2 {
 		t.Fatalf("after restart accept count=%d want 2", st.AcceptedCount)
+	}
+	ack, err = os.ReadFile(ackPath)
+	if err != nil || string(ack) != acceptedAckPayload {
+		t.Fatalf("accept ack=%q err=%v", ack, err)
+	}
+}
+
+func TestSubprocessExpectFailure_rejectsUnrelatedExit(t *testing.T) {
+	dir := t.TempDir()
+	statePath := filepath.Join(dir, "state.json")
+	ackPath := filepath.Join(dir, "ack")
+	if err := RunAcceptedCountChildExpectFailure(t, statePath, ackPath, "not-a-crash-mode"); err == nil {
+		t.Fatal("unsupported mode must error")
 	}
 }
 
