@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	igl "gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/gitlab"
@@ -30,9 +31,61 @@ const (
 	rulesCapabilityUnknown = "unknown"
 )
 
-// noApprovalReadRetry disables request-local retries while preserving transport errors.
-func noApprovalReadRetry(_ context.Context, _ *http.Response, err error) (bool, error) {
-	return false, err
+// approvalBodyCapture wraps a response body so non-EOF read failures survive
+// SDK CheckResponse (which discards io.ReadAll errors). Legitimate empty bodies
+// that reach clean EOF leave readErr nil.
+type approvalBodyCapture struct {
+	io.ReadCloser
+	mu      sync.Mutex
+	readErr error
+}
+
+func (c *approvalBodyCapture) Read(p []byte) (int, error) {
+	n, err := c.ReadCloser.Read(p)
+	if err != nil && !errors.Is(err, io.EOF) {
+		c.mu.Lock()
+		if c.readErr == nil {
+			c.readErr = err
+		}
+		c.mu.Unlock()
+	}
+	return n, err
+}
+
+func (c *approvalBodyCapture) capturedReadErr() error {
+	if c == nil {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.readErr
+}
+
+// approvalReadCheckRetry never retries. It wraps the response body before the
+// SDK error-body ReadAll so truncated/chunked/custom read failures are retained.
+// Original transport errors are passed through unchanged.
+func approvalReadCheckRetry(cap **approvalBodyCapture) retryablehttp.CheckRetry {
+	return func(_ context.Context, resp *http.Response, err error) (bool, error) {
+		if resp != nil && resp.Body != nil {
+			if _, ok := resp.Body.(*approvalBodyCapture); !ok {
+				c := &approvalBodyCapture{ReadCloser: resp.Body}
+				*cap = c
+				resp.Body = c
+			}
+		}
+		return false, err
+	}
+}
+
+// requirePostReadStillValid rechecks cancellation/elapsed after an SDK read
+// completes and before publishing normalized success. Exhausted request/byte
+// budgets for a *completed* read do not invalidate that read (next-dispatch
+// gating is separate via budgetAllowsNext).
+func requirePostReadStillValid(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return mapTransportOrBudgetErr(ctx, err)
+	}
+	return nil
 }
 
 // mrApprovalRuleObs is one presence-aware rule observation.
@@ -208,9 +261,10 @@ type approvalRawRead struct {
 
 func readApprovalResource(ctx context.Context, d Deps, projectPath string, mrIID int64, resource string) approvalRawRead {
 	path := fmt.Sprintf("projects/%s/merge_requests/%d/%s", gitlab.PathEscape(projectPath), mrIID, resource)
+	var bodyCap *approvalBodyCapture
 	req, err := d.Client.NewRequest(http.MethodGet, path, nil, []gitlab.RequestOptionFunc{
 		gitlab.WithContext(ctx),
-		gitlab.WithRequestRetry(noApprovalReadRetry),
+		gitlab.WithRequestRetry(approvalReadCheckRetry(&bodyCap)),
 	})
 	if err != nil {
 		return approvalRawRead{Err: mapTransportOrBudgetErr(ctx, err)}
@@ -222,6 +276,13 @@ func readApprovalResource(ctx context.Context, d Deps, projectPath string, mrIID
 	if resp != nil && resp.Response != nil {
 		out.Response = resp.Response
 		out.Status = resp.StatusCode
+	}
+	// Body-read failures (truncated Content-Length, chunked mid-stream, custom
+	// reader errors, budget-capped reads) must fail closed even when the SDK
+	// status error discarded the io.ReadAll error. Clean EOF / empty bodies OK.
+	if readErr := bodyCap.capturedReadErr(); readErr != nil {
+		out.Err = mapTransportOrBudgetErr(ctx, readErr)
+		return out
 	}
 	if err != nil {
 		if errors.Is(err, gitlab.ErrNotFound) {
@@ -805,6 +866,9 @@ func readNormalizedApprovals(ctx context.Context, d Deps, owner CanonicalProject
 		if err != nil {
 			return mrApprovalReadResult{Section: section}, err
 		}
+		if err := requirePostReadStillValid(ctx); err != nil {
+			return mrApprovalReadResult{Section: section}, err
+		}
 		return out, nil
 
 	case primary.Status == http.StatusMethodNotAllowed:
@@ -830,12 +894,12 @@ func readNormalizedApprovals(ctx context.Context, d Deps, owner CanonicalProject
 		if err != nil {
 			return mrApprovalReadResult{Section: section}, err
 		}
+		if err := requirePostReadStillValid(ctx); err != nil {
+			return mrApprovalReadResult{Section: section}, err
+		}
 		return out, nil
 
 	default:
 		return mrApprovalReadResult{Section: section}, approvalHTTPStatusErr(primary.Status)
 	}
 }
-
-// Silence unused import if retryablehttp type referenced only via WithRequestRetry signature.
-var _ retryablehttp.CheckRetry = noApprovalReadRetry

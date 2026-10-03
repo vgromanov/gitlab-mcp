@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -570,40 +571,37 @@ func TestMatchesConfiguredTarget_exactBasePathAndMethod(t *testing.T) {
 	}
 }
 
-func TestMRApproval_redirectAwayBack_noFallback(t *testing.T) {
+func TestMRApproval_redirectExactOriginalURL_awayBack_budgeted_noFallback(t *testing.T) {
+	// Exact original URL away/back (no query mutation): project + MR + approval_state
+	// + hop redirect target + approval_state again = 5 budgeted RoundTrips; P/F=1/0.
 	counts := &approvalCallCounts{}
-	var primary *httptest.Server
-	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		path := r.URL.Path
-		w.Header().Set("Content-Type", "application/json")
-		switch {
-		case strings.Contains(path, "/approval_state"):
-			counts.approvalState.Add(1)
-			if r.URL.Query().Get("hop") == "" {
-				http.Redirect(w, r, primary.URL+"/api/v4/projects/42/merge_requests/1/approval_state?hop=1", http.StatusFound)
-				return
+	var hops atomic.Int64
+	base := approvalFixtureHandler(counts, func(w http.ResponseWriter, r *http.Request, path string) bool {
+		if strings.HasSuffix(path, "/approval_state") {
+			n := hops.Add(1)
+			if n == 1 {
+				http.Redirect(w, r, "/approval-hop", http.StatusFound)
+				return true
 			}
 			w.Header().Set("Allow", "POST, OPTIONS")
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			_, _ = io.WriteString(w, `{}`)
-		case strings.Contains(path, "/approvals"):
-			counts.approvals.Add(1)
-			_, _ = io.WriteString(w, `{"approved":true}`)
-		case strings.Contains(path, "/merge_requests/"):
-			counts.mrGet.Add(1)
-			_, _ = io.WriteString(w, `{"id":1,"iid":1,"project_id":42,"source_project_id":42}`)
-		case strings.Contains(path, "/projects/"):
-			_, _ = io.WriteString(w, `{"id":42,"path_with_namespace":"g/p","namespace":{"id":7,"kind":"group"}}`)
-		default:
-			http.NotFound(w, r)
+			return true
 		}
+		return false
 	})
-	primary = httptest.NewTLSServer(h)
-	t.Cleanup(primary.Close)
-	httpClient := primary.Client()
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/approval-hop" {
+			http.Redirect(w, r, "/api/v4/projects/42/merge_requests/1/approval_state", http.StatusFound)
+			return
+		}
+		base.ServeHTTP(w, r)
+	}))
+	t.Cleanup(ts.Close)
+	httpClient := ts.Client()
 	httpClient.Transport = igl.BudgetInterceptor()(httpClient.Transport)
 	cli, err := gitlab.NewClient("t",
-		gitlab.WithBaseURL(primary.URL+"/api/v4"),
+		gitlab.WithBaseURL(ts.URL+"/api/v4"),
 		gitlab.WithoutRetries(),
 		gitlab.WithHTTPClient(httpClient),
 	)
@@ -611,12 +609,22 @@ func TestMRApproval_redirectAwayBack_noFallback(t *testing.T) {
 		t.Fatal(err)
 	}
 	d := Deps{Config: &config.Config{Token: "t"}, Client: cli}
-	_, err = callApproval(t, d, context.Background())
+	b := &igl.Budget{MaxItems: 100, MaxBytes: 1 << 20, MaxRequests: 16, MaxElapsed: time.Minute}
+	ctx := igl.WithBudget(context.Background(), b)
+	defer b.Cancel()
+	_, err = callApproval(t, d, ctx)
 	if err == nil {
 		t.Fatal("want reject redirected 405")
 	}
 	if counts.approvals.Load() != 0 {
 		t.Fatalf("fallback=%d", counts.approvals.Load())
+	}
+	if counts.approvalState.Load() != 2 {
+		t.Fatalf("approval_state hits=%d want 2 (away+back)", counts.approvalState.Load())
+	}
+	rq, _, _ := b.Stats()
+	if rq != 5 {
+		t.Fatalf("budgeted round trips=%d want 5 (project+MR+state+hop+state)", rq)
 	}
 }
 
@@ -688,26 +696,33 @@ func TestMRApproval_itemBudgetExhausted_beforeNextRule(t *testing.T) {
 	}
 }
 
-func TestMRApproval_budgetRequestsBlocksFallback(t *testing.T) {
-	counts := &approvalCallCounts{}
-	d, _ := newApprovalDepsTLS(t, approvalFixtureHandler(counts, func(w http.ResponseWriter, r *http.Request, path string) bool {
-		if strings.Contains(path, "/approval_state") {
-			w.Header().Set("Allow", "POST")
-			w.WriteHeader(http.StatusMethodNotAllowed)
-			_, _ = io.WriteString(w, `{}`)
-			return true
-		}
-		return false
-	}))
-	b := &igl.Budget{MaxItems: 50, MaxBytes: 1 << 20, MaxRequests: 2, MaxElapsed: time.Minute}
-	ctx := igl.WithBudget(context.Background(), b)
-	defer b.Cancel()
-	_, err := callApproval(t, d, ctx)
-	if err == nil {
-		t.Fatal("want budget error")
-	}
-	if counts.approvals.Load() != 0 {
-		t.Fatalf("fallback fired under exhausted budget: %d", counts.approvals.Load())
+func TestMRApproval_preContentBudgetExhaustion_0_0(t *testing.T) {
+	// Retained separately from post-405 phase tests: these limits stop before primary.
+	for _, kind := range []string{"bytes128", "requests2"} {
+		t.Run(kind, func(t *testing.T) {
+			counts := &approvalCallCounts{}
+			d, _ := newApprovalDepsTLS(t, approvalFixtureHandler(counts, func(w http.ResponseWriter, r *http.Request, path string) bool {
+				if strings.Contains(path, "/approval_state") {
+					w.Header().Set("Allow", "POST, OPTIONS")
+					w.WriteHeader(http.StatusMethodNotAllowed)
+					_, _ = io.WriteString(w, strings.Repeat("x", 4096))
+					return true
+				}
+				return false
+			}))
+			b := &igl.Budget{MaxItems: 100, MaxBytes: 1 << 20, MaxRequests: 16, MaxElapsed: time.Minute}
+			if kind == "bytes128" {
+				b.MaxBytes = 128
+			} else {
+				b.MaxRequests = 2
+			}
+			ctx := igl.WithBudget(context.Background(), b)
+			defer b.Cancel()
+			_, err := callApproval(t, d, ctx)
+			if err == nil || counts.approvalState.Load() != 0 || counts.approvals.Load() != 0 {
+				t.Fatalf("want pre-content P/F=0/0; got P/F=%d/%d err=%v", counts.approvalState.Load(), counts.approvals.Load(), err)
+			}
+		})
 	}
 }
 
@@ -942,26 +957,226 @@ func TestMRApproval_byteBudgetOnPrimaryBody_noFallback(t *testing.T) {
 	}
 }
 
-func TestMRApproval_errorBodyBudgetSwallow_noFallback(t *testing.T) {
+func TestMRApproval_truncated405Body_noFallback(t *testing.T) {
+	// R1: Content-Length lies → UnexpectedEOF on error-body read → P/F=1/0.
+	for _, active := range []bool{false, true} {
+		name := "allowall"
+		if active {
+			name = "active"
+		}
+		t.Run(name, func(t *testing.T) {
+			counts := &approvalCallCounts{}
+			body := &approvalProbeBody{}
+			d := newApprovalProbeDepsTLS(t, counts, func(w http.ResponseWriter, r *http.Request, path string) bool {
+				if strings.HasSuffix(path, "/approval_state") {
+					w.Header().Set("Allow", "POST, OPTIONS")
+					w.Header().Set("Content-Length", "128")
+					w.WriteHeader(http.StatusMethodNotAllowed)
+					_, _ = io.WriteString(w, `{}`)
+					return true
+				}
+				return false
+			}, body, false)
+			if active {
+				d.Config.AllowedProjectIDs = []string{"42"}
+			}
+			out, err := callApproval(t, d, context.Background())
+			if counts.mrGet.Load() != 1 || counts.approvalState.Load() != 1 || !body.unexpected.Load() || !body.closed.Load() {
+				t.Fatalf("fixture phase/closure: MR=%d P=%d unexpectedEOF=%v closed=%v", counts.mrGet.Load(), counts.approvalState.Load(), body.unexpected.Load(), body.closed.Load())
+			}
+			if err == nil || counts.approvals.Load() != 0 {
+				t.Fatalf("truncated 405 must not fallback: P/F=%d/%d err=%v endpoint=%v", counts.approvalState.Load(), counts.approvals.Load(), err, out["endpoint"])
+			}
+			if strings.Contains(err.Error(), "unexpected EOF") || strings.Contains(err.Error(), "partial") {
+				t.Fatalf("must not leak raw read/body detail: %v", err)
+			}
+		})
+	}
+}
+
+func TestMRApproval_empty405Body_stillFallback(t *testing.T) {
+	// Legitimate empty 405 body (clean EOF) remains trusted; distinguishes from failed reads.
 	counts := &approvalCallCounts{}
 	d, _ := newApprovalDepsTLS(t, approvalFixtureHandler(counts, func(w http.ResponseWriter, r *http.Request, path string) bool {
-		if strings.Contains(path, "/approval_state") {
+		if strings.HasSuffix(path, "/approval_state") {
 			w.Header().Set("Allow", "POST, OPTIONS")
 			w.WriteHeader(http.StatusMethodNotAllowed)
-			_, _ = io.WriteString(w, strings.Repeat("x", 4096))
+			return true
+		}
+		if strings.HasSuffix(path, "/approvals") {
+			_, _ = io.WriteString(w, `{"approved":true,"user_has_approved":false,"user_can_approve":true,"approved_by":[],"approvers":[],"approver_groups":[]}`)
 			return true
 		}
 		return false
 	}))
-	b := &igl.Budget{MaxItems: 100, MaxBytes: 128, MaxRequests: 16, MaxElapsed: time.Minute}
-	ctx := igl.WithBudget(context.Background(), b)
-	defer b.Cancel()
-	_, err := callApproval(t, d, ctx)
-	if err == nil {
-		t.Fatal("want error after budgeted 405 body")
+	out, err := callApproval(t, d, context.Background())
+	if err != nil {
+		t.Fatal(err)
 	}
-	if counts.approvals.Load() != 0 {
-		t.Fatalf("fallback must not run after error-body budget: %d", counts.approvals.Load())
+	if counts.approvalState.Load() != 1 || counts.approvals.Load() != 1 {
+		t.Fatalf("want P/F=1/1 got %d/%d", counts.approvalState.Load(), counts.approvals.Load())
+	}
+	if out["endpoint"] != endpointApprovals {
+		t.Fatalf("endpoint=%v", out["endpoint"])
+	}
+}
+
+func TestMRApproval_customReadErrorOn405_noFallback(t *testing.T) {
+	counts := &approvalCallCounts{}
+	base := approvalFixtureHandler(counts, func(w http.ResponseWriter, r *http.Request, path string) bool {
+		if strings.HasSuffix(path, "/approval_state") {
+			w.Header().Set("Allow", "POST, OPTIONS")
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			_, _ = io.WriteString(w, `{}`)
+			return true
+		}
+		return false
+	})
+	ts := httptest.NewTLSServer(base)
+	t.Cleanup(ts.Close)
+	httpClient := ts.Client()
+	baseRT := httpClient.Transport
+	httpClient.Transport = igl.BudgetInterceptor()(approvalRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		resp, err := baseRT.RoundTrip(req)
+		if err != nil || resp == nil || resp.Body == nil {
+			return resp, err
+		}
+		if strings.HasSuffix(req.URL.Path, "/approval_state") {
+			resp.Body = &errOnReadBody{ReadCloser: resp.Body, err: errors.New("injected-read-failure")}
+		}
+		return resp, nil
+	}))
+	cli, err := gitlab.NewClient("t",
+		gitlab.WithBaseURL(ts.URL+"/api/v4"),
+		gitlab.WithoutRetries(),
+		gitlab.WithHTTPClient(httpClient),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := Deps{Config: &config.Config{Token: "t"}, Client: cli}
+	_, err = callApproval(t, d, context.Background())
+	if err == nil {
+		t.Fatal("custom body read error must stop before fallback")
+	}
+	if counts.approvalState.Load() != 1 || counts.approvals.Load() != 0 {
+		t.Fatalf("want P/F=1/0 got %d/%d", counts.approvalState.Load(), counts.approvals.Load())
+	}
+	if strings.Contains(err.Error(), "injected-read-failure") {
+		t.Fatalf("must not leak raw error: %v", err)
+	}
+}
+
+type errOnReadBody struct {
+	io.ReadCloser
+	err error
+}
+
+func (b *errOnReadBody) Read(p []byte) (int, error) {
+	return 0, b.err
+}
+
+type approvalProbeBody struct {
+	io.ReadCloser
+	reads      atomic.Int64
+	closed     atomic.Bool
+	unexpected atomic.Bool
+	onRead     func()
+}
+
+func (b *approvalProbeBody) Read(p []byte) (int, error) {
+	b.reads.Add(1)
+	if b.onRead != nil {
+		b.onRead()
+	}
+	n, err := b.ReadCloser.Read(p)
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		b.unexpected.Store(true)
+	}
+	return n, err
+}
+
+func (b *approvalProbeBody) Close() error {
+	b.closed.Store(true)
+	return b.ReadCloser.Close()
+}
+
+func newApprovalProbeDepsTLS(t *testing.T, counts *approvalCallCounts, route func(http.ResponseWriter, *http.Request, string) bool, body *approvalProbeBody, wrapFallback bool) Deps {
+	t.Helper()
+	base := approvalFixtureHandler(counts, route)
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/approval-hop" {
+			http.Redirect(w, r, "/api/v4/projects/42/merge_requests/1/approval_state", http.StatusFound)
+			return
+		}
+		base.ServeHTTP(w, r)
+	}))
+	t.Cleanup(ts.Close)
+	httpClient := ts.Client()
+	next := httpClient.Transport
+	httpClient.Transport = igl.BudgetInterceptor()(approvalRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		resp, err := next.RoundTrip(req)
+		if err != nil || resp == nil || resp.Body == nil || body == nil {
+			return resp, err
+		}
+		wrapPrimary := !wrapFallback && strings.HasSuffix(req.URL.Path, "/approval_state")
+		wrapFB := wrapFallback && strings.HasSuffix(req.URL.Path, "/approvals") && !strings.HasSuffix(req.URL.Path, "/approval_state")
+		if wrapPrimary || wrapFB {
+			body.ReadCloser = resp.Body
+			resp.Body = body
+		}
+		return resp, nil
+	}))
+	cli, err := gitlab.NewClient("t",
+		gitlab.WithBaseURL(ts.URL+"/api/v4"),
+		gitlab.WithoutRetries(),
+		gitlab.WithHTTPClient(httpClient),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return Deps{Config: &config.Config{Token: "t"}, Client: cli}
+}
+
+func TestMRApproval_post405_budgetPhaseAndClosure(t *testing.T) {
+	// Reviewer fixtures: MaxBytes=1024 / MaxRequests=3 / elapsed after primary → P/F=1/0 + closed.
+	for _, kind := range []string{"bytes", "requests", "elapsed"} {
+		t.Run(kind, func(t *testing.T) {
+			counts := &approvalCallCounts{}
+			body := &approvalProbeBody{}
+			d := newApprovalProbeDepsTLS(t, counts, func(w http.ResponseWriter, r *http.Request, path string) bool {
+				if strings.HasSuffix(path, "/approval_state") {
+					w.Header().Set("Allow", "POST, OPTIONS")
+					w.WriteHeader(http.StatusMethodNotAllowed)
+					if kind == "elapsed" {
+						if f, ok := w.(http.Flusher); ok {
+							f.Flush()
+						}
+						<-r.Context().Done()
+						return true
+					}
+					_, _ = io.WriteString(w, strings.Repeat("x", 4096))
+					return true
+				}
+				return false
+			}, body, false)
+			b := &igl.Budget{MaxItems: 100, MaxBytes: 1 << 20, MaxRequests: 16, MaxElapsed: time.Minute}
+			if kind == "bytes" {
+				b.MaxBytes = 1024
+			}
+			if kind == "requests" {
+				b.MaxRequests = 3
+			}
+			if kind == "elapsed" {
+				b.MaxElapsed = 500 * time.Millisecond
+			}
+			ctx := igl.WithBudget(context.Background(), b)
+			defer b.Cancel()
+			_, err := callApproval(t, d, ctx)
+			if err == nil || counts.approvalState.Load() != 1 || counts.approvals.Load() != 0 || !body.closed.Load() {
+				t.Fatalf("phase/closure: P/F=%d/%d closed=%v reads=%d err=%v", counts.approvalState.Load(), counts.approvals.Load(), body.closed.Load(), body.reads.Load(), err)
+			}
+		})
 	}
 }
 
@@ -1014,33 +1229,73 @@ func TestMRApproval_cancelBetweenEndpoints_noFallback(t *testing.T) {
 }
 
 func TestMRApproval_cancelDuringPrimaryBody_closedReader(t *testing.T) {
+	// R2: cancel on first body Read; completed short body must not publish success.
 	counts := &approvalCallCounts{}
+	body := &approvalProbeBody{}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	d, _ := newApprovalDepsHTTP(t, approvalFixtureHandler(counts, func(w http.ResponseWriter, r *http.Request, path string) bool {
-		if strings.Contains(path, "/approval_state") {
-			w.WriteHeader(http.StatusOK)
-			flusher, _ := w.(http.Flusher)
-			_, _ = io.WriteString(w, `{"rules":[`)
-			if flusher != nil {
-				flusher.Flush()
-			}
-			cancel()
-			time.Sleep(20 * time.Millisecond)
-			_, _ = io.WriteString(w, `{"id":1,"approved":true}]}`)
-			return true
-		}
-		return false
-	}))
+	body.onRead = cancel
+	d := newApprovalProbeDepsTLS(t, counts, nil, body, false)
 	b := igl.DefaultBudget()
 	ctx = igl.WithBudget(ctx, b)
 	defer b.Cancel()
-	_, err := callApproval(t, d, ctx)
-	if err == nil {
-		t.Fatal("want cancel during body")
+	out, err := callApproval(t, d, ctx)
+	if !errors.Is(ctx.Err(), context.Canceled) {
+		t.Fatal("did not cancel inside body read")
 	}
-	if counts.approvals.Load() != 0 {
-		t.Fatal("no fallback")
+	if err == nil || counts.approvalState.Load() != 1 || counts.approvals.Load() != 0 || body.reads.Load() == 0 || !body.closed.Load() {
+		t.Fatalf("reader phase/closure: P/F=%d/%d reads=%d closed=%v err=%v endpoint=%v", counts.approvalState.Load(), counts.approvals.Load(), body.reads.Load(), body.closed.Load(), err, out["endpoint"])
+	}
+}
+
+func TestMRApproval_cancelDuringFallbackBody_closedReader(t *testing.T) {
+	counts := &approvalCallCounts{}
+	body := &approvalProbeBody{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	body.onRead = cancel
+	d := newApprovalProbeDepsTLS(t, counts, func(w http.ResponseWriter, r *http.Request, path string) bool {
+		if strings.HasSuffix(path, "/approval_state") {
+			w.Header().Set("Allow", "POST, OPTIONS")
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			_, _ = io.WriteString(w, `{}`)
+			return true
+		}
+		if strings.HasSuffix(path, "/approvals") {
+			_, _ = io.WriteString(w, `{"approved":true,"user_has_approved":false,"user_can_approve":true,"approved_by":[],"approvers":[],"approver_groups":[]}`)
+			return true
+		}
+		return false
+	}, body, true)
+	b := igl.DefaultBudget()
+	ctx = igl.WithBudget(ctx, b)
+	defer b.Cancel()
+	out, err := callApproval(t, d, ctx)
+	if !errors.Is(ctx.Err(), context.Canceled) {
+		t.Fatal("did not cancel inside fallback body read")
+	}
+	if err == nil || counts.approvalState.Load() != 1 || counts.approvals.Load() != 1 || body.reads.Load() == 0 || !body.closed.Load() {
+		t.Fatalf("fallback reader: P/F=%d/%d reads=%d closed=%v err=%v endpoint=%v", counts.approvalState.Load(), counts.approvals.Load(), body.reads.Load(), body.closed.Load(), err, out["endpoint"])
+	}
+}
+
+func TestMRApproval_maxRequestsEqualsCompletedRead_stillOK(t *testing.T) {
+	// Next-dispatch gating ≠ completed-read validation: finishing exactly at MaxRequests is OK.
+	counts := &approvalCallCounts{}
+	d, _ := newApprovalDepsHTTP(t, approvalFixtureHandler(counts, nil))
+	b := &igl.Budget{MaxItems: 100, MaxBytes: 1 << 20, MaxRequests: 3, MaxElapsed: time.Minute}
+	ctx := igl.WithBudget(context.Background(), b)
+	defer b.Cancel()
+	out, err := callApproval(t, d, ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out["endpoint"] != endpointApprovalState {
+		t.Fatalf("endpoint=%v", out["endpoint"])
+	}
+	rq, _, _ := b.Stats()
+	if rq != 3 {
+		t.Fatalf("requests=%d want 3", rq)
 	}
 }
 

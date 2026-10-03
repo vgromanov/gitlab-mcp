@@ -48,10 +48,15 @@ Ordinary infrastructure for the verified authority may advertise method
 refusal. No product-unsupported inference.
 
 **Never** fall back on: generic 404 (even when the MR is visible), 401, 403,
-429, any 5xx, malformed primary success, transport failure, or budget /
-cancellation exhaustion. A qualifying 405 followed by fallback failure or a
+429, any 5xx, malformed primary success, transport failure (including
+non-EOF error-body read failures such as truncated or interrupted 405
+bodies), or budget / cancellation exhaustion. Cancellation or elapsed
+exhaustion discovered after a completed SDK body read still rejects
+publishing that success. A qualifying 405 followed by fallback failure or a
 malformed fallback object yields a safe failure / unknown — never a third
-endpoint, retry, or recurse.
+endpoint, retry, or recurse. Completed reads that land exactly at the
+request-budget ceiling remain valid; that ceiling only gates the next
+dispatch.
 
 ## Normalized output shape
 
