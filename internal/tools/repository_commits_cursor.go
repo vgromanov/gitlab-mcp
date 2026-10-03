@@ -125,13 +125,24 @@ func resumeListCommitsCursor(ctx context.Context, in listCommitsIn, d Deps, budg
 	if err != nil {
 		return nil, nil, err
 	}
-	// Same-policy revocation (fingerprint unchanged) fails closed via authz_denied here.
-	pid, err := resolveCursorProjectCanonical(ctx, d, in.ProjectID)
+	// Actor binding before project policy so a different actor is not masked by authz_denied.
+	if actorID != payload.ActorID {
+		return nil, nil, fmt.Errorf("%s: binding mismatch", codeResyncRequired)
+	}
+
+	// Narrow identity only (no policy): compare complete list_commits reference scope
+	// (ScopeProject + numeric ProjectID, no MR/group/pipeline fields) before policy.
+	canon, err := resolveCursorProjectIdentity(ctx, d, in.ProjectID)
 	if err != nil {
 		return nil, nil, err
 	}
+	pid := strconv.FormatInt(canon.ID, 10)
+	expectedScope := cursor.Scope{Kind: cursor.ScopeProject, ProjectID: pid}
+	if !listCommitsScopeEqual(payload.Scope, expectedScope) {
+		return nil, nil, fmt.Errorf("%s: project scope mismatch", codeResyncRequired)
+	}
 
-	// Independently normalize request selection; strict repeat of bound originals.
+	// Independently normalize request selection before policy when identity matches.
 	// Resume mode projects normalize failures as static resync_required (no raw echo).
 	reqFilters, err := normalizeCommitSelection(in)
 	if err != nil {
@@ -147,12 +158,13 @@ func resumeListCommitsCursor(ctx context.Context, in listCommitsIn, d Deps, budg
 	expected.CallerUntil = reqFilters.CallerUntil
 	expected.PerPage = reqFilters.PerPage
 
-	scope := cursor.Scope{Kind: cursor.ScopeProject, ProjectID: pid}
-	if err := cursor.MatchBinding(payload, instance, actorID, policyFP, cursor.ToolListCommits, cursor.SectionListCommits, scope, expected, payload.ImmutableRefs, payload.UpperBound); err != nil {
-		return nil, nil, fmt.Errorf("%s: binding mismatch", codeResyncRequired)
+	// Same-policy revocation of the signed project fails closed via authz_denied here.
+	if err := reauthorizeCursorProject(ctx, d, canon); err != nil {
+		return nil, nil, err
 	}
-	if payload.Scope.Kind != cursor.ScopeProject || payload.Scope.ProjectID != pid {
-		return nil, nil, fmt.Errorf("%s: project scope mismatch", codeResyncRequired)
+
+	if err := cursor.MatchBinding(payload, instance, actorID, policyFP, cursor.ToolListCommits, cursor.SectionListCommits, expectedScope, expected, payload.ImmutableRefs, payload.UpperBound); err != nil {
+		return nil, nil, fmt.Errorf("%s: binding mismatch", codeResyncRequired)
 	}
 
 	tipSHA := cursor.TipRef(payload.ImmutableRefs)
@@ -577,10 +589,72 @@ func resolveCursorActor(ctx context.Context, d Deps) (int64, error) {
 	return u.ID, nil
 }
 
-// resolveCursorProjectCanonical always resolves a numeric project identity via
-// AuthorizeCanonicalProject (works with empty allowlists). Lookup RoundTrips are
-// budgeted through ctx. Errors stay allowlisted codes — never echo Config/secrets
-// or raw upstream bodies. Does not alter legacy resolveProjectAuthz behavior.
+// listCommitsScopeEqual mirrors cursor.MatchBinding's scope field comparison for the
+// list_commits reference shape (ScopeProject + ProjectID; GroupID/MR/pipeline unset).
+// Kept local so a non-project or polluted signed scope cannot be masked by later policy.
+func listCommitsScopeEqual(got, want cursor.Scope) bool {
+	if got.Kind != want.Kind || got.ProjectID != want.ProjectID || got.GroupID != want.GroupID {
+		return false
+	}
+	if (got.MergeRequestIID == nil) != (want.MergeRequestIID == nil) {
+		return false
+	}
+	if got.MergeRequestIID != nil && *got.MergeRequestIID != *want.MergeRequestIID {
+		return false
+	}
+	if (got.PipelineID == nil) != (want.PipelineID == nil) {
+		return false
+	}
+	if got.PipelineID != nil && *got.PipelineID != *want.PipelineID {
+		return false
+	}
+	return true
+}
+
+// resolveCursorProjectIdentity resolves a numeric canonical project via narrow
+// identity lookup only (no policy). Used on resume so signed-scope mismatch can
+// surface as resync_required before allowlist denial. Budgeted through ctx;
+// never returns raw API objects or echoes upstream bodies.
+func resolveCursorProjectIdentity(ctx context.Context, d Deps, projectID string) (CanonicalProject, error) {
+	def := ""
+	if d.Config != nil {
+		def = d.Config.DefaultProjectID
+	}
+	pid, err := ResolveProjectID(projectID, def)
+	if err != nil {
+		return CanonicalProject{}, fmt.Errorf("%s: project identity", readmeta.CodeIdentityUnresolved)
+	}
+	p, err := getProjectSafe(ctx, d, pid)
+	if err != nil {
+		return CanonicalProject{}, fmt.Errorf("%s: project identity", readmeta.CodeIdentityUnresolved)
+	}
+	c := projectFromAPI(p)
+	if c.ID < 1 {
+		return CanonicalProject{}, fmt.Errorf("%s: project identity", readmeta.CodeIdentityUnresolved)
+	}
+	return c, nil
+}
+
+// reauthorizeCursorProject applies current policy to an already-matched canonical
+// project (same signed scope). Unchanged-fingerprint live revocation stays authz_denied.
+func reauthorizeCursorProject(ctx context.Context, d Deps, canon CanonicalProject) error {
+	if err := projectSatisfiesPolicy(ctx, d, canon); err != nil {
+		msg := err.Error()
+		switch {
+		case strings.HasPrefix(msg, readmeta.CodeAuthzDenied):
+			return fmt.Errorf("%s: project not authorized", readmeta.CodeAuthzDenied)
+		case strings.HasPrefix(msg, readmeta.CodeIdentityUnresolved):
+			return fmt.Errorf("%s: project identity", readmeta.CodeIdentityUnresolved)
+		default:
+			return fmt.Errorf("%s: project not authorized", readmeta.CodeAuthzDenied)
+		}
+	}
+	return nil
+}
+
+// resolveCursorProjectCanonical resolves identity and authorizes in one step for
+// initial cursor requests (works with empty allowlists). Does not alter legacy
+// resolveProjectAuthz behavior.
 func resolveCursorProjectCanonical(ctx context.Context, d Deps, projectID string) (string, error) {
 	c, err := AuthorizeCanonicalProject(ctx, d, projectID)
 	if err != nil {

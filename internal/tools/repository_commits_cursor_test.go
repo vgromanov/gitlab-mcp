@@ -151,10 +151,12 @@ func listCommitsHandler(probe *commitProbe, mutate func(page string, body *strin
 			}
 			_, _ = io.WriteString(w, body)
 		case strings.Contains(path, "/projects/"):
-			// Path alias → 42; numeric tokens echo themselves (policy allowlist resolution).
+			// Path alias group/proj → 42; other/proj and numeric 99 → 99.
 			id := int64(42)
 			ns := "group/proj"
-			if strings.Contains(path, "/projects/99") {
+			if strings.Contains(path, "/projects/99") ||
+				strings.Contains(path, "other%2Fproj") ||
+				strings.Contains(path, "/projects/other/proj") {
 				id = 99
 				ns = "other/proj"
 			}
@@ -1610,6 +1612,407 @@ func TestListCommits_whitespaceCursorMalformedNoBackend(t *testing.T) {
 		}
 		if probe.listHits.Load() != 0 {
 			t.Fatal("zero backend")
+		}
+	})
+}
+
+func TestListCommitsScopeEqual(t *testing.T) {
+	mr := int64(1)
+	pipe := int64(9)
+	want := cursor.Scope{Kind: cursor.ScopeProject, ProjectID: "42"}
+	cases := []struct {
+		name string
+		got  cursor.Scope
+		eq   bool
+	}{
+		{"exact", cursor.Scope{Kind: cursor.ScopeProject, ProjectID: "42"}, true},
+		{"project_mismatch", cursor.Scope{Kind: cursor.ScopeProject, ProjectID: "99"}, false},
+		{"kind_group", cursor.Scope{Kind: cursor.ScopeGroupQueue, GroupID: "10"}, false},
+		{"polluted_group_id", cursor.Scope{Kind: cursor.ScopeProject, ProjectID: "42", GroupID: "10"}, false},
+		{"polluted_mr", cursor.Scope{Kind: cursor.ScopeProject, ProjectID: "42", MergeRequestIID: &mr}, false},
+		{"polluted_pipeline", cursor.Scope{Kind: cursor.ScopeProject, ProjectID: "42", PipelineID: &pipe}, false},
+	}
+	for _, tc := range cases {
+		if got := listCommitsScopeEqual(tc.got, want); got != tc.eq {
+			t.Fatalf("%s: got %v want %v", tc.name, got, tc.eq)
+		}
+	}
+}
+
+// F5: project/scope binding mismatch must resync before policy denial; same-scope
+// same-fingerprint revocation remains authz_denied. All cases use one server instance.
+func TestListCommits_projectMismatchRecoveryOrderingMCP(t *testing.T) {
+	clk := &cursor.FakeClock{T: time.Date(2026, 10, 3, 12, 0, 0, 0, time.UTC)}
+
+	t.Run("mismatch_project99_denied_project_allowlist_resync", func(t *testing.T) {
+		probe := &commitProbe{}
+		d := newCursorDeps(t, listCommitsHandler(probe, nil), &config.Config{
+			CursorKey:         []byte(testCursorKey),
+			AllowedProjectIDs: []string{"42"},
+		}, clk)
+		out, err := callListCommitsMCPRaw(t, d, map[string]any{"project_id": "42", "use_cursor": true, "per_page": 2})
+		if err != nil {
+			t.Fatal(err)
+		}
+		tok := out["section"].(map[string]any)["next_cursor"].(string)
+		list0, get0 := probe.listHits.Load(), probe.getCommit.Load()
+		proj0 := probe.projectHits.Load()
+		_, err = callListCommitsMCPRaw(t, d, map[string]any{"project_id": "99", "cursor": tok, "per_page": 2})
+		if err == nil || !strings.Contains(err.Error(), cursor.ResyncRequired) {
+			t.Fatalf("want resync_required for project scope mismatch, got %v", err)
+		}
+		if strings.Contains(err.Error(), readmeta.CodeAuthzDenied) {
+			t.Fatalf("scope mismatch must not surface as authz_denied: %v", err)
+		}
+		if probe.listHits.Load() != list0 || probe.getCommit.Load() != get0 {
+			t.Fatal("mismatch must not continue list/ref")
+		}
+		// Narrow identity lookup of 99 only; no allowlist re-resolution for policy.
+		delta := probe.projectHits.Load() - proj0
+		if delta < 1 || delta > 2 {
+			t.Fatalf("bounded identity lookup expected, projectHits delta=%d", delta)
+		}
+	})
+
+	t.Run("mismatch_alias_resolving_99_resync", func(t *testing.T) {
+		probe := &commitProbe{}
+		d := newCursorDeps(t, listCommitsHandler(probe, nil), &config.Config{
+			CursorKey:         []byte(testCursorKey),
+			AllowedProjectIDs: []string{"42"},
+		}, clk)
+		out, err := callListCommitsMCPRaw(t, d, map[string]any{"project_id": "42", "use_cursor": true, "per_page": 2})
+		if err != nil {
+			t.Fatal(err)
+		}
+		tok := out["section"].(map[string]any)["next_cursor"].(string)
+		list0, get0 := probe.listHits.Load(), probe.getCommit.Load()
+		_, err = callListCommitsMCPRaw(t, d, map[string]any{"project_id": "other/proj", "cursor": tok, "per_page": 2})
+		if err == nil || !strings.Contains(err.Error(), cursor.ResyncRequired) {
+			t.Fatalf("want resync_required for alias→99 scope mismatch, got %v", err)
+		}
+		if strings.Contains(err.Error(), readmeta.CodeAuthzDenied) {
+			t.Fatalf("alias mismatch must not surface as authz_denied: %v", err)
+		}
+		if probe.listHits.Load() != list0 || probe.getCommit.Load() != get0 {
+			t.Fatal("alias mismatch must not continue list/ref")
+		}
+	})
+
+	t.Run("mismatch_project99_denied_group_policy_resync", func(t *testing.T) {
+		probe := &commitProbe{}
+		h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			probe.note(r)
+			w.Header().Set("Content-Type", "application/json")
+			path := r.URL.Path
+			switch {
+			case strings.HasSuffix(path, "/user"):
+				_, _ = io.WriteString(w, `{"id":7,"username":"alice"}`)
+			case strings.Contains(path, "/groups/10") || strings.HasSuffix(path, "/groups/acme"):
+				_, _ = io.WriteString(w, `{"id":10,"full_path":"acme","parent_id":0}`)
+			case strings.Contains(path, "/repository/commits/") && !strings.HasSuffix(path, "/commits"):
+				_, _ = io.WriteString(w, commitJSON(tipSHA))
+			case strings.HasSuffix(path, "/repository/commits"):
+				w.Header().Set("X-Next-Page", "2")
+				_, _ = io.WriteString(w, pageCommits(sha1, sha2))
+			case strings.Contains(path, "/projects/"):
+				id, nsID, nsPath := int64(42), int64(10), "acme"
+				if strings.Contains(path, "/projects/99") ||
+					strings.Contains(path, "other%2Fproj") ||
+					strings.Contains(path, "/projects/other/proj") {
+					id, nsID, nsPath = 99, 99, "other"
+				}
+				_, _ = io.WriteString(w, fmt.Sprintf(
+					`{"id":%d,"path_with_namespace":%q,"namespace":{"id":%d,"kind":"group","full_path":%q,"parent_id":0}}`,
+					id, nsPath+"/p", nsID, nsPath))
+			default:
+				_, _ = io.WriteString(w, `{}`)
+			}
+		})
+		d := newCursorDeps(t, h, &config.Config{
+			CursorKey:       []byte(testCursorKey),
+			AllowedGroupIDs: []string{"10"},
+		}, clk)
+		out, err := callListCommitsMCPRaw(t, d, map[string]any{"project_id": "42", "use_cursor": true, "per_page": 2})
+		if err != nil {
+			t.Fatal(err)
+		}
+		tok := out["section"].(map[string]any)["next_cursor"].(string)
+		list0, get0 := probe.listHits.Load(), probe.getCommit.Load()
+		_, err = callListCommitsMCPRaw(t, d, map[string]any{"project_id": "99", "cursor": tok, "per_page": 2})
+		if err == nil || !strings.Contains(err.Error(), cursor.ResyncRequired) {
+			t.Fatalf("want resync_required under denied group policy, got %v", err)
+		}
+		if strings.Contains(err.Error(), readmeta.CodeAuthzDenied) {
+			t.Fatalf("group-policy-denied mismatch must not surface as authz_denied: %v", err)
+		}
+		if probe.listHits.Load() != list0 || probe.getCommit.Load() != get0 {
+			t.Fatal("group-policy mismatch must not continue list/ref")
+		}
+	})
+
+	t.Run("same_scope_path_allowlist_remap_authz_denied", func(t *testing.T) {
+		// Fingerprint stays on raw token "group/proj"; live resolve remaps away from 42.
+		probe := &commitProbe{}
+		var remapped atomic.Bool
+		h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			probe.note(r)
+			w.Header().Set("Content-Type", "application/json")
+			path := r.URL.Path
+			switch {
+			case strings.HasSuffix(path, "/user"):
+				_, _ = io.WriteString(w, `{"id":7,"username":"alice"}`)
+			case strings.Contains(path, "/repository/commits/") && !strings.HasSuffix(path, "/commits"):
+				_, _ = io.WriteString(w, commitJSON(tipSHA))
+			case strings.HasSuffix(path, "/repository/commits"):
+				w.Header().Set("X-Next-Page", "2")
+				_, _ = io.WriteString(w, pageCommits(sha1, sha2))
+			case strings.Contains(path, "/projects/"):
+				id := int64(42)
+				ns := "group/proj"
+				isPathAlias := strings.Contains(path, "group%2Fproj") || strings.Contains(path, "/projects/group/proj")
+				if remapped.Load() && isPathAlias {
+					id, ns = 99, "other/proj"
+				} else if strings.Contains(path, "/projects/99") {
+					id, ns = 99, "other/proj"
+				}
+				_, _ = io.WriteString(w, fmt.Sprintf(
+					`{"id":%d,"path_with_namespace":%q,"namespace":{"id":9,"kind":"group","full_path":"group","parent_id":0}}`,
+					id, ns))
+			default:
+				_, _ = io.WriteString(w, `{}`)
+			}
+		})
+		d := newCursorDeps(t, h, &config.Config{
+			CursorKey:         []byte(testCursorKey),
+			AllowedProjectIDs: []string{"group/proj"},
+		}, clk)
+		fpBefore := d.Config.PolicyFingerprint()
+		out, err := callListCommitsMCPRaw(t, d, map[string]any{"project_id": "42", "use_cursor": true, "per_page": 2})
+		if err != nil {
+			t.Fatal(err)
+		}
+		tok := out["section"].(map[string]any)["next_cursor"].(string)
+		list0, get0 := probe.listHits.Load(), probe.getCommit.Load()
+		remapped.Store(true)
+		if d.Config.PolicyFingerprint() != fpBefore {
+			t.Fatal("test bug: fingerprint must stay unchanged")
+		}
+		_, err = callListCommitsMCPRaw(t, d, map[string]any{"project_id": "42", "cursor": tok, "per_page": 2})
+		if err == nil || !strings.Contains(err.Error(), readmeta.CodeAuthzDenied) {
+			t.Fatalf("want authz_denied for same-scope path allowlist remap, got %v", err)
+		}
+		if strings.Contains(err.Error(), cursor.ResyncRequired) {
+			t.Fatalf("same-scope revocation must not surface as resync: %v", err)
+		}
+		if probe.listHits.Load() != list0 || probe.getCommit.Load() != get0 {
+			t.Fatal("same-scope project revocation must not continue list/ref")
+		}
+	})
+
+	t.Run("same_scope_group_ancestry_revocation_authz_denied", func(t *testing.T) {
+		probe := &commitProbe{}
+		var moved atomic.Bool
+		h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			probe.note(r)
+			w.Header().Set("Content-Type", "application/json")
+			path := r.URL.Path
+			switch {
+			case strings.HasSuffix(path, "/user"):
+				_, _ = io.WriteString(w, `{"id":7,"username":"alice"}`)
+			case strings.Contains(path, "/groups/10") || strings.HasSuffix(path, "/groups/acme"):
+				_, _ = io.WriteString(w, `{"id":10,"full_path":"acme","parent_id":0}`)
+			case strings.Contains(path, "/groups/99"):
+				_, _ = io.WriteString(w, `{"id":99,"full_path":"other","parent_id":0}`)
+			case strings.Contains(path, "/repository/commits/") && !strings.HasSuffix(path, "/commits"):
+				_, _ = io.WriteString(w, commitJSON(tipSHA))
+			case strings.HasSuffix(path, "/repository/commits"):
+				w.Header().Set("X-Next-Page", "2")
+				_, _ = io.WriteString(w, pageCommits(sha1, sha2))
+			case strings.Contains(path, "/projects/"):
+				nsID, nsPath := int64(10), "acme"
+				if moved.Load() {
+					nsID, nsPath = 99, "other"
+				}
+				_, _ = io.WriteString(w, fmt.Sprintf(
+					`{"id":42,"path_with_namespace":%q,"namespace":{"id":%d,"kind":"group","full_path":%q,"parent_id":0}}`,
+					nsPath+"/p", nsID, nsPath))
+			default:
+				_, _ = io.WriteString(w, `{}`)
+			}
+		})
+		d := newCursorDeps(t, h, &config.Config{
+			CursorKey:       []byte(testCursorKey),
+			AllowedGroupIDs: []string{"10"},
+		}, clk)
+		fpBefore := d.Config.PolicyFingerprint()
+		out, err := callListCommitsMCPRaw(t, d, map[string]any{"project_id": "42", "use_cursor": true, "per_page": 2})
+		if err != nil {
+			t.Fatal(err)
+		}
+		tok := out["section"].(map[string]any)["next_cursor"].(string)
+		list0, get0 := probe.listHits.Load(), probe.getCommit.Load()
+		moved.Store(true)
+		if d.Config.PolicyFingerprint() != fpBefore {
+			t.Fatal("test bug: fingerprint must stay unchanged")
+		}
+		_, err = callListCommitsMCPRaw(t, d, map[string]any{"project_id": "42", "cursor": tok, "per_page": 2})
+		if err == nil || !strings.Contains(err.Error(), readmeta.CodeAuthzDenied) {
+			t.Fatalf("want authz_denied for same-scope group ancestry revocation, got %v", err)
+		}
+		if probe.listHits.Load() != list0 || probe.getCommit.Load() != get0 {
+			t.Fatal("group ancestry revocation must not continue list/ref")
+		}
+	})
+
+	t.Run("alias_equivalence_42_allowlist_success", func(t *testing.T) {
+		probe := &commitProbe{}
+		d := newCursorDeps(t, listCommitsHandler(probe, nil), &config.Config{
+			CursorKey:         []byte(testCursorKey),
+			AllowedProjectIDs: []string{"42"},
+		}, clk)
+		out, err := callListCommitsMCPRaw(t, d, map[string]any{"project_id": "group/proj", "use_cursor": true, "per_page": 2})
+		if err != nil {
+			t.Fatal(err)
+		}
+		tok := out["section"].(map[string]any)["next_cursor"].(string)
+		p, err := cursor.Decode([]byte(testCursorKey), tok, clk.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p.Scope.ProjectID != "42" {
+			t.Fatalf("cursor must bind canonical 42, got %q", p.Scope.ProjectID)
+		}
+		list0 := probe.listHits.Load()
+		out2, err := callListCommitsMCPRaw(t, d, map[string]any{"project_id": "group/proj", "cursor": tok, "per_page": 2})
+		if err != nil {
+			t.Fatalf("alias→42 resume must succeed: %v", err)
+		}
+		if out2["section"].(map[string]any)["next_cursor"] == nil && out2["section"].(map[string]any)["pagination_exhausted"] != true {
+			t.Fatalf("expected page-2 progress: %#v", out2["section"])
+		}
+		if probe.listHits.Load() <= list0 {
+			t.Fatal("alias resume must list (guard+next)")
+		}
+	})
+
+	t.Run("actor_mismatch_on_revoked_scope_resync_before_policy", func(t *testing.T) {
+		probe := &commitProbe{}
+		var moved atomic.Bool
+		var actorID atomic.Int64
+		actorID.Store(7)
+		h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			probe.note(r)
+			w.Header().Set("Content-Type", "application/json")
+			path := r.URL.Path
+			switch {
+			case strings.HasSuffix(path, "/user"):
+				_, _ = io.WriteString(w, fmt.Sprintf(`{"id":%d,"username":"alice"}`, actorID.Load()))
+			case strings.Contains(path, "/groups/10") || strings.HasSuffix(path, "/groups/acme"):
+				_, _ = io.WriteString(w, `{"id":10,"full_path":"acme","parent_id":0}`)
+			case strings.Contains(path, "/groups/99"):
+				_, _ = io.WriteString(w, `{"id":99,"full_path":"other","parent_id":0}`)
+			case strings.Contains(path, "/repository/commits/") && !strings.HasSuffix(path, "/commits"):
+				_, _ = io.WriteString(w, commitJSON(tipSHA))
+			case strings.HasSuffix(path, "/repository/commits"):
+				w.Header().Set("X-Next-Page", "2")
+				_, _ = io.WriteString(w, pageCommits(sha1, sha2))
+			case strings.Contains(path, "/projects/"):
+				nsID, nsPath := int64(10), "acme"
+				if moved.Load() {
+					nsID, nsPath = 99, "other"
+				}
+				_, _ = io.WriteString(w, fmt.Sprintf(
+					`{"id":42,"path_with_namespace":%q,"namespace":{"id":%d,"kind":"group","full_path":%q,"parent_id":0}}`,
+					nsPath+"/p", nsID, nsPath))
+			default:
+				_, _ = io.WriteString(w, `{}`)
+			}
+		})
+		d := newCursorDeps(t, h, &config.Config{
+			CursorKey:       []byte(testCursorKey),
+			AllowedGroupIDs: []string{"10"},
+		}, clk)
+		out, err := callListCommitsMCPRaw(t, d, map[string]any{"project_id": "42", "use_cursor": true, "per_page": 2})
+		if err != nil {
+			t.Fatal(err)
+		}
+		tok := out["section"].(map[string]any)["next_cursor"].(string)
+		list0, get0 := probe.listHits.Load(), probe.getCommit.Load()
+		proj0 := probe.projectHits.Load()
+		moved.Store(true)
+		actorID.Store(8) // different actor on same instance; must win over revoked-scope denial
+		user0 := probe.userHits.Load()
+		_, err = callListCommitsMCPRaw(t, d, map[string]any{"project_id": "42", "cursor": tok, "per_page": 2})
+		if err == nil || !strings.Contains(err.Error(), cursor.ResyncRequired) {
+			t.Fatalf("want resync_required for actor mismatch on revoked scope, got %v", err)
+		}
+		if strings.Contains(err.Error(), readmeta.CodeAuthzDenied) {
+			t.Fatalf("actor mismatch must not be masked by authz_denied: %v", err)
+		}
+		if probe.userHits.Load() <= user0 {
+			t.Fatal("actor check must reach /user on same instance")
+		}
+		if probe.listHits.Load() != list0 || probe.getCommit.Load() != get0 {
+			t.Fatal("actor mismatch must not continue list/ref")
+		}
+		if probe.projectHits.Load() != proj0 {
+			t.Fatal("actor mismatch must precede project identity/policy")
+		}
+	})
+
+	t.Run("filter_mismatch_on_revoked_scope_resync_before_policy", func(t *testing.T) {
+		probe := &commitProbe{}
+		var moved atomic.Bool
+		h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			probe.note(r)
+			w.Header().Set("Content-Type", "application/json")
+			path := r.URL.Path
+			switch {
+			case strings.HasSuffix(path, "/user"):
+				_, _ = io.WriteString(w, `{"id":7,"username":"alice"}`)
+			case strings.Contains(path, "/groups/10") || strings.HasSuffix(path, "/groups/acme"):
+				_, _ = io.WriteString(w, `{"id":10,"full_path":"acme","parent_id":0}`)
+			case strings.Contains(path, "/groups/99"):
+				_, _ = io.WriteString(w, `{"id":99,"full_path":"other","parent_id":0}`)
+			case strings.Contains(path, "/repository/commits/") && !strings.HasSuffix(path, "/commits"):
+				_, _ = io.WriteString(w, commitJSON(tipSHA))
+			case strings.HasSuffix(path, "/repository/commits"):
+				w.Header().Set("X-Next-Page", "2")
+				_, _ = io.WriteString(w, pageCommits(sha1, sha2))
+			case strings.Contains(path, "/projects/"):
+				nsID, nsPath := int64(10), "acme"
+				if moved.Load() {
+					nsID, nsPath = 99, "other"
+				}
+				_, _ = io.WriteString(w, fmt.Sprintf(
+					`{"id":42,"path_with_namespace":%q,"namespace":{"id":%d,"kind":"group","full_path":%q,"parent_id":0}}`,
+					nsPath+"/p", nsID, nsPath))
+			default:
+				_, _ = io.WriteString(w, `{}`)
+			}
+		})
+		d := newCursorDeps(t, h, &config.Config{
+			CursorKey:       []byte(testCursorKey),
+			AllowedGroupIDs: []string{"10"},
+		}, clk)
+		out, err := callListCommitsMCPRaw(t, d, map[string]any{"project_id": "42", "use_cursor": true, "per_page": 2})
+		if err != nil {
+			t.Fatal(err)
+		}
+		tok := out["section"].(map[string]any)["next_cursor"].(string)
+		list0, get0 := probe.listHits.Load(), probe.getCommit.Load()
+		moved.Store(true)
+		_, err = callListCommitsMCPRaw(t, d, map[string]any{
+			"project_id": "42", "cursor": tok, "per_page": 2, "path": "changed/filter",
+		})
+		if err == nil || !strings.Contains(err.Error(), cursor.ResyncRequired) {
+			t.Fatalf("want resync_required for filter mismatch on revoked scope, got %v", err)
+		}
+		if strings.Contains(err.Error(), readmeta.CodeAuthzDenied) {
+			t.Fatalf("filter mismatch must not be masked by authz_denied: %v", err)
+		}
+		if probe.listHits.Load() != list0 || probe.getCommit.Load() != get0 {
+			t.Fatal("filter mismatch must not continue list/ref")
 		}
 	})
 }
