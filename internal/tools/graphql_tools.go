@@ -11,7 +11,12 @@ import (
 )
 
 // RegisterGraphQLTools registers GraphQL-based work item and utility tools.
+// Every GraphQL call is HTTP POST (including query-looking text), so when a
+// Guarded client is present the entire registration closes over it.
 func RegisterGraphQLTools(s *mcp.Server, d Deps) {
+	if d.Guarded != nil {
+		d.Client = d.Guarded
+	}
 	AddTool(s, d, false, "", &mcp.Tool{Name: "execute_graphql", Description: "Run an arbitrary GitLab GraphQL query or mutation"}, executeGraphQL)
 	AddTool(s, d, false, "work_items", &mcp.Tool{Name: "get_work_item", Description: "Get a work item by global id"}, getWorkItem)
 	AddTool(s, d, false, "work_items", &mcp.Tool{Name: "list_work_items", Description: "List work items for a project"}, listWorkItems)

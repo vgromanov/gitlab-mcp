@@ -43,8 +43,13 @@ func runWithConfig(parent context.Context, cfg *config.Config) int {
 		slog.Error("gitlab client", "err", err)
 		return 1
 	}
+	guarded, err := glclient.NewGuardedClient(cfg)
+	if err != nil {
+		slog.Error("gitlab guarded client", "err", err)
+		return 1
+	}
 
-	srv := mcpsrv.NewServer(cfg, client, log)
+	srv := mcpsrv.NewServer(cfg, client, log, mcpsrv.WithGuardedClient(guarded))
 	ctx, stop := signal.NotifyContext(parent, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 

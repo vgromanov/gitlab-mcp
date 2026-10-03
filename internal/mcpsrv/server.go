@@ -13,16 +13,38 @@ import (
 	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/version"
 )
 
+// ServerOption configures optional NewServer behavior without breaking the
+// existing (cfg, client, logger) call signature.
+type ServerOption func(*serverOptions)
+
+type serverOptions struct {
+	guarded *gitlab.Client
+}
+
+// WithGuardedClient supplies the WithoutRetries publication/mutation/GraphQL client.
+func WithGuardedClient(c *gitlab.Client) ServerOption {
+	return func(o *serverOptions) {
+		o.guarded = c
+	}
+}
+
 // NewServer builds the MCP server with all GitLab tools registered.
-func NewServer(cfg *config.Config, client *gitlab.Client, logger *slog.Logger) *mcp.Server {
+// Optional WithGuardedClient wires Deps.Guarded for mutating and GraphQL tools.
+func NewServer(cfg *config.Config, client *gitlab.Client, logger *slog.Logger, opts ...ServerOption) *mcp.Server {
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	}
+	var so serverOptions
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&so)
+		}
 	}
 	s := mcp.NewServer(&mcp.Implementation{Name: version.Name, Version: version.Version}, &mcp.ServerOptions{
 		Logger:       logger,
 		Instructions: "GitLab MCP: PAT-authenticated tools for projects, MRs, issues, CI, wiki, releases, and GraphQL.",
 	})
-	tools.RegisterAll(s, tools.Deps{Config: cfg, Client: client})
+	tools.RegisterAll(s, tools.Deps{Config: cfg, Client: client, Guarded: so.guarded})
 	tools.WarnUnknownSelectionTools(cfg, logger)
 	return s
 }
