@@ -125,13 +125,17 @@ func trustedEscapedPath(u *url.URL) string {
 	return normalizeURLPath(p)
 }
 
-// bindSoleVerifiedRefQuery requires query to be exactly one key "ref" with the
-// verified SHA (encoding-equivalent forms allowed; no extra keys/values).
+// bindSoleVerifiedRefQuery requires RawQuery to parse cleanly as exactly one
+// key "ref" with the verified SHA. url.URL.Query() silently drops malformed
+// semicolon-bearing pairs, so we use url.ParseQuery and fail closed on error.
 func bindSoleVerifiedRefQuery(ref string, u *url.URL) error {
 	if u == nil {
 		return fmt.Errorf("missing url")
 	}
-	q := u.Query()
+	q, err := url.ParseQuery(u.RawQuery)
+	if err != nil {
+		return fmt.Errorf("malformed query")
+	}
 	if len(q) != 1 {
 		return fmt.Errorf("forged or missing query")
 	}

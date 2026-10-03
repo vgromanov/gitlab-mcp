@@ -443,18 +443,26 @@ func TestBatchGetFileContents_upstreamBudgetPreserved(t *testing.T) {
 }
 
 func TestBatchGetFileContents_redirectCannotChangeImmutableRef(t *testing.T) {
+	testBatchRedirectRejectsQuery(t, "ref=main")
+}
+
+func TestBatchGetFileContents_redirectRejectsMalformedExtraQuery(t *testing.T) {
+	const sha = "1234567890abcdef1234567890abcdef12345678"
+	testBatchRedirectRejectsQuery(t, "ref="+sha+"&unexpected=value;bad")
+}
+
+func testBatchRedirectRejectsQuery(t *testing.T, redirectQuery string) {
+	t.Helper()
 	const sha = "1234567890abcdef1234567890abcdef12345678"
 	var pinned, floating atomic.Int64
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/raw"):
-			if r.URL.Query().Get("ref") == sha {
+			if r.URL.RawQuery == "ref="+sha {
 				pinned.Add(1)
 				u := *r.URL
-				q := u.Query()
-				q.Set("ref", "main")
-				u.RawQuery = q.Encode()
+				u.RawQuery = redirectQuery
 				http.Redirect(w, r, u.String(), http.StatusFound)
 				return
 			}

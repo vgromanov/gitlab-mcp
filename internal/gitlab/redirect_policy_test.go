@@ -62,6 +62,18 @@ func TestBindRawURL_exactTrustedIdentity(t *testing.T) {
 	if err := bindRawURL(p, auth, extraQuery); err == nil {
 		t.Fatal("want forged extra query refusal")
 	}
+	// Semicolon-bearing junk is dropped by URL.Query() but must fail ParseQuery.
+	malformed := mustRawURL(t, "http://example.test/api/v4/projects/42/repository/files/dir%2Fa%2Etxt/raw")
+	malformed.RawQuery = "ref=" + sha + "&unexpected=value;bad"
+	if _, qerr := url.ParseQuery(malformed.RawQuery); qerr == nil {
+		t.Fatal("test setup: expected ParseQuery error for semicolon pair")
+	}
+	if got := malformed.Query(); len(got) != 1 || got.Get("ref") != sha {
+		t.Fatalf("test setup: Query() should silently keep sole ref, got %v", got)
+	}
+	if err := bindRawURL(p, auth, malformed); err == nil || !errors.Is(err, ErrRawProvenance) {
+		t.Fatalf("want malformed query refusal, got %v", err)
+	}
 	cross := mustRawURL(t, "https://evil.test/api/v4/projects/42/repository/files/dir%2Fa%2Etxt/raw?ref="+sha)
 	if err := bindRawURL(p, auth, cross); err == nil {
 		t.Fatal("want cross-origin refusal")
@@ -109,6 +121,16 @@ func TestValidateRawResponseProvenance_awayThenBack(t *testing.T) {
 }
 
 func TestStreamRawFile_redirectChangedRefDropsContent(t *testing.T) {
+	testStreamRawFileRedirectDrops(t, "ref=main")
+}
+
+func TestStreamRawFile_redirectMalformedExtraQueryDropsContent(t *testing.T) {
+	const sha = "1234567890abcdef1234567890abcdef12345678"
+	testStreamRawFileRedirectDrops(t, "ref="+sha+"&unexpected=value;bad")
+}
+
+func testStreamRawFileRedirectDrops(t *testing.T, redirectQuery string) {
+	t.Helper()
 	const sha = "1234567890abcdef1234567890abcdef12345678"
 	var pinned, floating atomic.Int64
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -116,12 +138,10 @@ func TestStreamRawFile_redirectChangedRefDropsContent(t *testing.T) {
 			http.NotFound(w, r)
 			return
 		}
-		if r.URL.Query().Get("ref") == sha {
+		if r.URL.RawQuery == "ref="+sha {
 			pinned.Add(1)
 			u := *r.URL
-			q := u.Query()
-			q.Set("ref", "main")
-			u.RawQuery = q.Encode()
+			u.RawQuery = redirectQuery
 			http.Redirect(w, r, u.String(), http.StatusFound)
 			return
 		}
@@ -150,6 +170,9 @@ func TestStreamRawFile_redirectChangedRefDropsContent(t *testing.T) {
 	}
 	if len(res.Data) != 0 || res.FullContentKnown || res.WindowComplete {
 		t.Fatalf("must drop content and refuse completeness: %+v", res)
+	}
+	if floating.Load() < 0 {
+		t.Fatal("unreachable")
 	}
 }
 
