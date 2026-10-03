@@ -191,11 +191,11 @@ func StreamRawFile(ctx context.Context, client *gitlab.Client, req RawStreamRequ
 	if headers == nil && resp != nil && resp.Response != nil {
 		headers = resp.Response.Header
 	}
-	applyRawHeaders(&out, headers)
 
 	// Immutable provenance: final response (and redirect chain) must stay bound
 	// to the authorized canonical raw URL including verified ref. Fail closed:
 	// drop content and refuse completeness when origin cannot be attested.
+	// Provider headers are adopted only after provenance succeeds.
 	dropProvenance := func(perr error) RawStreamResult {
 		out.Err = perr
 		out.Data = nil
@@ -206,6 +206,12 @@ func StreamRawFile(ctx context.Context, client *gitlab.Client, req RawStreamRequ
 		out.WriterTruncated = false
 		out.ObservedStart = nil
 		out.ObservedEndExcl = nil
+		out.BlobID = ""
+		out.ContentSHA256 = ""
+		out.SizeKnown = false
+		out.Size = 0
+		out.HeaderEncoding = ""
+		out.RangeHonored = false
 		return out
 	}
 	if doErr != nil && (errors.Is(doErr, ErrRawProvenance) || strings.Contains(doErr.Error(), "raw_provenance") || strings.Contains(doErr.Error(), "ref changed")) {
@@ -223,6 +229,7 @@ func StreamRawFile(ctx context.Context, client *gitlab.Client, req RawStreamRequ
 			return dropProvenance(fmt.Errorf("%w: unverifiable response origin", ErrRawProvenance))
 		}
 	}
+	applyRawHeaders(&out, headers)
 
 	out.WriterSatisfied = capW.satisfied
 	out.WriterTruncated = capW.truncated
@@ -314,6 +321,13 @@ func StreamRawFile(ctx context.Context, client *gitlab.Client, req RawStreamRequ
 	return out
 }
 
+func clearObservedWindow(out *RawStreamResult) {
+	out.ObservedStart = nil
+	out.ObservedEndExcl = nil
+	out.WindowComplete = false
+	out.FullContentKnown = false
+}
+
 func finalizeRawObservation(out *RawStreamResult, reqStart int64, reqEndExcl *int64, hdr http.Header) {
 	_ = hdr
 	switch out.Status {
@@ -321,26 +335,24 @@ func finalizeRawObservation(out *RawStreamResult, reqStart int64, reqEndExcl *in
 		out.RangeHonored = out.RangeRequested
 		crStart, crEndIncl, crTotal, crOK := parseContentRange(headerGet(hdr, "Content-Range"))
 		if !crOK {
-			out.WindowComplete = false
+			clearObservedWindow(out)
 			out.Err = fmt.Errorf("malformed Content-Range")
 			return
 		}
 		if crEndIncl == math.MaxInt64 {
-			out.WindowComplete = false
+			clearObservedWindow(out)
 			out.Err = fmt.Errorf("malformed Content-Range: end+1 overflow")
 			return
 		}
-		endExcl := crEndIncl + 1
-		if endExcl < crEndIncl {
-			out.WindowComplete = false
+		providerEndExcl := crEndIncl + 1
+		if providerEndExcl < crEndIncl {
+			clearObservedWindow(out)
 			out.Err = fmt.Errorf("malformed Content-Range: end+1 overflow")
 			return
 		}
-		out.ObservedStart = &crStart
-		out.ObservedEndExcl = &endExcl
 		if crTotal >= 0 {
 			if crEndIncl >= crTotal {
-				out.WindowComplete = false
+				clearObservedWindow(out)
 				out.Err = fmt.Errorf("malformed Content-Range: end >= total")
 				return
 			}
@@ -348,21 +360,32 @@ func finalizeRawObservation(out *RawStreamResult, reqStart int64, reqEndExcl *in
 			out.Size = crTotal
 		}
 		if crStart != reqStart {
-			out.WindowComplete = false
+			clearObservedWindow(out)
 			out.Err = fmt.Errorf("Content-Range start mismatch")
 			return
 		}
-		if int64(len(out.Data)) != (endExcl - crStart) {
+		retained := int64(len(out.Data))
+		providerSpan := providerEndExcl - crStart
+		// Intentional local max_bytes truncation: report the retained interval,
+		// not the provider's larger Content-Range extent.
+		if out.WriterTruncated {
+			endRetained := crStart + retained
+			out.ObservedStart = &crStart
+			out.ObservedEndExcl = &endRetained
 			out.WindowComplete = false
+			out.FullContentKnown = false
+			return
+		}
+		if retained != providerSpan {
+			// Genuine framing mismatch (not local cap): offsets unknown.
+			clearObservedWindow(out)
 			out.Err = fmt.Errorf("Content-Range length mismatch")
 			return
 		}
-		if out.WriterTruncated {
-			out.WindowComplete = false
-		} else {
-			out.WindowComplete = windowCoversRequest(reqStart, reqEndExcl, crStart, endExcl, out.SizeKnown, out.Size)
-		}
-		out.FullContentKnown = out.SizeKnown && crStart == 0 && endExcl == out.Size && !out.WriterTruncated
+		out.ObservedStart = &crStart
+		out.ObservedEndExcl = &providerEndExcl
+		out.WindowComplete = windowCoversRequest(reqStart, reqEndExcl, crStart, providerEndExcl, out.SizeKnown, out.Size)
+		out.FullContentKnown = out.SizeKnown && crStart == 0 && providerEndExcl == out.Size
 
 	case http.StatusOK:
 		if out.RangeRequested && reqStart > 0 {

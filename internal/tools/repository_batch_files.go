@@ -241,6 +241,50 @@ func fetchBatchPath(ctx context.Context, d Deps, pid, sha string, spec batchPath
 		MaxReturnBytes: remainReturn,
 	})
 
+	if res.Err != nil {
+		item.Error = mapStreamErr(res.Err)
+		if item.Error != nil && item.Error.Code == readmeta.CodeInconsistent {
+			// Provenance break: never emit unattested provider identity/size.
+			item.BlobID = nil
+			item.FullContentDigest = nil
+			item.ObservedTotalSize = nil
+			item.ObservedStart = nil
+			item.ObservedEndExcl = nil
+			item.ReturnedRangeHash = nil
+			item.RangeHonored = nil
+			f := false
+			item.WindowComplete = &f
+			item.FullContentComplete = &f
+			return item
+		}
+		// Preserve any partial bytes only when useful; on hard errors drop content.
+		if res.BlobID != "" {
+			b := res.BlobID
+			item.BlobID = &b
+		}
+		if res.ContentSHA256 != "" {
+			dgst := res.ContentSHA256
+			item.FullContentDigest = &dgst
+		}
+		if res.SizeKnown {
+			sz := res.Size
+			item.ObservedTotalSize = &sz
+		}
+		item.ObservedStart = res.ObservedStart
+		item.ObservedEndExcl = res.ObservedEndExcl
+		if res.RangeRequested {
+			h := res.RangeHonored
+			item.RangeHonored = &h
+		}
+		wc := res.WindowComplete
+		fc := res.FullContentKnown
+		item.WindowComplete = &wc
+		item.FullContentComplete = &fc
+		if res.Data != nil && len(res.Data) > 0 && item.Error.Code == readmeta.CodePartial {
+			attachContent(&item, res.Data, res.ReturnedRangeSHA)
+		}
+		return item
+	}
 	if res.BlobID != "" {
 		b := res.BlobID
 		item.BlobID = &b
@@ -263,15 +307,6 @@ func fetchBatchPath(ctx context.Context, d Deps, pid, sha string, spec batchPath
 	fc := res.FullContentKnown
 	item.WindowComplete = &wc
 	item.FullContentComplete = &fc
-
-	if res.Err != nil {
-		item.Error = mapStreamErr(res.Err)
-		// Preserve any partial bytes only when useful; on hard errors drop content.
-		if res.Data != nil && len(res.Data) > 0 && item.Error.Code == readmeta.CodePartial {
-			attachContent(&item, res.Data, res.ReturnedRangeSHA)
-		}
-		return item
-	}
 	if res.Status == 404 {
 		item.Error = &batchItemError{Code: readmeta.CodeInaccessible, Message: "file not found"}
 		return item
@@ -306,11 +341,12 @@ func attachContent(item *batchFileItem, data []byte, rangeHash string) {
 		h := rangeHash
 		item.ReturnedRangeHash = &h
 	}
-	utf8ok := utf8.Valid(data) && !strings.Contains(string(data), "\x00")
-	isBin := !utf8ok
+	// UTF-8 validity is independent of the binary/NUL presentation heuristic.
+	utf8ok := utf8.Valid(data)
+	isBin := !utf8ok || strings.Contains(string(data), "\x00")
 	item.UTF8Valid = &utf8ok
 	item.IsBinary = &isBin
-	if utf8ok {
+	if !isBin {
 		item.ContentEncoding = "utf-8"
 		item.Content = string(data)
 		return

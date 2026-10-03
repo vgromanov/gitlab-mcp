@@ -78,6 +78,17 @@ func TestBindRawURL_exactTrustedIdentity(t *testing.T) {
 	if err := bindRawURL(p, auth, cross); err == nil {
 		t.Fatal("want cross-origin refusal")
 	}
+	// Trailing slash must not be normalized away under exact escaped-path contract.
+	withSlash := mustRawURL(t, "http://example.test/api/v4/projects/42/repository/files/dir%2Fa%2Etxt/raw/?ref="+sha)
+	if err := bindRawURL(p, auth, withSlash); err == nil {
+		t.Fatal("want refusal when trailing slash diverges from trusted path")
+	}
+	emptyPath := mustRawURL(t, "http://example.test?ref="+sha)
+	emptyPath.Path = ""
+	emptyPath.RawPath = ""
+	if err := bindRawURL(p, auth, emptyPath); err == nil {
+		t.Fatal("want refusal for empty escaped path identity")
+	}
 }
 
 func TestSafeCheckRedirect_rawProvenanceOptInOnly(t *testing.T) {
@@ -146,7 +157,10 @@ func testStreamRawFileRedirectDrops(t *testing.T, redirectQuery string) {
 			return
 		}
 		floating.Add(1)
+		w.Header().Set("X-Gitlab-Blob-Id", strings.Repeat("1", 40))
+		w.Header().Set("X-Gitlab-Content-Sha256", strings.Repeat("2", 64))
 		w.Header().Set("X-Gitlab-Size", "7")
+		w.Header().Set("X-Gitlab-Encoding", "text")
 		_, _ = io.WriteString(w, "MOVING!")
 	}))
 	t.Cleanup(ts.Close)
@@ -165,14 +179,20 @@ func testStreamRawFileRedirectDrops(t *testing.T, redirectQuery string) {
 	if pinned.Load() != 1 {
 		t.Fatalf("pinned=%d", pinned.Load())
 	}
+	if floating.Load() != 1 {
+		t.Fatalf("follow client must hit floating target once, floating=%d", floating.Load())
+	}
 	if res.Err == nil || !errors.Is(res.Err, ErrRawProvenance) {
 		t.Fatalf("want ErrRawProvenance, got err=%v data=%q", res.Err, res.Data)
 	}
 	if len(res.Data) != 0 || res.FullContentKnown || res.WindowComplete {
 		t.Fatalf("must drop content and refuse completeness: %+v", res)
 	}
-	if floating.Load() < 0 {
-		t.Fatal("unreachable")
+	if res.BlobID != "" || res.ContentSHA256 != "" || res.SizeKnown || res.Size != 0 || res.HeaderEncoding != "" {
+		t.Fatalf("unattested provider metadata must be cleared: %+v", res)
+	}
+	if res.ObservedStart != nil || res.ObservedEndExcl != nil || res.ReturnedRangeSHA != "" {
+		t.Fatalf("offsets/hash must be unknown after provenance reject: %+v", res)
 	}
 }
 

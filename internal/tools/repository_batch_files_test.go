@@ -415,8 +415,8 @@ func TestBatchGetFileContents_upstreamBudgetPreserved(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if b != igl.BudgetFromContext(ctx) && igl.BudgetFromContext(ctx) != nil {
-		// ensureBatchBudget reuses upstream; context may be child deadline ctx
+	if got := igl.BudgetFromContext(ctx); got != b {
+		t.Fatalf("ensureBatchBudget must reuse upstream budget object: got %p want %p", got, b)
 	}
 	raw, _ := json.Marshal(out)
 	var m map[string]any
@@ -467,6 +467,8 @@ func testBatchRedirectRejectsQuery(t *testing.T, redirectQuery string) {
 				return
 			}
 			floating.Add(1)
+			w.Header().Set("X-Gitlab-Blob-Id", strings.Repeat("1", 40))
+			w.Header().Set("X-Gitlab-Content-Sha256", strings.Repeat("2", 64))
 			w.Header().Set("X-Gitlab-Size", "7")
 			_, _ = io.WriteString(w, "MOVING!")
 		case strings.Contains(r.URL.Path, "/repository/commits/"):
@@ -477,6 +479,25 @@ func testBatchRedirectRejectsQuery(t *testing.T, redirectQuery string) {
 			http.NotFound(w, r)
 		}
 	})
+
+	assertRejectedNoLeak := func(t *testing.T, item map[string]any) {
+		t.Helper()
+		if item["content"] == "MOVING!" || item["error"] == nil {
+			t.Fatalf("must reject: %#v", item)
+		}
+		errObj := item["error"].(map[string]any)
+		if errObj["code"] != readmeta.CodeInconsistent {
+			t.Fatalf("code=%v want inconsistent", errObj["code"])
+		}
+		for _, k := range []string{"blob_id", "full_content_digest", "observed_total_size", "returned_range_hash", "observed_start_byte", "observed_end_byte"} {
+			if item[k] != nil {
+				t.Fatalf("unattested %s must be unknown: %#v", k, item)
+			}
+		}
+		if item["full_content_complete"] == true || item["window_complete"] == true {
+			t.Fatalf("cannot attest completeness: %#v", item)
+		}
+	}
 
 	// Production-shaped client: CheckRedirect refuses changed-ref hops.
 	d := batchDeps(t, h, nil)
@@ -489,20 +510,11 @@ func testBatchRedirectRejectsQuery(t *testing.T, redirectQuery string) {
 	if pinned.Load() != 1 {
 		t.Fatalf("pinned=%d", pinned.Load())
 	}
+	if floating.Load() != 0 {
+		t.Fatalf("production CheckRedirect must not follow unauthorized hop, floating=%d", floating.Load())
+	}
 	item := out["items"].([]any)[0].(map[string]any)
-	if item["content"] == "MOVING!" {
-		t.Fatalf("must not accept floating body: %#v", item)
-	}
-	if item["error"] == nil {
-		t.Fatalf("want item error, got %#v", item)
-	}
-	errObj := item["error"].(map[string]any)
-	if errObj["code"] != readmeta.CodeInconsistent {
-		t.Fatalf("code=%v want inconsistent", errObj["code"])
-	}
-	if item["full_content_complete"] == true {
-		t.Fatal("cannot attest full_content_complete after provenance break")
-	}
+	assertRejectedNoLeak(t, item)
 	sec := out["section"].(map[string]any)
 	if sec["consistency"] == "consistent" || sec["content_complete"] == true || sec["content_complete"] == "true" {
 		t.Fatalf("section must not attest complete/consistent: %#v", sec)
@@ -527,10 +539,10 @@ func testBatchRedirectRejectsQuery(t *testing.T, redirectQuery string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	item2 := out2["items"].([]any)[0].(map[string]any)
-	if item2["content"] == "MOVING!" || item2["error"] == nil {
-		t.Fatalf("followed redirect must still drop floating content: %#v floating=%d", item2, floating.Load())
+	if floating.Load() != 1 {
+		t.Fatalf("follow client must observe floating once, floating=%d", floating.Load())
 	}
+	assertRejectedNoLeak(t, out2["items"].([]any)[0].(map[string]any))
 }
 
 func TestBatchGetFileContents_nestedPinnedPathSucceeds(t *testing.T) {
@@ -585,5 +597,152 @@ func TestBatchGetFileContents_nestedPinnedPathSucceeds(t *testing.T) {
 	item := out["items"].([]any)[0].(map[string]any)
 	if item["error"] != nil || item["content"] != "PINNED!" || item["full_content_complete"] != true {
 		t.Fatalf("valid nested immutable path must succeed: %#v", item)
+	}
+}
+
+func TestBatchGetFileContents_F1_retained206WindowEqualsBytes(t *testing.T) {
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/projects/42"):
+			_, _ = io.WriteString(w, `{"id":42,"path_with_namespace":"g/p","namespace":{"id":7,"kind":"group"}}`)
+		case strings.Contains(r.URL.Path, "/commits/"):
+			_, _ = io.WriteString(w, fmt.Sprintf(`{"id":%q}`, batchTipSHA))
+		case strings.HasSuffix(r.URL.Path, "/raw"):
+			w.Header().Set("Content-Range", "bytes 10-1009/2000")
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = io.WriteString(w, strings.Repeat("A", 1000))
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	d := batchDeps(t, h, nil)
+	end := int64(1010)
+	maxB := int64(100)
+	out, err := callBatch(t, d, batchGetFileContentsIn{
+		ProjectID: "42", CommitSHA: batchTipSHA, MaxBytes: &maxB,
+		Paths: []batchPathSpec{{Path: "a.txt", Range: &batchByteRange{StartByte: 10, EndByte: &end}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item := out["items"].([]any)[0].(map[string]any)
+	if item["error"] != nil {
+		t.Fatalf("local cap truncation is not framing error: %#v", item)
+	}
+	if item["observed_start_byte"] != float64(10) || item["observed_end_byte"] != float64(110) || item["bytes_returned"] != float64(100) {
+		t.Fatalf("retained interval must be [10,110): %#v", item)
+	}
+	if item["window_complete"] != false || item["full_content_complete"] != false {
+		t.Fatalf("incomplete: %#v", item)
+	}
+	if item["returned_range_hash"] == nil {
+		t.Fatal("hash must cover retained bytes")
+	}
+	sum := sha256.Sum256([]byte(strings.Repeat("A", 100)))
+	if item["returned_range_hash"] != hex.EncodeToString(sum[:]) {
+		t.Fatalf("hash mismatch: %v", item["returned_range_hash"])
+	}
+}
+
+func TestBatchGetFileContents_F1_siblingConsumesAggregateThenTruncates(t *testing.T) {
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/projects/42"):
+			_, _ = io.WriteString(w, `{"id":42,"path_with_namespace":"g/p","namespace":{"id":7,"kind":"group"}}`)
+		case strings.Contains(r.URL.Path, "/commits/"):
+			_, _ = io.WriteString(w, fmt.Sprintf(`{"id":%q}`, batchTipSHA))
+		case strings.Contains(r.URL.Path, "/files/") && strings.HasSuffix(r.URL.Path, "/raw"):
+			if strings.Contains(r.URL.EscapedPath(), "a%2Etxt") || strings.HasSuffix(r.URL.Path, "/a.txt/raw") {
+				body := strings.Repeat("X", 80)
+				w.Header().Set("X-Gitlab-Size", fmt.Sprintf("%d", len(body)))
+				_, _ = io.WriteString(w, body)
+				return
+			}
+			w.Header().Set("Content-Range", "bytes 0-499/500")
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = io.WriteString(w, strings.Repeat("Y", 500))
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	d := batchDeps(t, h, nil)
+	maxB := int64(100)
+	end := int64(500)
+	out, err := callBatch(t, d, batchGetFileContentsIn{
+		ProjectID: "42", CommitSHA: batchTipSHA, MaxBytes: &maxB,
+		Paths: []batchPathSpec{
+			{Path: "a.txt"},
+			{Path: "b.txt", Range: &batchByteRange{StartByte: 0, EndByte: &end}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	items := out["items"].([]any)
+	first := items[0].(map[string]any)
+	second := items[1].(map[string]any)
+	if first["bytes_returned"] != float64(80) {
+		t.Fatalf("first sibling bytes=%v", first["bytes_returned"])
+	}
+	// Remaining aggregate return budget is 20.
+	if second["bytes_returned"] != float64(20) || second["observed_end_byte"] != float64(20) {
+		t.Fatalf("second retained must be 20 bytes [0,20): %#v", second)
+	}
+	if second["window_complete"] != false || second["error"] != nil {
+		t.Fatalf("second truncated without framing error: %#v", second)
+	}
+}
+
+func TestBatchGetFileContents_F3_utf8ValidityIndependentOfNULBinary(t *testing.T) {
+	cases := []struct {
+		name    string
+		body    []byte
+		utf8ok  bool
+		binary  bool
+		enc     string
+		content string // exact for small cases; empty to skip
+	}{
+		{name: "plain", body: []byte("hello"), utf8ok: true, binary: false, enc: "utf-8", content: "hello"},
+		{name: "nul_valid_utf8", body: []byte{'a', 0, 'b'}, utf8ok: true, binary: true, enc: "base64", content: "YQBi"},
+		{name: "invalid_non_nul", body: []byte{0xff, 0xfe}, utf8ok: false, binary: true, enc: "base64"},
+		{name: "empty", body: []byte{}, utf8ok: true, binary: false, enc: "utf-8", content: ""},
+		{name: "multibyte_split", body: []byte{0xe2, 0x82}, utf8ok: false, binary: true, enc: "base64"}, // split €
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case strings.HasSuffix(r.URL.Path, "/projects/42"):
+					_, _ = io.WriteString(w, `{"id":42,"path_with_namespace":"g/p","namespace":{"id":7,"kind":"group"}}`)
+				case strings.Contains(r.URL.Path, "/commits/"):
+					_, _ = io.WriteString(w, fmt.Sprintf(`{"id":%q}`, batchTipSHA))
+				case strings.HasSuffix(r.URL.Path, "/raw"):
+					w.Header().Set("X-Gitlab-Size", fmt.Sprintf("%d", len(tc.body)))
+					_, _ = w.Write(tc.body)
+				default:
+					http.NotFound(w, r)
+				}
+			})
+			d := batchDeps(t, h, nil)
+			out, err := callBatch(t, d, batchGetFileContentsIn{
+				ProjectID: "42", CommitSHA: batchTipSHA, Paths: []batchPathSpec{{Path: "x.bin"}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			item := out["items"].([]any)[0].(map[string]any)
+			if item["utf8_valid"] != tc.utf8ok || item["is_binary"] != tc.binary || item["content_encoding"] != tc.enc {
+				t.Fatalf("got utf8=%v bin=%v enc=%v want utf8=%v bin=%v enc=%v item=%#v",
+					item["utf8_valid"], item["is_binary"], item["content_encoding"], tc.utf8ok, tc.binary, tc.enc, item)
+			}
+			if tc.name == "empty" {
+				if item["content"] != nil && item["content"] != "" {
+					t.Fatalf("empty content must be omitted/empty, got %#v", item["content"])
+				}
+			} else if tc.content != "" && item["content"] != tc.content {
+				t.Fatalf("content=%q want %q", item["content"], tc.content)
+			}
+		})
 	}
 }

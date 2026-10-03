@@ -113,16 +113,15 @@ func trustedEscapedPath(u *url.URL) string {
 	if u == nil {
 		return ""
 	}
-	// Prefer RawPath when the GitLab client stamped the PathEscape form
-	// (e.g. dir%2Fa%2Etxt). Fall back to EscapedPath.
-	p := u.RawPath
-	if p == "" {
-		p = u.EscapedPath()
+	// Exact escaped-path identity: prefer RawPath (GitLab PathEscape stamp,
+	// e.g. dir%2Fa%2Etxt). No trailing-slash normalization — literal equality.
+	if u.RawPath != "" {
+		return u.RawPath
 	}
-	if p == "" {
-		p = u.Path
+	if ep := u.EscapedPath(); ep != "" {
+		return ep
 	}
-	return normalizeURLPath(p)
+	return u.Path
 }
 
 // bindSoleVerifiedRefQuery requires RawQuery to parse cleanly as exactly one
@@ -144,16 +143,6 @@ func bindSoleVerifiedRefQuery(ref string, u *url.URL) error {
 		return fmt.Errorf("ref changed")
 	}
 	return nil
-}
-
-func normalizeURLPath(p string) string {
-	if p == "" {
-		return "/"
-	}
-	if !strings.HasPrefix(p, "/") {
-		p = "/" + p
-	}
-	return strings.TrimSuffix(p, "/")
 }
 
 // ValidateRawResponseProvenance walks the final request redirect chain and
