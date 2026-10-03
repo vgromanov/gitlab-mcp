@@ -38,6 +38,7 @@ func clearKnownConfigEnv(t *testing.T) {
 		"GITLAB_INSECURE",
 		"HTTP_PROXY",
 		"HTTPS_PROXY",
+		"GITLAB_MCP_CURSOR_KEY",
 	}
 	for _, k := range keys {
 		t.Setenv(k, "")

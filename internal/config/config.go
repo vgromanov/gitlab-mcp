@@ -10,6 +10,9 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
+
+	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/cursor"
 )
 
 // Config holds runtime configuration (env + CLI; CLI wins when set).
@@ -40,6 +43,9 @@ type Config struct {
 	InsecureSkipVerify bool
 	HTTPProxy          string
 	HTTPSProxy         string
+	// CursorKey is the raw operator secret from GITLAB_MCP_CURSOR_KEY.
+	// Empty allows legacy startup; cursor-dependent paths fail closed at use.
+	CursorKey []byte
 }
 
 func envBool(key string, def bool) bool {
@@ -108,6 +114,10 @@ func Load() *Config {
 	}
 	if raw := envString("GITLAB_ALLOWED_GROUP_IDS", ""); raw != "" {
 		c.AllowedGroupIDs = parseCSV(raw)
+	}
+	// Cursor key: raw secret bytes; do not trim (operators may intentionally include spaces).
+	if v, ok := os.LookupEnv("GITLAB_MCP_CURSOR_KEY"); ok {
+		c.CursorKey = []byte(v)
 	}
 
 	var (
@@ -282,16 +292,30 @@ func applyToolProfileFlag(c *Config, visited bool, raw string) {
 
 // Validate reports configuration errors that must fail closed at startup.
 // Unknown ToolProfile values are rejected; empty profile is legacy behavior.
+// Missing GITLAB_MCP_CURSOR_KEY is allowed (legacy tools); a present invalid key fails without echo.
 func (c *Config) Validate() error {
 	if c == nil {
 		return fmt.Errorf("config is nil")
 	}
 	switch c.ToolProfile {
 	case "", "daily", "review_read", "review_write":
-		return nil
 	default:
 		return fmt.Errorf("unknown GITLAB_TOOL_PROFILE %q; allowed: unset, daily, review_read, review_write", c.ToolProfile)
 	}
+	if err := cursor.ValidateKey(c.CursorKey); err != nil {
+		return err
+	}
+	return nil
+}
+
+// CursorSigningEnabled reports whether a usable cursor signing key is configured.
+func (c *Config) CursorSigningEnabled() bool {
+	return c != nil && len(c.CursorKey) >= cursor.MinKeyBytes
+}
+
+// CursorTTL returns the fixed absolute cursor lifetime (2h).
+func (c *Config) CursorTTL() time.Duration {
+	return cursor.DefaultTTL
 }
 
 // RestrictedMode is on when USE_DAILY_TOOLS, any new family flag, or a non-empty
