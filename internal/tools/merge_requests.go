@@ -235,6 +235,8 @@ type getMergeRequestDiffsIn struct {
 }
 
 func getMergeRequestDiffs(ctx context.Context, _ *mcp.CallToolRequest, in getMergeRequestDiffsIn, d Deps) (*mcp.CallToolResult, any, error) {
+	ctx, release := ensureLegacyInvocationBudget(ctx, 100)
+	defer release()
 	owner, err := authorizeMROwnerAndForks(ctx, d, in.ProjectID, in.MergeRequestIID)
 	if err != nil {
 		return nil, nil, err
@@ -269,6 +271,8 @@ type getMergeRequestConflictsIn struct {
 }
 
 func getMergeRequestConflicts(ctx context.Context, _ *mcp.CallToolRequest, in getMergeRequestConflictsIn, d Deps) (*mcp.CallToolResult, any, error) {
+	ctx, release := ensureLegacyInvocationBudget(ctx, 200)
+	defer release()
 	owner, err := authorizeMROwnerAndForks(ctx, d, in.ProjectID, in.MergeRequestIID)
 	if err != nil {
 		return nil, nil, err
@@ -361,6 +365,8 @@ type getMergeRequestFileDiffIn struct {
 }
 
 func getMergeRequestFileDiff(ctx context.Context, _ *mcp.CallToolRequest, in getMergeRequestFileDiffIn, d Deps) (*mcp.CallToolResult, any, error) {
+	ctx, release := ensureLegacyInvocationBudget(ctx, 200)
+	defer release()
 	owner, err := authorizeMROwnerAndForks(ctx, d, in.ProjectID, in.MergeRequestIID)
 	if err != nil {
 		return nil, nil, err

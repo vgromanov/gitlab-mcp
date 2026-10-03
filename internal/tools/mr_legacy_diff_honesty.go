@@ -52,13 +52,31 @@ const (
 	patchWrongType
 )
 
+// ensureLegacyInvocationBudget attaches one DefaultBudget before authorization when
+// the caller has not already supplied a contextual budget. Caller-supplied budgets
+// are reused as-is (MaxItems not raised) so synthetic tight-cap tests remain meaningful.
+// The returned release cancels owned deadline timers; it is a no-op when reusing.
+func ensureLegacyInvocationBudget(ctx context.Context, perPage int64) (context.Context, func()) {
+	if igl.BudgetFromContext(ctx) != nil {
+		return ctx, func() {}
+	}
+	budget := igl.DefaultBudget()
+	if perPage > 0 && int(perPage) > budget.MaxItems {
+		budget.MaxItems = int(perPage)
+	}
+	ctx = igl.WithBudget(ctx, budget)
+	return ctx, budget.Cancel
+}
+
 // fetchLegacyMRDiffPage streams a single first page of MR diffs with presence-aware
 // section metadata. Caller must already have authorized owner/forks via
-// authorizeMROwnerAndForks; this helper re-fetches MR metadata and re-applies
-// requireProvenMRForkProjects under active policy before streaming content.
+// authorizeMROwnerAndForks and should attach the invocation budget before that authz.
+// This helper re-fetches MR metadata and re-applies requireProvenMRForkProjects under
+// active policy before streaming content. It reuses any contextual budget and does
+// not allocate/cancel a second timer when one is already present.
 func fetchLegacyMRDiffPage(ctx context.Context, d Deps, opts legacyMRDiffFetchOpts) (legacyMRDiffPage, error) {
 	out := legacyMRDiffPage{
-		Diffs: make([]*MRDiffItem, 0),
+		Diffs: make([]*MRDiffItem, 0), // empty backend page → JSON [] (SDK semantics)
 	}
 	if opts.MergeRequestIID < 1 {
 		return out, fmt.Errorf("merge_request_iid must be >= 1")
@@ -68,12 +86,10 @@ func fetchLegacyMRDiffPage(ctx context.Context, d Deps, opts legacyMRDiffFetchOp
 		perPage = 100
 	}
 
-	// Contextual budget seam: reuse a caller-supplied synthetic budget (for tests /
-	// tight caps) instead of replacing it. Otherwise allocate a default sized to the
-	// single-page ceiling.
 	budget := igl.BudgetFromContext(ctx)
 	ownsBudget := false
 	if budget == nil {
+		// Fallback only — getters normally attach before authz.
 		budget = igl.DefaultBudget()
 		if int(perPage) > budget.MaxItems {
 			budget.MaxItems = int(perPage)
@@ -438,7 +454,7 @@ func filterLegacyDiffsByWant(diffs []*MRDiffItem, wantFiles []string, section re
 		want[f] = struct{}{}
 	}
 	seen := map[string]struct{}{}
-	filtered := make([]*MRDiffItem, 0)
+	var filtered []*MRDiffItem // nil when empty → JSON null (legacy base shape)
 	for _, df := range diffs {
 		if df == nil {
 			continue
@@ -492,7 +508,7 @@ func filterLegacyDiffsByWant(diffs []*MRDiffItem, wantFiles []string, section re
 }
 
 func scanConflictFiles(diffs []*MRDiffItem) []string {
-	var conflictFiles []string
+	var conflictFiles []string // nil when empty → JSON null (legacy base shape)
 	for _, df := range diffs {
 		if df == nil {
 			continue
@@ -500,9 +516,6 @@ func scanConflictFiles(diffs []*MRDiffItem) []string {
 		if strings.Contains(df.Diff, "<<<<<<<") || strings.Contains(df.Diff, ">>>>>>>") {
 			conflictFiles = append(conflictFiles, df.NewPath)
 		}
-	}
-	if conflictFiles == nil {
-		conflictFiles = []string{}
 	}
 	return conflictFiles
 }

@@ -1,8 +1,10 @@
 package tools
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -269,16 +271,21 @@ func TestGetMergeRequestConflicts_flagsPreservedHeuristicCoverage(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	m := mustMap(t, out)
-	if m["has_conflicts"] != true {
-		t.Fatalf("has_conflicts=%v want true from MR", m["has_conflicts"])
+	raw, err := json.Marshal(out)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if m["detailed_merge_status"] != "conflict" {
-		t.Fatalf("detailed_merge_status=%v", m["detailed_merge_status"])
+	if !bytes.Contains(raw, []byte(`"has_conflicts":true`)) {
+		t.Fatalf("has_conflicts missing/true: %s", raw)
 	}
-	cf, _ := m["conflict_files"].([]any)
-	if len(cf) != 0 {
-		t.Fatalf("conflict_files=%v want empty scan", cf)
+	if !bytes.Contains(raw, []byte(`"detailed_merge_status":"conflict"`)) {
+		t.Fatalf("detailed_merge_status: %s", raw)
+	}
+	if !bytes.Contains(raw, []byte(`"conflict_files":null`)) {
+		t.Fatalf("empty scan must be conflict_files:null, got %s", raw)
+	}
+	if bytes.Contains(raw, []byte(`"conflict_files":[]`)) {
+		t.Fatalf("must not normalize empty scan to [], got %s", raw)
 	}
 	sec := sectionFromOut(t, out)
 	lims, _ := sec["limitations"].([]any)
@@ -295,9 +302,9 @@ func TestGetMergeRequestConflicts_flagsPreservedHeuristicCoverage(t *testing.T) 
 }
 
 func TestGetMergeRequestConflicts_over200Incomplete(t *testing.T) {
-	// AC1 for conflicts ceiling: NextPage with large page.
-	items := make([]string, 0, 5)
-	for i := 0; i < 5; i++ {
+	// AC1 conflict ceiling: 201 items with NextPage; retain ≤200, incomplete, flags preserved.
+	items := make([]string, 0, 201)
+	for i := 0; i < 201; i++ {
 		items = append(items, diffItemJSON(fmt.Sprintf("c%d.go", i), "<<<<<<< HEAD\nx\n>>>>>>>\n", legacyBool(false), legacyBool(false)))
 	}
 	body := "[" + strings.Join(items, ",") + "]"
@@ -308,17 +315,28 @@ func TestGetMergeRequestConflicts_over200Incomplete(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	m := mustMap(t, out)
-	if m["has_conflicts"] != true {
-		t.Fatal("flags must stay true")
+	raw, err := json.Marshal(out)
+	if err != nil {
+		t.Fatal(err)
 	}
+	if !bytes.Contains(raw, []byte(`"has_conflicts":true`)) {
+		t.Fatalf("flags must stay true: %s", raw)
+	}
+	m := mustMap(t, out)
 	cf, _ := m["conflict_files"].([]any)
-	if len(cf) != 5 {
-		t.Fatalf("conflict_files=%v", cf)
+	if len(cf) != 200 {
+		t.Fatalf("conflict_files retained=%d want 200 (per_page/item ceiling)", len(cf))
+	}
+	pag, _ := m["pagination"].(map[string]any)
+	if pag["next_page"].(float64) != 2 {
+		t.Fatalf("next_page=%v want 2", pag["next_page"])
 	}
 	sec := sectionFromOut(t, out)
 	if sec["content_complete"] == readmeta.ContentCompleteTrue {
-		t.Fatal("NextPage must keep scan incomplete")
+		t.Fatal("NextPage/ceiling must keep scan incomplete")
+	}
+	if sec["next_cursor"] != "2" {
+		t.Fatalf("next_cursor=%v want \"2\"", sec["next_cursor"])
 	}
 }
 
@@ -695,7 +713,7 @@ func TestGetMergeRequestDiffs_freshMRForkChangeDenyBeforeDiff(t *testing.T) {
 }
 
 func TestGetMergeRequestFileDiff_emptyFilesReturnsNoDiffs(t *testing.T) {
-	// Compatibility: files:[] / nil must not return the whole page.
+	// Compatibility: files:[] / nil must yield JSON null diffs (not []).
 	d := newMRDiffsDeps(t, legacyMRHandler(42, knownPresenceDiff, "", true, false, ""))
 	for _, files := range [][]string{nil, {}} {
 		_, out, err := getMergeRequestFileDiff(context.Background(), nil, getMergeRequestFileDiffIn{
@@ -705,10 +723,15 @@ func TestGetMergeRequestFileDiff_emptyFilesReturnsNoDiffs(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		m := mustMap(t, out)
-		diffs, _ := m["diffs"].([]any)
-		if len(diffs) != 0 {
-			t.Fatalf("files=%v diffs=%v want empty", files, diffs)
+		raw, err := json.Marshal(out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Contains(raw, []byte(`"diffs":null`)) {
+			t.Fatalf("files=%v want diffs:null, got %s", files, raw)
+		}
+		if bytes.Contains(raw, []byte(`"diffs":[]`)) {
+			t.Fatalf("files=%v must not emit diffs:[], got %s", files, raw)
 		}
 	}
 }
@@ -756,9 +779,15 @@ func TestReviewProfiles_fileDiffEmptyFilesNoPatches(t *testing.T) {
 				t.Fatalf("IsError: %v", res)
 			}
 			m := structuredOrTextMap(t, res)
-			diffs, _ := m["diffs"].([]any)
-			if len(diffs) != 0 {
-				t.Fatalf("files:[] must return no patches, got %#v", diffs)
+			raw, err := json.Marshal(m)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Contains(raw, []byte(`"diffs":null`)) {
+				t.Fatalf("files:[] must return diffs:null, got %s", raw)
+			}
+			if bytes.Contains(raw, []byte(`"diffs":[]`)) {
+				t.Fatalf("files:[] must not return diffs:[], got %s", raw)
 			}
 			if _, ok := m["section"].(map[string]any); !ok {
 				t.Fatal("missing section")
@@ -804,5 +833,232 @@ func TestDecodeDiffPatchPresence(t *testing.T) {
 		if got != tc.want {
 			t.Fatalf("raw=%s got=%v want=%v", tc.raw, got, tc.want)
 		}
+	}
+}
+
+func TestFixV1_nullShapesRegisteredMCPBothProfiles(t *testing.T) {
+	// F1: literal JSON null vs [] via registered MCP under both review profiles.
+	bodyNoMarkers := "[" + diffItemJSON("a.go", "+x\n", legacyBool(false), legacyBool(false)) + "]"
+	for _, profile := range []string{"review_read", "review_write"} {
+		profile := profile
+		t.Run(profile, func(t *testing.T) {
+			d := newMRDiffsDeps(t, legacyMRHandler(42, bodyNoMarkers, "2", true, true, ""))
+			d.Config.ToolProfile = profile
+			d.Config.AllowedProjectIDs = []string{"42"}
+			srv := mcp.NewServer(&mcp.Implementation{Name: "t", Version: "0"}, nil)
+			RegisterAll(srv, d)
+			cs := testutil.MCPConnect(t, srv)
+
+			cases := []struct {
+				name   string
+				tool   string
+				args   map[string]any
+				nullAt string // JSON key that must be null
+			}{
+				{"empty_files", "get_merge_request_file_diff", map[string]any{
+					"project_id": "42", "merge_request_iid": 1, "files": []any{},
+				}, "diffs"},
+				{"missing_file", "get_merge_request_file_diff", map[string]any{
+					"project_id": "42", "merge_request_iid": 1, "files": []any{"nope.go"},
+				}, "diffs"},
+				{"empty_conflicts", "get_merge_request_conflicts", map[string]any{
+					"project_id": "42", "merge_request_iid": 1,
+				}, "conflict_files"},
+			}
+			for _, tc := range cases {
+				tc := tc
+				t.Run(tc.name, func(t *testing.T) {
+					res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{Name: tc.tool, Arguments: tc.args})
+					if err != nil {
+						t.Fatal(err)
+					}
+					if res.IsError {
+						t.Fatalf("IsError: %v", res)
+					}
+					raw := mcpResultJSON(t, res)
+					needle := `"` + tc.nullAt + `":null`
+					if !bytes.Contains(raw, []byte(needle)) {
+						t.Fatalf("want %s in %s", needle, raw)
+					}
+					bad := `"` + tc.nullAt + `":[]`
+					if bytes.Contains(raw, []byte(bad)) {
+						t.Fatalf("must not emit %s in %s", bad, raw)
+					}
+					if !bytes.Contains(raw, []byte(`"section":`)) {
+						t.Fatalf("missing section: %s", raw)
+					}
+					if !bytes.Contains(raw, []byte(`"pagination":`)) {
+						t.Fatalf("missing pagination: %s", raw)
+					}
+				})
+			}
+
+			// get_merge_request_diffs empty page keeps SDK [] (not null).
+			emptyDiffs := newMRDiffsDeps(t, legacyMRHandler(42, `[]`, "", true, false, ""))
+			emptyDiffs.Config.ToolProfile = profile
+			emptyDiffs.Config.AllowedProjectIDs = []string{"42"}
+			srv2 := mcp.NewServer(&mcp.Implementation{Name: "t2", Version: "0"}, nil)
+			RegisterAll(srv2, emptyDiffs)
+			cs2 := testutil.MCPConnect(t, srv2)
+			res, err := cs2.CallTool(context.Background(), &mcp.CallToolParams{
+				Name:      "get_merge_request_diffs",
+				Arguments: map[string]any{"project_id": "42", "merge_request_iid": 1},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			raw := mcpResultJSON(t, res)
+			if !bytes.Contains(raw, []byte(`"diffs":[]`)) {
+				t.Fatalf("get_merge_request_diffs empty must be [], got %s", raw)
+			}
+			if bytes.Contains(raw, []byte(`"diffs":null`)) {
+				t.Fatalf("get_merge_request_diffs must not use null for empty SDK page: %s", raw)
+			}
+		})
+	}
+}
+
+func mcpResultJSON(t *testing.T, res *mcp.CallToolResult) []byte {
+	t.Helper()
+	if res.StructuredContent != nil {
+		b, err := json.Marshal(res.StructuredContent)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return b
+	}
+	for _, c := range res.Content {
+		if tc, ok := c.(*mcp.TextContent); ok && tc != nil {
+			return []byte(tc.Text)
+		}
+	}
+	t.Fatal("no content")
+	return nil
+}
+
+func TestFixV1_defaultContextAllBackendRequestsBudgeted(t *testing.T) {
+	// F2: with default (no caller budget), every client RoundTrip must see a budget.
+	var total, withBudget int32
+	record := func(next http.RoundTripper) http.RoundTripper {
+		return roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			atomic.AddInt32(&total, 1)
+			if igl.BudgetFromContext(req.Context()) != nil {
+				atomic.AddInt32(&withBudget, 1)
+			}
+			return next.RoundTrip(req)
+		})
+	}
+	base := legacyMRHandler(42, knownPresenceDiff, "", true, false, "")
+	ts := httptest.NewServer(base)
+	t.Cleanup(ts.Close)
+
+	for _, tool := range []string{"diffs", "file_diff", "conflicts"} {
+		tool := tool
+		t.Run(tool, func(t *testing.T) {
+			atomic.StoreInt32(&total, 0)
+			atomic.StoreInt32(&withBudget, 0)
+			cli, err := gitlab.NewClient("t",
+				gitlab.WithBaseURL(ts.URL+"/api/v4"),
+				gitlab.WithoutRetries(),
+				gitlab.WithInterceptor(func(next http.RoundTripper) http.RoundTripper {
+					return record(igl.BudgetInterceptor()(next))
+				}),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			d := Deps{Config: &config.Config{
+				Token:             "t",
+				AllowedProjectIDs: []string{"42"},
+			}, Client: cli}
+			var callErr error
+			switch tool {
+			case "diffs":
+				_, _, callErr = getMergeRequestDiffs(context.Background(), nil, getMergeRequestDiffsIn{
+					pidMR: pidMR{ProjectID: "42", MergeRequestIID: 1},
+				}, d)
+			case "file_diff":
+				_, _, callErr = getMergeRequestFileDiff(context.Background(), nil, getMergeRequestFileDiffIn{
+					pidMR: pidMR{ProjectID: "42", MergeRequestIID: 1},
+					Files: []string{"a.go"},
+				}, d)
+			case "conflicts":
+				_, _, callErr = getMergeRequestConflicts(context.Background(), nil, getMergeRequestConflictsIn{
+					pidMR: pidMR{ProjectID: "42", MergeRequestIID: 1},
+				}, d)
+			}
+			if callErr != nil {
+				t.Fatal(callErr)
+			}
+			gotT, gotB := atomic.LoadInt32(&total), atomic.LoadInt32(&withBudget)
+			if gotT == 0 {
+				t.Fatal("expected backend requests")
+			}
+			if gotT != gotB {
+				t.Fatalf("unbudgeted requests: total=%d withBudget=%d", gotT, gotB)
+			}
+		})
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestFixV1_earlyAuthzRequestBudgetStop(t *testing.T) {
+	// F2: MaxRequests=1 stops during authorization before diffs when allowlist forces identity + MR.
+	var diffHits int32
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		path := r.URL.Path
+		switch {
+		case strings.HasSuffix(path, "/diffs"):
+			atomic.AddInt32(&diffHits, 1)
+			_, _ = io.WriteString(w, knownPresenceDiff)
+		case strings.Contains(path, "/merge_requests/"):
+			_, _ = io.WriteString(w, `{"id":1,"iid":1,"project_id":42,"source_project_id":42,"has_conflicts":false,"detailed_merge_status":"can_be_merged","diff_refs":{"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","base_sha":"b","start_sha":"b"}}`)
+		case strings.Contains(path, "/projects/"):
+			_, _ = io.WriteString(w, `{"id":42,"path_with_namespace":"g/p","namespace":{"id":7,"kind":"group"}}`)
+		default:
+			_, _ = io.WriteString(w, `{}`)
+		}
+	})
+	ts := httptest.NewServer(h)
+	t.Cleanup(ts.Close)
+	cli, err := gitlab.NewClient("t",
+		gitlab.WithBaseURL(ts.URL+"/api/v4"),
+		gitlab.WithoutRetries(),
+		gitlab.WithInterceptor(igl.BudgetInterceptor()),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := Deps{Config: &config.Config{
+		Token:             "t",
+		AllowedProjectIDs: []string{"42"},
+	}, Client: cli}
+	budget := igl.DefaultBudget()
+	budget.MaxRequests = 1
+	ctx := igl.WithBudget(context.Background(), budget)
+	defer budget.Cancel()
+	_, _, err = getMergeRequestDiffs(ctx, nil, getMergeRequestDiffsIn{
+		pidMR: pidMR{ProjectID: "42", MergeRequestIID: 1},
+	}, d)
+	if err == nil {
+		t.Fatal("expected early budget failure during authz")
+	}
+	if atomic.LoadInt32(&diffHits) != 0 {
+		t.Fatalf("diffs must not run after early authz budget stop, hits=%d", diffHits)
+	}
+	reqs, _, _ := budget.Stats()
+	if reqs < 1 {
+		t.Fatal("expected at least one charged authz request under budget")
+	}
+	// ErrBudgetRequests may surface directly or be wrapped as identity_unresolved by authz helpers.
+	if !errors.Is(err, igl.ErrBudgetRequests) &&
+		!strings.Contains(err.Error(), igl.ErrBudgetRequests.Error()) &&
+		!strings.Contains(err.Error(), readmeta.CodeIdentityUnresolved) &&
+		!strings.Contains(err.Error(), readmeta.CodeHTTPError) {
+		t.Fatalf("want budget/authz stop error, got %v", err)
 	}
 }

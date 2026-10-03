@@ -108,7 +108,50 @@ migration:
 | `get_merge_request_file_diff` | `diffs` | First page only (`per_page` 200). Requested path missing on a partial page ⇒ limitation **unobserved** (never conclusive absence). |
 | `get_merge_request_conflicts` | `has_conflicts`, `detailed_merge_status`, `conflict_files`, `merge_request_iid` | Heuristic marker scan coverage is described in `section`; scan never overrides GitLab mergeability flags. |
 
-Consumer example (`get_merge_request_diffs` partial / next page):
+Consumer examples (success + partial) for the shared `{diffs, pagination, section}`
+envelope shape. Empty filtered `get_merge_request_file_diff` results and empty
+`conflict_files` stay JSON `null` (legacy) — see examples under those tools in
+[`tools.md`](tools.md). `get_merge_request_diffs` empty pages stay SDK `[]`.
+
+**Success (exhausted known page):**
+
+```json
+{
+  "diffs": [
+    {
+      "old_path": "a.go",
+      "new_path": "a.go",
+      "a_mode": "100644",
+      "b_mode": "100644",
+      "diff": "+x\n",
+      "new_file": false,
+      "renamed_file": false,
+      "deleted_file": false,
+      "generated_file": false,
+      "collapsed": false,
+      "too_large": false
+    }
+  ],
+  "pagination": { "next_page": 0 },
+  "section": {
+    "retrieved_at": "2026-10-03T15:00:00Z",
+    "source": "gitlab_rest",
+    "provider": "gitlab",
+    "capability_version": "readmeta.mr_diffs.v1",
+    "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "pagination_exhausted": true,
+    "content_complete": "true",
+    "consistency": "consistent",
+    "limitations": [],
+    "next_cursor": null,
+    "counts": { "items": 1, "bytes": 120, "files": null },
+    "manifest_coverage": "full",
+    "patch_coverage": "full"
+  }
+}
+```
+
+**Partial (next page):**
 
 ```json
 {

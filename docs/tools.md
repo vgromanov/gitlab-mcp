@@ -80,12 +80,74 @@ This document describes the tool surface currently registered by
 - `get_merge_request_conflicts` — returns authoritative `has_conflicts` /
   `detailed_merge_status` plus a heuristic `conflict_files` marker scan of the
   inspected first page (`per_page` 200). Scan coverage is described in `section`;
-  an incomplete/empty scan never overrides GitLab mergeability flags.
+  an incomplete/empty scan never overrides GitLab mergeability flags. Empty scans
+  keep legacy `"conflict_files": null` (not `[]`).
+
+  Example (authoritative conflict flags; empty heuristic scan):
+
+  ```json
+  {
+    "has_conflicts": true,
+    "detailed_merge_status": "conflict",
+    "conflict_files": null,
+    "merge_request_iid": 1,
+    "pagination": { "next_page": 0 },
+    "section": {
+      "retrieved_at": "2026-10-03T15:00:00Z",
+      "source": "gitlab_rest",
+      "provider": "gitlab",
+      "capability_version": "readmeta.mr_diffs.v1",
+      "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "pagination_exhausted": true,
+      "content_complete": "true",
+      "consistency": "consistent",
+      "limitations": [
+        {
+          "code": "partial",
+          "message": "conflict_files is a heuristic marker scan of the inspected diffs page only; does not override has_conflicts or detailed_merge_status"
+        }
+      ],
+      "next_cursor": null,
+      "counts": { "items": 1, "bytes": 90, "files": null },
+      "manifest_coverage": "full",
+      "patch_coverage": "full"
+    }
+  }
+  ```
 - `list_merge_request_changed_files`
 - `get_merge_request_file_diff` — diffs for requested paths from the inspected
   first page (`per_page` 200) as `{diffs, pagination, section}`. A requested path
   missing from a partial page is **unobserved** (limitation), not conclusively
-  absent.
+  absent. Empty/`files:[]` keeps legacy `"diffs": null` (not `[]`).
+
+  Example (unobserved requested path on a partial page):
+
+  ```json
+  {
+    "diffs": null,
+    "pagination": { "next_page": 2 },
+    "section": {
+      "retrieved_at": "2026-10-03T15:00:00Z",
+      "source": "gitlab_rest",
+      "provider": "gitlab",
+      "capability_version": "readmeta.mr_diffs.v1",
+      "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "pagination_exhausted": false,
+      "content_complete": "false",
+      "consistency": "consistent",
+      "limitations": [
+        {
+          "code": "partial",
+          "message": "requested file(s) not observed on inspected page (unobserved, not proven absent): missing.go"
+        }
+      ],
+      "next_cursor": "2",
+      "counts": { "items": 0, "bytes": 80, "files": null },
+      "manifest_coverage": "partial",
+      "patch_coverage": "partial"
+    }
+  }
+  ```
 - `list_merge_request_versions`
 - `get_merge_request_version`
 
