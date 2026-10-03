@@ -150,8 +150,17 @@ func TestGraphQLVariablesObject_Unmarshal(t *testing.T) {
 
 func TestTopLevelAndPayloadGraphQLErrors(t *testing.T) {
 	t.Parallel()
+	if err := topLevelGraphQLErrors(map[string]any{"data": map[string]any{"ok": true}}); err != nil {
+		t.Fatalf("absent errors key: %v", err)
+	}
 	if err := topLevelGraphQLErrors(map[string]any{"data": map[string]any{"ok": true}, "errors": []any{}}); err != nil {
 		t.Fatalf("empty errors: %v", err)
+	}
+	if err := topLevelGraphQLErrors(map[string]any{
+		"data":   map[string]any{"ok": true},
+		"errors": nil,
+	}); err == nil || !strings.Contains(err.Error(), "malformed") {
+		t.Fatalf("want present null fail-closed, got %v", err)
 	}
 	if err := topLevelGraphQLErrors(map[string]any{
 		"data":   map[string]any{"ok": true},
@@ -183,14 +192,28 @@ func TestTopLevelAndPayloadGraphQLErrors(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("nested malformed decoy: %v", err)
 	}
+	// Nested present-null user "errors" must also be ignored at top-level.
+	if err := topLevelGraphQLErrors(map[string]any{
+		"data": map[string]any{"user": map[string]any{"errors": nil}},
+	}); err != nil {
+		t.Fatalf("nested null decoy: %v", err)
+	}
 	fields := []string{
 		"createWorkItem", "workItemUpdate", "workItemConvert",
 		"workItemMove", "workItemNoteCreate", "timelineEventCreate",
 	}
 	for _, field := range fields {
+		absent := map[string]any{"data": map[string]any{field: map[string]any{"workItem": map[string]any{"id": "1"}}}}
+		if err := knownMutationPayloadErrors(absent, field); err != nil {
+			t.Fatalf("%s absent: %v", field, err)
+		}
 		okBody := map[string]any{"data": map[string]any{field: map[string]any{"errors": []any{}}}}
 		if err := knownMutationPayloadErrors(okBody, field); err != nil {
 			t.Fatalf("%s empty: %v", field, err)
+		}
+		nullBody := map[string]any{"data": map[string]any{field: map[string]any{"errors": nil}}}
+		if err := knownMutationPayloadErrors(nullBody, field); err == nil || !strings.Contains(err.Error(), "malformed") {
+			t.Fatalf("%s present null: %v", field, err)
 		}
 		badBody := map[string]any{"data": map[string]any{field: map[string]any{"errors": []any{"nope"}}}}
 		if err := knownMutationPayloadErrors(badBody, field); err == nil || !strings.Contains(err.Error(), "nope") {
@@ -341,6 +364,82 @@ func TestExecuteGraphQL_topLevelHTTP200Errors(t *testing.T) {
 	}
 	if cap.attempts.Load() != 1 {
 		t.Fatalf("attempts=%d", cap.attempts.Load())
+	}
+}
+
+func TestExecuteGraphQL_MCPTopLevelErrorsPresentNullVsAbsent(t *testing.T) {
+	// Present JSON null with partial data must fail closed (AC4 review finding).
+	nullCap := &gqlCapture{handler: func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"errors":null,"data":{"__typename":"Query","ok":true}}`)
+	}}
+	nullDeps := newGraphQLDeps(t, &config.Config{}, nullCap)
+	srvNull := mcp.NewServer(&mcp.Implementation{Name: "t", Version: "t"}, nil)
+	RegisterGraphQLTools(srvNull, nullDeps)
+	csNull := testutil.MCPConnect(t, srvNull)
+	res, err := csNull.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "execute_graphql",
+		Arguments: map[string]any{"query": `{ __typename }`},
+	})
+	if err != nil {
+		t.Fatalf("present-null protocol: %v", err)
+	}
+	if res == nil || !res.IsError {
+		t.Fatalf("present-null must be tool error, got %+v", res)
+	}
+	if nullCap.attempts.Load() != 1 {
+		t.Fatalf("present-null attempts=%d", nullCap.attempts.Load())
+	}
+	// Direct handler path must match MCP overlay.
+	_, _, herr := executeGraphQL(context.Background(), nil, executeGraphQLIn{Query: `{ __typename }`}, nullDeps)
+	if herr == nil || !strings.Contains(herr.Error(), "malformed") {
+		t.Fatalf("present-null direct want malformed, got %v", herr)
+	}
+
+	// Absent errors key with data is success.
+	absentCap := &gqlCapture{handler: func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"data":{"__typename":"Query"}}`)
+	}}
+	absentDeps := newGraphQLDeps(t, &config.Config{}, absentCap)
+	srvAbsent := mcp.NewServer(&mcp.Implementation{Name: "t", Version: "t"}, nil)
+	RegisterGraphQLTools(srvAbsent, absentDeps)
+	csAbsent := testutil.MCPConnect(t, srvAbsent)
+	res, err = csAbsent.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "execute_graphql",
+		Arguments: map[string]any{"query": `{ __typename }`},
+	})
+	if err != nil {
+		t.Fatalf("absent protocol: %v", err)
+	}
+	if res != nil && res.IsError {
+		t.Fatalf("absent errors key must succeed, got %+v", res)
+	}
+	if absentCap.attempts.Load() != 1 {
+		t.Fatalf("absent attempts=%d", absentCap.attempts.Load())
+	}
+
+	// Empty errors list remains success.
+	emptyCap := &gqlCapture{handler: func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"data":{"__typename":"Query"},"errors":[]}`)
+	}}
+	emptyDeps := newGraphQLDeps(t, &config.Config{}, emptyCap)
+	srvEmpty := mcp.NewServer(&mcp.Implementation{Name: "t", Version: "t"}, nil)
+	RegisterGraphQLTools(srvEmpty, emptyDeps)
+	csEmpty := testutil.MCPConnect(t, srvEmpty)
+	res, err = csEmpty.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "execute_graphql",
+		Arguments: map[string]any{"query": `{ __typename }`},
+	})
+	if err != nil {
+		t.Fatalf("empty-list protocol: %v", err)
+	}
+	if res != nil && res.IsError {
+		t.Fatalf("errors:[] must succeed, got %+v", res)
+	}
+	if emptyCap.attempts.Load() != 1 {
+		t.Fatalf("empty-list attempts=%d", emptyCap.attempts.Load())
 	}
 }
 
@@ -524,7 +623,7 @@ func TestKnownMutationHandlers_payloadErrors(t *testing.T) {
 		}},
 	}
 	for _, tc := range fields {
-		t.Run(tc.field, func(t *testing.T) {
+		t.Run(tc.field+"/nonempty", func(t *testing.T) {
 			cap := &gqlCapture{handler: func(w http.ResponseWriter, _ *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
 				_, _ = io.WriteString(w, `{"data":{"`+tc.field+`":{"errors":["payload-boom"]},"user":{"errors":["decoy"]}}}`)
@@ -536,6 +635,39 @@ func TestKnownMutationHandlers_payloadErrors(t *testing.T) {
 			}
 			if strings.Contains(err.Error(), "decoy") {
 				t.Fatalf("must not surface nested decoy: %v", err)
+			}
+		})
+		t.Run(tc.field+"/present_null", func(t *testing.T) {
+			cap := &gqlCapture{handler: func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"data":{"`+tc.field+`":{"errors":null,"ok":true},"user":{"errors":null}}}`)
+			}}
+			d := newGraphQLDeps(t, &config.Config{}, cap)
+			err := tc.call(context.Background(), d)
+			if err == nil || !strings.Contains(err.Error(), "malformed") {
+				t.Fatalf("want present-null malformed, got %v", err)
+			}
+			if strings.Contains(err.Error(), "user") {
+				t.Fatalf("must not surface nested null decoy: %v", err)
+			}
+			if cap.attempts.Load() != 1 {
+				t.Fatalf("attempts=%d", cap.attempts.Load())
+			}
+		})
+		t.Run(tc.field+"/absent_and_empty", func(t *testing.T) {
+			absentCap := &gqlCapture{handler: func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"data":{"`+tc.field+`":{"ok":true},"user":{"errors":null}}}`)
+			}}
+			if err := tc.call(context.Background(), newGraphQLDeps(t, &config.Config{}, absentCap)); err != nil {
+				t.Fatalf("absent payload errors must succeed, got %v", err)
+			}
+			emptyCap := &gqlCapture{handler: func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"data":{"`+tc.field+`":{"errors":[]},"user":{"errors":["decoy"]}}}`)
+			}}
+			if err := tc.call(context.Background(), newGraphQLDeps(t, &config.Config{}, emptyCap)); err != nil {
+				t.Fatalf("errors:[] must succeed, got %v", err)
 			}
 		})
 	}

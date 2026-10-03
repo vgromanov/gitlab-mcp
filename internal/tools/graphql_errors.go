@@ -6,17 +6,20 @@ import (
 )
 
 // topLevelGraphQLErrors turns nonempty top-level GraphQL errors into a tool error.
-// errors:[] and a missing/null errors field are success. A present malformed
-// (non-array) top-level errors value fails closed. Nested fields named "errors"
-// are ignored here.
+// Missing errors key and errors:[] are success. A present null or other non-array
+// top-level errors value fails closed. Nested fields named "errors" are ignored.
 func topLevelGraphQLErrors(out any) error {
 	root, ok := out.(map[string]any)
 	if !ok || root == nil {
 		return nil
 	}
 	raw, exists := root["errors"]
-	if !exists || raw == nil {
+	if !exists {
 		return nil
+	}
+	// Present null is malformed (distinct from an absent key).
+	if raw == nil {
+		return fmt.Errorf("malformed GraphQL top-level errors value")
 	}
 	msgs, fail, ok := graphQLErrorMessages(raw)
 	if !ok {
@@ -30,7 +33,8 @@ func topLevelGraphQLErrors(out any) error {
 
 // knownMutationPayloadErrors checks documented payload errors for one known
 // mutation field under data.<field>.errors. It never walks arbitrary user fields.
-// A present malformed (non-array) payload errors value fails closed.
+// Absent errors and errors:[] succeed; a present null or other non-array value
+// fails closed.
 func knownMutationPayloadErrors(out any, field string) error {
 	root, ok := out.(map[string]any)
 	if !ok || root == nil {
@@ -45,8 +49,11 @@ func knownMutationPayloadErrors(out any, field string) error {
 		return nil
 	}
 	raw, exists := payload["errors"]
-	if !exists || raw == nil {
+	if !exists {
 		return nil
+	}
+	if raw == nil {
+		return fmt.Errorf("malformed GraphQL %s errors value", field)
 	}
 	msgs, fail, ok := graphQLErrorMessages(raw)
 	if !ok {
