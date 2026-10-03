@@ -68,7 +68,8 @@ This document describes the tool surface currently registered by
 - `update_merge_request`
 - `approve_merge_request`
 - `unapprove_merge_request`
-- `get_merge_request_approval_state`
+- `get_merge_request_approval_state` — normalized approval read with evidence-based
+  `/approval_state` → `/approvals` fallback (see [`approval-reads.md`](approval-reads.md))
 - `get_merge_request_diffs` — first page (`per_page` 100) of MR diffs as an object
   `{diffs, pagination, section}`. Preserves the existing `diffs` array field; adds
   honest pagination (`next_page`) and presence-aware `section` completeness

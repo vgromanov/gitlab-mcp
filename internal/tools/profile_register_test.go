@@ -209,7 +209,7 @@ var reviewAuthzPath = map[string]string{
 	"get_project":                      "resolveProjectAuthz",
 	"get_merge_request":                "pidMR.resolve",
 	"list_merge_requests":              "resolveProjectAuthz|AuthorizeCanonicalGroup|filterMergeRequestsByPolicy",
-	"get_merge_request_approval_state": "pidMR.resolve",
+	"get_merge_request_approval_state": "authorizeAndVerifyApprovalMR",
 	"get_merge_request_conflicts":      "authorizeMROwnerAndForks",
 	"get_merge_request_diffs":          "authorizeMROwnerAndForks",
 	"get_merge_request_file_diff":      "authorizeMROwnerAndForks",
