@@ -16,34 +16,31 @@ var annotationForceNotReadOnly = map[string]struct{}{
 
 // annotationAdditiveMutating lists mutating tools that are only additive creates
 // (destructiveHint=false). Audited against handlers — exclude overwrite/update/delete,
-// pipeline/job execution, draft publish (consumes draft state), and similar.
+// pipeline/job execution, draft publish (consumes draft state), command-capable
+// free-form note/discussion bodies (GitLab quick actions like /close), and similar.
 var annotationAdditiveMutating = map[string]struct{}{
-	"create_repository":                    {},
-	"fork_repository":                      {},
-	"create_branch":                        {},
-	"create_merge_request":                 {},
-	"create_merge_request_note":            {},
-	"create_merge_request_thread":          {},
-	"create_merge_request_discussion_note": {},
-	"create_note":                          {},
-	"approve_merge_request":                {},
-	"create_issue":                         {},
-	"create_issue_link":                    {},
-	"create_issue_note":                    {},
-	"create_label":                         {},
-	"create_milestone":                     {},
-	"create_wiki_page":                     {},
-	"create_group_wiki_page":               {},
-	"create_release":                       {},
-	"create_release_evidence":              {},
-	"create_draft_note":                    {},
-	"create_work_item":                     {},
-	"create_work_item_note":                {},
-	"create_timeline_event":                {},
+	"create_repository":       {},
+	"fork_repository":         {},
+	"create_branch":           {},
+	"create_merge_request":    {},
+	"approve_merge_request":   {},
+	"create_issue":            {},
+	"create_issue_link":       {},
+	"create_label":            {},
+	"create_milestone":        {},
+	"create_wiki_page":        {},
+	"create_group_wiki_page":  {},
+	"create_release":          {},
+	"create_release_evidence": {},
+	"create_work_item":        {},
+	"create_timeline_event":   {},
 	// intentionally NOT additive:
 	// create_or_update_file, push_files (overwrite/delete actions),
 	// create_pipeline / play_pipeline_job (arbitrary job execution),
 	// publish_draft_note / bulk_publish_draft_notes (consume/change draft state),
+	// create_note / create_merge_request_note / create_merge_request_thread /
+	// create_merge_request_discussion_note / create_issue_note /
+	// create_work_item_note / create_draft_note (arbitrary body; quick actions),
 	// updates/deletes/cancels/merges.
 }
 

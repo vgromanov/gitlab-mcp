@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -183,6 +184,13 @@ func TestRegisterAll_annotationProbes(t *testing.T) {
 	assertAnn("play_pipeline_job", false, &tr)     // arbitrary job play
 	assertAnn("publish_draft_note", false, &tr)    // consumes draft state
 	assertAnn("bulk_publish_draft_notes", false, &tr)
+	assertAnn("create_merge_request_note", false, &tr) // quick-action body
+	assertAnn("create_note", false, &tr)               // quick-action body
+	assertAnn("create_merge_request_thread", false, &tr)
+	assertAnn("create_merge_request_discussion_note", false, &tr)
+	assertAnn("create_issue_note", false, &tr)
+	assertAnn("create_work_item_note", false, &tr)
+	assertAnn("create_draft_note", false, &tr)
 	assertAnn("execute_graphql", false, &tr)
 	assertAnn("upload_markdown", false, &tr)
 	assertAnn("download_job_artifacts", false, &tr) // os.Create truncates
@@ -202,12 +210,12 @@ var reviewAuthzPath = map[string]string{
 	"get_merge_request":                "pidMR.resolve",
 	"list_merge_requests":              "resolveProjectAuthz|AuthorizeCanonicalGroup|filterMergeRequestsByPolicy",
 	"get_merge_request_approval_state": "pidMR.resolve",
-	"get_merge_request_conflicts":      "pidMR.resolve",
-	"get_merge_request_diffs":          "pidMR.resolve",
-	"get_merge_request_file_diff":      "pidMR.resolve",
-	"list_merge_request_changed_files": "pidMR.resolve",
-	"list_merge_request_versions":      "pidMR.resolve",
-	"get_merge_request_version":        "pidMR.resolve",
+	"get_merge_request_conflicts":      "authorizeMROwnerAndForks",
+	"get_merge_request_diffs":          "authorizeMROwnerAndForks",
+	"get_merge_request_file_diff":      "authorizeMROwnerAndForks",
+	"list_merge_request_changed_files": "authorizeMROwnerAndForks",
+	"list_merge_request_versions":      "authorizeMROwnerAndForks",
+	"get_merge_request_version":        "authorizeMROwnerAndForks",
 	"list_merge_request_diffs":         "AuthorizeCanonicalProject+020envelope",
 	"mr_discussions":                   "pidMR.resolve",
 	"get_merge_request_notes":          "pidMR.resolve",
@@ -465,4 +473,187 @@ func TestReviewProfiles_listMergeRequestDiffsCallToolEnvelope(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestAnnotation_noteBodiesDestructiveWithQuickActionCapture proves tools/list
+// advertises destructiveHint=true for command-capable free-form note/discussion
+// tools, and CallTool forwards body/note "/close" unchanged to the synthetic
+// GitLab API (no live quick-action execution). Exact JSON field equality —
+// not substring Contains — proves the quick-action text was not altered.
+func TestAnnotation_noteBodiesDestructiveWithQuickActionCapture(t *testing.T) {
+	const quick = "/close"
+	var captured []string
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Body != nil && (r.Method == http.MethodPost || r.Method == http.MethodPut) {
+			b, _ := io.ReadAll(r.Body)
+			captured = append(captured, string(b))
+			_ = r.Body.Close()
+		}
+		path := r.URL.Path
+		switch {
+		case strings.Contains(path, "/graphql"):
+			_, _ = io.WriteString(w, `{"data":{"workItemNoteCreate":{"note":{"id":"gid://1","body":"ok"},"errors":[]}}}`)
+		case strings.Contains(path, "/draft_notes"):
+			_, _ = io.WriteString(w, `{"id":1,"note":"ok"}`)
+		case strings.Contains(path, "/notes"):
+			// Top-level notes and discussion-note replies both return Note (id int64).
+			_, _ = io.WriteString(w, `{"id":1,"body":"ok"}`)
+		case strings.Contains(path, "/discussions"):
+			_, _ = io.WriteString(w, `{"id":"d1","notes":[{"id":1,"body":"ok"}]}`)
+		case strings.Contains(path, "/merge_requests/"):
+			_, _ = io.WriteString(w, mrJSON(42, 42, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"))
+		case strings.Contains(path, "/projects/"):
+			_, _ = io.WriteString(w, `{"id":42,"path_with_namespace":"g/p"}`)
+		default:
+			_, _ = io.WriteString(w, `{}`)
+		}
+	})
+	ts := httptest.NewServer(h)
+	t.Cleanup(ts.Close)
+	cli, err := gitlab.NewClient("t",
+		gitlab.WithBaseURL(ts.URL+"/api/v4"),
+		gitlab.WithoutRetries(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Legacy unrestricted (new-family booleans false) so note tools register.
+	cfg := &config.Config{Token: "t", Wiki: true, Pipeline: true}
+	if cfg.RestrictedMode() {
+		t.Fatal("must stay unrestricted")
+	}
+	srv := mcp.NewServer(&mcp.Implementation{Name: "note-ann", Version: "t"}, nil)
+	RegisterAll(srv, Deps{Config: cfg, Client: cli})
+	cs := testutil.MCPConnect(t, srv)
+
+	listed, err := cs.ListTools(context.Background(), &mcp.ListToolsParams{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	byName := map[string]*mcp.Tool{}
+	for _, tool := range listed.Tools {
+		if tool != nil {
+			byName[tool.Name] = tool
+		}
+	}
+
+	commandCapable := []string{
+		"create_merge_request_note",
+		"create_note",
+		"create_merge_request_thread",
+		"create_merge_request_discussion_note",
+		"create_issue_note",
+		"create_work_item_note",
+		"create_draft_note",
+	}
+	for _, name := range commandCapable {
+		tool := byName[name]
+		if tool == nil {
+			t.Fatalf("missing registered tool %q", name)
+		}
+		if tool.Annotations == nil || tool.Annotations.ReadOnlyHint {
+			t.Fatalf("%s: want ReadOnlyHint=false", name)
+		}
+		if tool.Annotations.DestructiveHint == nil || *tool.Annotations.DestructiveHint != true {
+			t.Fatalf("%s: want explicit DestructiveHint=true (command-capable body), got %#v", name, tool.Annotations.DestructiveHint)
+		}
+		if tool.Annotations.IdempotentHint {
+			t.Fatalf("%s: IdempotentHint must stay false", name)
+		}
+	}
+	// Genuinely additive create of a new object remains destructiveHint=false.
+	if issue := byName["create_issue"]; issue == nil || issue.Annotations == nil ||
+		issue.Annotations.DestructiveHint == nil || *issue.Annotations.DestructiveHint != false {
+		t.Fatalf("create_issue must remain additive destructiveHint=false")
+	}
+
+	// extractQuickAction returns the exact forwarded free-form text field for
+	// each tool's synthetic request JSON (tool-specific paths, not a shared oracle).
+	extractQuickAction := func(toolName, raw string) (string, error) {
+		var top map[string]any
+		if err := json.Unmarshal([]byte(raw), &top); err != nil {
+			return "", fmt.Errorf("parse request JSON: %w; raw=%q", err, raw)
+		}
+		switch toolName {
+		case "create_merge_request_note", "create_note", "create_merge_request_thread",
+			"create_merge_request_discussion_note", "create_issue_note":
+			v, ok := top["body"].(string)
+			if !ok {
+				return "", fmt.Errorf("missing string field body; raw=%q", raw)
+			}
+			return v, nil
+		case "create_draft_note":
+			v, ok := top["note"].(string)
+			if !ok {
+				return "", fmt.Errorf("missing string field note; raw=%q", raw)
+			}
+			return v, nil
+		case "create_work_item_note":
+			vars, _ := top["variables"].(map[string]any)
+			if vars == nil {
+				return "", fmt.Errorf("missing GraphQL variables; raw=%q", raw)
+			}
+			input, _ := vars["input"].(map[string]any)
+			if input == nil {
+				return "", fmt.Errorf("missing GraphQL variables.input; raw=%q", raw)
+			}
+			// Handler maps CallTool body → GraphQL input.note.
+			v, ok := input["note"].(string)
+			if !ok {
+				return "", fmt.Errorf("missing GraphQL variables.input.note; raw=%q", raw)
+			}
+			return v, nil
+		default:
+			return "", fmt.Errorf("unknown tool %q", toolName)
+		}
+	}
+
+	call := func(name string, args map[string]any) {
+		t.Helper()
+		before := len(captured)
+		res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{Name: name, Arguments: args})
+		if err != nil {
+			t.Fatalf("%s CallTool err: %v", name, err)
+		}
+		if res == nil {
+			t.Fatalf("%s: nil CallToolResult", name)
+		}
+		if res.IsError {
+			t.Fatalf("%s IsError: %q", name, toolErrorText(t, res))
+		}
+		if len(captured) <= before {
+			t.Fatalf("%s: no synthetic HTTP body captured", name)
+		}
+		last := captured[len(captured)-1]
+		got, err := extractQuickAction(name, last)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if got != quick {
+			t.Fatalf("%s: forwarded text %q want exact %q; raw=%q", name, got, quick, last)
+		}
+	}
+
+	call("create_merge_request_note", map[string]any{
+		"project_id": "42", "merge_request_iid": 1, "body": quick,
+	})
+	call("create_note", map[string]any{
+		"project_id": "42", "noteable_type": "merge_request", "noteable_iid": 1, "body": quick,
+	})
+	call("create_merge_request_thread", map[string]any{
+		"project_id": "42", "merge_request_iid": 1, "body": quick,
+	})
+	call("create_merge_request_discussion_note", map[string]any{
+		"project_id": "42", "merge_request_iid": 1, "discussion_id": "d1", "body": quick,
+	})
+	call("create_issue_note", map[string]any{
+		"project_id": "42", "issue_iid": 1, "discussion_id": "d1", "body": quick,
+	})
+	call("create_draft_note", map[string]any{
+		"project_id": "42", "merge_request_iid": 1, "note": quick,
+	})
+	call("create_work_item_note", map[string]any{
+		"id": "gid://gitlab/WorkItem/1", "body": quick,
+	})
 }
