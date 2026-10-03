@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- Legacy MR diff getters (`get_merge_request_diffs`, `get_merge_request_file_diff`,
+  `get_merge_request_conflicts`) now include honest `pagination` / `section`
+  completeness metadata on their existing object responses (RVG-127 /
+  LOCAL-GLM-013). Existing field names (`diffs`, `has_conflicts`,
+  `detailed_merge_status`, `conflict_files`, …) are preserved. Partial pages,
+  local `truncate_lines`, collapsed/too_large/omitted presence, and heuristic
+  conflict scans no longer imply false completeness; a missing requested file on
+  a partial page is reported as unobserved. See `docs/read-envelopes.md` and
+  `docs/tools.md`.
+
 ### Added
 
 - Corp GitLab home `skunk-works/tools/gitlab-mcp` with shared

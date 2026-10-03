@@ -69,11 +69,23 @@ This document describes the tool surface currently registered by
 - `approve_merge_request`
 - `unapprove_merge_request`
 - `get_merge_request_approval_state`
-- `get_merge_request_diffs`
+- `get_merge_request_diffs` — first page (`per_page` 100) of MR diffs as an object
+  `{diffs, pagination, section}`. Preserves the existing `diffs` array field; adds
+  honest pagination (`next_page`) and presence-aware `section` completeness
+  (see [`read-envelopes.md`](read-envelopes.md)). Does not walk further pages.
+  Local `truncate_lines` marks patch content incomplete. Continuation via
+  informational `section.next_cursor` / `pagination.next_page` only (unsigned page
+  hint; not an authenticated cursor).
 - `list_merge_request_diffs` — lists MR diffs with pagination; additive `section` completeness envelope (see [`read-envelopes.md`](read-envelopes.md))
-- `get_merge_request_conflicts`
+- `get_merge_request_conflicts` — returns authoritative `has_conflicts` /
+  `detailed_merge_status` plus a heuristic `conflict_files` marker scan of the
+  inspected first page (`per_page` 200). Scan coverage is described in `section`;
+  an incomplete/empty scan never overrides GitLab mergeability flags.
 - `list_merge_request_changed_files`
-- `get_merge_request_file_diff`
+- `get_merge_request_file_diff` — diffs for requested paths from the inspected
+  first page (`per_page` 200) as `{diffs, pagination, section}`. A requested path
+  missing from a partial page is **unobserved** (limitation), not conclusively
+  absent.
 - `list_merge_request_versions`
 - `get_merge_request_version`
 
