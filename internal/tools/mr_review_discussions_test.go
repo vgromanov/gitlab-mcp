@@ -248,10 +248,9 @@ func TestDiscussionReviewContext(t *testing.T) {
 			if cursor != "" {
 				item.Cursors = []reviewContextCursorIn{{Section: "discussions", Cursor: cursor}}
 			}
-			before, _, beforeItems := b.Stats()
-			_ = before
+			beforeReqs, beforeBytes, beforeItems := b.Stats()
 			out, err := callReviewDirect(t, d, igl.WithBudget(context.Background(), b), []reviewContextItemIn{item})
-			_, _, afterItems := b.Stats()
+			afterReqs, afterBytes, afterItems := b.Stats()
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -263,16 +262,20 @@ func TestDiscussionReviewContext(t *testing.T) {
 			if *(*got.Discussions.Notes)[0].NoteID != wantID {
 				t.Fatalf("call %d note %s", i, *(*got.Discussions.Notes)[0].NoteID)
 			}
-			if got.Discussions.FullRevisionDigest != nil || got.Sections["discussions"].ContentComplete == readmeta.ContentCompleteTrue {
-				t.Fatalf("call %d claimed full revision", i)
+			if got.Discussions.SemanticFeedbackDigest != nil || got.Discussions.PositionDigest != nil || got.Discussions.FullRevisionDigest != nil || got.Sections["discussions"].ContentComplete == readmeta.ContentCompleteTrue {
+				t.Fatalf("call %d claimed discussions evidence %+v", i, got.Discussions)
 			}
-			delta := afterItems - beforeItems
-			if i == 0 && delta < 1 {
-				t.Fatalf("call 0 inspected %d", delta)
+			// One budget object: opening 6 + replayed-and-new notes + closing 3.
+			// A reset would drop the end count; a missed closing charge would stop at 6+(i+1).
+			inspected := i + 1
+			wantItems := 6 + inspected + 3
+			if beforeReqs != 0 || beforeBytes != 0 || beforeItems != 0 || afterItems != wantItems || afterItems != maxItems || afterReqs != 11 || afterReqs <= beforeReqs || afterBytes < beforeBytes {
+				t.Fatalf("call %d counters reqs %d->%d bytes %d->%d items %d->%d wantItems %d wantReqs 11", i, beforeReqs, afterReqs, beforeBytes, afterBytes, beforeItems, afterItems, wantItems)
 			}
-			if i > 0 && delta < i+1 {
-				t.Fatalf("call %d replay+new inspected %d", i, delta)
+			if log.count("/versions") != 2 || got.Cause != "" || got.ContextRef == nil {
+				t.Fatalf("call %d versions %d cause=%s ref=%v", i, log.count("/versions"), got.Cause, got.ContextRef != nil)
 			}
+			assertMetadataRefExcludesDiscussions(t, d, *got.ContextRef)
 			itemsBefore = afterItems
 			if i < 2 {
 				if got.Sections["discussions"].NextCursor == nil {
@@ -667,27 +670,68 @@ func TestDiscussionShortAllowanceCursor(t *testing.T) {
 	d := newReviewDeps(t, http.HandlerFunc(script.serve))
 	b := reviewBudget(128)
 	b.MaxBytes = 96 << 10
-	item := metaItem("42", 1, "discussions")
+	item := metaItem("42", 1, "metadata", "discussions")
 	item.DiscussionSelection = "all"
+	beforeReqs, beforeBytes, beforeItems := b.Stats()
 	out, err := callReviewDirect(t, d, igl.WithBudget(context.Background(), b), []reviewContextItemIn{item})
+	afterReqs, afterBytes, afterItems := b.Stats()
 	if err != nil {
 		t.Fatal(err)
+	}
+	if b.MaxBytes != 96<<10 {
+		t.Fatalf("byte cap changed to %d", b.MaxBytes)
 	}
 	got := out.Items[0]
 	if got.Discussions == nil || got.Discussions.Notes == nil || len(*got.Discussions.Notes) != 1 || *(*got.Discussions.Notes)[0].NoteID != "1" {
 		t.Fatalf("notes=%v cause=%s lim=%#v", notesOf(got), got.Cause, got.Sections["discussions"].Limitations)
 	}
-	cur := got.Sections["discussions"].NextCursor
-	if cur == nil {
-		t.Fatalf("short allowance minted nothing lim=%#v", got.Sections["discussions"].Limitations)
+	if got.Cause != "" || got.ContextRef == nil || log.count("/versions") != 2 {
+		t.Fatalf("versions %d cause=%s ref=%v", log.count("/versions"), got.Cause, got.ContextRef != nil)
 	}
-	for _, lim := range got.Sections["discussions"].Limitations {
+	// Kept note is charged; the cut note is not. Closing still adds 3 on this single-row fixture.
+	if beforeReqs != 0 || beforeBytes != 0 || beforeItems != 0 || afterItems != 6+1+3 || afterReqs <= beforeReqs || afterBytes <= beforeBytes || afterBytes > b.MaxBytes {
+		t.Fatalf("counters reqs %d->%d bytes %d->%d items %d->%d cap %d", beforeReqs, afterReqs, beforeBytes, afterBytes, beforeItems, afterItems, b.MaxBytes)
+	}
+	sec := got.Sections["discussions"]
+	if sec.ContentComplete == readmeta.ContentCompleteTrue || got.Discussions.SemanticFeedbackDigest != nil || got.Discussions.PositionDigest != nil || got.Discussions.FullRevisionDigest != nil {
+		t.Fatalf("short allowance claimed evidence %+v sec=%+v", got.Discussions, sec)
+	}
+	for _, lim := range sec.Limitations {
 		if lim.Code == readmeta.CodeTooLarge {
 			t.Fatal("short allowance reported too_large")
 		}
 	}
+	assertMetadataRefExcludesDiscussions(t, d, *got.ContextRef)
+	cur := sec.NextCursor
+	if cur == nil {
+		t.Fatalf("short allowance minted nothing lim=%#v", sec.Limitations)
+	}
 	payload, err := cursor.Decode(d.Config.CursorKey, *cur, time.Date(2026, 10, 4, 12, 30, 0, 0, time.UTC))
-	if err != nil || payload.DiscussionsCont == nil || payload.DiscussionsCont.P != 1 || payload.DiscussionsCont.NI != 1 {
+	if err != nil || payload.DiscussionsCont == nil || payload.DiscussionsCont.P != 1 || payload.DiscussionsCont.NI != 1 || payload.DiscussionsCont.DI != 0 {
 		t.Fatalf("cursor err=%v cont=%+v", err, payload.DiscussionsCont)
+	}
+}
+
+func assertMetadataRefExcludesDiscussions(t *testing.T, d Deps, token string) {
+	t.Helper()
+	payload, err := cursor.Decode(d.Config.CursorKey, token, time.Date(2026, 10, 4, 12, 30, 0, 0, time.UTC))
+	if err != nil || payload.ContextRef == nil {
+		t.Fatalf("context ref err=%v", err)
+	}
+	ref := payload.ContextRef
+	if len(ref.Complete) != 1 || ref.Complete[0] != "metadata" {
+		t.Fatalf("complete %#v", ref.Complete)
+	}
+	if _, ok := ref.Digests["discussions"]; ok {
+		t.Fatalf("discussions digest %#v", ref.Digests)
+	}
+	excluded := false
+	for _, name := range ref.Excluded {
+		if name == "discussions" {
+			excluded = true
+		}
+	}
+	if !excluded {
+		t.Fatalf("excluded %#v", ref.Excluded)
 	}
 }
