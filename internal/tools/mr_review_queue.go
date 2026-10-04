@@ -136,9 +136,10 @@ func getMergeRequestReviewQueue(ctx context.Context, _ *mcp.CallToolRequest, in 
 	filters := buildQueueFilters(norm, discoveryActor)
 
 	group, err := queueAuthorizeCanonicalGroup(ctx, d, norm.groupID)
-	if err != nil {
+	if err != nil && (group.ID == 0 || (!isTypedBudget(err) && !errors.Is(err, errQueueCancelled))) {
 		return nil, nil, sanitizeQueueErr(err)
 	}
+	authStop := err
 	groupID := strconv.FormatInt(group.ID, 10)
 	scope := cursor.Scope{Kind: cursor.ScopeGroupQueue, GroupID: groupID}
 	upper := ""
@@ -176,7 +177,13 @@ func getMergeRequestReviewQueue(ctx context.Context, _ *mcp.CallToolRequest, in 
 	st.movingDiscovery = true
 	st.persistLimitation(readmeta.CodeInconsistent, "moving discovery window")
 
-	if qc.Phase == "discover" {
+	if authStop != nil {
+		if isTypedBudget(authStop) {
+			st.noteBudget(authStop)
+		} else if errors.Is(authStop, errQueueCancelled) {
+			st.persistLimitation(readmeta.CodeCancelled, "invocation cancelled")
+		}
+	} else if qc.Phase == "discover" {
 		if !st.qc.Term {
 			if err := st.runDiscover(ctx); err != nil && !errors.Is(err, errQueueStop) {
 				if isTypedBudget(err) {
@@ -198,7 +205,7 @@ func getMergeRequestReviewQueue(ctx context.Context, _ *mcp.CallToolRequest, in 
 	}
 
 	var items []reviewQueueItem
-	if st.qc.Phase == "emit" {
+	if authStop == nil && st.qc.Phase == "emit" {
 		items, err = st.runEmit(ctx)
 		if err != nil && !errors.Is(err, errQueueStop) {
 			if isTypedBudget(err) {
@@ -2110,6 +2117,18 @@ func newReviewQueueSection(now time.Time) readmeta.Section {
 func sanitizeQueueErr(err error) error {
 	if err == nil {
 		return nil
+	}
+	switch {
+	case errors.Is(err, igl.ErrBudgetItems):
+		return fmt.Errorf("%s", readmeta.CodeBudgetItems)
+	case errors.Is(err, igl.ErrBudgetBytes):
+		return fmt.Errorf("%s", readmeta.CodeBudgetBytes)
+	case errors.Is(err, igl.ErrBudgetRequests):
+		return fmt.Errorf("%s", readmeta.CodeBudgetRequests)
+	case errors.Is(err, igl.ErrBudgetElapsed):
+		return fmt.Errorf("%s", readmeta.CodeBudgetElapsed)
+	case errors.Is(err, errQueueCancelled):
+		return fmt.Errorf("%s", readmeta.CodeCancelled)
 	}
 	msg := err.Error()
 	switch {

@@ -289,6 +289,12 @@ func queueAuthorizeCanonicalGroup(ctx context.Context, d Deps, groupID string) (
 		}
 		ag, err := queueGetGroup(ctx, d, tok)
 		if err != nil {
+			// The requested group is already known. A budget or cancel here has
+			// not observed a provider page, so the caller can keep that group
+			// and resume without treating the stop as a malformed page.
+			if isTypedBudget(err) || errors.Is(err, errQueueCancelled) {
+				return canon, err
+			}
 			return CanonicalGroup{}, err
 		}
 		allowed[ag.ID] = struct{}{}
@@ -298,6 +304,9 @@ func queueAuthorizeCanonicalGroup(ctx context.Context, d Deps, groupID string) (
 	}
 	ok, err := queueGroupAncestryContains(ctx, d, canon.ID, allowed)
 	if err != nil {
+		if isTypedBudget(err) || errors.Is(err, errQueueCancelled) {
+			return canon, err
+		}
 		return CanonicalGroup{}, err
 	}
 	if !ok {

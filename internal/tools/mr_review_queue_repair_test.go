@@ -343,6 +343,37 @@ func TestReviewQueue_F5ResumableDiscussionBoundary(t *testing.T) {
 	}
 }
 
+func TestReviewQueue_R1UnobservedPageBudget(t *testing.T) {
+	for _, ongoing := range []bool{false, true} {
+		t.Run(fmt.Sprintf("ongoing_%t", ongoing), func(t *testing.T) {
+			tr := &repairRT{}
+			d := repairDeps(t, tr, nil)
+			b := igl.DefaultBudget()
+			t.Cleanup(b.Cancel)
+			b.MaxRequests = 2
+			in := getMergeRequestReviewQueueIn{GroupID: "9", Kinds: []string{"reviewer"}, PageSize: 20}
+			if ongoing {
+				b.MaxRequests = 4
+				in.Kinds = []string{"ongoing"}
+				in.KnownMRs = []knownMRSeed{{ProjectID: "42", MergeRequestIID: 1}}
+			}
+			_, v, err := getMergeRequestReviewQueue(igl.WithBudget(context.Background(), b), nil, in, d)
+			if err != nil {
+				t.Fatal(err)
+			}
+			out := v.(map[string]any)
+			tok, _ := sectionMap(out)["next_cursor"].(string)
+			codes := limitationCodes(sectionMap(out))
+			if tr.listHits != 0 || tr.discussionHits != 0 {
+				t.Fatalf("page observed lists=%d discussions=%d", tr.listHits, tr.discussionHits)
+			}
+			if tok == "" || hasCode(codes, readmeta.CodeProviderPageAmbiguous) || !hasCode(codes, readmeta.CodeBudgetRequests) {
+				t.Fatalf("misclassified tok=%q codes=%v", tok, codes)
+			}
+		})
+	}
+}
+
 func TestReviewQueue_R1IntentionalCallbackBudget(t *testing.T) {
 	for _, mode := range []string{"", "discovery", "noheader", "dupheader", "jump"} {
 		t.Run(mode, func(t *testing.T) {
