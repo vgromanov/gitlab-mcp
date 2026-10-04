@@ -3,7 +3,6 @@
 package gitcache
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"io"
@@ -110,19 +109,20 @@ func nativeVersionAndIndex(t *testing.T, helper, git string, idn BuildIdentity, 
 	if err := r.Activate(id); err != nil {
 		t.Fatal(err)
 	}
-	buf := &bytes.Buffer{}
-	old := launchStdout
-	launchStdout = buf
-	t.Cleanup(func() { launchStdout = old })
+	buf := newLaunchBuf()
+	old := launchCapture
+	launchCapture = buf
+	t.Cleanup(func() { launchCapture = old })
 	if err := r.Launch(RoleVersion, git, id, "", idn, kernel, major); err != nil {
 		t.Fatal(err)
 	}
 	if err := r.Quiesce(id); err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.Now().Add(time.Second)
-	for !strings.Contains(buf.String(), idn.VersionLine) && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
+	select {
+	case <-buf.done:
+	case <-time.After(roleWait):
+		t.Fatal("version stdout drain did not finish")
 	}
 	if strings.TrimSpace(buf.String()) != idn.VersionLine {
 		t.Fatalf("version %q want %q", buf.String(), idn.VersionLine)
@@ -161,6 +161,10 @@ func nativeVersionAndIndex(t *testing.T, helper, git string, idn BuildIdentity, 
 	}
 	if st.Size() == 0 {
 		t.Fatal("empty idx")
+	}
+	charge, err := CommittedCharge(uint64(len(pack)), uint64(st.Size()))
+	if err != nil || charge != uint64(len(pack))+uint64(st.Size())+MetaMax {
+		t.Fatalf("C %d %v", charge, err)
 	}
 }
 

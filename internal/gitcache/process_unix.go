@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -160,9 +161,36 @@ func roleArgv(role Role, git, tip string) ([]string, error) {
 // A test may select __gitcache_git_failas to force the AS gate closed.
 var gitLaunchArg = "__gitcache_git"
 
-// launchStdout is a test seam. Production leaves it nil. A native test may
-// set it to record the child stdout that drainLimit would otherwise discard.
-var launchStdout *bytes.Buffer
+// launchCapture is a test seam. Production leaves it nil.
+// Writes are synchronized, and done is closed after the stdout drain returns.
+var launchCapture *launchBuf
+
+type launchBuf struct {
+	mu   sync.Mutex
+	buf  bytes.Buffer
+	once sync.Once
+	done chan struct{}
+}
+
+func newLaunchBuf() *launchBuf {
+	return &launchBuf{done: make(chan struct{})}
+}
+
+func (b *launchBuf) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *launchBuf) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func (b *launchBuf) finish() {
+	b.once.Do(func() { close(b.done) })
+}
 
 func LaunchGit(role Role, helper, git, genPath, tip string, root *os.File, lock *os.File) (*exec.Cmd, error) {
 	fsize, err := roleFSIZE(role)
@@ -213,11 +241,16 @@ func LaunchGit(role Role, helper, git, genPath, tip string, root *os.File, lock 
 		outLimit = CatFileStdoutMax
 	}
 	var out io.ReadCloser = stdout
-	if launchStdout != nil {
-		launchStdout.Reset()
-		out = closeReader{Reader: io.TeeReader(stdout, launchStdout), Closer: stdout}
+	capBuf := launchCapture
+	if capBuf != nil {
+		out = closeReader{Reader: io.TeeReader(stdout, capBuf), Closer: stdout}
 	}
-	go drainLimit(out, cmd.Process.Pid, outLimit)
+	go func() {
+		drainLimit(out, cmd.Process.Pid, outLimit)
+		if capBuf != nil {
+			capBuf.finish()
+		}
+	}()
 	_ = fsize
 	_ = argv // rebuilt in the child from the role, the absolute git path, and the tip
 	payload := []byte(string(role) + "\x00" + git + "\x00" + genPath + "\x00" + tip)

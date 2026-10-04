@@ -134,13 +134,34 @@ func startFS(helper string, root *os.File) (*fsClient, error) {
 }
 
 func readFullDeadline(r io.Reader, buf []byte, d time.Duration) error {
-	if f, ok := r.(interface{ SetReadDeadline(time.Time) error }); ok {
-		_ = f.SetReadDeadline(time.Now().Add(d))
-		defer f.SetReadDeadline(time.Time{})
+	f, ok := r.(interface{ SetReadDeadline(time.Time) error })
+	if !ok {
+		return ErrNotQuiescent
 	}
+	if err := f.SetReadDeadline(time.Now().Add(d)); err != nil {
+		return err
+	}
+	defer f.SetReadDeadline(time.Time{})
 	_, err := io.ReadFull(r, buf)
 	return err
 }
+
+func writeFullDeadline(w io.Writer, p []byte, d time.Duration) error {
+	f, ok := w.(interface{ SetWriteDeadline(time.Time) error })
+	if !ok {
+		return ErrNotQuiescent
+	}
+	if err := f.SetWriteDeadline(time.Now().Add(d)); err != nil {
+		return err
+	}
+	defer f.SetWriteDeadline(time.Time{})
+	_, err := w.Write(p)
+	return err
+}
+
+// helperFsyncFault is a test-only injection. Production leaves it nil.
+// It runs only after a physical write has returned a byte count.
+var helperFsyncFault func() error
 
 func drainLimit(r io.ReadCloser, pid, n int) {
 	defer r.Close()
@@ -173,11 +194,13 @@ func (c *fsClient) call(op byte, payload []byte) ([]byte, error) {
 	var hdr [5]byte
 	binary.LittleEndian.PutUint32(hdr[:4], uint32(len(payload)))
 	hdr[4] = op
-	if _, err := c.in.Write(hdr[:]); err != nil {
-		return nil, err
+	if err := writeFullDeadline(c.in, hdr[:], ackWait); err != nil {
+		c.killLocked()
+		return nil, ErrNotQuiescent
 	}
-	if _, err := c.in.Write(payload); err != nil {
-		return nil, err
+	if err := writeFullDeadline(c.in, payload, ackWait); err != nil {
+		c.killLocked()
+		return nil, ErrNotQuiescent
 	}
 	var rh [8]byte
 	if err := readFullDeadline(c.out, rh[:], ackWait); err != nil {
@@ -340,6 +363,8 @@ func (h *fsHelper) op(op byte, payload []byte) (uint32, []byte) {
 			return 5, nil
 		}
 		return 0, nil
+	case 9:
+		return h.openStat(payload)
 	default:
 		return 5, nil
 	}
@@ -376,9 +401,40 @@ func (h *fsHelper) step(name string) error {
 	if err != nil {
 		return err
 	}
+	if err := fstatHeld(fd, h.dev, true, 0700); err != nil {
+		syscall.Close(fd)
+		return err
+	}
 	err = syscall.Fchdir(fd)
 	syscall.Close(fd)
 	return err
+}
+
+func fstatHeld(fd int, dev uint64, dir bool, mode uint64) error {
+	var st syscall.Stat_t
+	if err := syscall.Fstat(fd, &st); err != nil {
+		return err
+	}
+	if uint64(st.Dev) != dev || uint32(st.Uid) != uint32(os.Geteuid()) {
+		return ErrPath
+	}
+	if dir {
+		if st.Mode&syscall.S_IFMT != syscall.S_IFDIR || st.Mode&0777 != 0700 {
+			return ErrPath
+		}
+		return nil
+	}
+	if st.Mode&syscall.S_IFMT != syscall.S_IFREG || st.Nlink != 1 {
+		return ErrPath
+	}
+	got := uint64(st.Mode & 0777)
+	if mode != 0 && got != mode {
+		return ErrPath
+	}
+	if mode == 0 && got != 0600 && got != 0444 {
+		return ErrPath
+	}
+	return nil
 }
 
 func splitRel(rel string) ([]string, error) {
@@ -422,14 +478,20 @@ func (h *fsHelper) write(payload []byte) (uint32, []byte) {
 		} else if lerr != nil {
 			return lerr
 		}
-		if off == 0 {
-			flags |= syscall.O_TRUNC
-		}
 		fd, err := syscall.Open(base, flags, 0600)
 		if err != nil {
 			return err
 		}
 		defer syscall.Close(fd)
+		want := uint64(0600)
+		if err := fstatHeld(fd, h.dev, false, want); err != nil {
+			return err
+		}
+		if off == 0 {
+			if err := syscall.Ftruncate(fd, 0); err != nil {
+				return err
+			}
+		}
 		if _, err := syscall.Seek(fd, int64(off), io.SeekStart); err != nil {
 			return err
 		}
@@ -440,6 +502,11 @@ func (h *fsHelper) write(payload []byte) (uint32, []byte) {
 		}
 		if wn != len(data) {
 			return ErrQuota
+		}
+		if helperFsyncFault != nil {
+			if err := helperFsyncFault(); err != nil {
+				return err
+			}
 		}
 		if err := syscall.Fsync(fd); err != nil {
 			return err
@@ -473,7 +540,17 @@ func (h *fsHelper) read(payload []byte) (uint32, []byte) {
 			return err
 		}
 		defer syscall.Close(fd)
-		buf = make([]byte, st.Size)
+		if err := fstatHeld(fd, h.dev, false, 0); err != nil {
+			return err
+		}
+		var got syscall.Stat_t
+		if err := syscall.Fstat(fd, &got); err != nil {
+			return err
+		}
+		if got.Size < 0 || uint64(got.Size) > 1<<20 {
+			return ErrQuota
+		}
+		buf = make([]byte, got.Size)
 		return readFullFD(fd, buf)
 	})
 	if err != nil {
@@ -579,6 +656,30 @@ func (h *fsHelper) lstat(payload []byte) (uint32, []byte) {
 	return 0, []byte(line)
 }
 
+func (h *fsHelper) openStat(payload []byte) (uint32, []byte) {
+	var line string
+	err := h.at(string(payload), func(base string) error {
+		fd, err := syscall.Open(base, syscall.O_RDONLY|syscall.O_NOFOLLOW, 0)
+		if err != nil {
+			return err
+		}
+		defer syscall.Close(fd)
+		var st syscall.Stat_t
+		if err := syscall.Fstat(fd, &st); err != nil {
+			return err
+		}
+		if uint64(st.Dev) != h.dev || uint32(st.Uid) != uint32(os.Geteuid()) {
+			return ErrPath
+		}
+		line = fmt.Sprintf("%d %d %d %d %d", st.Mode, st.Nlink, st.Size, st.Uid, st.Dev)
+		return nil
+	})
+	if err != nil {
+		return mapErr(err), nil
+	}
+	return 0, []byte(line)
+}
+
 func (h *fsHelper) list(payload []byte) (uint32, []byte) {
 	if err := syscall.Fchdir(h.root); err != nil {
 		return 5, nil
@@ -599,8 +700,7 @@ func (h *fsHelper) list(payload []byte) (uint32, []byte) {
 	if err != nil {
 		return 5, nil
 	}
-	var st syscall.Stat_t
-	if err := syscall.Fstat(fd, &st); err != nil || st.Mode&syscall.S_IFMT != syscall.S_IFDIR || uint64(st.Dev) != h.dev {
+	if err := fstatHeld(fd, h.dev, true, 0700); err != nil {
 		syscall.Close(fd)
 		return 3, nil
 	}

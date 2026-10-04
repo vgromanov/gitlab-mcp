@@ -41,7 +41,7 @@ Before `Exec`, the launcher sets soft=hard:
 | `RLIMIT_CORE` | 0 | 0 |
 | `RLIMIT_NOFILE` | 64 | 64 |
 
-Production CPU stays soft=hard 30s. The evidence helper may separate soft and hard only in the test process. A pass is an actual `Wait` of `SIGXCPU` (exit 1 and the text `cpu-enforced SIGXCPU`) or of hard-limit `SIGKILL`. Equal soft and hard limits do not have to deliver `SIGXCPU`. Any other signal fails. If the helper is still running after 20s, the parent kills the group and then reads the `Wait` that was already started.
+Production CPU stays soft=hard 30s. The evidence helper may separate soft and hard only in the test process. It prints `cpu-ready` after the limit readback and before the burn. A pass is an actual `Wait` of `SIGXCPU` (exit 1 and `cpu-enforced SIGXCPU`) or of hard-limit `SIGKILL` only when `cpu-ready` was printed and the child consumed CPU time. A kill with no setup marker fails. Equal soft and hard limits do not have to deliver `SIGXCPU`. If the helper is still running after 20s, the parent kills the group and then reads the `Wait` that was already started.
 
 If a limit cannot be set or does not read back, the launcher does not `Exec`. Matching `getrlimit` is not enough for `RLIMIT_AS`. The helper maps 1GiB of `PROT_NONE` anonymous address space, which must succeed, then maps 8GiB+4096, which must fail with `ENOMEM`. The pages are not written. If the oversized map succeeds, or the 8GiB rlimit cannot be installed, the probe fails and `Exec` is skipped. The bound stays 8GiB.
 
@@ -49,7 +49,7 @@ If a limit cannot be set or does not read back, the launcher does not `Exec`. Ma
 
 A token frame is read only after `RLIMIT_CORE` is confirmed to be 0. Startup must ack within 2 seconds; otherwise the known child group is killed and waited, and the reservation stays charged.
 
-Positive quiescence is `SIGKILL` of the process group, `Wait` of the leader, then `kill(-pgid, 0) == ESRCH`. Leader `Wait` alone is not quiescence. A `setsid` descendant would escape this check. The audited `index-pack` argv does not call `setsid` and does not take the promisor `pack-objects` path. Unknown closure fails closed.
+A normal Git role waits for exit 0, then `kill(-pgid, 0) == ESRCH`, and only then measures pack and index. A timeout, nonzero exit, or unknown wait kills the known group, reaps it, and does not promote. Cancellation quiescence is `SIGKILL` of the process group, `Wait` of the leader, then `kill(-pgid, 0) == ESRCH`. Leader `Wait` alone is not quiescence. A `setsid` descendant would escape this check. The audited `index-pack` argv does not call `setsid` and does not take the promisor `pack-objects` path. Unknown closure fails closed.
 
 ## Selected Git build
 

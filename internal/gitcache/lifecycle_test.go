@@ -185,26 +185,23 @@ func TestLifecyclePinLRUAndClose(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(root, id)); !os.IsNotExist(err) {
 		t.Fatal("source dir must be gone after promotion")
 	}
+	if _, _, n, err := r.State(id); err != nil || n != 1 {
+		t.Fatalf("publication pin %d %v", n, err)
+	}
 	if err := r.Pin(id); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, n, err := r.State(id); err != nil || n != 1 {
-		t.Fatalf("pin %d %v", n, err)
+	if _, _, n, err := r.State(id); err != nil || n != 2 {
+		t.Fatalf("reader pin %d %v", n, err)
 	}
 	if _, err := r.EvictLRU(); err != ErrBusy {
 		t.Fatalf("pinned evict %v", err)
 	}
-	if err := r.Close(); err != ErrPinned {
-		t.Fatalf("close pinned %v", err)
-	}
-	if _, err := r.EvictLRU(); err != ErrClosed {
-		t.Fatalf("evict while draining %v", err)
-	}
-	if err := r.Unpin(id); err != nil {
+	if err := r.StartReader(id); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := r.EvictLRU(); err != ErrClosed {
-		t.Fatalf("evict remains closed while draining %v", err)
+	if err := r.Unpin(id); err != ErrBusy {
+		t.Fatalf("unpin while reader active %v", err)
 	}
 	if err := r.Close(); err != nil {
 		t.Fatal(err)
@@ -338,17 +335,22 @@ func TestLimitsAndQuiescence(t *testing.T) {
 		})
 		t.Fatalf("cpu helper exceeded 20s wall bound: wait %v quiesce %v %s", waitErr, qerr, cpuOut.String())
 	}
-	cpuOK := false
 	var exitErr *exec.ExitError
-	if errors.As(waitErr, &exitErr) && exitErr.ExitCode() == 1 && strings.Contains(cpuOut.String(), "cpu-enforced SIGXCPU") {
-		cpuOK = true
-	}
-	if !cpuOK && exitErr != nil {
+	code := 0
+	signaled := false
+	if errors.As(waitErr, &exitErr) {
+		code = exitErr.ExitCode()
 		if ws, ok := exitErr.Sys().(syscall.WaitStatus); ok && ws.Signaled() && ws.Signal() == syscall.SIGKILL {
-			cpuOK = true
+			signaled = true
 		}
 	}
-	if !cpuOK {
+	cpuTime := time.Duration(0)
+	if cmd.ProcessState != nil {
+		if ru, ok := cmd.ProcessState.SysUsage().(*syscall.Rusage); ok {
+			cpuTime = time.Duration(ru.Utime.Nano() + ru.Stime.Nano())
+		}
+	}
+	if !cpuTerminationOK(code, cpuOut.String(), signaled, cpuTime) {
 		t.Fatalf("cpu %v %s", waitErr, cpuOut.String())
 	}
 	if kerr := syscall.Kill(-cmd.Process.Pid, 0); !errors.Is(kerr, syscall.ESRCH) {

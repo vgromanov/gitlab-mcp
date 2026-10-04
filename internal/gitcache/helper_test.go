@@ -27,7 +27,12 @@ func dispatchHelper(role string) int {
 		return runGitLauncher()
 	case "__gitcache_git_failas":
 		enforceVirtualAS = func(uint64) error { return errASIneffective }
+		if err := enforceVirtualAS(LimitAS); errors.Is(err, errASIneffective) {
+			fmt.Fprintln(os.Stderr, "as-branch=overmap")
+		}
 		return runGitLauncher()
+	case "__gitcache_reader":
+		select {}
 	case "__gitcache_fsize":
 		if err := EnforceFSIZE(4096); err != nil {
 			fmt.Fprintln(os.Stderr, err.Error())
@@ -52,6 +57,13 @@ func dispatchHelper(role string) int {
 			fmt.Fprintln(os.Stderr, err.Error())
 			return 2
 		}
+		var got syscall.Rlimit
+		if err := syscall.Getrlimit(syscall.RLIMIT_CPU, &got); err != nil || got.Cur != 1 || got.Max != 8 {
+			fmt.Fprintln(os.Stderr, "cpu-setup-failed")
+			return 2
+		}
+		fmt.Fprintf(os.Stdout, "cpu-ready soft=%d hard=%d\n", got.Cur, got.Max)
+		_ = os.Stdout.Sync()
 		ch := make(chan os.Signal, 1)
 		signal.Notify(ch, syscall.SIGXCPU)
 		var x uint64
@@ -81,7 +93,17 @@ func dispatchHelper(role string) int {
 	case "__gitcache_as":
 		lim := syscall.Rlimit{Cur: LimitAS, Max: LimitAS}
 		if err := syscall.Setrlimit(syscall.RLIMIT_AS, &lim); err != nil {
+			fmt.Fprintln(os.Stderr, "as-branch=setter")
 			fmt.Fprintln(os.Stderr, "as-reject")
+			err = EnforceVirtualAS(LimitAS)
+			switch {
+			case err == nil:
+				fmt.Fprintln(os.Stderr, "as-map=enforced")
+			case errors.Is(err, errASIneffective):
+				fmt.Fprintln(os.Stderr, "as-map=ineffective")
+			default:
+				fmt.Fprintln(os.Stderr, "as-map=error")
+			}
 			return 3
 		}
 		var got syscall.Rlimit

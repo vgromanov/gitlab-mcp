@@ -385,7 +385,7 @@ func TestWriteAndPinFreeze(t *testing.T) {
 	}
 	r.fs.callHook = nil
 	_, _, n, err := r.State(id)
-	if err != nil || n != 0 {
+	if err != nil || n != 1 {
 		t.Fatalf("pin rollback %d %v", n, err)
 	}
 	if err := r.Close(); err != nil {

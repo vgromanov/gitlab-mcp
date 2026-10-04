@@ -13,6 +13,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 )
 
 func saveWD(t *testing.T) {
@@ -331,10 +332,16 @@ func TestEdgeCoverage(t *testing.T) {
 	if err := r.Commit(id, dest); err != nil {
 		t.Fatal(err)
 	}
+	if _, _, n, err := r.State(id); err != nil || n != 1 {
+		t.Fatalf("publication %d %v", n, err)
+	}
+	if err := r.Unpin(id); err != nil {
+		t.Fatal(err)
+	}
 	if err := r.Unpin(id); err == nil {
 		t.Fatal("unpin zero")
 	}
-	for i := 0; i < MaxLeases; i++ {
+	for i := 0; i < MaxLeases+1; i++ {
 		if err := r.Pin(id); err != nil {
 			t.Fatal(err)
 		}
@@ -350,7 +357,7 @@ func TestEdgeCoverage(t *testing.T) {
 		t.Fatal(err)
 	}
 	r.draining = false
-	for i := 0; i < MaxLeases; i++ {
+	for i := 0; i < MaxLeases+1; i++ {
 		if err := r.Unpin(id); err != nil {
 			t.Fatal(err)
 		}
@@ -372,6 +379,14 @@ func (failWriter) Write([]byte) (int, error) { return 0, io.ErrClosedPipe }
 func (failWriter) Close() error              { return nil }
 
 type memWriteCloser struct{ bytes.Buffer }
+
+func (m *memWriteCloser) SetWriteDeadline(time.Time) error { return nil }
+
+type framed struct{ *bytes.Reader }
+
+func (framed) SetReadDeadline(time.Time) error { return nil }
+
+func frame(b []byte) framed { return framed{bytes.NewReader(b)} }
 
 func (m *memWriteCloser) Close() error { return nil }
 
@@ -429,28 +444,28 @@ func TestDenseBranches(t *testing.T) {
 
 	var hdr [8]byte
 	binary.LittleEndian.PutUint32(hdr[4:], 1<<20+1)
-	c := &fsClient{in: &memWriteCloser{}, out: bytes.NewReader(hdr[:])}
+	c := &fsClient{in: &memWriteCloser{}, out: frame(hdr[:])}
 	if _, err := c.call(2, nil); err != ErrCorrupt {
 		t.Fatal(err)
 	}
 	binary.LittleEndian.PutUint32(hdr[:4], 2)
 	binary.LittleEndian.PutUint32(hdr[4:], 0)
-	c.out = bytes.NewReader(hdr[:])
+	c.out = frame(hdr[:])
 	if _, err := c.call(2, nil); err != ErrCorrupt {
 		t.Fatal(err)
 	}
 	binary.LittleEndian.PutUint32(hdr[:4], 3)
-	c.out = bytes.NewReader(hdr[:])
+	c.out = frame(hdr[:])
 	if _, err := c.call(2, nil); err != ErrPath {
 		t.Fatal(err)
 	}
 	binary.LittleEndian.PutUint32(hdr[:4], 4)
-	c.out = bytes.NewReader(hdr[:])
+	c.out = frame(hdr[:])
 	if _, err := c.call(2, nil); err != ErrQuota {
 		t.Fatal(err)
 	}
 	c.in = failWriter{}
-	c.out = bytes.NewReader(nil)
+	c.out = frame(nil)
 	if _, err := c.call(2, []byte("x")); err == nil {
 		t.Fatal("write fail")
 	}
