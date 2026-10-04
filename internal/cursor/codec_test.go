@@ -607,6 +607,16 @@ func TestQueueCont_rejectsBadCandidatesKeysBitsAndProgress(t *testing.T) {
 	}
 }
 
+func observedLive(p Payload) ReviewLiveRefs {
+	c := p.ContextRef
+	return ReviewLiveRefs{
+		OwnerProjectID: c.OwnerProjectID, SourceProjectID: c.SourceProjectID, TargetProjectID: c.TargetProjectID,
+		SourceBranch: c.SourceBranch, TargetBranch: c.TargetBranch,
+		SourceSHA: c.SourceSHA, TargetSHA: c.TargetSHA, VersionID: c.VersionID,
+		VersionHead: c.VersionHead, VersionBase: c.VersionBase, VersionStart: c.VersionStart,
+	}
+}
+
 func reviewContextPayload(now time.Time) Payload {
 	iid := int64(7)
 	head := strings.Repeat("a", 40)
@@ -651,13 +661,13 @@ func TestReviewContextToken(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if err := VerifyContextBinding(got, p.Instance, p.ActorID, p.PolicyFP, p.Tool, p.Section, p.Scope, p.Filters, p.UpperBound, []string{"metadata"}); err != nil {
+	if err := VerifyContextBinding(got, p.Instance, p.ActorID, p.PolicyFP, p.Tool, p.Section, p.Scope, p.Filters, p.UpperBound, observedLive(p), []string{"metadata"}); err != nil {
 		t.Fatalf("verify metadata: %v", err)
 	}
-	if err := VerifyContextBinding(got, p.Instance, p.ActorID, p.PolicyFP, p.Tool, p.Section, p.Scope, p.Filters, p.UpperBound, []string{"approvals"}); err == nil {
+	if err := VerifyContextBinding(got, p.Instance, p.ActorID, p.PolicyFP, p.Tool, p.Section, p.Scope, p.Filters, p.UpperBound, observedLive(p), []string{"approvals"}); err == nil {
 		t.Fatal("metadata-only token satisfied an approvals demand")
 	}
-	if err := VerifyContextBinding(got, p.Instance, p.ActorID, p.PolicyFP, p.Tool, p.Section, p.Scope, p.Filters, p.UpperBound, []string{"metadata", "approvals"}); err == nil {
+	if err := VerifyContextBinding(got, p.Instance, p.ActorID, p.PolicyFP, p.Tool, p.Section, p.Scope, p.Filters, p.UpperBound, observedLive(p), []string{"metadata", "approvals"}); err == nil {
 		t.Fatal("metadata-only token satisfied a full review demand")
 	}
 	if ContextWriteFresh(got, now.Add(ReviewWriteFresh)) {
@@ -666,7 +676,7 @@ func TestReviewContextToken(t *testing.T) {
 	if !ContextWriteFresh(got, now.Add(time.Minute)) {
 		t.Fatal("write freshness inside the window")
 	}
-	if err := VerifyContextBinding(got, p.Instance, 8, p.PolicyFP, p.Tool, p.Section, p.Scope, p.Filters, p.UpperBound, []string{"metadata"}); err == nil {
+	if err := VerifyContextBinding(got, p.Instance, 8, p.PolicyFP, p.Tool, p.Section, p.Scope, p.Filters, p.UpperBound, observedLive(p), []string{"metadata"}); err == nil {
 		t.Fatal("actor mismatch")
 	}
 

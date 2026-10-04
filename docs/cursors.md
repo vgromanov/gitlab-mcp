@@ -110,7 +110,12 @@ excluded masks are disjoint, sorted, and union to the requested set. Digests exi
 only for complete sections. `retrieved_at + 5m` is `write_fresh_until`; `retrieved_at
 + 2h` is `expires_at`. Neither window is renewed. `Decode` proves HMAC and this
 structure. `VerifyContextBinding` checks the live instance, actor, policy, scope,
-selection, and refs, then requires every demanded section to be complete. A
-metadata-only token fails a demand for `approvals`. Missing `GITLAB_MCP_CURSOR_KEY`
+and selection, then an independently supplied live ref tuple: owner, source, and
+target project ids and branches, source and target SHAs, and the version id,
+head, base, and start. A missing observation fails closed. Only `metadata` and
+`approvals` are complete evidence in this revision; `discussions`,
+`pipeline_graph`, and `diff_manifest` may be requested or excluded, and a token
+that marks one of them complete is rejected. A metadata-only token fails a
+demand for `approvals`. Missing `GITLAB_MCP_CURSOR_KEY`
 is the same class of configuration error as the queue. The signature does not
 attest that a human reviewed the change.

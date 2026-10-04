@@ -1081,10 +1081,31 @@ func ruleDigest(env map[string]json.RawMessage, field string) ([]approvalDigestR
 		})
 	}
 	sort.Slice(out, func(i, j int) bool {
-		if out[i].ID != out[j].ID {
-			return out[i].ID < out[j].ID
-		}
-		return out[i].Name < out[j].Name
+		return approvalRuleLess(out[i], out[j])
 	})
 	return out, "rows", nil
+}
+
+func approvalRuleLess(a, b approvalDigestRule) bool {
+	ai, aerr := strconv.ParseInt(a.ID, 10, 64)
+	bi, berr := strconv.ParseInt(b.ID, 10, 64)
+	if aerr == nil && berr == nil && ai != bi {
+		return ai < bi
+	}
+	if (aerr == nil) != (berr == nil) {
+		return aerr == nil
+	}
+	if a.ID != b.ID {
+		return a.ID < b.ID
+	}
+	if a.Name != b.Name {
+		return a.Name < b.Name
+	}
+	if a.Approved != b.Approved {
+		return a.Approved < b.Approved
+	}
+	if a.ApprovalsRequired != b.ApprovalsRequired {
+		return a.ApprovalsRequired < b.ApprovalsRequired
+	}
+	return a.ContainsHiddenGroups < b.ContainsHiddenGroups
 }

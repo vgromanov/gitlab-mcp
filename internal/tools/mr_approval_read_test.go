@@ -1444,4 +1444,25 @@ func TestApprovalDigest_presenceRulesAndFailure(t *testing.T) {
 	if err != nil || fail1 != fail2 {
 		t.Fatalf("failure digest unstable: %v", err)
 	}
+	hiFirst := []byte(`{"rules":[{"id":10,"name":"z","approved":true,"approvals_required":1,"contains_hidden_groups":false},{"id":2,"name":"a","approved":false,"approvals_required":2,"contains_hidden_groups":true},{"id":10,"name":"z","approved":false,"approvals_required":1,"contains_hidden_groups":false}]}`)
+	loFirst := []byte(`{"rules":[{"id":10,"name":"z","approved":false,"approvals_required":1,"contains_hidden_groups":false},{"id":2,"name":"a","approved":false,"approvals_required":2,"contains_hidden_groups":true},{"id":10,"name":"z","approved":true,"approvals_required":1,"contains_hidden_groups":false}]}`)
+	left, _, err := ruleDigest(mustObject(t, hiFirst), "rules")
+	right, _, err2 := ruleDigest(mustObject(t, loFirst), "rules")
+	if err != nil || err2 != nil || len(left) != 3 || left[0].ID != "2" || left[1].Approved > left[2].Approved {
+		t.Fatalf("numeric order %+v %v %v", left, err, err2)
+	}
+	rawLeft, _ := json.Marshal(left)
+	rawRight, _ := json.Marshal(right)
+	if string(rawLeft) != string(rawRight) {
+		t.Fatalf("reordered duplicate pairs\n%s\n%s", rawLeft, rawRight)
+	}
+}
+
+func mustObject(t *testing.T, raw []byte) map[string]json.RawMessage {
+	t.Helper()
+	var env map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &env); err != nil {
+		t.Fatal(err)
+	}
+	return env
 }

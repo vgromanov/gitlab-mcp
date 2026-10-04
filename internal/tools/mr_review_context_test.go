@@ -33,6 +33,9 @@ type pathLog struct {
 }
 
 func (p *pathLog) add(path, rawQuery string) {
+	if p == nil {
+		return
+	}
 	p.mu.Lock()
 	p.paths = append(p.paths, path+"?"+rawQuery)
 	p.mu.Unlock()
@@ -62,8 +65,16 @@ type reviewScript struct {
 	branchN             map[string]int
 	approval            int
 	version             string
+	versionIID          int64
 	driftIID            int64
 	driftSHA            string
+	driftHeadIID        int64
+	driftHeadSHA        string
+	driftBranchIID      int64
+	driftVersionIID     int64
+	secondTgtIID        int64
+	missingBranchIID    int64
+	verN                map[int64]int
 	forkID              int64
 	redirect            string
 	cancel              context.CancelFunc
@@ -100,8 +111,17 @@ func (s *reviewScript) serve(w http.ResponseWriter, r *http.Request) {
 	case strings.HasSuffix(path, "/user"):
 		_, _ = io.WriteString(w, `{"id":7}`)
 	case strings.Contains(path, "/repository/branches/"):
+		if s.missingBranchIID != 0 && strings.Contains(path, "/feature-"+strconv.FormatInt(s.missingBranchIID, 10)) {
+			http.NotFound(w, r)
+			return
+		}
 		s.writeBranch(w, r)
 	case strings.Contains(path, "/approval_state"):
+		if s.approval == 401 || s.approval == 403 || s.approval == 404 || s.approval == 405 {
+			w.WriteHeader(s.approval)
+			_, _ = io.WriteString(w, `{"message":"nope"}`)
+			return
+		}
 		if s.cancelOnApproval && s.cancel != nil {
 			s.cancel()
 			<-r.Context().Done()
@@ -188,8 +208,15 @@ func (s *reviewScript) writeDetail(w http.ResponseWriter, r *http.Request) {
 		head = s.driftSHA
 		source = 999
 	}
-	fmt.Fprintf(w, `{"id":%d,"iid":%d,"project_id":42,"source_project_id":%d,"target_project_id":42,"source_branch":"feature-%d","target_branch":"main-%d","sha":%q,"diff_refs":{"base_sha":%q,"head_sha":%q,"start_sha":%q}}`,
-		5000+iid, iid, source, iid, iid, head, base, head, start)
+	if s.driftHeadIID == iid && s.detailN[iid] >= 2 && s.driftHeadSHA != "" {
+		head = s.driftHeadSHA
+	}
+	sourceBranch := fmt.Sprintf("feature-%d", iid)
+	if s.driftBranchIID == iid && s.detailN[iid] >= 2 {
+		sourceBranch = "renamed"
+	}
+	fmt.Fprintf(w, `{"id":%d,"iid":%d,"project_id":42,"source_project_id":%d,"target_project_id":42,"source_branch":%q,"target_branch":"main-%d","sha":%q,"diff_refs":{"base_sha":%q,"head_sha":%q,"start_sha":%q}}`,
+		5000+iid, iid, source, sourceBranch, iid, head, base, head, start)
 }
 
 func (s *reviewScript) writeBranch(w http.ResponseWriter, r *http.Request) {
@@ -208,7 +235,7 @@ func (s *reviewScript) writeBranch(w http.ResponseWriter, r *http.Request) {
 		if sha == "" {
 			sha = shaN(300 + int(iid))
 		}
-		if s.secondTgt != "" && s.branchN[name] >= 3 {
+		if s.secondTgt != "" && s.secondTgtIID == iid && s.branchN[name] >= 2 {
 			sha = s.secondTgt
 		}
 	} else {
@@ -229,7 +256,11 @@ func (s *reviewScript) writeVersions(w http.ResponseWriter, r *http.Request) {
 	head := shaN(int(iid))
 	base := shaN(100 + int(iid))
 	start := shaN(200 + int(iid))
-	switch s.version {
+	mode := s.version
+	if s.versionIID != 0 && iid != s.versionIID {
+		mode = ""
+	}
+	switch mode {
 	case "empty":
 		w.Header().Set("X-Next-Page", "")
 		_, _ = io.WriteString(w, `[]`)
@@ -245,9 +276,50 @@ func (s *reviewScript) writeVersions(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, `[{"id":5,"merge_request_id":%d,"head_commit_sha":%q,"base_commit_sha":%q,"start_commit_sha":%q}]`, 5000+iid, head, shaN(9), start)
 	case "unknown-paging":
 		fmt.Fprintf(w, `[{"id":5,"merge_request_id":%d,"head_commit_sha":%q,"base_commit_sha":%q,"start_commit_sha":%q}]`, 5000+iid, head, base, start)
+	case "malformed-plus-match":
+		w.Header().Set("X-Next-Page", "")
+		other := shaN(9)
+		fmt.Fprintf(w, `[{},{"id":%d,"merge_request_id":%d,"head_commit_sha":%q,"base_commit_sha":%q,"start_commit_sha":%q},{"id":8,"merge_request_id":%d,"head_commit_sha":%q,"base_commit_sha":%q,"start_commit_sha":%q}]`,
+			7000+iid, 5000+iid, head, base, start, 5000+iid, other, other, other)
+	case "dup-next":
+		w.Header().Add("X-Next-Page", "")
+		w.Header().Add("X-Next-Page", "2")
+		fmt.Fprintf(w, `[{"id":%d,"merge_request_id":%d,"head_commit_sha":%q,"base_commit_sha":%q,"start_commit_sha":%q}]`, 7000+iid, 5000+iid, head, base, start)
+	case "repeat-next":
+		w.Header().Add("X-Next-Page", "2")
+		w.Header().Add("X-Next-Page", "2")
+		fmt.Fprintf(w, `[{"id":%d,"merge_request_id":%d,"head_commit_sha":%q,"base_commit_sha":%q,"start_commit_sha":%q}]`, 7000+iid, 5000+iid, head, base, start)
+	case "ws-next":
+		w.Header().Set("X-Next-Page", " 2")
+		fmt.Fprintf(w, `[{"id":%d,"merge_request_id":%d,"head_commit_sha":%q,"base_commit_sha":%q,"start_commit_sha":%q}]`, 7000+iid, 5000+iid, head, base, start)
+	case "bad-next":
+		w.Header().Set("X-Next-Page", "next")
+		fmt.Fprintf(w, `[{"id":%d,"merge_request_id":%d,"head_commit_sha":%q,"base_commit_sha":%q,"start_commit_sha":%q}]`, 7000+iid, 5000+iid, head, base, start)
+	case "pad-next":
+		w.Header().Set("X-Next-Page", "02")
+		fmt.Fprintf(w, `[{"id":%d,"merge_request_id":%d,"head_commit_sha":%q,"base_commit_sha":%q,"start_commit_sha":%q}]`, 7000+iid, 5000+iid, head, base, start)
+	case "back-next":
+		w.Header().Set("X-Next-Page", "1")
+		fmt.Fprintf(w, `[{"id":%d,"merge_request_id":%d,"head_commit_sha":%q,"base_commit_sha":%q,"start_commit_sha":%q}]`, 7000+iid, 5000+iid, head, base, start)
+	case "jump-next":
+		w.Header().Set("X-Next-Page", "3")
+		fmt.Fprintf(w, `[{"id":%d,"merge_request_id":%d,"head_commit_sha":%q,"base_commit_sha":%q,"start_commit_sha":%q}]`, 7000+iid, 5000+iid, head, base, start)
+	case "historical-plus-match":
+		w.Header().Set("X-Next-Page", "")
+		other := shaN(9)
+		fmt.Fprintf(w, `[{"id":4,"merge_request_id":%d,"head_commit_sha":%q,"base_commit_sha":%q,"start_commit_sha":%q},{"id":%d,"merge_request_id":%d,"head_commit_sha":%q,"base_commit_sha":%q,"start_commit_sha":%q}]`,
+			5000+iid, other, other, other, 7000+iid, 5000+iid, head, base, start)
 	default:
 		w.Header().Set("X-Next-Page", "")
-		fmt.Fprintf(w, `[{"id":%d,"merge_request_id":%d,"head_commit_sha":%q,"base_commit_sha":%q,"start_commit_sha":%q}]`, 7000+iid, 5000+iid, head, base, start)
+		if s.verN == nil {
+			s.verN = map[int64]int{}
+		}
+		s.verN[iid]++
+		verID := int64(7000 + iid)
+		if s.driftVersionIID == iid && s.verN[iid] >= 2 {
+			verID = 8000 + iid
+		}
+		fmt.Fprintf(w, `[{"id":%d,"merge_request_id":%d,"head_commit_sha":%q,"base_commit_sha":%q,"start_commit_sha":%q}]`, verID, 5000+iid, head, base, start)
 	}
 	s.versionWrites++
 	if s.cancel != nil && s.cancelAfterVersions > 0 && s.versionWrites == s.cancelAfterVersions {
@@ -377,8 +449,12 @@ func TestReviewContext_registeredMatrix(t *testing.T) {
 		if last["context_ref"] == nil {
 			t.Fatalf("metadata-only mask missing ref: %#v", last)
 		}
-		if last["approvals"] != nil {
-			t.Fatalf("500 approvals body: %#v", last["approvals"])
+		if last["approvals"] == nil {
+			t.Fatal("500 approvals skeleton missing")
+		}
+		approvalShapeKeys(t, asMap(t, last["approvals"]))
+		if asMap(t, last["approvals"])["approved"] != nil || asMap(t, last["approvals"])["rules"] != nil {
+			t.Fatalf("500 success fields: %#v", last["approvals"])
 		}
 		secs := asMap(t, last["sections"])
 		ap := asMap(t, secs["approvals"])
@@ -393,7 +469,14 @@ func TestReviewContext_registeredMatrix(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := cursor.VerifyContextBinding(payload, payload.Instance, payload.ActorID, payload.PolicyFP, payload.Tool, payload.Section, payload.Scope, payload.Filters, payload.UpperBound, []string{"approvals"}); err == nil {
+		stored := payload.ContextRef
+		live := cursor.ReviewLiveRefs{
+			OwnerProjectID: stored.OwnerProjectID, SourceProjectID: stored.SourceProjectID, TargetProjectID: stored.TargetProjectID,
+			SourceBranch: stored.SourceBranch, TargetBranch: stored.TargetBranch,
+			SourceSHA: stored.SourceSHA, TargetSHA: stored.TargetSHA, VersionID: stored.VersionID,
+			VersionHead: stored.VersionHead, VersionBase: stored.VersionBase, VersionStart: stored.VersionStart,
+		}
+		if err := cursor.VerifyContextBinding(payload, payload.Instance, payload.ActorID, payload.PolicyFP, payload.Tool, payload.Section, payload.Scope, payload.Filters, payload.UpperBound, live, []string{"approvals"}); err == nil {
 			t.Fatal("metadata token accepted approvals demand")
 		}
 		dig1, _ := last["approval_digest"].(string)
@@ -810,12 +893,15 @@ func TestReviewContext_registeredMatrix(t *testing.T) {
 			Tool: cursor.ToolListCommits, Section: cursor.SectionListCommits,
 			Scope:   cursor.Scope{Kind: cursor.ScopeProject, ProjectID: "42"},
 			Filters: cursor.Filters{PerPage: 1, Selection: "list_commits"}, ImmutableRefs: []string{shaN(1)},
-			UpperBound: "2026-10-03T12:00:00Z", ExpiresAt: "2026-10-03T14:00:00Z",
+			UpperBound: "2026-10-04T12:00:00Z", ExpiresAt: "2026-10-04T16:00:00Z",
 			PageState: cursor.PageState{Page: 1, PerPage: 1, ItemsOnPage: 1, LastSHA: shaN(1), SequenceDigest: strings.Repeat("ab", 32)},
 		}
 		tok, err := cursor.Encode(key, legacy)
 		if err != nil {
 			t.Fatal(err)
+		}
+		if _, err := cursor.Decode(key, tok, time.Date(2026, 10, 4, 12, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatalf("foreign token expired or inauthentic: %v", err)
 		}
 		before := log.snapshot()
 		if _, err := callReviewContext(t, d, nil, map[string]any{"items": []any{itemArg("42", 1, []any{"metadata"}, map[string]any{"cursors": []any{map[string]any{"section": "metadata", "cursor": tok}}})}}, false); err == nil || !strings.Contains(err.Error(), cursor.ResyncRequired) {

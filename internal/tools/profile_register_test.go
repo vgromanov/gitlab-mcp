@@ -22,9 +22,9 @@ import (
 	gitlab "gitlab.com/gitlab-org/api/client-go/v2"
 )
 
-// literalExpectedReview27 is the independent AC oracle for review profiles
+// literalExpectedReview28 is the independent AC oracle for the 28 review-profile tools
 // (not derived from production ReviewReadTools()).
-var literalExpectedReview27 = []string{
+var literalExpectedReview28 = []string{
 	"get_project",
 	"get_merge_request",
 	"list_merge_requests",
@@ -100,7 +100,7 @@ func TestRegisterAll_toolProfiles(t *testing.T) {
 				EnabledTools:  []string{"execute_graphql", "list_issues"},
 				UseDailyTools: true,
 			})
-			assertExactToolSet(t, names, literalExpectedReview27)
+			assertExactToolSet(t, names, literalExpectedReview28)
 			if len(ReviewReadTools()) != 28 {
 				t.Fatal("production ReviewReadTools must stay len 28")
 			}
@@ -236,21 +236,21 @@ var reviewAuthzPath = map[string]string{
 	"get_pipeline_job":                 "resolvePipelineProject",
 	"get_pipeline_job_output":          "resolvePipelineProject",
 	"get_merge_request_review_queue":   "AuthorizeCanonicalGroup|authorizeGroupProject|AuthorizeAdditionalProjects",
-	"get_merge_request_review_context": "reviewAuthorizeProject",
+	"get_merge_request_review_context": "authorizeProject",
 }
 
-func TestReviewProfile_authzPathTableExact27(t *testing.T) {
-	if len(literalExpectedReview27) != 28 || len(reviewAuthzPath) != 28 {
-		t.Fatalf("literal want 28; list=%d map=%d", len(literalExpectedReview27), len(reviewAuthzPath))
+func TestReviewProfile_authzPathTableExact28(t *testing.T) {
+	if len(literalExpectedReview28) != 28 || len(reviewAuthzPath) != 28 {
+		t.Fatalf("literal want 28; list=%d map=%d", len(literalExpectedReview28), len(reviewAuthzPath))
 	}
-	for _, name := range literalExpectedReview27 {
+	for _, name := range literalExpectedReview28 {
 		if reviewAuthzPath[name] == "" {
 			t.Fatalf("missing 018 authz path for literal %q", name)
 		}
 	}
 	for name := range reviewAuthzPath {
 		found := false
-		for _, n := range literalExpectedReview27 {
+		for _, n := range literalExpectedReview28 {
 			if n == name {
 				found = true
 				break
@@ -268,7 +268,7 @@ func TestReviewProfile_authzPathTableExact27(t *testing.T) {
 			m[n] = true
 		}
 		return m
-	}(), literalExpectedReview27)
+	}(), literalExpectedReview28)
 }
 
 func TestReviewProfiles_handlerPolicyProbes(t *testing.T) {
@@ -285,7 +285,7 @@ func TestReviewProfiles_handlerPolicyProbes(t *testing.T) {
 			cs := testutil.MCPConnect(t, srv)
 
 			names := testutil.ToolNames(t, cs)
-			assertExactToolSet(t, names, literalExpectedReview27)
+			assertExactToolSet(t, names, literalExpectedReview28)
 
 			call := func(name string, args map[string]any) *mcp.CallToolResult {
 				t.Helper()

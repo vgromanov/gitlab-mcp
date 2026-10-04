@@ -331,35 +331,82 @@ func reviewChargeItem(ctx context.Context) error {
 	return nil
 }
 
+type reviewPhaseHookKey struct{}
+
+func withReviewPhaseHook(ctx context.Context, fn func(string) error) context.Context {
+	return context.WithValue(ctx, reviewPhaseHookKey{}, fn)
+}
+
+func (rt *reviewRuntime) phaseErr(name string) error {
+	if fn, ok := rt.ctx.Value(reviewPhaseHookKey{}).(func(string) error); ok && fn != nil {
+		if err := fn(name); err != nil {
+			return err
+		}
+	}
+	return rt.ctx.Err()
+}
+
+func (rt *reviewRuntime) sealRequested(item reviewContextItemIn, out *reviewContextItemOut) {
+	for _, name := range item.Sections {
+		if _, ok := out.Sections[name]; ok {
+			continue
+		}
+		sec := unsupportedReviewSection(rt.now, name)
+		sec.ContentComplete = readmeta.ContentCompleteUnknown
+		sec.Consistency = readmeta.ConsistencyUnknown
+		sec.HeadSHA = nil
+		sec.NextCursor = nil
+		sec.Limitations = []readmeta.Limitation{}
+		if name == "metadata" || name == "approvals" {
+			sec.CapabilityVersion = capabilityReviewContextMetaV1
+		}
+		out.Sections[name] = sec
+	}
+	if out.Cause != "" {
+		out.ReviewClean = false
+		out.ContextRef = nil
+	}
+}
+
 func reviewTransportErr(err error) error {
 	if err == nil {
 		return nil
 	}
-	if isTypedBudget(err) {
-		return fmt.Errorf("%s", reviewBudgetCode(err))
+	return fmt.Errorf("%s", reviewClassify(err))
+}
+
+func reviewClassify(err error) string {
+	if err == nil {
+		return ""
 	}
-	if errors.Is(err, errQueueCancelled) || errors.Is(err, context.Canceled) {
-		return fmt.Errorf("%s", readmeta.CodeCancelled)
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, igl.ErrBudgetElapsed) {
+		return readmeta.CodeBudgetElapsed
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, errQueueCancelled) {
+		return readmeta.CodeCancelled
+	}
+	if isTypedBudget(err) {
+		return reviewBudgetCode(err)
 	}
 	msg := err.Error()
-	switch {
-	case strings.HasPrefix(msg, readmeta.CodeBudgetRequests):
-		return fmt.Errorf("%s", readmeta.CodeBudgetRequests)
-	case strings.HasPrefix(msg, readmeta.CodeBudgetBytes):
-		return fmt.Errorf("%s", readmeta.CodeBudgetBytes)
-	case strings.HasPrefix(msg, readmeta.CodeBudgetElapsed):
-		return fmt.Errorf("%s", readmeta.CodeBudgetElapsed)
-	case strings.HasPrefix(msg, readmeta.CodeBudgetItems):
-		return fmt.Errorf("%s", readmeta.CodeBudgetItems)
-	case strings.HasPrefix(msg, readmeta.CodeCancelled):
-		return fmt.Errorf("%s", readmeta.CodeCancelled)
-	case strings.HasPrefix(msg, readmeta.CodeAuthzDenied):
-		return fmt.Errorf("%s", readmeta.CodeAuthzDenied)
-	case strings.HasPrefix(msg, readmeta.CodeIdentityUnresolved):
-		return fmt.Errorf("%s", readmeta.CodeIdentityUnresolved)
-	default:
-		return fmt.Errorf("%s", readmeta.CodeHTTPError)
+	for _, code := range []string{
+		readmeta.CodeBudgetRequests,
+		readmeta.CodeBudgetBytes,
+		readmeta.CodeBudgetElapsed,
+		readmeta.CodeBudgetItems,
+		readmeta.CodeCancelled,
+		readmeta.CodeAuthzDenied,
+		readmeta.CodeIdentityUnresolved,
+		readmeta.CodeInaccessible,
+		readmeta.CodeUnsupported,
+		readmeta.CodeInconsistent,
+		readmeta.CodeHTTPError,
+	} {
+		if strings.HasPrefix(msg, code) {
+			return code
+		}
 	}
+	return readmeta.CodeHTTPError
 }
 
 func reviewBudgetCode(err error) string {
@@ -470,8 +517,9 @@ func (rt *reviewRuntime) one(item reviewContextItemIn) reviewContextItemOut {
 		Sections:                 map[string]readmeta.Section{},
 	}
 	rt.fillUnsupported(item, &out)
-	if err := rt.ctx.Err(); err != nil {
-		out.Cause = readmeta.CodeCancelled
+	defer rt.sealRequested(item, &out)
+	if err := rt.phaseErr("proof"); err != nil {
+		out.Cause = reviewClassify(err)
 		return out
 	}
 	owner, err := rt.authorizeProject(item.ProjectID)
@@ -512,6 +560,12 @@ func (rt *reviewRuntime) one(item reviewContextItemIn) reviewContextItemOut {
 		return out
 	}
 	if itemWants(item, "approvals") {
+		if err := rt.phaseErr("section"); err != nil {
+			out.Cause = reviewClassify(err)
+			out.ContextRef = nil
+			out.Metadata = nil
+			return out
+		}
 		rt.readApprovals(owner, item.MergeRequestIID, &out)
 		if out.Cause == readmeta.CodeBudgetRequests || out.Cause == readmeta.CodeBudgetBytes || out.Cause == readmeta.CodeBudgetElapsed || out.Cause == readmeta.CodeBudgetItems || out.Cause == readmeta.CodeCancelled {
 			out.ContextRef = nil
@@ -519,9 +573,10 @@ func (rt *reviewRuntime) one(item reviewContextItemIn) reviewContextItemOut {
 			return out
 		}
 	}
-	if err := rt.ctx.Err(); err != nil {
-		out.Cause = readmeta.CodeCancelled
+	if err := rt.phaseErr("bracket"); err != nil {
+		out.Cause = reviewClassify(err)
 		out.ContextRef = nil
+		out.ReviewClean = false
 		return out
 	}
 	secondDetail, cause2, consistency2, serr := rt.readDetail(owner, item.MergeRequestIID)
@@ -616,8 +671,8 @@ func (rt *reviewRuntime) one(item reviewContextItemIn) reviewContextItemOut {
 		return out
 	}
 	rt.beforeMint()
-	if err := rt.ctx.Err(); err != nil {
-		out.Cause = readmeta.CodeCancelled
+	if err := rt.phaseErr("mint"); err != nil {
+		out.Cause = reviewClassify(err)
 		out.ContextRef = nil
 		out.ReviewClean = false
 		return out
@@ -714,7 +769,7 @@ type bracketRead struct {
 }
 
 func (rt *reviewRuntime) readDetail(owner CanonicalProject, iid int64) (reviewBracket, string, string, error) {
-	if err := rt.ctx.Err(); err != nil {
+	if err := rt.phaseErr("detail"); err != nil {
 		return reviewBracket{}, "", "", err
 	}
 	body, _, err := rt.rawGET(fmt.Sprintf("projects/%s/merge_requests/%d", gitlab.PathEscape(projectAPIID(owner)), iid), nil)
@@ -828,6 +883,9 @@ func (rt *reviewRuntime) rawGET(path string, opt any) ([]byte, http.Header, erro
 		if errors.Is(err, igl.ErrExactReadRedirect) {
 			return nil, nil, fmt.Errorf("%s", readmeta.CodeHTTPError)
 		}
+		if errors.Is(err, gitlab.ErrNotFound) {
+			return nil, nil, fmt.Errorf("%s", readmeta.CodeIdentityUnresolved)
+		}
 		return nil, nil, reviewTransportErr(err)
 	}
 	if resp == nil || resp.StatusCode != http.StatusOK {
@@ -910,12 +968,45 @@ func parseDetail(ownerID, iid int64, body []byte) (reviewBracket, string, string
 	}, "", ""
 }
 
+func reviewVersionPaging(hdr http.Header, sdkNext *int64) (exhausted bool) {
+	vals, present := queueNextPageValues(hdr)
+	if !present || len(vals) != 1 {
+		return false
+	}
+	raw := vals[0]
+	if strings.TrimSpace(raw) != raw {
+		return false
+	}
+	if raw == "" || raw == "0" {
+		return sdkNext == nil || *sdkNext == 0
+	}
+	n, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || n <= 0 || strconv.FormatInt(n, 10) != raw {
+		return false
+	}
+	if sdkNext != nil && *sdkNext != n {
+		return false
+	}
+	return false
+}
+
+func provedVersionRow(env map[string]json.RawMessage) (id, mrID int64, head, base, start string, ok bool) {
+	id, idOK := jsonInt(env["id"])
+	mrID, mrOK := jsonInt(env["merge_request_id"])
+	head, hok := readmeta.ObservedHeadSHA(reviewJSONString(env["head_commit_sha"]))
+	base, bok := readmeta.ObservedHeadSHA(reviewJSONString(env["base_commit_sha"]))
+	start, sok := readmeta.ObservedHeadSHA(reviewJSONString(env["start_commit_sha"]))
+	if !idOK || !mrOK || !hok || !bok || !sok {
+		return 0, 0, "", "", "", false
+	}
+	return id, mrID, head, base, start, true
+}
+
 func selectReviewVersion(ctx context.Context, body []byte, hdr http.Header, b reviewBracket) (int64, string) {
 	var rows []json.RawMessage
 	if err := json.Unmarshal(body, &rows); err != nil {
 		return 0, "ambiguous"
 	}
-	paging := readmeta.ObservePaging(hdr, 0)
 	var selected int64
 	matches := 0
 	headDisagree := false
@@ -927,22 +1018,21 @@ func selectReviewVersion(ctx context.Context, body []byte, hdr http.Header, b re
 		if err := json.Unmarshal(raw, &env); err != nil {
 			return 0, "ambiguous"
 		}
-		id, _ := jsonInt(env["id"])
-		mrID, _ := jsonInt(env["merge_request_id"])
-		head, hok := readmeta.ObservedHeadSHA(reviewJSONString(env["head_commit_sha"]))
-		base, bok := readmeta.ObservedHeadSHA(reviewJSONString(env["base_commit_sha"]))
-		start, sok := readmeta.ObservedHeadSHA(reviewJSONString(env["start_commit_sha"]))
-		full := id > 0 && mrID == b.MRID && hok && bok && sok && head == b.Head && base == b.Base && start == b.Start
+		id, mrID, head, base, start, ok := provedVersionRow(env)
+		if !ok {
+			return 0, "ambiguous"
+		}
+		full := mrID == b.MRID && head == b.Head && base == b.Base && start == b.Start
 		if full {
 			matches++
 			selected = id
 			continue
 		}
-		if hok && head == b.Head && (!bok || !sok || base != b.Base || start != b.Start) {
+		if head == b.Head && (base != b.Base || start != b.Start) {
 			headDisagree = true
 		}
 	}
-	if !paging.PagingKnown || !paging.ExhaustedObserved || paging.SDKNextPage > 0 {
+	if !reviewVersionPaging(hdr, nil) {
 		return 0, "ambiguous"
 	}
 	if matches > 1 {
@@ -976,18 +1066,26 @@ func (rt *reviewRuntime) readApprovals(owner CanonicalProject, iid int64, out *r
 		sec = newApprovalsSection(rt.now)
 	}
 	if err != nil {
-		code := causeOf(err)
-		if code == readmeta.CodeHTTPError || code == readmeta.CodeInaccessible || code == readmeta.CodeUnsupported {
-			sec.ContentComplete = readmeta.ContentCompleteUnknown
-			sec.Consistency = readmeta.ConsistencyUnknown
-			sec.HeadSHA = nil
-			sec.NextCursor = nil
-			if code == readmeta.CodeHTTPError {
-				sec.AddLimitation(readmeta.CodeHTTPError, "upstream server error")
+		code := reviewClassify(err)
+		sec.ContentComplete = readmeta.ContentCompleteUnknown
+		sec.Consistency = readmeta.ConsistencyUnknown
+		sec.HeadSHA = nil
+		sec.NextCursor = nil
+		switch code {
+		case readmeta.CodeHTTPError:
+			sec.AddLimitation(readmeta.CodeHTTPError, "upstream server error")
+		case readmeta.CodeInaccessible:
+			sec.AddLimitation(readmeta.CodeInaccessible, "authorization denied")
+		case readmeta.CodeUnsupported:
+			msg := "approval resource unavailable"
+			if strings.Contains(err.Error(), "method not allowed") {
+				msg = "method not allowed"
 			}
+			sec.AddLimitation(readmeta.CodeUnsupported, msg)
 		}
 		dig, digErr := approvalFailureDigest(endpointApprovalState, code, sec.Limitations)
-		out.Approvals = nil
+		skeleton := mrApprovalReadResult{Endpoint: endpointApprovalState, Section: sec}
+		out.Approvals = &skeleton
 		out.Sections["approvals"] = sec
 		if digErr == nil {
 			out.ApprovalDigest = &dig
@@ -1199,31 +1297,5 @@ func reviewJSONString(raw json.RawMessage) string {
 }
 
 func causeOf(err error) string {
-	if err == nil {
-		return ""
-	}
-	if isTypedBudget(err) {
-		return reviewBudgetCode(err)
-	}
-	if errors.Is(err, errQueueCancelled) || errors.Is(err, context.Canceled) {
-		return readmeta.CodeCancelled
-	}
-	msg := err.Error()
-	for _, code := range []string{
-		readmeta.CodeBudgetRequests,
-		readmeta.CodeBudgetBytes,
-		readmeta.CodeBudgetElapsed,
-		readmeta.CodeBudgetItems,
-		readmeta.CodeCancelled,
-		readmeta.CodeAuthzDenied,
-		readmeta.CodeIdentityUnresolved,
-		readmeta.CodeInconsistent,
-		readmeta.CodeHTTPError,
-		readmeta.ConsistencyUnknown,
-	} {
-		if strings.HasPrefix(msg, code) || strings.Contains(msg, code) {
-			return code
-		}
-	}
-	return readmeta.CodeHTTPError
+	return reviewClassify(err)
 }

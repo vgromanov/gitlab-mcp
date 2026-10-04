@@ -866,7 +866,7 @@ func validateContextRef(p *Payload) error {
 	if !ref.BracketConsistent || len(ref.Complete) == 0 {
 		return ErrResyncRequired
 	}
-	if !validSectionMask(ref.Requested) || !validSectionMask(ref.Complete) || !validSectionMask(ref.Excluded) {
+	if !validSectionMask(ref.Requested) || !validCompleteMask(ref.Complete) || !validSectionMask(ref.Excluded) {
 		return ErrResyncRequired
 	}
 	seen := map[string]struct{}{}
@@ -930,11 +930,19 @@ func validateContextRef(p *Payload) error {
 }
 
 func validSectionMask(names []string) bool {
+	return validNameMask(names, reviewSectionName)
+}
+
+func validCompleteMask(names []string) bool {
+	return validNameMask(names, reviewCompleteEvidence)
+}
+
+func validNameMask(names []string, allow func(string) bool) bool {
 	if names == nil {
 		return false
 	}
 	for i, name := range names {
-		if !reviewSectionName(name) {
+		if !allow(name) {
 			return false
 		}
 		if i > 0 && names[i] <= names[i-1] {
@@ -951,6 +959,42 @@ func reviewSectionName(name string) bool {
 	default:
 		return false
 	}
+}
+
+func reviewCompleteEvidence(name string) bool {
+	return name == "metadata" || name == "approvals"
+}
+
+// ReviewLiveRefs is an independently observed provenance tuple.
+// A zero value is not an observation and fails closed.
+type ReviewLiveRefs struct {
+	OwnerProjectID  int64
+	SourceProjectID int64
+	TargetProjectID int64
+	SourceBranch    string
+	TargetBranch    string
+	SourceSHA       string
+	TargetSHA       string
+	VersionID       int64
+	VersionHead     string
+	VersionBase     string
+	VersionStart    string
+}
+
+func (r ReviewLiveRefs) proved() bool {
+	if r.OwnerProjectID < 1 || r.SourceProjectID < 1 || r.TargetProjectID < 1 || r.VersionID < 1 {
+		return false
+	}
+	if r.SourceBranch == "" || r.SourceBranch != strings.TrimSpace(r.SourceBranch) {
+		return false
+	}
+	if r.TargetBranch == "" || r.TargetBranch != strings.TrimSpace(r.TargetBranch) {
+		return false
+	}
+	if !isGitSHA(r.SourceSHA) || !isGitSHA(r.TargetSHA) || !isGitSHA(r.VersionHead) || !isGitSHA(r.VersionBase) || !isGitSHA(r.VersionStart) {
+		return false
+	}
+	return r.SourceSHA == r.VersionHead
 }
 
 func containsString(ss []string, want string) bool {
@@ -979,17 +1023,25 @@ func isGitSHA(s string) bool {
 }
 
 // VerifyContextBinding checks a decoded review-context token against the live
-// caller binding and requires every demanded section to be in the complete mask.
-// It performs no I/O. A metadata-only token fails a demand for approvals.
-func VerifyContextBinding(p Payload, instance string, actorID int64, policyFP, tool, section string, scope Scope, filters Filters, upperBound string, demand []string) error {
+// caller binding, an independently supplied provenance tuple, and the demanded
+// complete sections. It performs no I/O. A missing observation fails closed.
+// A metadata-only token fails a demand for approvals.
+func VerifyContextBinding(p Payload, instance string, actorID int64, policyFP, tool, section string, scope Scope, filters Filters, upperBound string, live ReviewLiveRefs, demand []string) error {
 	if err := MatchBinding(p, instance, actorID, policyFP, tool, section, scope, filters, nil, upperBound); err != nil {
 		return err
 	}
-	if p.ContextRef == nil || !p.ContextRef.BracketConsistent || len(demand) == 0 {
+	if p.ContextRef == nil || !p.ContextRef.BracketConsistent || len(demand) == 0 || !live.proved() {
+		return ErrResyncRequired
+	}
+	ref := p.ContextRef
+	if ref.OwnerProjectID != live.OwnerProjectID || ref.SourceProjectID != live.SourceProjectID || ref.TargetProjectID != live.TargetProjectID ||
+		ref.SourceBranch != live.SourceBranch || ref.TargetBranch != live.TargetBranch ||
+		ref.SourceSHA != live.SourceSHA || ref.TargetSHA != live.TargetSHA ||
+		ref.VersionID != live.VersionID || ref.VersionHead != live.VersionHead || ref.VersionBase != live.VersionBase || ref.VersionStart != live.VersionStart {
 		return ErrResyncRequired
 	}
 	for _, name := range demand {
-		if !containsString(p.ContextRef.Complete, name) {
+		if !containsString(ref.Complete, name) {
 			return ErrResyncRequired
 		}
 	}
