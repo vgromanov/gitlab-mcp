@@ -343,6 +343,191 @@ func TestReviewQueue_F5ResumableDiscussionBoundary(t *testing.T) {
 	}
 }
 
+func TestReviewQueue_R1InvalidPageProofBudget(t *testing.T) {
+	for _, mode := range []string{"noheader", "dupheader", "jump", "truncated", "junk", ""} {
+		for _, where := range []string{"owner", "source_after_proved"} {
+			for _, cause := range []error{igl.ErrBudgetRequests, igl.ErrBudgetBytes} {
+				name := mode + "_" + where + "_" + cause.Error()
+				if mode == "" {
+					name = "valid_" + where + "_" + cause.Error()
+				}
+				t.Run(name, func(t *testing.T) {
+					tr := &repairRT{mode: mode, budgetErr: cause, budgetPath: "/projects/42"}
+					if where == "source_after_proved" {
+						tr.two = true
+						tr.fork = true
+						tr.budgetPath = "/projects/99"
+					}
+					d := repairDeps(t, tr, nil)
+					out, err := callReviewQueue(t, d, map[string]any{"group_id": "9", "kinds": []any{"reviewer"}, "page_size": 20})
+					if err != nil {
+						t.Fatal(err)
+					}
+					tok, _ := sectionMap(out)["next_cursor"].(string)
+					if mode == "" {
+						if tok == "" {
+							t.Fatal("valid page lost its budget continuation")
+						}
+						return
+					}
+					if tok != "" {
+						t.Fatal("invalid page minted a continuation after proof budget")
+					}
+					if !hasCode(limitationCodes(sectionMap(out)), readmeta.CodeProviderPageAmbiguous) {
+						t.Fatal("invalid page lost provider_page_ambiguous")
+					}
+					items, _ := out["items"].([]any)
+					if where == "source_after_proved" && len(items) != 1 {
+						t.Fatalf("proved prefix lost: items=%d", len(items))
+					}
+					for _, raw := range items {
+						if raw.(map[string]any)["iid"] == float64(2) {
+							t.Fatal("unproved fork candidate emitted")
+						}
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestReviewQueue_R1InvalidDiscussionNoteBudget(t *testing.T) {
+	for _, mode := range []string{"disc_noheader", "disc_duplicate", "disc_jump", "disc_truncated", "disc_junk", ""} {
+		t.Run(mode, func(t *testing.T) {
+			if mode == "" {
+				t.Run("valid", func(t *testing.T) { testR1Discussion(t, "") })
+				return
+			}
+			testR1Discussion(t, mode)
+		})
+	}
+}
+
+func testR1Discussion(t *testing.T, mode string) {
+	t.Helper()
+	tr := &repairRT{mode: mode, discuss: true}
+	d := repairDeps(t, tr, nil)
+	b := igl.DefaultBudget()
+	t.Cleanup(b.Cancel)
+	for n := 0; n < 98; n++ {
+		if err := b.AddItem(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, v, err := getMergeRequestReviewQueue(igl.WithBudget(context.Background(), b), nil, getMergeRequestReviewQueueIn{
+		GroupID: "9", Kinds: []string{"ongoing"}, PageSize: 20,
+		KnownMRs: []knownMRSeed{{ProjectID: "42", MergeRequestIID: 1}},
+	}, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := v.(map[string]any)
+	tok, _ := sectionMap(out)["next_cursor"].(string)
+	if mode == "" {
+		if tok == "" {
+			t.Fatal("valid discussion lost note-0 continuation")
+		}
+		return
+	}
+	if tok != "" {
+		t.Fatal("invalid discussion minted a continuation")
+	}
+	if !hasCode(limitationCodes(sectionMap(out)), readmeta.CodeProviderPageAmbiguous) {
+		t.Fatal("invalid discussion lost provider_page_ambiguous")
+	}
+}
+
+func TestReviewQueue_R2DirectMRContext(t *testing.T) {
+	for _, cause := range []error{context.Canceled, context.DeadlineExceeded} {
+		for _, phase := range []string{"discovery", "emit", "seed"} {
+			t.Run(cause.Error()+"_"+phase, func(t *testing.T) {
+				tr := &repairRT{budgetPath: "/projects/42/merge_requests/1", budgetErr: fmt.Errorf("fake direct metadata cause: %w", cause)}
+				d := repairDeps(t, tr, nil)
+				in := getMergeRequestReviewQueueIn{GroupID: "9", Kinds: []string{"reviewer"}, PageSize: 20}
+				if phase == "seed" {
+					in.Kinds = []string{"ongoing"}
+					in.KnownMRs = []knownMRSeed{{ProjectID: "42", MergeRequestIID: 1}}
+				}
+				n, err := normalizeReviewQueueInput(in)
+				if err != nil {
+					t.Fatal(err)
+				}
+				b := igl.DefaultBudget()
+				t.Cleanup(b.Cancel)
+				sec := newReviewQueueSection(d.now())
+				ctx := igl.WithBudget(context.Background(), b)
+				st := &queueRuntime{d: d, budget: b, group: CanonicalGroup{ID: 9}, groupID: "9", authActor: 7, discoveryActor: 7, norm: n, filters: cursor.Filters{Until: "2026-10-03T12:00:00Z", PerPage: n.pageSize}, section: &sec, qc: newQueueCont(n), ctx: ctx, now: d.now()}
+				switch phase {
+				case "discovery":
+					err = st.discoverKindStream(ctx, 0)
+					if st.qc.KP[0].CN != 0 || st.qc.KP[0].E {
+						t.Fatalf("discovery progress consumed CN=%d E=%v", st.qc.KP[0].CN, st.qc.KP[0].E)
+					}
+				case "emit":
+					st.qc.Phase = "emit"
+					st.qc.CM = []cursor.QueueCandidate{{K: "42:1", B: 1, U: "2026-10-03T11:00:00Z"}}
+					_, err = st.runEmit(ctx)
+					if st.qc.EI != 0 {
+						t.Fatalf("EI consumed=%d", st.qc.EI)
+					}
+				case "seed":
+					err = st.discoverOngoing(ctx)
+					if st.qc.OG.SI != 0 || st.qc.OG.E {
+						t.Fatalf("seed consumed SI=%d E=%v", st.qc.OG.SI, st.qc.OG.E)
+					}
+				}
+				want := errQueueCancelled
+				if errors.Is(cause, context.DeadlineExceeded) {
+					want = igl.ErrBudgetElapsed
+				}
+				if !errors.Is(err, want) {
+					t.Fatalf("got %v want %v", err, want)
+				}
+			})
+		}
+	}
+}
+
+func TestReviewQueue_R3SeedlessOngoingEmitResume(t *testing.T) {
+	tr := &repairRT{two: true}
+	d := repairDeps(t, tr, nil)
+	args := map[string]any{"group_id": "9", "kinds": []any{"reviewer", "ongoing"}, "page_size": 1}
+	seenEmit := false
+	for n := 0; n < 8; n++ {
+		out, err := callReviewQueue(t, d, args)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sec := out["sections"].(map[string]any)["ongoing"].(map[string]any)
+		if sec["pagination_exhausted"] != false {
+			t.Fatalf("response %d exhausted seedless ongoing: %v", n+1, sec["pagination_exhausted"])
+		}
+		if sec["content_complete"] == readmeta.ContentCompleteTrue {
+			t.Fatal("seedless ongoing claimed complete")
+		}
+		items, _ := out["items"].([]any)
+		if len(items) > 0 && !hasCode(limitationCodes(sec), readmeta.CodeUnsupported) {
+			t.Fatal("emit page dropped unsupported")
+		}
+		tok, _ := sectionMap(out)["next_cursor"].(string)
+		if tok == "" {
+			if !seenEmit {
+				t.Fatal("fixture never resumed emission")
+			}
+			return
+		}
+		p, err := cursor.Decode(d.Config.CursorKey, tok, d.now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p.QueueCont.Phase == "emit" {
+			seenEmit = true
+		}
+		args["cursor"] = tok
+	}
+	t.Fatal("seedless resume did not finish")
+}
+
 func repairSystemNotes(start, count int) string {
 	ns := make([]string, 0, count)
 	for n := 0; n < count; n++ {
@@ -719,6 +904,18 @@ func (tr *repairRT) RoundTrip(r *http.Request) (*http.Response, error) {
 				leadCount = 1
 			}
 			body = `[{"id":"lead","notes":[` + repairSystemNotes(1, leadCount) + `]},` + body[1:]
+		}
+		switch tr.mode {
+		case "disc_noheader":
+			delete(hdr, "X-Next-Page")
+		case "disc_duplicate":
+			hdr["X-Next-Page"] = []string{"2", "3"}
+		case "disc_jump":
+			hdr["X-Next-Page"] = []string{"3"}
+		case "disc_truncated":
+			body = strings.TrimSuffix(body, "]") + `,{"id":`
+		case "disc_junk":
+			body += ` trailing-junk`
 		}
 	case strings.Contains(r.URL.Path, "/merge_requests/"):
 		tr.mrHits++

@@ -169,6 +169,7 @@ func getMergeRequestReviewQueue(ctx context.Context, _ *mcp.CallToolRequest, in 
 		norm: norm, filters: filters, section: &section,
 		qc: qc, instance: instance, policyFP: policyFP,
 		upper: upper, expires: expires, now: now, ctx: ctx,
+		seedlessOngoing: norm.wantOng && len(norm.seeds) == 0,
 	}
 	st.reapplyPersistedLimitations()
 	// Review-queue discovery is a moving window: never claim snapshot consistency.
@@ -717,6 +718,23 @@ func (st *queueRuntime) reapplyPersistedLimitations() {
 	}
 }
 
+func (st *queueRuntime) invalidPage(ambiguous bool, err error) bool {
+	return ambiguous || queuePageFraming(err)
+}
+
+// terminalKnownInvalidPage closes a provider page whose framing or paging was
+// already invalid. Proved candidates stay; the cursor does not.
+func (st *queueRuntime) terminalKnownInvalidPage(cause error) {
+	st.markTerminal(readmeta.CodeProviderPageAmbiguous, "provider page incomplete")
+	st.persistLimitation(readmeta.CodePartial, "decoded provider prefix retained")
+	st.persistLimitation(readmeta.CodeMembershipIncomplete, "invalid provider page omitted unseen memberships")
+	if isTypedBudget(cause) {
+		st.noteBudget(cause)
+	} else if errors.Is(cause, errQueueCancelled) {
+		st.persistLimitation(readmeta.CodeCancelled, "invocation cancelled")
+	}
+}
+
 func (st *queueRuntime) markTerminal(code, message string) {
 	st.persistLimitation(code, message)
 	if st.qc != nil {
@@ -795,6 +813,12 @@ func (st *queueRuntime) discoverKindStream(ctx context.Context, idx int) error {
 			ent := page.ents[i]
 			if nerr := st.noteCandidate(ctx, ent, bit); nerr != nil {
 				if errors.Is(nerr, errQueueStop) || isTypedBudget(nerr) || errors.Is(nerr, errQueueCancelled) {
+					// Ambiguity is already known. A later proof stop must not
+					// mint a continuation for this page.
+					if st.invalidPage(page.ambiguous, err) {
+						st.terminalKnownInvalidPage(nerr)
+						return errQueueStop
+					}
 					kp.CN = i
 					if i == 0 {
 						kp.PD = ""
@@ -815,8 +839,9 @@ func (st *queueRuntime) discoverKindStream(ctx context.Context, idx int) error {
 			// An ambiguous or truncated page cannot be resumed: keep the proved prefix
 			// and terminalize instead of minting a continuation.
 			if len(st.qc.CM)-st.qc.EI >= st.norm.pageSize && i+1 < len(page.ents) {
-				if page.ambiguous || queuePageFraming(err) {
-					st.markTerminal(readmeta.CodeProviderPageAmbiguous, "provider page incomplete")
+				if st.invalidPage(page.ambiguous, err) {
+					st.terminalKnownInvalidPage(nil)
+					return errQueueStop
 				}
 				if isTypedBudget(err) || errors.Is(err, errQueueCancelled) {
 					return err
@@ -825,6 +850,10 @@ func (st *queueRuntime) discoverKindStream(ctx context.Context, idx int) error {
 			}
 		}
 		if isTypedBudget(err) || errors.Is(err, errQueueCancelled) {
+			if st.invalidPage(page.ambiguous, err) {
+				st.terminalKnownInvalidPage(err)
+				return errQueueStop
+			}
 			return err
 		}
 		if err != nil || page.ambiguous {
@@ -1056,8 +1085,8 @@ func (st *queueRuntime) verifyMR(ctx context.Context, projectID, iid int64) (see
 	}
 	mr, _, err := st.d.Client.MergeRequests.GetMergeRequest(owner.ID, iid, nil, gitlab.WithContext(ctx))
 	if err != nil {
-		if isTypedBudget(err) {
-			return meta, err
+		if kept := queueBudgetOrContext(err); kept != nil {
+			return meta, kept
 		}
 		return meta, identityErr("merge request")
 	}
@@ -1156,6 +1185,9 @@ func (st *queueRuntime) discoverOngoing(ctx context.Context) error {
 		}
 		owner, mrMeta, err := st.loadSeedMR(ctx, seed)
 		if err != nil {
+			if isTypedBudget(err) || errors.Is(err, errQueueCancelled) {
+				return err
+			}
 			msg := err.Error()
 			if strings.HasPrefix(msg, readmeta.CodeUnsupported) || strings.HasPrefix(msg, readmeta.CodeIdentityUnresolved) || strings.HasPrefix(msg, readmeta.CodeAuthzDenied) {
 				st.persistLimitation(strings.Split(msg, ":")[0], "seed rejected")
@@ -1165,9 +1197,6 @@ func (st *queueRuntime) discoverOngoing(ctx context.Context) error {
 				og.PD = ""
 				og.E = false
 				continue
-			}
-			if isTypedBudget(err) {
-				return err
 			}
 			return err
 		}
@@ -1224,8 +1253,8 @@ func (st *queueRuntime) loadSeedMR(ctx context.Context, seed knownMRSeed) (Canon
 	}
 	mr, _, err := st.d.Client.MergeRequests.GetMergeRequest(owner.ID, seed.MergeRequestIID, nil, gitlab.WithContext(ctx))
 	if err != nil {
-		if isTypedBudget(err) {
-			return CanonicalProject{}, meta, err
+		if kept := queueBudgetOrContext(err); kept != nil {
+			return CanonicalProject{}, meta, kept
 		}
 		return CanonicalProject{}, meta, identityErr("seed merge request")
 	}
@@ -1312,29 +1341,6 @@ func (st *queueRuntime) scanSeedParticipation(ctx context.Context, owner Canonic
 			page = append(page, queueDisc{id: d.ID, notes: d.Notes})
 			return nil
 		})
-		if err != nil && len(page) == 0 && isTypedBudget(err) {
-			return qualified, err
-		}
-		if err != nil && len(page) == 0 && !queuePageFraming(err) {
-			var hdr http.Header
-			var sdkNext int64
-			if resp != nil {
-				sdkNext = resp.NextPage
-				if resp.Response != nil {
-					hdr = resp.Response.Header
-				}
-			}
-			if !observeQueuePage(og.DP, hdr, sdkNext, 0).ambiguous {
-				return qualified, err
-			}
-		}
-		qualified, stop, serr := st.walkDiscussionPage(ctx, page, og, key, owner.ID, iid, meta)
-		if serr != nil {
-			return qualified, serr
-		}
-		if stop || st.qc.Term {
-			return qualified, errQueueStop
-		}
 		var hdr http.Header
 		var sdkNext int64
 		if resp != nil {
@@ -1344,7 +1350,33 @@ func (st *queueRuntime) scanSeedParticipation(ctx context.Context, owner Canonic
 			}
 		}
 		obs := observeQueuePage(og.DP, hdr, sdkNext, len(page))
+		invalid := st.invalidPage(obs.ambiguous, err)
+		if err != nil && len(page) == 0 && isTypedBudget(err) {
+			if invalid {
+				st.terminalKnownInvalidPage(err)
+				return qualified, errQueueStop
+			}
+			return qualified, err
+		}
+		if err != nil && len(page) == 0 && !invalid {
+			return qualified, err
+		}
+		qualified, stop, serr := st.walkDiscussionPage(ctx, page, og, key, owner.ID, iid, meta)
+		if serr != nil {
+			if invalid && (isTypedBudget(serr) || errors.Is(serr, errQueueCancelled)) {
+				st.terminalKnownInvalidPage(serr)
+				return qualified, errQueueStop
+			}
+			return qualified, serr
+		}
+		if stop || st.qc.Term {
+			return qualified, errQueueStop
+		}
 		if isTypedBudget(err) || errors.Is(err, errQueueCancelled) {
+			if invalid {
+				st.terminalKnownInvalidPage(err)
+				return qualified, errQueueStop
+			}
 			return qualified, err
 		}
 		if err != nil || obs.ambiguous {
@@ -1923,7 +1955,9 @@ func (st *queueRuntime) kindExhausted(kind string) bool {
 		return false
 	}
 	if kind == "ongoing" {
-		if st.seedlessOngoing || st.qc.OG == nil {
+		// Seedless ongoing is unsupported on every invocation, including an
+		// emit resume. OG.E from the discovery cursor is not provider exhaustion.
+		if st.seedlessOngoing || len(st.norm.seeds) == 0 || st.qc.OG == nil {
 			return false
 		}
 		return st.qc.OG.E
