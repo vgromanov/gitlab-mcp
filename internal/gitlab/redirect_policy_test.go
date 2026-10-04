@@ -11,6 +11,8 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/config"
+
 	gitlab "gitlab.com/gitlab-org/api/client-go/v2"
 )
 
@@ -287,5 +289,34 @@ func TestStreamRawFile_sameURLRedirectAllowedAndChargesHops(t *testing.T) {
 	reqN, _, _ := budget.Stats()
 	if reqN < 2 {
 		t.Fatalf("budget requests=%d want ≥2 (every hop charged)", reqN)
+	}
+}
+
+func TestExactRead_productionClientRefusesChangedPath(t *testing.T) {
+	var dest atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "evil") {
+			dest.Add(1)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		http.Redirect(w, r, "/evil", http.StatusFound)
+	}))
+	t.Cleanup(ts.Close)
+	cli, err := NewClient(&config.Config{Token: "t", APIURL: ts.URL + "/api/v4"}, WithRetryWaitMinMax(0, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := WithExactReadProvenance(context.Background())
+	req, err := cli.NewRequest(http.MethodGet, "projects/1", nil, []gitlab.RequestOptionFunc{gitlab.WithContext(ctx)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = cli.Do(req, io.Discard)
+	if dest.Load() != 0 {
+		t.Fatalf("destination hits=%d err=%v", dest.Load(), err)
+	}
+	if !errors.Is(err, ErrExactReadRedirect) {
+		t.Fatalf("err=%v", err)
 	}
 }

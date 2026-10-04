@@ -1389,3 +1389,59 @@ func TestAllowExcludesGET(t *testing.T) {
 		t.Fatal("GET must reject")
 	}
 }
+
+func TestApprovalDigest_presenceRulesAndFailure(t *testing.T) {
+	body := []byte(`{
+		"approved": true,
+		"user_has_approved": null,
+		"approvals_required": 2,
+		"approvals_left": null,
+		"rules": [
+			{"id": 2, "name": "b", "approved": false, "approvals_required": 1, "contains_hidden_groups": false},
+			{"id": 2, "name": null, "approved": true, "approvals_required": null},
+			{"id": 1, "name": "a", "approved": null}
+		],
+		"approval_rules_left": []
+	}`)
+	limits := []readmeta.Limitation{
+		{Code: "z", Message: "later"},
+		{Code: "a", Message: "second"},
+		{Code: "a", Message: "first"},
+	}
+	first, err := approvalSemanticDigest(endpointApprovalState, body, limits)
+	if err != nil || len(first) != 64 {
+		t.Fatalf("digest: %v %q", err, first)
+	}
+	second, err := approvalSemanticDigest(endpointApprovalState, body, []readmeta.Limitation{
+		{Code: "a", Message: "first"},
+		{Code: "a", Message: "second"},
+		{Code: "z", Message: "later"},
+	})
+	if err != nil || first != second {
+		t.Fatalf("order changed digest: %v %s %s", err, first, second)
+	}
+	absent, err := approvalSemanticDigest(endpointApprovalState, []byte(`{"rules":null}`), nil)
+	if err != nil || absent == first {
+		t.Fatalf("null rules: %v %s", err, absent)
+	}
+	if _, err := approvalSemanticDigest(endpointApprovalState, []byte(`[]`), nil); err == nil {
+		t.Fatal("array body accepted")
+	}
+	if _, err := approvalSemanticDigest(endpointApprovalState, []byte(`{"rules":{"id":1}}`), nil); err == nil {
+		t.Fatal("object rules accepted")
+	}
+	if _, err := approvalSemanticDigest(endpointApprovalState, []byte(`{"rules":[1]}`), nil); err == nil {
+		t.Fatal("scalar rule accepted")
+	}
+	if _, err := approvalSemanticDigest(endpointApprovalState, []byte(`{"rules":[{"name":1}]}`), nil); err == nil {
+		t.Fatal("numeric name accepted")
+	}
+	fail1, err := approvalFailureDigest(endpointApprovalState, readmeta.CodeHTTPError, limits)
+	if err != nil || len(fail1) != 64 || fail1 == first {
+		t.Fatalf("failure digest: %v %s", err, fail1)
+	}
+	fail2, err := approvalFailureDigest(endpointApprovalState, readmeta.CodeHTTPError, limits)
+	if err != nil || fail1 != fail2 {
+		t.Fatalf("failure digest unstable: %v", err)
+	}
+}

@@ -52,6 +52,7 @@ var literalExpectedReview27 = []string{
 	"get_pipeline_job",
 	"get_pipeline_job_output",
 	"get_merge_request_review_queue",
+	"get_merge_request_review_context",
 }
 
 var reviewForbiddenTools = []string{
@@ -91,7 +92,7 @@ func TestRegisterAll_toolProfiles(t *testing.T) {
 	})
 	for _, profile := range []string{"review_read", "review_write"} {
 		profile := profile
-		t.Run(profile+"_exact_27", func(t *testing.T) {
+		t.Run(profile+"_exact_28", func(t *testing.T) {
 			names := registerNames(t, &config.Config{
 				Token:         "x",
 				ToolProfile:   profile,
@@ -100,8 +101,8 @@ func TestRegisterAll_toolProfiles(t *testing.T) {
 				UseDailyTools: true,
 			})
 			assertExactToolSet(t, names, literalExpectedReview27)
-			if len(ReviewReadTools()) != 27 {
-				t.Fatal("production ReviewReadTools must stay len 27")
+			if len(ReviewReadTools()) != 28 {
+				t.Fatal("production ReviewReadTools must stay len 28")
 			}
 			for _, bad := range reviewForbiddenTools {
 				if names[bad] {
@@ -119,8 +120,8 @@ func TestRegisterAll_toolProfiles(t *testing.T) {
 		if names["list_pipelines"] {
 			t.Fatal("disabled list_pipelines must be absent")
 		}
-		if len(names) != 26 {
-			t.Fatalf("got %d want 26", len(names))
+		if len(names) != 27 {
+			t.Fatalf("got %d want 27", len(names))
 		}
 	})
 }
@@ -235,11 +236,12 @@ var reviewAuthzPath = map[string]string{
 	"get_pipeline_job":                 "resolvePipelineProject",
 	"get_pipeline_job_output":          "resolvePipelineProject",
 	"get_merge_request_review_queue":   "AuthorizeCanonicalGroup|authorizeGroupProject|AuthorizeAdditionalProjects",
+	"get_merge_request_review_context": "reviewAuthorizeProject",
 }
 
 func TestReviewProfile_authzPathTableExact27(t *testing.T) {
-	if len(literalExpectedReview27) != 27 || len(reviewAuthzPath) != 27 {
-		t.Fatalf("literal want 27; list=%d map=%d", len(literalExpectedReview27), len(reviewAuthzPath))
+	if len(literalExpectedReview27) != 28 || len(reviewAuthzPath) != 28 {
+		t.Fatalf("literal want 28; list=%d map=%d", len(literalExpectedReview27), len(reviewAuthzPath))
 	}
 	for _, name := range literalExpectedReview27 {
 		if reviewAuthzPath[name] == "" {

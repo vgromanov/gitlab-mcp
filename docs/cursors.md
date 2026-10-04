@@ -101,3 +101,16 @@ overflow keeps proved successes, reports `known_terminal_omitted` when that
 count is known, and sets `next_cursor=null`. Moving discovery always reports
 consistency unknown with a limitation and never treats provider exhaustion alone
 as content complete.
+
+`get_merge_request_review_context` signs one v1 token per proved merge request.
+Scope kind is `review_context` with the canonical owner project id and a positive
+IID. `immutable_refs` and `page_state` are empty, `per_page` is 1, and `queue_cont`
+is absent. `list_commits`, `rq2`, and pipeline tokens are unchanged. Complete and
+excluded masks are disjoint, sorted, and union to the requested set. Digests exist
+only for complete sections. `retrieved_at + 5m` is `write_fresh_until`; `retrieved_at
++ 2h` is `expires_at`. Neither window is renewed. `Decode` proves HMAC and this
+structure. `VerifyContextBinding` checks the live instance, actor, policy, scope,
+selection, and refs, then requires every demanded section to be complete. A
+metadata-only token fails a demand for `approvals`. Missing `GITLAB_MCP_CURSOR_KEY`
+is the same class of configuration error as the queue. The signature does not
+attest that a human reviewed the change.

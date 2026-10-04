@@ -3,12 +3,15 @@ package tools
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -849,57 +852,239 @@ func decodeApprovalsLegacyRaw(ctx context.Context, raw []byte, section *readmeta
 }
 
 func readNormalizedApprovals(ctx context.Context, d Deps, owner CanonicalProject, mrIID int64) (mrApprovalReadResult, error) {
+	res, _, err := readReviewApprovals(ctx, d, owner, mrIID)
+	return res, err
+}
+
+// readReviewApprovals is the review-context seam. The raw body is the exact
+// payload hashed before presence collapse. Public approval JSON is unchanged.
+func readReviewApprovals(ctx context.Context, d Deps, owner CanonicalProject, mrIID int64) (mrApprovalReadResult, []byte, error) {
 	section := newApprovalsSection(time.Now())
 	projectPath := projectAPIID(owner)
 
 	primary := readApprovalResource(ctx, d, projectPath, mrIID, endpointApprovalState)
 	if primary.Err != nil {
-		return mrApprovalReadResult{Section: section}, primary.Err
+		return mrApprovalReadResult{Section: section}, nil, primary.Err
 	}
 
 	switch {
 	case primary.Status == http.StatusOK:
 		if responseWasRedirected(primary.Response) {
-			return mrApprovalReadResult{Section: section}, approvalSafeErr(readmeta.CodeHTTPError, "redirected approval_state response")
+			return mrApprovalReadResult{Section: section}, nil, approvalSafeErr(readmeta.CodeHTTPError, "redirected approval_state response")
 		}
 		out, err := decodeApprovalStateRaw(ctx, primary.Body, &section)
 		if err != nil {
-			return mrApprovalReadResult{Section: section}, err
+			return mrApprovalReadResult{Section: section}, primary.Body, err
 		}
 		if err := requirePostReadStillValid(ctx); err != nil {
-			return mrApprovalReadResult{Section: section}, err
+			return mrApprovalReadResult{Section: section}, primary.Body, err
 		}
-		return out, nil
+		return out, primary.Body, nil
 
 	case primary.Status == http.StatusMethodNotAllowed:
-		// Recheck budget/ctx after SDK error-body handling before fallback.
 		if err := budgetAllowsNext(ctx); err != nil {
-			return mrApprovalReadResult{Section: section}, err
+			return mrApprovalReadResult{Section: section}, nil, err
 		}
 		if !qualifiesApprovalStateMethodFallback(d, projectPath, mrIID, primary) {
-			return mrApprovalReadResult{Section: section}, approvalHTTPStatusErr(http.StatusMethodNotAllowed)
+			return mrApprovalReadResult{Section: section}, nil, approvalHTTPStatusErr(http.StatusMethodNotAllowed)
 		}
 		section.AddLimitation(readmeta.CodeUnsupported, "approval_state GET currently unavailable; cause unknown")
 		legacy := readApprovalResource(ctx, d, projectPath, mrIID, endpointApprovals)
 		if legacy.Err != nil {
-			return mrApprovalReadResult{Section: section}, legacy.Err
+			return mrApprovalReadResult{Section: section}, nil, legacy.Err
 		}
 		if legacy.Status != http.StatusOK {
-			return mrApprovalReadResult{Section: section}, approvalHTTPStatusErr(legacy.Status)
+			return mrApprovalReadResult{Section: section}, legacy.Body, approvalHTTPStatusErr(legacy.Status)
 		}
 		if responseWasRedirected(legacy.Response) {
-			return mrApprovalReadResult{Section: section}, approvalSafeErr(readmeta.CodeHTTPError, "redirected approvals response")
+			return mrApprovalReadResult{Section: section}, nil, approvalSafeErr(readmeta.CodeHTTPError, "redirected approvals response")
 		}
 		out, err := decodeApprovalsLegacyRaw(ctx, legacy.Body, &section)
 		if err != nil {
-			return mrApprovalReadResult{Section: section}, err
+			return mrApprovalReadResult{Section: section}, legacy.Body, err
 		}
 		if err := requirePostReadStillValid(ctx); err != nil {
-			return mrApprovalReadResult{Section: section}, err
+			return mrApprovalReadResult{Section: section}, legacy.Body, err
 		}
-		return out, nil
+		return out, legacy.Body, nil
 
 	default:
-		return mrApprovalReadResult{Section: section}, approvalHTTPStatusErr(primary.Status)
+		return mrApprovalReadResult{Section: section}, primary.Body, approvalHTTPStatusErr(primary.Status)
 	}
+}
+
+type approvalDigestRule struct {
+	ID                   string `json:"id"`
+	Name                 string `json:"name"`
+	Approved             string `json:"approved"`
+	ApprovalsRequired    string `json:"approvals_required"`
+	ContainsHiddenGroups string `json:"contains_hidden_groups"`
+}
+
+type approvalDigestDoc struct {
+	Endpoint          string                `json:"endpoint"`
+	Approved          string                `json:"approved"`
+	ActorApproved     string                `json:"actor_approved"`
+	ActorCanApprove   string                `json:"actor_can_approve"`
+	ApprovalsRequired string                `json:"approvals_required"`
+	ApprovalsLeft     string                `json:"approvals_left"`
+	RulesState        string                `json:"rules_state"`
+	Rules             []approvalDigestRule  `json:"rules"`
+	RulesLeftState    string                `json:"rules_left_state"`
+	RulesLeft         []approvalDigestRule  `json:"rules_left"`
+	Limitations       []readmeta.Limitation `json:"limitations"`
+	Result            json.RawMessage       `json:"result,omitempty"`
+	Error             string                `json:"error,omitempty"`
+}
+
+// approvalSemanticDigest hashes presence before bool collapse. Envelope clocks are omitted.
+func approvalSemanticDigest(endpoint string, raw []byte, limitations []readmeta.Limitation) (string, error) {
+	doc := approvalDigestDoc{
+		Endpoint:    endpoint,
+		Limitations: sortedLimitations(limitations),
+		Rules:       []approvalDigestRule{},
+		RulesLeft:   []approvalDigestRule{},
+	}
+	env, err := objectFields(raw)
+	if err != nil {
+		return "", err
+	}
+	doc.Approved = presenceLabel(raw, "approved")
+	doc.ActorApproved = presenceLabel(raw, "user_has_approved")
+	doc.ActorCanApprove = presenceLabel(raw, "user_can_approve")
+	doc.ApprovalsRequired = scalarLabel(env, "approvals_required")
+	doc.ApprovalsLeft = scalarLabel(env, "approvals_left")
+	rules, rulesState, err := ruleDigest(env, "rules")
+	if err != nil {
+		return "", err
+	}
+	left, leftState, err := ruleDigest(env, "approval_rules_left")
+	if err != nil {
+		return "", err
+	}
+	doc.Rules, doc.RulesState = rules, rulesState
+	doc.RulesLeft, doc.RulesLeftState = left, leftState
+	return hashDigestDoc(doc)
+}
+
+// approvalFailureDigest hashes an error skeleton with a null success object and no clocks.
+func approvalFailureDigest(endpoint, code string, limitations []readmeta.Limitation) (string, error) {
+	doc := approvalDigestDoc{
+		Endpoint:          endpoint,
+		Approved:          string(readmeta.PresenceAbsent),
+		ActorApproved:     string(readmeta.PresenceAbsent),
+		ActorCanApprove:   string(readmeta.PresenceAbsent),
+		ApprovalsRequired: "absent",
+		ApprovalsLeft:     "absent",
+		RulesState:        "absent",
+		Rules:             []approvalDigestRule{},
+		RulesLeftState:    "absent",
+		RulesLeft:         []approvalDigestRule{},
+		Limitations:       sortedLimitations(limitations),
+		Result:            json.RawMessage("null"),
+		Error:             code,
+	}
+	return hashDigestDoc(doc)
+}
+
+func hashDigestDoc(doc approvalDigestDoc) (string, error) {
+	raw, err := json.Marshal(doc)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+func sortedLimitations(in []readmeta.Limitation) []readmeta.Limitation {
+	out := append([]readmeta.Limitation(nil), in...)
+	if out == nil {
+		out = []readmeta.Limitation{}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Code != out[j].Code {
+			return out[i].Code < out[j].Code
+		}
+		return out[i].Message < out[j].Message
+	})
+	return out
+}
+
+func presenceLabel(raw []byte, field string) string {
+	p, err := readmeta.DecodeBoolPresence(raw, field)
+	if err != nil {
+		return "invalid"
+	}
+	return string(p)
+}
+
+func objectFields(raw []byte) (map[string]json.RawMessage, error) {
+	var env map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return nil, err
+	}
+	return env, nil
+}
+
+func scalarLabel(env map[string]json.RawMessage, field string) string {
+	raw, ok := env[field]
+	if !ok {
+		return "absent"
+	}
+	s := string(bytes.TrimSpace(raw))
+	if s == "null" {
+		return "null"
+	}
+	var n int64
+	if err := json.Unmarshal(raw, &n); err != nil {
+		return "invalid"
+	}
+	return strconv.FormatInt(n, 10)
+}
+
+func ruleDigest(env map[string]json.RawMessage, field string) ([]approvalDigestRule, string, error) {
+	raw, ok := env[field]
+	if !ok {
+		return []approvalDigestRule{}, "absent", nil
+	}
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return []approvalDigestRule{}, "null", nil
+	}
+	var rows []json.RawMessage
+	if err := json.Unmarshal(raw, &rows); err != nil {
+		return nil, "", err
+	}
+	out := make([]approvalDigestRule, 0, len(rows))
+	for _, row := range rows {
+		fields, err := objectFields(row)
+		if err != nil {
+			return nil, "", err
+		}
+		name := "absent"
+		if nraw, ok := fields["name"]; ok {
+			if bytes.Equal(bytes.TrimSpace(nraw), []byte("null")) {
+				name = "null"
+			} else {
+				var s string
+				if err := json.Unmarshal(nraw, &s); err != nil {
+					return nil, "", err
+				}
+				name = "value:" + s
+			}
+		}
+		out = append(out, approvalDigestRule{
+			ID:                   scalarLabel(fields, "id"),
+			Name:                 name,
+			Approved:             presenceLabel(row, "approved"),
+			ApprovalsRequired:    scalarLabel(fields, "approvals_required"),
+			ContainsHiddenGroups: presenceLabel(row, "contains_hidden_groups"),
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].ID != out[j].ID {
+			return out[i].ID < out[j].ID
+		}
+		return out[i].Name < out[j].Name
+	})
+	return out, "rows", nil
 }

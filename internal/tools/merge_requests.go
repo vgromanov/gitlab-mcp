@@ -33,6 +33,7 @@ func RegisterMergeRequests(s *mcp.Server, d Deps) {
 	AddTool(s, d, true, "", &mcp.Tool{Name: "unapprove_merge_request", Description: "Remove your approval from an MR"}, unapproveMergeRequest)
 	AddTool(s, d, false, "", &mcp.Tool{Name: "get_merge_request_approval_state", Description: "Get MR approval state"}, getMergeRequestApprovalState)
 	registerMergeRequestReviewQueue(s, d)
+	registerMergeRequestReviewContext(s, d)
 }
 
 type pidMR struct {
