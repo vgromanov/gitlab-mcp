@@ -252,6 +252,105 @@ func TestReviewQueue_F5DiscussionNoteTerminal(t *testing.T) {
 	})
 }
 
+func TestReviewQueue_F5DiscussionBoundaryProgress(t *testing.T) {
+	tr := &repairRT{notes: 1, leading: true, leadingNotes: 97, discuss: true}
+	d := repairDeps(t, tr, nil)
+	args := map[string]any{
+		"group_id": "9", "kinds": []any{"ongoing"},
+		"known_mrs": []any{map[string]any{"project_id": "42", "iid": 1}},
+	}
+	var prior cursor.QueueOngoingProg
+	for n := 0; n < 3; n++ {
+		out, err := callReviewQueue(t, d, args)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tok, _ := sectionMap(out)["next_cursor"].(string)
+		if tok == "" {
+			codes := limitationCodes(sectionMap(out))
+			for _, code := range []string{readmeta.CodeBudgetItems, readmeta.CodePartial, readmeta.CodeMembershipIncomplete} {
+				if !hasCode(codes, code) {
+					t.Fatalf("boundary terminal missing %s: %v", code, codes)
+				}
+			}
+			items, _ := out["items"].([]any)
+			if len(items) != 0 {
+				t.Fatalf("unseen qualifying note emitted: %v", items)
+			}
+			qc, _ := out["queue_counts"].(map[string]any)
+			if _, ok := qc["unobserved_membership_count"]; !ok || qc["unobserved_membership_count"] != nil {
+				t.Fatalf("unfinished seed membership must stay unknown, counts=%v", qc)
+			}
+			return
+		}
+		p, err := cursor.Decode(d.Config.CursorKey, tok, d.now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		cur := *p.QueueCont.OG
+		if n > 0 && cur == prior {
+			t.Fatalf("identical discussion-boundary cursor on attempt %d: %#v", n+1, cur)
+		}
+		prior = cur
+		args["cursor"] = tok
+	}
+	t.Fatal("97-note boundary neither progressed nor terminalized")
+}
+
+func TestReviewQueue_F5ResumableDiscussionBoundary(t *testing.T) {
+	tr := &repairRT{perSeed: true, leading: true, leadingNotes: 87, notes: 1, discuss: true}
+	d := repairDeps(t, tr, nil)
+	args := map[string]any{
+		"group_id": "9", "kinds": []any{"ongoing"},
+		"known_mrs": []any{
+			map[string]any{"project_id": "42", "iid": 1},
+			map[string]any{"project_id": "42", "iid": 2},
+		},
+	}
+	out, err := callReviewQueue(t, d, args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tok, _ := sectionMap(out)["next_cursor"].(string)
+	if tok == "" {
+		t.Fatal("representable discussion boundary was terminalized")
+	}
+	p, err := cursor.Decode(d.Config.CursorKey, tok, d.now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.QueueCont.OG == nil || p.QueueCont.OG.SI != 1 || p.QueueCont.OG.DP != 1 || p.QueueCont.OG.CN != 1 {
+		t.Fatalf("expected seed-2 discussion boundary, got %#v", p.QueueCont.OG)
+	}
+	args["cursor"] = tok
+	out, err = callReviewQueue(t, d, args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tok2, _ := sectionMap(out)["next_cursor"].(string)
+	if tok2 != "" {
+		p2, err := cursor.Decode(d.Config.CursorKey, tok2, d.now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p2.QueueCont.OG != nil && *p2.QueueCont.OG == *p.QueueCont.OG {
+			t.Fatalf("resume replayed the same boundary: %#v", p2.QueueCont.OG)
+		}
+	}
+	items, _ := out["items"].([]any)
+	if len(items) != 1 {
+		t.Fatalf("resume did not emit the qualifying note, items=%v", items)
+	}
+}
+
+func repairSystemNotes(start, count int) string {
+	ns := make([]string, 0, count)
+	for n := 0; n < count; n++ {
+		ns = append(ns, fmt.Sprintf(`{"id":%d,"system":true,"body":"fixture","author":{"id":7}}`, start+n))
+	}
+	return strings.Join(ns, ",")
+}
+
 func TestReviewQueue_F6StrictProviderPages(t *testing.T) {
 	for _, mode := range []string{"repeat", "jump", "dupheader"} {
 		t.Run(mode, func(t *testing.T) {
@@ -493,6 +592,8 @@ type repairRT struct {
 	fork, discuss     bool
 	leading, ancestry bool
 	notes, chainPages int
+	leadingNotes      int
+	perSeed           bool
 	budgetPath        string
 	budgetErr         error
 	hits, listHits    int
@@ -590,6 +691,15 @@ func (tr *repairRT) RoundTrip(r *http.Request) (*http.Response, error) {
 	case strings.HasSuffix(r.URL.Path, "/discussions"):
 		tr.discussionHits++
 		hdr["X-Next-Page"] = []string{""}
+		parts := strings.Split(r.URL.Path, "/")
+		iid := ""
+		if len(parts) >= 2 {
+			iid = parts[len(parts)-2]
+		}
+		if tr.perSeed && iid == "1" {
+			body = `[{"id":"seed1","notes":[` + repairSystemNotes(1, 8) + `]}]`
+			break
+		}
 		count := tr.notes
 		if count == 0 {
 			count = 1
@@ -604,7 +714,11 @@ func (tr *repairRT) RoundTrip(r *http.Request) (*http.Response, error) {
 		}
 		body = `[{"id":"d1","notes":[` + strings.Join(ns, ",") + `]}]`
 		if tr.leading {
-			body = `[{"id":"lead","notes":[{"id":1,"system":true,"body":"fixture","author":{"id":7}}]},` + body[1:]
+			leadCount := tr.leadingNotes
+			if leadCount == 0 {
+				leadCount = 1
+			}
+			body = `[{"id":"lead","notes":[` + repairSystemNotes(1, leadCount) + `]},` + body[1:]
 		}
 	case strings.Contains(r.URL.Path, "/merge_requests/"):
 		tr.mrHits++

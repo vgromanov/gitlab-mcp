@@ -1383,15 +1383,11 @@ func (st *queueRuntime) walkDiscussionPage(ctx context.Context, page []queueDisc
 	for i := 0; i < og.CN && i < len(page); i++ {
 		fact, _, ferr := st.chargeDiscussionNotes(page[i], key, projectID, iid, meta, false)
 		if ferr != nil {
-			if isTypedBudget(ferr) || errors.Is(ferr, errQueueCancelled) {
-				rem := remainingNotes(page, i, noteFailIndex(ferr))
-				if noteFailIndex(ferr) > 0 {
-					st.terminalMidDiscussion(rem)
-					return qualified, true, nil
-				}
-				return qualified, false, ferr
+			if stop, ret := st.classifyNoteStop(ferr, page, og.CN, noteFailIndex(ferr)); stop {
+				return qualified, true, nil
+			} else if ret != nil {
+				return qualified, false, ret
 			}
-			return qualified, false, ferr
 		}
 		facts[i] = fact
 	}
@@ -1405,17 +1401,14 @@ func (st *queueRuntime) walkDiscussionPage(ctx context.Context, page []queueDisc
 			qualified = true
 		}
 		if ferr != nil {
-			if isTypedBudget(ferr) || errors.Is(ferr, errQueueCancelled) {
-				if noteFailIndex(ferr) > 0 {
-					st.terminalMidDiscussion(remainingNotes(page, i, noteFailIndex(ferr)))
-					return qualified, true, nil
-				}
-				return qualified, false, ferr
-			}
 			if errors.Is(ferr, errQueueStop) {
 				return qualified, true, nil
 			}
-			return qualified, false, ferr
+			if stop, ret := st.classifyNoteStop(ferr, page, og.CN, noteFailIndex(ferr)); stop {
+				return qualified, true, nil
+			} else if ret != nil {
+				return qualified, false, ret
+			}
 		}
 		facts[i] = fact
 		og.CN = i + 1
@@ -1438,20 +1431,6 @@ func noteFailIndex(err error) int {
 		return n.index
 	}
 	return 0
-}
-
-func remainingNotes(page []queueDisc, discIdx, noteIdx int) int {
-	if discIdx < 0 || discIdx >= len(page) {
-		return 0
-	}
-	n := len(page[discIdx].notes) - noteIdx
-	if n < 0 {
-		n = 0
-	}
-	for i := discIdx + 1; i < len(page); i++ {
-		n += len(page[i].notes)
-	}
-	return n
 }
 
 func (st *queueRuntime) chargeDiscussionNotes(d queueDisc, key string, projectID, iid int64, meta seedMRMeta, admit bool) (string, bool, error) {
@@ -1482,14 +1461,80 @@ func (st *queueRuntime) chargeDiscussionNotes(d queueDisc, key string, projectID
 	return strings.Join(parts, ";"), qualified, nil
 }
 
-func (st *queueRuntime) terminalMidDiscussion(remaining int) {
-	st.markTerminal(readmeta.CodeBudgetItems, "note inspection stopped inside a discussion")
+// classifyNoteStop decides whether a charged-note failure can be resumed.
+// Item budget inside a discussion, or at a discussion boundary whose replay
+// cannot admit one new note on a fresh item allowance, is terminal. Request,
+// byte, and elapsed budgets stay typed at a representable boundary. Cancellation
+// is never relabeled as an item-budget terminal.
+func (st *queueRuntime) classifyNoteStop(err error, page []queueDisc, cursorCN, noteIdx int) (bool, error) {
+	if err == nil || errors.Is(err, errQueueCancelled) {
+		return false, err
+	}
+	if errors.Is(err, igl.ErrBudgetRequests) || errors.Is(err, igl.ErrBudgetBytes) || errors.Is(err, igl.ErrBudgetElapsed) {
+		if noteIdx > 0 {
+			st.terminalUnrepresentable(noteBudgetCode(err))
+			return true, nil
+		}
+		return false, err
+	}
+	if !errors.Is(err, igl.ErrBudgetItems) {
+		return false, err
+	}
+	// rq2 can store the discussion index only. A stop after the first note of
+	// that discussion cannot move forward. A stop on note 0 is resumable only
+	// when the next invocation can replay this boundary and still charge one
+	// unseen note; otherwise the same cursor repeats forever.
+	if noteIdx > 0 || !st.discussionBoundaryResumable(page, cursorCN) {
+		st.terminalUnrepresentable(readmeta.CodeBudgetItems)
+		return true, nil
+	}
+	return false, err
+}
+
+// discussionBoundaryResumable reports whether a later invocation, with a fresh
+// item allowance, can reload this seed, re-read this discussion page, replay
+// the consumed note prefix, and charge one unseen note.
+func (st *queueRuntime) discussionBoundaryResumable(page []queueDisc, cursorCN int) bool {
+	if st.budget == nil {
+		return false
+	}
+	maxItems, _, _, _ := st.budget.LimitsSnapshot()
+	if maxItems <= 0 {
+		return true
+	}
+	notes := 0
+	for i := 0; i < cursorCN && i < len(page); i++ {
+		notes += len(page[i].notes)
+	}
+	// 1 seed reload + one item per discussion element on the re-read page
+	// + replayed notes + the next unseen note.
+	need := 1 + len(page) + notes + 1
+	return need <= maxItems
+}
+
+func noteBudgetCode(err error) string {
+	switch {
+	case errors.Is(err, igl.ErrBudgetBytes):
+		return readmeta.CodeBudgetBytes
+	case errors.Is(err, igl.ErrBudgetElapsed):
+		return readmeta.CodeBudgetElapsed
+	case errors.Is(err, igl.ErrBudgetRequests):
+		return readmeta.CodeBudgetRequests
+	default:
+		return readmeta.CodeBudgetItems
+	}
+}
+
+func (st *queueRuntime) terminalUnrepresentable(code string) {
+	msg := "note inspection stopped where rq2 cannot represent forward progress"
+	if code == readmeta.CodeBudgetItems {
+		msg = "note inspection stopped inside a discussion"
+	}
+	st.markTerminal(code, msg)
 	st.persistLimitation(readmeta.CodePartial, "rq2 has no within-discussion note index; forward progress cannot be represented")
 	st.persistLimitation(readmeta.CodeMembershipIncomplete, "unscanned discussion notes were not skipped")
-	if remaining >= 0 {
-		n := remaining
-		st.unobservedMembership = &n
-	}
+	// One unfinished seed qualifies as zero or one candidate. A remaining note
+	// count is not an exact membership count, so leave it null.
 }
 
 func (st *queueRuntime) cmHasBit(key string, bit int) bool {
