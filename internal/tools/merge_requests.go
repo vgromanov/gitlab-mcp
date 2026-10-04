@@ -2,7 +2,6 @@ package tools
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -108,7 +107,7 @@ func loadAuthorizedMR(ctx context.Context, d Deps, projectID string, mrIID int64
 	}
 	mr, _, err := d.Client.MergeRequests.GetMergeRequest(owner.ID, mrIID, nil, gitlab.WithContext(ctx))
 	if err != nil {
-		if cause := groupContextCause(ctx, err); errors.Is(cause, context.Canceled) || errors.Is(cause, context.DeadlineExceeded) || errors.Is(cause, glclient.ErrBudgetElapsed) {
+		if cause, ok := providerTimeoutCause(ctx, err); ok {
 			return CanonicalProject{}, nil, cause
 		}
 		if passthroughTypedProviderErr(err) {
@@ -180,7 +179,7 @@ func loadDiffIdentity(ctx context.Context, d Deps, projectID string, mrIID int64
 	}
 	mr, _, err := d.Client.MergeRequests.GetMergeRequest(owner.ID, mrIID, nil, gitlab.WithContext(ctx))
 	if err != nil {
-		if cause := groupContextCause(ctx, err); errors.Is(cause, context.Canceled) || errors.Is(cause, context.DeadlineExceeded) || errors.Is(cause, glclient.ErrBudgetElapsed) {
+		if cause, ok := providerTimeoutCause(ctx, err); ok {
 			return CanonicalProject{}, nil, cause
 		}
 		if passthroughTypedProviderErr(err) {

@@ -1142,17 +1142,30 @@ func holdAfterBoth(match func(string) bool, fast func(*http.Request) (*http.Resp
 	})
 }
 
+func authClientDirect(t *testing.T, next http.RoundTripper) Deps {
+	t.Helper()
+	return authClientOpt(t, next, false)
+}
+
 func authClient(t *testing.T, next http.RoundTripper) Deps {
+	t.Helper()
+	return authClientOpt(t, next, true)
+}
+
+func authClientOpt(t *testing.T, next http.RoundTripper, intercept bool) Deps {
 	t.Helper()
 	d := newReviewDeps(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 		t.Fatal("real server reached")
 	}))
-	cli, err := gitlab.NewClient("fixture-only",
+	opts := []gitlab.ClientOptionFunc{
 		gitlab.WithBaseURL(d.Config.APIURL),
 		gitlab.WithoutRetries(),
 		gitlab.WithHTTPClient(&http.Client{Transport: next, Timeout: 2 * time.Second}),
-		gitlab.WithInterceptor(igl.BudgetInterceptor()),
-	)
+	}
+	if intercept {
+		opts = append(opts, gitlab.WithInterceptor(igl.BudgetInterceptor()))
+	}
+	cli, err := gitlab.NewClient("fixture-only", opts...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1283,6 +1296,56 @@ func TestRepairAuth_ownerMRForkEarlierDeadline(t *testing.T) {
 		_, err = getProjectSafe(context.Background(), d, "42")
 		if err == nil || !strings.Contains(err.Error(), readmeta.CodeIdentityUnresolved) || errors.Is(err, igl.ErrBudgetElapsed) {
 			t.Fatalf("ordinary: %v", err)
+		}
+	})
+	t.Run("typed and ordinary stay after parent expiry", func(t *testing.T) {
+		// The client does not call RoundTrip once the parent is already expired.
+		// Sleep inside RoundTrip, after the call has started, so the typed or
+		// ordinary provider result arrives with the parent already expired.
+		// No BudgetInterceptor: it would rewrite every late error to ErrBudgetElapsed.
+		late := func(resp *http.Response, err error) (*http.Response, error) {
+			time.Sleep(40 * time.Millisecond)
+			return resp, err
+		}
+		parentOf := func(t *testing.T) (context.Context, context.Context) {
+			t.Helper()
+			parent, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+			t.Cleanup(cancel)
+			b := igl.DefaultBudget()
+			b.MaxElapsed = 30 * time.Second
+			b.MaxRequests = 16
+			return parent, igl.WithBudget(parent, b)
+		}
+		for _, sentinel := range []error{igl.ErrBudgetRequests, igl.ErrBudgetBytes, igl.ErrBudgetItems, context.Canceled} {
+			parent, ctx := parentOf(t)
+			d := authClientDirect(t, roundTripFunc(func(*http.Request) (*http.Response, error) {
+				return late(nil, sentinel)
+			}))
+			_, err := getProjectSafe(ctx, d, "42")
+			if !errors.Is(err, sentinel) || parent.Err() == nil || (sentinel != context.Canceled && errors.Is(err, context.DeadlineExceeded)) {
+				t.Fatalf("%v after parent expiry: %v parent=%v", sentinel, err, parent.Err())
+			}
+		}
+		parent, ctx := parentOf(t)
+		d := authClientDirect(t, roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if strings.Contains(req.URL.Path, "/merge_requests/") {
+				resp, err := jsonProvider(req, http.StatusInternalServerError, `{}`)
+				return late(resp, err)
+			}
+			return project42(req)
+		}))
+		_, _, err := loadDiffIdentity(ctx, d, "42", 1)
+		if err == nil || !strings.Contains(err.Error(), readmeta.CodeHTTPError) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, igl.ErrBudgetElapsed) || parent.Err() == nil {
+			t.Fatalf("mr http after parent expiry: %v parent=%v", err, parent.Err())
+		}
+		parent, ctx = parentOf(t)
+		d = authClientDirect(t, roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			resp, err := jsonProvider(req, http.StatusNotFound, `{}`)
+			return late(resp, err)
+		}))
+		_, err = getProjectSafe(ctx, d, "42")
+		if err == nil || !strings.Contains(err.Error(), readmeta.CodeIdentityUnresolved) || errors.Is(err, context.DeadlineExceeded) || parent.Err() == nil {
+			t.Fatalf("identity after parent expiry: %v parent=%v", err, parent.Err())
 		}
 	})
 }

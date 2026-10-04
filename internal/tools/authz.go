@@ -88,7 +88,7 @@ func getProjectSafe(ctx context.Context, d Deps, pid string) (*gitlab.Project, e
 	wantNumeric, isNumeric := parseStrictPositiveID(tok)
 	p, _, err := d.Client.Projects.GetProject(tok, nil, gitlab.WithContext(ctx))
 	if err != nil {
-		if cause := groupContextCause(ctx, err); errors.Is(cause, context.Canceled) || errors.Is(cause, context.DeadlineExceeded) || errors.Is(cause, igl.ErrBudgetElapsed) {
+		if cause, ok := providerTimeoutCause(ctx, err); ok {
 			return nil, cause
 		}
 		if passthroughTypedProviderErr(err) {
@@ -122,6 +122,19 @@ func groupBudgetPreflight(ctx context.Context) error {
 		return igl.ErrBudgetItems
 	}
 	return nil
+}
+
+// providerTimeoutCause classifies only an incoming deadline or budget-elapsed
+// error. context.Canceled and every other typed or ordinary provider error stay
+// as they arrived, even when the parent context has since expired.
+func providerTimeoutCause(ctx context.Context, err error) (error, bool) {
+	if errors.Is(err, context.Canceled) {
+		return err, true
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, igl.ErrBudgetElapsed) {
+		return groupContextCause(ctx, err), true
+	}
+	return nil, false
 }
 
 // groupContextCause keeps parent cancellation and an earlier parent deadline
