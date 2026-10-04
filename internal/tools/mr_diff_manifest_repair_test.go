@@ -429,7 +429,22 @@ func TestRepairF5_lateFailuresDropManifest(t *testing.T) {
 	preMint(t, "pre-mint requests", readmeta.CodeBudgetRequests, func(b *igl.Budget) { b.CapLimits(0, 0, 1) })
 	preMint(t, "pre-mint bytes", readmeta.CodeBudgetBytes, func(b *igl.Budget) { b.CapLimits(0, 1, 0) })
 	preMint(t, "pre-mint items", readmeta.CodeBudgetItems, func(b *igl.Budget) { b.CapLimits(1, 0, 0) })
-	preMint(t, "pre-mint elapsed", readmeta.CodeBudgetElapsed, func(b *igl.Budget) { b.TightenElapsed(time.Nanosecond) })
+	t.Run("pre-mint elapsed", func(t *testing.T) {
+		d := newReviewDeps(t, repairReviewHandler(body, nil))
+		b := reviewBudget(128)
+		b.MaxElapsed = 2 * time.Second
+		ctx := withReviewMintHook(igl.WithBudget(context.Background(), b), func() {
+			time.Sleep(3 * time.Second)
+		})
+		out, err := callReviewDirect(t, d, ctx, []reviewContextItemIn{metaItem("42", 1, "metadata", "approvals", "diff_manifest")})
+		if err != nil {
+			t.Fatal(err)
+		}
+		item := out.Items[0]
+		if item.Cause != readmeta.CodeBudgetElapsed || manifestClaimLeft(item) || item.Metadata == nil {
+			t.Fatalf("cause=%s digest=%q nested=%v sec=%+v", item.Cause, item.diffManifestDigest, item.DiffManifest != nil && item.DiffManifest.Digest != nil, item.Sections["diff_manifest"])
+		}
+	})
 	t.Run("pre-mint cancel", func(t *testing.T) {
 		d := newReviewDeps(t, repairReviewHandler(body, nil))
 		parent, cancel := context.WithCancel(context.Background())
@@ -898,6 +913,203 @@ func TestRepairF7_groupPolicyTypedErrors(t *testing.T) {
 		_, err := AuthorizeCanonicalProject(context.Background(), d, "42")
 		if err == nil || !strings.Contains(err.Error(), readmeta.CodeAuthzDenied) || errors.Is(err, context.Canceled) {
 			t.Fatalf("got %v", err)
+		}
+	})
+}
+
+func diffPaths(entries []any) []string {
+	var out []string
+	for _, raw := range entries {
+		m, _ := raw.(map[string]any)
+		if p, _ := m["new_path"].(string); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func assertResumeEmitsNothing(t *testing.T, out map[string]any) {
+	t.Helper()
+	sec := sectionMap(out)
+	entries := asSlice(t, out["entries"])
+	if len(entries) != 0 || out["digest"] != nil || sec["next_cursor"] != nil || sec["content_complete"] == readmeta.ContentCompleteTrue {
+		t.Fatalf("resume left entries=%v digest=%v cursor=%v complete=%v", diffPaths(entries), out["digest"], sec["next_cursor"], sec["content_complete"])
+	}
+}
+
+func TestRepairR1_incompleteResumeAndInitialBound(t *testing.T) {
+	head, base, start := shaN(1), shaN(2), shaN(3)
+	two := `[{"old_path":"a.txt","new_path":"a.txt","diff":"p"},{"old_path":"b.txt","new_path":"b.txt","diff":"p"}]`
+	changed := `[{"old_path":"a.txt","new_path":"a.txt","diff":"p"},{"old_path":"new-unverified.txt","new_path":"new-unverified.txt","diff":"p"}]`
+	mr := `{"id":5001,"iid":1,"project_id":42,"source_project_id":42,"target_project_id":42}`
+	serveSwitch := func(after int, next string) http.Handler {
+		var n int
+		return serveDiffBase(&pathLog{}, func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case strings.Contains(r.URL.Path, "/versions/1"):
+				n++
+				body := versionObject(1, 5001, head, base, start, "collected", "2", two)
+				if n > after {
+					body = next
+				}
+				_, _ = io.WriteString(w, body)
+			case strings.Contains(r.URL.Path, "/merge_requests/"):
+				_, _ = io.WriteString(w, mr)
+			default:
+				http.NotFound(w, r)
+			}
+		})
+	}
+	firstCursor := func(t *testing.T, h http.Handler) (Deps, string) {
+		t.Helper()
+		d := diffDeps(t, h)
+		out, err := callDiffWindow(t, d, nil, map[string]any{"project_id": "42", "merge_request_iid": 1, "diff_version_id": 1, "per_page": 1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		cur, _ := sectionMap(out)["next_cursor"].(string)
+		if cur == "" || out["digest"] == nil || len(asSlice(t, out["entries"])) != 1 {
+			t.Fatalf("first page did not mint a window: %#v", out)
+		}
+		return d, cur
+	}
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"capped count", versionObject(1, 5001, head, base, start, "collected", "100+", changed)},
+		{"missing count", fmt.Sprintf(`{"id":1,"merge_request_id":5001,"head_commit_sha":%q,"base_commit_sha":%q,"start_commit_sha":%q,"state":"collected","diffs":%s}`, head, base, start, changed)},
+		{"mismatched count", versionObject(1, 5001, head, base, start, "collected", "9", changed)},
+		{"missing state", fmt.Sprintf(`{"id":1,"merge_request_id":5001,"head_commit_sha":%q,"base_commit_sha":%q,"start_commit_sha":%q,"real_size":"2","diffs":%s}`, head, base, start, changed)},
+		{"non-collected", versionObject(1, 5001, head, base, start, "overflow", "2", changed)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d, cur := firstCursor(t, serveSwitch(2, tc.body))
+			out, err := callDiffWindow(t, d, nil, map[string]any{"project_id": "42", "merge_request_iid": 1, "diff_version_id": 1, "per_page": 1, "cursor": cur})
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertResumeEmitsNothing(t, out)
+		})
+	}
+	t.Run("stable resume still proves the next page", func(t *testing.T) {
+		d, cur := firstCursor(t, serveSwitch(99, two))
+		out, err := callDiffWindow(t, d, nil, map[string]any{"project_id": "42", "merge_request_iid": 1, "diff_version_id": 1, "per_page": 1, "cursor": cur})
+		if err != nil {
+			t.Fatal(err)
+		}
+		sec := sectionMap(out)
+		paths := diffPaths(asSlice(t, out["entries"]))
+		if len(paths) != 1 || paths[0] != "b.txt" || out["digest"] == nil || sec["next_cursor"] != nil || sec["content_complete"] != readmeta.ContentCompleteTrue {
+			t.Fatalf("positive resume paths=%v digest=%v sec=%#v", paths, out["digest"], sec)
+		}
+	})
+	t.Run("initial partial respects per_page", func(t *testing.T) {
+		var diffs []string
+		for i := 0; i < 60; i++ {
+			diffs = append(diffs, fmt.Sprintf(`{"old_path":"p%02d","new_path":"p%02d","diff":"x"}`, i, i))
+		}
+		body := versionObject(1, 5001, head, base, start, "collected", "61", "["+strings.Join(diffs, ",")+"]")
+		h := serveDiffBase(&pathLog{}, func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case strings.Contains(r.URL.Path, "/versions/1"):
+				_, _ = io.WriteString(w, body)
+			case strings.Contains(r.URL.Path, "/merge_requests/"):
+				_, _ = io.WriteString(w, mr)
+			default:
+				http.NotFound(w, r)
+			}
+		})
+		out, err := callDiffWindow(t, diffDeps(t, h), nil, map[string]any{"project_id": "42", "merge_request_iid": 1, "diff_version_id": 1, "per_page": 20})
+		if err != nil {
+			t.Fatal(err)
+		}
+		sec := sectionMap(out)
+		entries := asSlice(t, out["entries"])
+		if len(entries) > 20 || out["digest"] != nil || sec["next_cursor"] != nil || sec["content_complete"] == readmeta.ContentCompleteTrue {
+			t.Fatalf("initial partial entries=%d digest=%v cursor=%v complete=%v", len(entries), out["digest"], sec["next_cursor"], sec["content_complete"])
+		}
+	})
+}
+
+func TestRepairR2_earlierParentDeadlineAfterBudget(t *testing.T) {
+	groupDeps := func(t *testing.T, h http.Handler) Deps {
+		t.Helper()
+		d := newReviewDeps(t, h)
+		d.Config.AllowedProjectIDs = nil
+		d.Config.AllowedGroupIDs = []string{"10"}
+		return d
+	}
+	t.Run("preflight after both elapsed", func(t *testing.T) {
+		parent, ctx, b := func() (context.Context, context.Context, *igl.Budget) {
+			parent, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+			t.Cleanup(cancel)
+			b := igl.DefaultBudget()
+			b.MaxElapsed = 80 * time.Millisecond
+			b.MaxRequests = 16
+			return parent, igl.WithBudget(parent, b), b
+		}()
+		time.Sleep(100 * time.Millisecond)
+		d := groupDeps(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+			t.Fatal("preflight reached HTTP")
+		}))
+		_, err := getGroupSafe(ctx, d, "10")
+		if !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, igl.ErrBudgetElapsed) || !b.ElapsedExceeded() || parent.Err() == nil {
+			t.Fatalf("got %v parent=%v elapsed=%v", err, parent.Err(), b.ElapsedExceeded())
+		}
+	})
+	t.Run("delayed transport classification", func(t *testing.T) {
+		parent, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		defer cancel()
+		b := igl.DefaultBudget()
+		b.MaxElapsed = 80 * time.Millisecond
+		ctx := igl.WithBudget(parent, b)
+		time.Sleep(100 * time.Millisecond)
+		err := groupContextCause(ctx, igl.ErrBudgetElapsed)
+		if !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, igl.ErrBudgetElapsed) {
+			t.Fatalf("got %v", err)
+		}
+	})
+	t.Run("in-flight request observed after both", func(t *testing.T) {
+		parent, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		defer cancel()
+		b := igl.DefaultBudget()
+		b.MaxElapsed = 80 * time.Millisecond
+		b.MaxRequests = 16
+		ctx := igl.WithBudget(parent, b)
+		d := groupDeps(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			timer := time.NewTimer(150 * time.Millisecond)
+			defer timer.Stop()
+			select {
+			case <-r.Context().Done():
+				<-timer.C
+			case <-timer.C:
+			}
+			http.Error(w, "late", http.StatusGatewayTimeout)
+		}))
+		_, err := getGroupSafe(ctx, d, "10")
+		if !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, igl.ErrBudgetElapsed) || parent.Err() == nil {
+			t.Fatalf("got %v parent=%v", err, parent.Err())
+		}
+	})
+	t.Run("genuine max elapsed keeps live parent", func(t *testing.T) {
+		parent := context.Background()
+		b := igl.DefaultBudget()
+		b.MaxElapsed = 80 * time.Millisecond
+		b.MaxRequests = 16
+		ctx := igl.WithBudget(parent, b)
+		d := groupDeps(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			timer := time.NewTimer(200 * time.Millisecond)
+			defer timer.Stop()
+			select {
+			case <-r.Context().Done():
+			case <-timer.C:
+			}
+		}))
+		_, err := getGroupSafe(ctx, d, "10")
+		if !errors.Is(err, igl.ErrBudgetElapsed) || parent.Err() != nil {
+			t.Fatalf("got %v parent=%v", err, parent.Err())
 		}
 	})
 }

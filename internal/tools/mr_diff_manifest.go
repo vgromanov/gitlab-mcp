@@ -503,15 +503,7 @@ func readVersionManifest(ctx context.Context, d Deps, q diffQuery, sec readmeta.
 		return diffWindowOut{}, err
 	}
 	if !proved.Full {
-		if status == "" {
-			status = readmeta.CodePartial
-		}
-		sec = stampDiffFailure(sec, status)
-		if proved.Head != "" {
-			head := proved.Head
-			sec.HeadSHA = &head
-		}
-		return diffWindowOut{Section: sec, Entries: entries}, nil
+		return incompleteManifestWindow(q, sec, proved.Head, status, entries), nil
 	}
 	return finishManifestWindow(q, sec, proved, entries)
 }
@@ -748,14 +740,28 @@ func manifestDigest(entries []diffManifestEntry) string {
 	return hex.EncodeToString(sum[:])
 }
 
+func incompleteManifestWindow(q diffQuery, sec readmeta.Section, head, status string, entries []diffManifestEntry) diffWindowOut {
+	if status == "" {
+		status = readmeta.CodePartial
+	}
+	sec = stampDiffFailure(sec, status)
+	if head != "" {
+		copied := head
+		sec.HeadSHA = &copied
+	}
+	if q.Resume != nil {
+		return diffWindowOut{Section: sec, Entries: []diffManifestEntry{}}
+	}
+	shown := entries
+	if !q.Full {
+		shown = windowEntries(entries, 0, q.Selection.PerPage)
+	}
+	return diffWindowOut{Section: sec, Entries: shown}
+}
+
 func finishManifestWindow(q diffQuery, sec readmeta.Section, proved provedManifest, entries []diffManifestEntry) (diffWindowOut, error) {
 	if !proved.Full {
-		sec = stampDiffFailure(sec, readmeta.CodePartial)
-		if proved.Head != "" {
-			head := proved.Head
-			sec.HeadSHA = &head
-		}
-		return diffWindowOut{Section: sec, Entries: windowEntries(entries, 0, len(entries))}, nil
+		return incompleteManifestWindow(q, sec, proved.Head, readmeta.CodePartial, entries), nil
 	}
 	full := manifestDigest(entries)
 	if q.Resume != nil {

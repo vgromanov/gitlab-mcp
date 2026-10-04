@@ -123,25 +123,42 @@ func groupBudgetPreflight(ctx context.Context) error {
 
 // groupContextCause keeps parent cancellation and an earlier parent deadline
 // distinct from the budget clock. ErrBudgetElapsed is only the MaxElapsed expiry.
+// An earlier parent deadline stays DeadlineExceeded even when the budget clock
+// has also expired by the time the error is classified.
 func groupContextCause(ctx context.Context, err error) error {
 	if errors.Is(ctx.Err(), context.Canceled) || errors.Is(err, context.Canceled) {
 		return context.Canceled
 	}
-	if errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.Is(err, context.DeadlineExceeded) {
-		if b := igl.BudgetFromContext(ctx); b != nil && b.ElapsedExceeded() {
-			return igl.ErrBudgetElapsed
-		}
+	deadline := errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, igl.ErrBudgetElapsed)
+	if !deadline {
+		return err
+	}
+	if parentDeadlineEarlier(ctx) {
 		return context.DeadlineExceeded
 	}
-	if errors.Is(err, igl.ErrBudgetElapsed) {
-		if b := igl.BudgetFromContext(ctx); b != nil && b.ElapsedExceeded() {
-			return igl.ErrBudgetElapsed
-		}
-		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			return context.DeadlineExceeded
-		}
+	if b := igl.BudgetFromContext(ctx); b != nil && b.ElapsedExceeded() {
+		return igl.ErrBudgetElapsed
+	}
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.Is(err, context.DeadlineExceeded) {
+		return context.DeadlineExceeded
 	}
 	return err
+}
+
+func parentDeadlineEarlier(ctx context.Context) bool {
+	effective, ok := ctx.Deadline()
+	if !ok {
+		return false
+	}
+	b := igl.BudgetFromContext(ctx)
+	if b == nil {
+		return true
+	}
+	original, has := b.OriginalDeadline()
+	if !has {
+		return true
+	}
+	return effective.Before(original)
 }
 
 func getGroupSafe(ctx context.Context, d Deps, gid string) (*gitlab.Group, error) {

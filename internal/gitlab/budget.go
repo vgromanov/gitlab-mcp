@@ -219,19 +219,6 @@ func (b *Budget) CapLimits(maxItems int, maxBytes int64, maxRequests int) {
 	}
 }
 
-// TightenElapsed lowers MaxElapsed when d is positive and stricter.
-// It does not move an existing context deadline.
-func (b *Budget) TightenElapsed(d time.Duration) {
-	if b == nil || d <= 0 {
-		return
-	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.MaxElapsed <= 0 || d < b.MaxElapsed {
-		b.MaxElapsed = d
-	}
-}
-
 // ElapsedExceeded reports that the budget clock, not a parent deadline, has passed.
 func (b *Budget) ElapsedExceeded() bool {
 	if b == nil {
@@ -240,6 +227,20 @@ func (b *Budget) ElapsedExceeded() bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.MaxElapsed > 0 && !b.start.IsZero() && time.Since(b.start) > b.MaxElapsed
+}
+
+// OriginalDeadline is the deadline WithBudget derived from the clock start.
+// It does not change the budget. A parent deadline can still be earlier.
+func (b *Budget) OriginalDeadline() (time.Time, bool) {
+	if b == nil {
+		return time.Time{}, false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.start.IsZero() || b.MaxElapsed <= 0 {
+		return time.Time{}, false
+	}
+	return b.start.Add(b.MaxElapsed), true
 }
 
 // LimitsSnapshot returns current Max* caps under lock (for tests/diagnostics).
