@@ -12,6 +12,7 @@ import (
 	"io"
 	"net"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -31,10 +32,18 @@ const (
 	ToolListCommits = "list_commits"
 	// SectionListCommits is the reference section binding.
 	SectionListCommits = "list_commits"
+	// ToolReviewQueue is the canonical review-queue aggregate tool binding.
+	ToolReviewQueue = "get_merge_request_review_queue"
+	// SectionReviewQueue is the review-queue section binding.
+	SectionReviewQueue = "review_queue"
+	// QueueContSchemaRQ2 is the locked typed queue continuation schema.
+	QueueContSchemaRQ2 = "rq2"
 	// ResyncRequired is the uniform fail-closed continuation error token.
 	ResyncRequired = "resync_required"
 	// MaxImmutableRefs caps plural immutable ref bindings (e.g. MR base+head).
 	MaxImmutableRefs = 8
+	// MaxQueueCandidates caps signed canonical map entries.
+	MaxQueueCandidates = 64
 )
 
 // ScopeKind enumerates supported binding scopes.
@@ -110,19 +119,67 @@ type Scope struct {
 // Payload is the authenticated v1 cursor body (never includes tokens/keys/notes).
 // ImmutableRefs is plural so future MR adapters can bind base+head (and similar)
 // while list_commits pins a single tip SHA as a one-element slice.
+// QueueCont is omitempty and valid only for group_queue + review-queue tool/section.
 type Payload struct {
-	SchemaVersion string    `json:"schema_version"`
-	Instance      string    `json:"instance"`
-	ActorID       int64     `json:"actor_id"`
-	PolicyFP      string    `json:"policy_fingerprint"`
-	Tool          string    `json:"tool"`
-	Section       string    `json:"section"`
-	Scope         Scope     `json:"scope"`
-	Filters       Filters   `json:"filters"`
-	ImmutableRefs []string  `json:"immutable_refs"`
-	UpperBound    string    `json:"upper_bound"`
-	ExpiresAt     string    `json:"expires_at"`
-	PageState     PageState `json:"page_state"`
+	SchemaVersion string     `json:"schema_version"`
+	Instance      string     `json:"instance"`
+	ActorID       int64      `json:"actor_id"`
+	PolicyFP      string     `json:"policy_fingerprint"`
+	Tool          string     `json:"tool"`
+	Section       string     `json:"section"`
+	Scope         Scope      `json:"scope"`
+	Filters       Filters    `json:"filters"`
+	ImmutableRefs []string   `json:"immutable_refs"`
+	UpperBound    string     `json:"upper_bound"`
+	ExpiresAt     string     `json:"expires_at"`
+	PageState     PageState  `json:"page_state"`
+	QueueCont     *QueueCont `json:"queue_cont,omitempty"`
+}
+
+// QueueCont is the typed rq2 continuation for the review-queue aggregate.
+type QueueCont struct {
+	V     string            `json:"v"`
+	Phase string            `json:"phase"`
+	KI    int               `json:"ki"`
+	Kinds []string          `json:"kinds"`
+	KP    []QueueKindProg   `json:"kp"`
+	OG    *QueueOngoingProg `json:"og"`
+	CM    []QueueCandidate  `json:"cm"`
+	EI    int               `json:"ei"`
+	// Lim persists safe limitation codes across resumes (never note text).
+	Lim []string `json:"lim,omitempty"`
+	// Term is true when continuation must not be minted (capacity/provider terminal).
+	Term bool `json:"term,omitempty"`
+}
+
+// QueueKindProg is per kind×state list-stream progress (reviewer/authored).
+type QueueKindProg struct {
+	Kind  string `json:"kind"`
+	State string `json:"state"`
+	P     int    `json:"p"`
+	N     int64  `json:"n"`
+	E     bool   `json:"e"`
+	CN    int    `json:"cn"`
+	PD    string `json:"pd"`
+	PSz   int    `json:"psz"`
+}
+
+// QueueOngoingProg is sorted-seed discussion progress.
+type QueueOngoingProg struct {
+	SI  int    `json:"si"`
+	DP  int    `json:"dp"`
+	CN  int    `json:"cn"`
+	PD  string `json:"pd"`
+	PSz int    `json:"psz"`
+	E   bool   `json:"e"`
+}
+
+// QueueCandidate is a confirmed canonical map entry.
+type QueueCandidate struct {
+	K string  `json:"k"`
+	B int     `json:"b"`
+	U string  `json:"u"`
+	H *string `json:"h"`
 }
 
 // ValidateKey reports whether key meets the minimum raw length. Empty key is allowed (legacy).
@@ -239,9 +296,6 @@ func validatePayload(p *Payload) error {
 	if strings.TrimSpace(p.PolicyFP) == "" || strings.TrimSpace(p.Tool) == "" || strings.TrimSpace(p.Section) == "" {
 		return ErrResyncRequired
 	}
-	if err := validateImmutableRefs(p.ImmutableRefs); err != nil {
-		return err
-	}
 	if strings.TrimSpace(p.UpperBound) == "" || strings.TrimSpace(p.ExpiresAt) == "" {
 		return ErrResyncRequired
 	}
@@ -254,9 +308,33 @@ func validatePayload(p *Payload) error {
 	if p.Filters.PerPage < 1 || p.Filters.PerPage > 50 {
 		return ErrResyncRequired
 	}
-	if err := validatePageState(p.PageState, p.Filters.PerPage); err != nil {
-		return err
+
+	isQueue := p.Scope.Kind == ScopeGroupQueue && p.Tool == ToolReviewQueue && p.Section == SectionReviewQueue
+	if p.QueueCont != nil && !isQueue {
+		return ErrResyncRequired
 	}
+	if isQueue {
+		if len(p.ImmutableRefs) != 0 {
+			return ErrResyncRequired
+		}
+		if err := validateQueuePageStateEmpty(p.PageState); err != nil {
+			return err
+		}
+		if p.QueueCont == nil {
+			return ErrResyncRequired
+		}
+		if err := validateQueueCont(p.QueueCont, p.Filters.PerPage); err != nil {
+			return err
+		}
+	} else {
+		if err := validateImmutableRefs(p.ImmutableRefs); err != nil {
+			return err
+		}
+		if err := validatePageState(p.PageState, p.Filters.PerPage); err != nil {
+			return err
+		}
+	}
+
 	switch p.Scope.Kind {
 	case ScopeProject:
 		if strings.TrimSpace(p.Scope.ProjectID) == "" {
@@ -275,6 +353,10 @@ func validatePayload(p *Payload) error {
 		if p.Scope.ProjectID != "" || p.Scope.MergeRequestIID != nil || p.Scope.PipelineID != nil {
 			return ErrResyncRequired
 		}
+		if !isQueue {
+			// group_queue without review-queue tool/section is not a valid wired token.
+			return ErrResyncRequired
+		}
 	case ScopePipeline:
 		if strings.TrimSpace(p.Scope.ProjectID) == "" || p.Scope.PipelineID == nil || *p.Scope.PipelineID < 1 {
 			return ErrResyncRequired
@@ -286,6 +368,185 @@ func validatePayload(p *Payload) error {
 		return ErrResyncRequired
 	}
 	return nil
+}
+
+func validateQueuePageStateEmpty(ps PageState) error {
+	if ps.Page != 0 || ps.PerPage != 0 || ps.ItemsOnPage != 0 || ps.ProviderNextPage != 0 {
+		return ErrResyncRequired
+	}
+	if ps.LastSHA != "" || ps.SequenceDigest != "" {
+		return ErrResyncRequired
+	}
+	return nil
+}
+
+func validateQueueCont(qc *QueueCont, filterPerPage int) error {
+	if qc == nil || qc.V != QueueContSchemaRQ2 {
+		return ErrResyncRequired
+	}
+	if qc.Phase != "discover" && qc.Phase != "emit" {
+		return ErrResyncRequired
+	}
+	if len(qc.Kinds) < 1 || len(qc.Kinds) > 3 {
+		return ErrResyncRequired
+	}
+	seenKind := map[string]struct{}{}
+	wantOngoing := false
+	for i, k := range qc.Kinds {
+		if k != "reviewer" && k != "ongoing" && k != "authored" {
+			return ErrResyncRequired
+		}
+		if _, dup := seenKind[k]; dup {
+			return ErrResyncRequired
+		}
+		seenKind[k] = struct{}{}
+		if i > 0 && qc.Kinds[i-1] >= k {
+			return ErrResyncRequired // must be unique sorted
+		}
+		if k == "ongoing" {
+			wantOngoing = true
+		}
+	}
+	if qc.KI < 0 || qc.KI > len(qc.KP) {
+		return ErrResyncRequired
+	}
+	if len(qc.CM) > MaxQueueCandidates {
+		return ErrResyncRequired
+	}
+	if qc.EI < 0 || qc.EI > len(qc.CM) {
+		return ErrResyncRequired
+	}
+	if qc.Phase == "discover" && qc.EI != 0 {
+		return ErrResyncRequired
+	}
+	seenKey := map[string]struct{}{}
+	wantBits := 0
+	for _, k := range qc.Kinds {
+		switch k {
+		case "reviewer":
+			wantBits |= 1
+		case "ongoing":
+			wantBits |= 2
+		case "authored":
+			wantBits |= 4
+		}
+	}
+	for _, c := range qc.CM {
+		if err := validateQueueCandidate(c); err != nil {
+			return err
+		}
+		if c.B&^wantBits != 0 {
+			return ErrResyncRequired // bits must be subset of requested kinds
+		}
+		if _, dup := seenKey[c.K]; dup {
+			return ErrResyncRequired
+		}
+		seenKey[c.K] = struct{}{}
+	}
+	seenStream := map[string]struct{}{}
+	for _, kp := range qc.KP {
+		if kp.Kind != "reviewer" && kp.Kind != "authored" {
+			return ErrResyncRequired
+		}
+		if _, ok := seenKind[kp.Kind]; !ok {
+			return ErrResyncRequired
+		}
+		if kp.State != "opened" && kp.State != "closed" && kp.State != "merged" {
+			return ErrResyncRequired
+		}
+		sk := kp.Kind + "|" + kp.State
+		if _, dup := seenStream[sk]; dup {
+			return ErrResyncRequired
+		}
+		seenStream[sk] = struct{}{}
+		if err := validateReplayProg(kp.P, kp.N, kp.E, kp.CN, kp.PD, kp.PSz, filterPerPage); err != nil {
+			return err
+		}
+	}
+	// Every non-ongoing requested kind must have exactly the requested state streams present
+	// (validated loosely here: kp kinds subset of requested; stream count checked by tool).
+	if wantOngoing {
+		if qc.OG == nil {
+			return ErrResyncRequired
+		}
+		if qc.OG.SI < 0 || qc.OG.DP < 1 {
+			return ErrResyncRequired
+		}
+		if err := validateReplayProg(qc.OG.DP, 0, qc.OG.E, qc.OG.CN, qc.OG.PD, qc.OG.PSz, filterPerPage); err != nil {
+			return err
+		}
+	} else if qc.OG != nil {
+		return ErrResyncRequired
+	}
+	for _, code := range qc.Lim {
+		if strings.TrimSpace(code) == "" {
+			return ErrResyncRequired
+		}
+	}
+	return nil
+}
+
+func validateReplayProg(page int, next int64, exhausted bool, cn int, pd string, psz, filterPerPage int) error {
+	if page < 1 || psz < 1 || psz > 50 || psz != filterPerPage {
+		return ErrResyncRequired
+	}
+	if cn < 0 || cn > psz {
+		return ErrResyncRequired
+	}
+	if next < 0 {
+		return ErrResyncRequired
+	}
+	if cn == 0 {
+		if pd != "" {
+			return ErrResyncRequired
+		}
+	} else if !isHexSHA256(pd) {
+		return ErrResyncRequired
+	}
+	if exhausted && next != 0 {
+		return ErrResyncRequired
+	}
+	_ = exhausted
+	return nil
+}
+
+func validateQueueCandidate(c QueueCandidate) error {
+	if !validQueueKey(c.K) {
+		return ErrResyncRequired
+	}
+	if c.B <= 0 || c.B > 7 {
+		return ErrResyncRequired
+	}
+	if _, err := time.Parse(time.RFC3339Nano, c.U); err != nil {
+		if _, err2 := time.Parse(time.RFC3339, c.U); err2 != nil {
+			return ErrResyncRequired
+		}
+	}
+	if c.H != nil {
+		h := strings.TrimSpace(*c.H)
+		if len(h) != 40 {
+			return ErrResyncRequired
+		}
+		for i := 0; i < 40; i++ {
+			ch := h[i]
+			switch {
+			case ch >= '0' && ch <= '9', ch >= 'a' && ch <= 'f':
+			default:
+				return ErrResyncRequired
+			}
+		}
+	}
+	return nil
+}
+
+func validQueueKey(k string) bool {
+	parts := strings.Split(k, ":")
+	if len(parts) != 2 {
+		return false
+	}
+	pid, err1 := strconv.ParseInt(parts[0], 10, 64)
+	iid, err2 := strconv.ParseInt(parts[1], 10, 64)
+	return err1 == nil && err2 == nil && pid > 0 && iid > 0
 }
 
 func validateImmutableRefs(refs []string) error {

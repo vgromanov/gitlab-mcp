@@ -163,6 +163,22 @@ func TestScopeBindings(t *testing.T) {
 				"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
 			}
 		}
+		if sc.Kind == ScopeGroupQueue {
+			p.Tool = ToolReviewQueue
+			p.Section = SectionReviewQueue
+			p.ImmutableRefs = nil
+			p.PageState = PageState{}
+			p.QueueCont = &QueueCont{
+				V:     QueueContSchemaRQ2,
+				Phase: "discover",
+				Kinds: []string{"reviewer"},
+				KP: []QueueKindProg{{
+					Kind: "reviewer", State: "opened", P: 1, N: 2, E: false, CN: 0, PD: "", PSz: 20,
+				}},
+				CM: nil,
+				EI: 0,
+			}
+		}
 		tok, err := Encode(key, p)
 		if err != nil {
 			t.Fatalf("scope %v encode: %v", sc.Kind, err)
@@ -440,5 +456,38 @@ func TestTerminalPageState_emptyOK(t *testing.T) {
 	}
 	if _, err := Decode(key, tok, time.Date(2026, 10, 3, 13, 0, 0, 0, time.UTC)); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestQueueCont_rejectsContradictoryReplay(t *testing.T) {
+	key := testKey(t)
+	p := basePayload()
+	p.Tool = ToolReviewQueue
+	p.Section = SectionReviewQueue
+	p.Scope = Scope{Kind: ScopeGroupQueue, GroupID: "9"}
+	p.ImmutableRefs = nil
+	p.PageState = PageState{}
+	p.QueueCont = &QueueCont{
+		V:     QueueContSchemaRQ2,
+		Phase: "discover",
+		Kinds: []string{"reviewer"},
+		KP: []QueueKindProg{{
+			Kind: "reviewer", State: "opened", P: 1, N: 2, E: true, CN: 0, PD: "", PSz: 20,
+		}},
+	}
+	if _, err := Encode(key, p); err == nil {
+		t.Fatal("exhausted with nonzero next must reject")
+	}
+	p.QueueCont.KP[0].E = false
+	p.QueueCont.KP[0].N = 0
+	p.QueueCont.KP[0].CN = 1
+	p.QueueCont.KP[0].PD = ""
+	if _, err := Encode(key, p); err == nil {
+		t.Fatal("cn>0 with empty pd must reject")
+	}
+	p.QueueCont.KP[0].CN = 0
+	p.QueueCont.Lim = []string{"", "dedupe_capacity"}
+	if _, err := Encode(key, p); err == nil {
+		t.Fatal("empty lim code must reject")
 	}
 }
