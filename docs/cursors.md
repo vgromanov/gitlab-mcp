@@ -84,5 +84,13 @@ Cancellation closes work; errors use safe static projections.
 
 Review aggregates that depend on signed cursors must fail closed when the signing
 key is missing — the same configuration error contract as `list_commits` cursor
-mode. Codec bindings also cover group-queue and project/pipeline scopes for
-future tools; only `list_commits` is wired in this slice.
+mode. Codec bindings also cover group-queue and project/pipeline scopes.
+
+`get_merge_request_review_queue` uses authenticated v1 cursors with typed
+`queue_cont` (`rq2`) on `ScopeGroupQueue` (empty immutable refs; no commit-shaped
+pagination). It pins `until=min(caller updated_before, initial UTC)` and absolute
+expiry at mint time; changed selection/bounds/policy fail `resync_required`
+before discovery. Terminal capacity / provider-page ambiguity preserve confirmed
+partial successes with `next_cursor=null`. Moving discovery always reports
+consistency unknown with a limitation and never treats provider exhaustion alone
+as content complete.

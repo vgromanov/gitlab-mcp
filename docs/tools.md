@@ -69,6 +69,7 @@ This document describes the tool surface currently registered by
 - `create_merge_request`
 - `get_merge_request`
 - `list_merge_requests` — list globally or by `project_id` / `group_id` (mutually exclusive). Optional filters: `state`, positive `author_id` / `reviewer_id`, explicit `scope` (`created_by_me|assigned_to_me|reviews_for_me|all`; omit for legacy GitLab default — do not invent `scope=all`), `updated_after` / `updated_before` (strict RFC3339 / RFC3339Nano: 2-digit hour, `.` fractions only, zone `Z` or `±HH:MM` with legal HH/MM; **at most 9 fractional digits / nanosecond precision** — longer fractions are rejected, never silently truncated; accepted instants are forwarded losslessly), `order_by` (`created_at|updated_at|label_priority|priority|milestone_due|popularity|title`), `sort` (`asc|desc`), plus pagination. Reviewer discovery: pass `scope=all` with `reviewer_id`. Group lists forward `author_id` (no longer dropped).
+- `get_merge_request_review_queue` — nonmutating canonical group review-queue aggregate for requested membership kinds (`reviewer` / `ongoing` / `authored`). Two-phase discover→emit with signed `queue_cont` continuation, pinned until window, owner+source authorization before emit, and honest moving-discovery section metadata. Review profiles only (not daily). Requires `GITLAB_MCP_CURSOR_KEY`. Ongoing is bounded `known_mrs` seeds with PRESENT `system=false` note participation.
 - `update_merge_request`
 - `approve_merge_request`
 - `unapprove_merge_request`
