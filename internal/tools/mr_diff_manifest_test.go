@@ -8,7 +8,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
-	"sync/atomic"
+	"sync"
 	"testing"
 	"time"
 
@@ -817,7 +817,8 @@ func TestDiffWindow_identityAndRefs(t *testing.T) {
 
 func TestDiffWindow_streamStopOmitsPatch(t *testing.T) {
 	const secret = "SECRET-PATCH-VALUE"
-	var sawCancel atomic.Bool
+	cancelled := make(chan struct{})
+	var once sync.Once
 	log := &pathLog{}
 	h := serveDiffBase(log, func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -835,7 +836,7 @@ func TestDiffWindow_streamStopOmitsPatch(t *testing.T) {
 			}
 			select {
 			case <-r.Context().Done():
-				sawCancel.Store(true)
+				once.Do(func() { close(cancelled) })
 			case <-time.After(3 * time.Second):
 			}
 		case strings.Contains(r.URL.Path, "/merge_requests/"):
@@ -866,7 +867,9 @@ func TestDiffWindow_streamStopOmitsPatch(t *testing.T) {
 	if sibling.Err() != nil {
 		t.Fatal("sibling cancelled")
 	}
-	if !sawCancel.Load() {
+	select {
+	case <-cancelled:
+	case <-time.After(2 * time.Second):
 		t.Fatal("owned request context was not cancelled")
 	}
 	if _, _, items := b.Stats(); items != 1 {
