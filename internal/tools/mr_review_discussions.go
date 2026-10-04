@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -47,6 +48,7 @@ var (
 	errDiscStop    = errors.New("discussions note stop")
 	errDiscUnwind  = errors.New("discussions unwind")
 	errDiscResync  = errors.New("discussion cursor resync")
+	errDiscElapsed = errors.New("discussions signed bound")
 )
 
 type discussionSelection string
@@ -445,9 +447,12 @@ func (rt *reviewRuntime) discAtByteCeiling() bool {
 	return maxBytes <= 0 || maxBytes >= reviewCeilBytes
 }
 
-func (rt *reviewRuntime) chargeDecodedNote() error {
+func (rt *reviewRuntime) chargeDecodedNote(deadline time.Time) error {
 	if rt.ctx.Err() != nil {
 		return rt.ctx.Err()
+	}
+	if !deadline.IsZero() && !rt.d.now().Before(deadline) {
+		return errDiscElapsed
 	}
 	if rt.budget != nil {
 		_, _, items := rt.budget.Stats()
@@ -493,7 +498,7 @@ func (rt *reviewRuntime) readDiscussions(item reviewContextItemIn, owner Canonic
 		c := p.DiscussionsCont
 		start = discCoord{P: c.P, DI: c.DI, NI: c.NI, DID: c.DID}
 		wantDP, wantND = c.DP, c.ND
-		if !rt.now.Before(deadline) {
+		if !rt.d.now().Before(deadline) {
 			rt.publishDisc(out, &view, selection, nil, nil, 0, false, false, false, false, readmeta.CodeBudgetElapsed, false, discCoord{}, start, deadline, expiry, b)
 			return nil
 		}
@@ -517,9 +522,10 @@ func (rt *reviewRuntime) readDiscussions(item reviewContextItemIn, owner Canonic
 			claim = false
 			break
 		}
-		if !rt.now.Before(deadline) {
+		if !rt.d.now().Before(deadline) {
 			limitation = readmeta.CodeBudgetElapsed
 			claim = false
+			mint = false
 			break
 		}
 		limit, room, why := rt.discRoomForGET()
@@ -540,7 +546,7 @@ func (rt *reviewRuntime) readDiscussions(item reviewContextItemIn, owner Canonic
 			resume = &start
 			dp, nd = wantDP, wantND
 		}
-		resp, dec, transport := rt.fetchDiscPage(owner, item.MergeRequestIID, coord.P, limit, resume, dp, nd, selection, st)
+		resp, dec, transport := rt.fetchDiscPage(owner, item.MergeRequestIID, coord.P, limit, resume, dp, nd, selection, st, deadline)
 		if transport != "" {
 			limitation = transport
 			claim = false
@@ -577,6 +583,12 @@ func (rt *reviewRuntime) readDiscussions(item reviewContextItemIn, owner Canonic
 		kept = append(kept, dec.kept...)
 		if len(dec.notes) > 0 || (dec.closed && dec.terminal == "") {
 			published = true
+		}
+		if !rt.d.now().Before(deadline) {
+			limitation = readmeta.CodeBudgetElapsed
+			claim = false
+			mint = false
+			break
 		}
 		if dec.terminal != "" {
 			claim = false
@@ -629,6 +641,13 @@ func (rt *reviewRuntime) readDiscussions(item reviewContextItemIn, owner Canonic
 }
 
 func (rt *reviewRuntime) publishDisc(out *reviewContextItemOut, view *discussionsView, selection string, returned []discussionNoteOut, kept []keptNote, inspected int, published, exhausted, claim, inconsistent bool, limitation string, mint bool, cursorAt, start discCoord, deadline, expiry time.Time, b reviewBracket) {
+	if !deadline.IsZero() && !rt.d.now().Before(deadline) {
+		claim = false
+		mint = false
+		if limitation == "" {
+			limitation = readmeta.CodeBudgetElapsed
+		}
+	}
 	sec := discSection(rt.now)
 	sec.PaginationExhausted = exhausted
 	if published || exhausted {
@@ -648,6 +667,9 @@ func (rt *reviewRuntime) publishDisc(out *reviewContextItemOut, view *discussion
 	if inspected > 0 {
 		items := inspected
 		sec.Counts.Items = &items
+	} else if published && limitation == "" {
+		zero := 0
+		sec.Counts.Items = &zero
 	}
 	if inconsistent {
 		sec.Consistency = readmeta.ConsistencyInconsistent
@@ -755,8 +777,23 @@ func (rt *reviewRuntime) mintDiscCursor(b reviewBracket, coord discCoord, deadli
 	return tok, nil
 }
 
-func (rt *reviewRuntime) fetchDiscPage(owner CanonicalProject, iid int64, page int, limit int64, resume *discCoord, dp, nd, selection string, st *discScanState) (*gitlab.Response, discDecoded, string) {
-	child, cancel := context.WithCancel(rt.ctx)
+func discBoundContext(parent context.Context, now, deadline time.Time) (context.Context, context.CancelFunc) {
+	if deadline.IsZero() {
+		return context.WithCancel(parent)
+	}
+	remain := deadline.Sub(now)
+	wall := time.Now().Add(remain)
+	if remain <= 0 {
+		wall = time.Now()
+	}
+	if parentDeadline, ok := parent.Deadline(); ok && parentDeadline.Before(wall) {
+		wall = parentDeadline
+	}
+	return context.WithDeadline(parent, wall)
+}
+
+func (rt *reviewRuntime) fetchDiscPage(owner CanonicalProject, iid int64, page int, limit int64, resume *discCoord, dp, nd, selection string, st *discScanState, deadline time.Time) (*gitlab.Response, discDecoded, string) {
+	child, cancel := discBoundContext(rt.ctx, rt.d.now(), deadline)
 	defer cancel()
 	path := fmt.Sprintf("projects/%s/merge_requests/%d/discussions", gitlab.PathEscape(projectAPIID(owner)), iid)
 	var bodyCap *approvalBodyCapture
@@ -774,11 +811,14 @@ func (rt *reviewRuntime) fetchDiscPage(owner CanonicalProject, iid int64, page i
 	go func() {
 		defer wg.Done()
 		defer pr.Close()
-		decoded = decodeDiscussionPage(pr, resume, dp, nd, selection, st, rt.chargeDecodedNote)
+		decoded = decodeDiscussionPage(pr, resume, dp, nd, selection, st, func() error { return rt.chargeDecodedNote(deadline) })
 	}()
 	resp, doErr := rt.d.Client.Do(req, pw)
 	_ = pw.Close()
 	wg.Wait()
+	if errors.Is(doErr, igl.ErrBudgetElapsed) || errors.Is(doErr, context.DeadlineExceeded) || errors.Is(child.Err(), context.DeadlineExceeded) {
+		return resp, decoded, readmeta.CodeBudgetElapsed
+	}
 	if bodyCap != nil {
 		if readErr := bodyCap.capturedReadErr(); errors.Is(readErr, errDiscLocal) || errors.Is(readErr, errDiscNoteCap) {
 			if decoded.terminal == "" || decoded.terminal == "cut" {
@@ -1052,7 +1092,9 @@ func walkDiscussion(dec *json.Decoder, out *discDecoded, st *discScanState, resu
 	}
 	st.seenDisc[discID] = struct{}{}
 	patchDiscussion(out, keptFrom, notesFrom, discID, indiv)
-	if !notesSeen || noteIndex == 0 {
+	if !notesSeen {
+		out.withhold = true
+	} else if noteIndex == 0 && !out.withhold {
 		if resume == nil || *reached {
 			shell := shellKept(discID, indiv)
 			out.kept = append(out.kept, shell)
@@ -1196,7 +1238,7 @@ func walkNotes(dec *json.Decoder, out *discDecoded, st *discScanState, resume *d
 		}
 		*noteIndex++
 		out.kept = append(out.kept, kn)
-		if selection == "all" || !kn.system {
+		if kn.ok && (selection == "all" || !kn.system) {
 			out.notes = append(out.notes, kn.out)
 		}
 		out.next = noteCursor(discIndex, *noteIndex, discID, *noteIDs, *completed)
@@ -1217,6 +1259,12 @@ func stopErr(out *discDecoded, err error) error {
 	if errors.Is(err, errDiscStop) {
 		out.terminal = "stop"
 		out.limitation = readmeta.CodeBudgetItems
+		return errDiscUnwind
+	}
+	if errors.Is(err, errDiscElapsed) {
+		out.terminal = "elapsed"
+		out.limitation = readmeta.CodeBudgetElapsed
+		out.cursorOK = false
 		return errDiscUnwind
 	}
 	if errors.Is(err, context.Canceled) {
@@ -1438,19 +1486,25 @@ func classifyNote(discID string, indiv presenceValue, raw json.RawMessage) (kept
 		kn.out.NoteID = &idText
 	}
 	sys, sysOK := presenceBool(obj, "system")
-	if !sysOK {
-		kn.ok = false
-		kn.full.System = absentP()
-	} else {
+	switch {
+	case sysOK && sys.State == "true":
 		kn.full.System = sys
-		if sys.State == "true" {
-			kn.system = true
-			kn.includeSem = false
-			t := true
-			kn.out.System = &t
-		} else if sys.State == "false" {
-			f := false
-			kn.out.System = &f
+		kn.system = true
+		kn.includeSem = false
+		t := true
+		kn.out.System = &t
+	case sysOK && sys.State == "false":
+		kn.full.System = sys
+		f := false
+		kn.out.System = &f
+	default:
+		kn.ok = false
+		kn.includeSem = false
+		kn.system = false
+		if sysOK {
+			kn.full.System = sys
+		} else {
+			kn.full.System = absentP()
 		}
 	}
 	author, authorN, authorOK := authorPresence(obj)
@@ -1670,6 +1724,129 @@ func resolvedByPresence(obj map[string]json.RawMessage) (presenceValue, bool) {
 	return p, true
 }
 
+func canonJSON(raw []byte) (string, bool) {
+	dec := json.NewDecoder(bytes.NewReader(bytes.TrimSpace(raw)))
+	dec.UseNumber()
+	out, err := writeCanon(dec)
+	if err != nil {
+		return "", false
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return "", false
+	}
+	return out, true
+}
+
+func writeCanon(dec *json.Decoder) (string, error) {
+	tok, err := dec.Token()
+	if err != nil {
+		return "", err
+	}
+	switch t := tok.(type) {
+	case json.Delim:
+		switch t {
+		case '{':
+			return writeCanonObject(dec)
+		case '[':
+			return writeCanonArray(dec)
+		default:
+			return "", fmt.Errorf("discussions canon")
+		}
+	case string:
+		b, err := json.Marshal(t)
+		if err != nil {
+			return "", err
+		}
+		return string(b), nil
+	case json.Number:
+		return t.String(), nil
+	case bool:
+		if t {
+			return "true", nil
+		}
+		return "false", nil
+	case nil:
+		return "null", nil
+	default:
+		return "", fmt.Errorf("discussions canon")
+	}
+}
+
+func writeCanonObject(dec *json.Decoder) (string, error) {
+	type pair struct{ key, val string }
+	var pairs []pair
+	seen := map[string]struct{}{}
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return "", err
+		}
+		key, ok := keyTok.(string)
+		if !ok {
+			return "", fmt.Errorf("discussions canon key")
+		}
+		if _, dup := seen[key]; dup {
+			return "", errDiscDupKey
+		}
+		seen[key] = struct{}{}
+		val, err := writeCanon(dec)
+		if err != nil {
+			return "", err
+		}
+		pairs = append(pairs, pair{key: key, val: val})
+	}
+	end, err := dec.Token()
+	if err != nil {
+		return "", err
+	}
+	if d, ok := end.(json.Delim); !ok || d != '}' {
+		return "", fmt.Errorf("discussions canon object")
+	}
+	sort.Slice(pairs, func(i, j int) bool { return pairs[i].key < pairs[j].key })
+	var buf strings.Builder
+	buf.WriteByte('{')
+	for i, p := range pairs {
+		if i > 0 {
+			buf.WriteByte(',')
+		}
+		kb, err := json.Marshal(p.key)
+		if err != nil {
+			return "", err
+		}
+		buf.Write(kb)
+		buf.WriteByte(':')
+		buf.WriteString(p.val)
+	}
+	buf.WriteByte('}')
+	return buf.String(), nil
+}
+
+func writeCanonArray(dec *json.Decoder) (string, error) {
+	var buf strings.Builder
+	buf.WriteByte('[')
+	first := true
+	for dec.More() {
+		val, err := writeCanon(dec)
+		if err != nil {
+			return "", err
+		}
+		if !first {
+			buf.WriteByte(',')
+		}
+		first = false
+		buf.WriteString(val)
+	}
+	end, err := dec.Token()
+	if err != nil {
+		return "", err
+	}
+	if d, ok := end.(json.Delim); !ok || d != ']' {
+		return "", fmt.Errorf("discussions canon array")
+	}
+	buf.WriteByte(']')
+	return buf.String(), nil
+}
+
 func positionPresence(obj map[string]json.RawMessage) (presenceValue, bool) {
 	raw, ok := obj["position"]
 	if !ok {
@@ -1707,7 +1884,12 @@ func positionPresence(obj map[string]json.RawMessage) (presenceValue, bool) {
 	} else if bytes.Equal(bytes.TrimSpace(lr), []byte("null")) {
 		canon.LineRange = nullP()
 	} else if bytes.HasPrefix(bytes.TrimSpace(lr), []byte{'{'}) || bytes.HasPrefix(bytes.TrimSpace(lr), []byte{'['}) {
-		canon.LineRange = valueP(string(bytes.TrimSpace(lr)))
+		canonRange, canonOK := canonJSON(lr)
+		if !canonOK {
+			good = false
+		} else {
+			canon.LineRange = valueP(canonRange)
+		}
 	} else {
 		good = false
 	}

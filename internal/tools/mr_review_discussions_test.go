@@ -735,3 +735,425 @@ func assertMetadataRefExcludesDiscussions(t *testing.T, d Deps, token string) {
 		t.Fatalf("excluded %#v", ref.Excluded)
 	}
 }
+
+func TestDiscussionF1UnknownSystem(t *testing.T) {
+	missing := []byte(`[{"id":"d","individual_note":false,"notes":[{"id":1,"author":{"id":9},"body":"x"}]}]`)
+	nullSys := []byte(`[{"id":"d","individual_note":false,"notes":[{"id":1,"author":{"id":9},"body":"x","system":null}]}]`)
+	if _, _, _, ok := discussionDigestDocuments(missing); ok {
+		t.Fatal("absent system minted digests")
+	}
+	if _, _, _, ok := discussionDigestDocuments(nullSys); ok {
+		t.Fatal("null system minted digests")
+	}
+	user := []byte("[" + discObj("d", noteObj(1, "x", "")) + "]")
+	su, _, fu, uok := discussionDigestDocuments(user)
+	if !uok || su == "" || fu == "" {
+		t.Fatal("system false user lost")
+	}
+	bot := []byte("[" + discObj("d", `{"id":2,"system":true,"author":{"id":9},"body":"bot"}`) + "]")
+	sb, pb, fb, bok := discussionDigestDocuments(bot)
+	emptySem := discSHA(`{"v":"discussions.semantic_feedback.v1","records":[]}`)
+	if !bok || sb != emptySem || pb == "" || fb == "" || fb == discSHA(`{"v":"discussions.full_revision.v1","records":[]}`) {
+		t.Fatalf("system true bot sem=%s pos=%s full=%s ok=%v", sb, pb, fb, bok)
+	}
+
+	for _, body := range []string{string(missing), string(nullSys)} {
+		log := &pathLog{}
+		script := &reviewScript{log: log, discussions: discPages(map[int]string{1: body}, map[int]string{1: ""})}
+		d := newReviewDeps(t, http.HandlerFunc(script.serve))
+		item := metaItem("42", 1, "metadata", "discussions")
+		out, err := callReviewDirect(t, d, context.Background(), []reviewContextItemIn{item})
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := out.Items[0]
+		if got.Discussions == nil || got.Discussions.SemanticFeedbackDigest != nil {
+			t.Fatalf("semantic treated unknown system as feedback %+v", got.Discussions)
+		}
+		mcpOut, err := callReviewContext(t, d, nil, map[string]any{"items": []any{itemArg("42", 1, []any{"metadata", "discussions"}, map[string]any{"discussion_selection": "all"})}}, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw := asMap(t, itemsOf(t, mcpOut)[0])
+		ref, _ := raw["context_ref"].(string)
+		if ref == "" {
+			t.Fatal("metadata ref missing")
+		}
+		assertMetadataRefExcludesDiscussions(t, d, ref)
+		disc := asMap(t, raw["discussions"])
+		sec := asMap(t, asMap(t, raw["sections"])["discussions"])
+		if disc["semantic_feedback_digest"] != nil || disc["position_digest"] != nil || disc["full_revision_digest"] != nil || sec["content_complete"] == readmeta.ContentCompleteTrue {
+			t.Fatalf("streamable claimed unknown system %#v %#v", disc, sec)
+		}
+	}
+}
+
+func TestDiscussionF2OmittedNotes(t *testing.T) {
+	omitted := []byte(`[{"id":"d","individual_note":false}]`)
+	nullNotes := []byte(`[{"id":"d","individual_note":false,"notes":null}]`)
+	if _, _, _, ok := discussionDigestDocuments(omitted); ok {
+		t.Fatal("omitted notes minted a shell")
+	}
+	if _, _, _, ok := discussionDigestDocuments(nullNotes); ok {
+		t.Fatal("null notes minted a shell")
+	}
+	emptyShell := []byte(`[{"id":"d","individual_note":false,"notes":[]}]`)
+	es, ep, ef, eok := discussionDigestDocuments(emptyShell)
+	if !eok || es == "" || ep == "" || ef == "" {
+		t.Fatal("explicit empty notes lost")
+	}
+	zs, zp, zf, zok := discussionDigestDocuments([]byte(`[]`))
+	emptySem := discSHA(`{"v":"discussions.semantic_feedback.v1","records":[]}`)
+	if !zok || zs != emptySem || zp == "" || zf == "" {
+		t.Fatal("empty list lost")
+	}
+	if es == zs {
+		t.Fatal("empty shell hashed like an empty document")
+	}
+
+	for name, body := range map[string]string{"omitted": string(omitted), "null": string(nullNotes)} {
+		log := &pathLog{}
+		script := &reviewScript{log: log, discussions: discPages(map[int]string{1: body}, map[int]string{1: ""})}
+		d := newReviewDeps(t, http.HandlerFunc(script.serve))
+		out, err := callReviewContext(t, d, nil, map[string]any{"items": []any{itemArg("42", 1, []any{"metadata", "discussions"}, map[string]any{"discussion_selection": "all"})}}, true)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		raw := asMap(t, itemsOf(t, out)[0])
+		ref, _ := raw["context_ref"].(string)
+		if ref == "" {
+			t.Fatalf("%s metadata ref missing", name)
+		}
+		assertMetadataRefExcludesDiscussions(t, d, ref)
+		disc := asMap(t, raw["discussions"])
+		sec := asMap(t, asMap(t, raw["sections"])["discussions"])
+		notes, _ := disc["notes"].([]any)
+		if disc["full_revision_digest"] != nil || sec["content_complete"] == readmeta.ContentCompleteTrue || len(notes) != 0 {
+			t.Fatalf("%s proved empty %#v notes=%d", name, sec, len(notes))
+		}
+	}
+
+	log := &pathLog{}
+	script := &reviewScript{log: log, discussions: discPages(map[int]string{1: string(emptyShell)}, map[int]string{1: ""})}
+	d := newReviewDeps(t, http.HandlerFunc(script.serve))
+	out, err := callReviewContext(t, d, nil, map[string]any{"items": []any{itemArg("42", 1, []any{"metadata", "discussions"}, map[string]any{"discussion_selection": "all"})}}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := asMap(t, itemsOf(t, out)[0])
+	ref, _ := raw["context_ref"].(string)
+	payload, err := cursor.Decode(d.Config.CursorKey, ref, time.Date(2026, 10, 4, 12, 30, 0, 0, time.UTC))
+	if err != nil || payload.ContextRef == nil || payload.ContextRef.Digests["discussions"] == "" {
+		t.Fatalf("empty shell evidence err=%v digests=%v", err, payload.ContextRef)
+	}
+	want, err := bundleHex(es, ep, ef)
+	if err != nil || payload.ContextRef.Digests["discussions"] != want {
+		t.Fatalf("empty shell bundle got %v want %s", payload.ContextRef.Digests["discussions"], want)
+	}
+}
+
+func TestDiscussionF3SignedBoundCrossRead(t *testing.T) {
+	page := "[" + discObj("d", noteObj(1, "a", "")+","+noteObj(2, "b", "")) + "]"
+	script := &reviewScript{discussions: discPages(map[int]string{1: page}, map[int]string{1: ""})}
+	d := newReviewDeps(t, http.HandlerFunc(script.serve))
+	b := reviewBudget(128)
+	b.MaxItems = 10
+	item := metaItem("42", 1, "metadata", "discussions")
+	item.DiscussionSelection = "all"
+	_, raw, err := getMergeRequestReviewContext(igl.WithBudget(context.Background(), b), nil, getMergeRequestReviewContextIn{Items: []reviewContextItemIn{item}, MaxElapsedMS: ptr64(5000)}, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seed := raw.(reviewContextOut).Items[0]
+	if seed.Sections["discussions"].NextCursor == nil {
+		t.Fatalf("seed cursor missing %+v", seed.Sections["discussions"])
+	}
+	seedTok, err := cursor.Decode(d.Config.CursorKey, *seed.Sections["discussions"].NextCursor, time.Date(2026, 10, 4, 12, 30, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.Clock.(*cursor.FakeClock).Advance(4700 * time.Millisecond)
+	started := make(chan struct{})
+	cancelled := make(chan struct{})
+	script.discussions = func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		select {
+		case <-r.Context().Done():
+			close(cancelled)
+		case <-time.After(900 * time.Millisecond):
+			w.Header().Set("X-Next-Page", "")
+			_, _ = io.WriteString(w, page)
+		}
+	}
+	item.Cursors = []reviewContextCursorIn{{Section: "discussions", Cursor: *seed.Sections["discussions"].NextCursor}}
+	b2 := reviewBudget(128)
+	beforeReqs, _, beforeItems := b2.Stats()
+	callDone := make(chan struct{})
+	var got reviewContextItemOut
+	var callErr error
+	go func() {
+		defer close(callDone)
+		_, raw, callErr = getMergeRequestReviewContext(igl.WithBudget(context.Background(), b2), nil, getMergeRequestReviewContextIn{Items: []reviewContextItemIn{item}, MaxElapsedMS: ptr64(30000)}, d)
+		if callErr == nil {
+			got = raw.(reviewContextOut).Items[0]
+		}
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("discussions response did not start")
+	}
+	select {
+	case <-cancelled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("in-flight discussions was not cancelled across the signed bound")
+	}
+	select {
+	case <-callDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("call did not return after cancellation")
+	}
+	if callErr != nil {
+		t.Fatal(callErr)
+	}
+	sec := got.Sections["discussions"]
+	if len(sec.Limitations) == 0 || sec.Limitations[0].Code != readmeta.CodeBudgetElapsed || sec.NextCursor != nil || sec.ContentComplete == readmeta.ContentCompleteTrue {
+		t.Fatalf("cross-read sec=%+v disc=%+v", sec, got.Discussions)
+	}
+	if got.Discussions != nil && (got.Discussions.SemanticFeedbackDigest != nil || got.Discussions.FullRevisionDigest != nil) {
+		t.Fatalf("cross-read minted evidence %+v", got.Discussions)
+	}
+	afterReqs, _, afterItems := b2.Stats()
+	if afterReqs < beforeReqs || afterItems < beforeItems {
+		t.Fatalf("counters reset %d->%d items %d->%d", beforeReqs, afterReqs, beforeItems, afterItems)
+	}
+	if seedTok.ExpiresAt == "" {
+		t.Fatal("seed expiry empty")
+	}
+}
+
+func TestDiscussionF3ClockAdvanceAcrossBound(t *testing.T) {
+	script := &reviewScript{}
+	d := newReviewDeps(t, http.HandlerFunc(script.serve))
+	script.discussions = discPages(map[int]string{
+		1: "[" + discObj("d1", noteObj(1, "a", "")) + "]",
+		2: "[" + discObj("d2", noteObj(2, "b", "")) + "]",
+		3: "[" + discObj("d3", noteObj(3, "c", "")) + "]",
+	}, map[int]string{1: "2", 2: "3", 3: ""})
+	b := reviewBudget(128)
+	b.MaxRequests = 11
+	item := metaItem("42", 1, "discussions")
+	item.DiscussionSelection = "all"
+	out, err := callReviewDirect(t, d, igl.WithBudget(context.Background(), b), []reviewContextItemIn{item})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cur := out.Items[0].Sections["discussions"].NextCursor
+	if cur == nil {
+		t.Fatalf("need page-2 cursor %+v", out.Items[0].Sections["discussions"])
+	}
+	seed, err := cursor.Decode(d.Config.CursorKey, *cur, time.Date(2026, 10, 4, 12, 30, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var page3 int
+	script.discussions = func(w http.ResponseWriter, r *http.Request) {
+		page := r.URL.Query().Get("page")
+		if page == "3" {
+			page3++
+		}
+		if page == "2" || page == "" {
+			d.Clock.(*cursor.FakeClock).Advance(time.Minute)
+			w.Header().Set("X-Next-Page", "3")
+			_, _ = io.WriteString(w, "["+discObj("d2", noteObj(2, "b", ""))+"]")
+			return
+		}
+		w.Header().Set("X-Next-Page", "")
+		_, _ = io.WriteString(w, "["+discObj("d3", noteObj(3, "c", ""))+"]")
+	}
+	item.Cursors = []reviewContextCursorIn{{Section: "discussions", Cursor: *cur}}
+	b2 := reviewBudget(128)
+	beforeReqs, _, beforeItems := b2.Stats()
+	out, err = callReviewDirect(t, d, igl.WithBudget(context.Background(), b2), []reviewContextItemIn{item})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := out.Items[0]
+	sec := got.Sections["discussions"]
+	if page3 != 0 || sec.NextCursor != nil || sec.ContentComplete == readmeta.ContentCompleteTrue {
+		t.Fatalf("page3=%d cursor=%v complete=%v lim=%#v", page3, sec.NextCursor != nil, sec.ContentComplete, sec.Limitations)
+	}
+	if len(sec.Limitations) == 0 || sec.Limitations[0].Code != readmeta.CodeBudgetElapsed {
+		t.Fatalf("lim %#v", sec.Limitations)
+	}
+	afterReqs, _, afterItems := b2.Stats()
+	if afterReqs <= beforeReqs || afterItems < beforeItems {
+		t.Fatalf("counters reset reqs %d->%d items %d->%d", beforeReqs, afterReqs, beforeItems, afterItems)
+	}
+	if got.Discussions != nil && got.Discussions.FullRevisionDigest != nil {
+		t.Fatal("promoted evidence after the bound")
+	}
+	_ = seed
+}
+
+func TestDiscussionF3ParentDeadlineAndCopiedExpiry(t *testing.T) {
+	page := "[" + discObj("d", noteObj(1, "a", "")+","+noteObj(2, "b", "")+","+noteObj(3, "c", "")) + "]"
+	script := &reviewScript{discussions: discPages(map[int]string{1: page}, map[int]string{1: ""})}
+	d := newReviewDeps(t, http.HandlerFunc(script.serve))
+	b := reviewBudget(128)
+	b.MaxItems = 10
+	item := metaItem("42", 1, "discussions")
+	item.DiscussionSelection = "all"
+	out, err := callReviewDirect(t, d, igl.WithBudget(context.Background(), b), []reviewContextItemIn{item})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cur := out.Items[0].Sections["discussions"].NextCursor
+	if cur == nil {
+		t.Fatal("seed")
+	}
+	seed, err := cursor.Decode(d.Config.CursorKey, *cur, time.Date(2026, 10, 4, 12, 30, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	cancelled := make(chan struct{})
+	script.discussions = func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		select {
+		case <-r.Context().Done():
+			close(cancelled)
+		case <-time.After(2 * time.Second):
+			w.Header().Set("X-Next-Page", "")
+			_, _ = io.WriteString(w, page)
+		}
+	}
+	item.Cursors = []reviewContextCursorIn{{Section: "discussions", Cursor: *cur}}
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	defer cancel()
+	b2 := reviewBudget(128)
+	beforeReqs, _, beforeItems := b2.Stats()
+	_, _, err = getMergeRequestReviewContext(igl.WithBudget(ctx, b2), nil, getMergeRequestReviewContextIn{Items: []reviewContextItemIn{item}, MaxElapsedMS: ptr64(30000)}, d)
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("parent-deadline response did not start")
+	}
+	select {
+	case <-cancelled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("earlier parent deadline did not cancel the child")
+	}
+	afterReqs, _, afterItems := b2.Stats()
+	if afterReqs < beforeReqs || afterItems < beforeItems {
+		t.Fatalf("counters reset %d->%d %d->%d", beforeReqs, afterReqs, beforeItems, afterItems)
+	}
+	_ = err
+
+	script.discussions = discPages(map[int]string{1: page}, map[int]string{1: ""})
+	b3 := reviewBudget(128)
+	b3.MaxItems = 11
+	out, err = callReviewDirect(t, d, igl.WithBudget(context.Background(), b3), []reviewContextItemIn{item})
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := out.Items[0].Sections["discussions"].NextCursor
+	if next == nil || out.Items[0].Sections["discussions"].ContentComplete == readmeta.ContentCompleteTrue {
+		t.Fatalf("before-bound resume %+v", out.Items[0].Sections["discussions"])
+	}
+	got, err := cursor.Decode(d.Config.CursorKey, *next, time.Date(2026, 10, 4, 12, 30, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ExpiresAt != seed.ExpiresAt || got.UpperBound != seed.UpperBound {
+		t.Fatalf("renewed expiry %s->%s bound %s->%s", seed.ExpiresAt, got.ExpiresAt, seed.UpperBound, got.UpperBound)
+	}
+}
+
+func TestDiscussionF4LineRangeOrder(t *testing.T) {
+	posA := `"position":{"new_path":"a.go","new_line":1,"line_range":{"end":{"new_line":2,"line_code":"z"},"start":{"line_code":"a","new_line":1}}}`
+	posB := `"position":{"line_range":{"start":{"new_line":1,"line_code":"a"},"end":{"line_code":"z","new_line":2}},"new_line":1,"new_path":"a.go"}`
+	a := []byte("[" + discObj("d", noteObj(1, "x", posA)) + "]")
+	b := []byte("[" + discObj("d", noteObj(1, "x", posB)) + "]")
+	as, ap, af, aok := discussionDigestDocuments(a)
+	bs, bp, bf, bok := discussionDigestDocuments(b)
+	if !aok || !bok || as != bs || ap != bp || af != bf {
+		t.Fatalf("reorder sem %s/%s pos %s/%s full %s/%s", as, bs, ap, bp, af, bf)
+	}
+	changed := `"position":{"new_path":"a.go","new_line":1,"line_range":{"start":{"line_code":"a","new_line":9},"end":{"line_code":"z","new_line":2}}}`
+	cs, cp, cf, cok := discussionDigestDocuments([]byte("[" + discObj("d", noteObj(1, "x", changed)) + "]"))
+	if !cok || cs != as || cp == ap || cf == af {
+		t.Fatalf("value change sem %s/%s pos %s/%s full %s/%s", as, cs, ap, cp, af, cf)
+	}
+	arr1 := `"position":{"new_path":"a.go","new_line":1,"line_range":[{"line_code":"a"},{"line_code":"z"}]}`
+	arr2 := `"position":{"new_path":"a.go","new_line":1,"line_range":[{"line_code":"z"},{"line_code":"a"}]}`
+	_, p1, f1, ok1 := discussionDigestDocuments([]byte("[" + discObj("d", noteObj(1, "x", arr1)) + "]"))
+	_, p2, f2, ok2 := discussionDigestDocuments([]byte("[" + discObj("d", noteObj(1, "x", arr2)) + "]"))
+	if !ok1 || !ok2 || p1 == p2 || f1 == f2 {
+		t.Fatal("array order collapsed")
+	}
+	n1 := `"position":{"new_path":"a.go","new_line":1,"line_range":{"start":{"new_line":1}}}`
+	n2 := `"position":{"new_path":"a.go","new_line":1,"line_range":{"start":{"new_line":1.0}}}`
+	_, pn1, _, on1 := discussionDigestDocuments([]byte("[" + discObj("d", noteObj(1, "x", n1)) + "]"))
+	_, pn2, _, on2 := discussionDigestDocuments([]byte("[" + discObj("d", noteObj(1, "x", n2)) + "]"))
+	if !on1 || !on2 || pn1 == pn2 {
+		t.Fatal("numeric lexeme collapsed")
+	}
+	if _, _, _, bad := discussionDigestDocuments([]byte(`[{"id":"d","individual_note":false,"notes":[{"id":1,"system":false,"author":{"id":9},"body":"x","position":{"line_range":{"start":{"line_code":"a","line_code":"b"}}}}]}]`)); bad {
+		t.Fatal("duplicate nested key minted")
+	}
+	absent := []byte("[" + discObj("d", noteObj(1, "x", "")) + "]")
+	nullRange := []byte("[" + discObj("d", noteObj(1, "x", `"position":{"new_path":"a.go","new_line":1,"line_range":null}`)) + "]")
+	_, pa, _, oa := discussionDigestDocuments(absent)
+	_, pn, _, on := discussionDigestDocuments(nullRange)
+	if !oa || !on || pa == pn || pa == ap || pn == ap {
+		t.Fatal("absent/null/value line_range collapsed")
+	}
+
+	log := &pathLog{}
+	script := &reviewScript{log: log, discussions: discPages(map[int]string{1: string(a)}, map[int]string{1: ""})}
+	d := newReviewDeps(t, http.HandlerFunc(script.serve))
+	first, err := callReviewContext(t, d, nil, map[string]any{"items": []any{itemArg("42", 1, []any{"metadata", "discussions"}, map[string]any{"discussion_selection": "all"})}}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	script.discussions = discPages(map[int]string{1: string(b)}, map[int]string{1: ""})
+	second, err := callReviewContext(t, d, nil, map[string]any{"items": []any{itemArg("42", 1, []any{"metadata", "discussions"}, map[string]any{"discussion_selection": "all"})}}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d1 := asMap(t, asMap(t, itemsOf(t, first)[0])["discussions"])
+	d2 := asMap(t, asMap(t, itemsOf(t, second)[0])["discussions"])
+	if d1["semantic_feedback_digest"] != d2["semantic_feedback_digest"] || d1["position_digest"] != d2["position_digest"] || d1["full_revision_digest"] != d2["full_revision_digest"] {
+		t.Fatalf("registered reorder %#v %#v", d1, d2)
+	}
+}
+
+func TestDiscussionN1EmptyInspectedCount(t *testing.T) {
+	log := &pathLog{}
+	script := &reviewScript{log: log, discussions: discPages(map[int]string{1: "[]"}, map[int]string{1: ""})}
+	d := newReviewDeps(t, http.HandlerFunc(script.serve))
+	item := metaItem("42", 1, "metadata", "discussions")
+	item.DiscussionSelection = "all"
+	out, err := callReviewDirect(t, d, context.Background(), []reviewContextItemIn{item})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sec := out.Items[0].Sections["discussions"]
+	if sec.Counts.Items == nil || *sec.Counts.Items != 0 || sec.ContentComplete != readmeta.ContentCompleteTrue {
+		t.Fatalf("empty list counts=%v complete=%v", sec.Counts.Items, sec.ContentComplete)
+	}
+	b := reviewBudget(128)
+	b.MaxItems = 9
+	log2 := &pathLog{}
+	script2 := &reviewScript{log: log2, discussions: discPages(map[int]string{1: "[]"}, map[int]string{1: ""})}
+	d2 := newReviewDeps(t, http.HandlerFunc(script2.serve))
+	out, err = callReviewDirect(t, d2, igl.WithBudget(context.Background(), b), []reviewContextItemIn{item})
+	if err != nil {
+		t.Fatal(err)
+	}
+	refused := out.Items[0].Sections["discussions"]
+	if log2.count("/discussions") != 0 || refused.Counts.Items != nil {
+		t.Fatalf("refused items=%v gets=%d", refused.Counts.Items, log2.count("/discussions"))
+	}
+}
