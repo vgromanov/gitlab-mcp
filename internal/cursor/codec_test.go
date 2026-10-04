@@ -965,3 +965,60 @@ func TestDiffManifestEvidenceKeyset(t *testing.T) {
 		t.Fatal("complete diff_manifest without evidence accepted")
 	}
 }
+
+func TestDiffWindowCursorModes(t *testing.T) {
+	key := []byte("0123456789abcdef0123456789abcdef")
+	now := time.Date(2026, 10, 4, 12, 0, 0, 0, time.UTC)
+	iid := int64(1)
+	sum := strings.Repeat("ab", 32)
+	upper := now.Format(time.RFC3339)
+	newPayload := func() Payload {
+		return Payload{
+			SchemaVersion: SchemaV1,
+			Instance:      "https://gitlab.example/api/v4",
+			ActorID:       7,
+			PolicyFP:      "policyfp",
+			Tool:          ToolDiffWindow,
+			Section:       SectionDiffManifest,
+			Scope:         Scope{Kind: ScopeProject, ProjectID: "42", MergeRequestIID: &iid},
+			Filters:       Filters{PerPage: 1, Until: upper},
+			UpperBound:    upper,
+			ExpiresAt:     now.Add(DefaultTTL).Format(time.RFC3339),
+			PageState:     PageState{Page: 1, PerPage: 1, ItemsOnPage: 1, LastSHA: sum, SequenceDigest: sum, ProviderNextPage: 2},
+		}
+	}
+	version := newPayload()
+	version.ImmutableRefs = []string{strings.Repeat("a", 40)}
+	version.Filters.Selection = "version:1"
+	version.DiffWindow = &DiffWindowCont{V: DiffWindowSchemaDM1, Mode: "full_version", VersionID: 1, Total: 2, Offset: 1, FullDigest: sum, PerPage: 1}
+	tok, err := Encode(key, version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Decode(key, tok, now); err != nil {
+		t.Fatal(err)
+	}
+	tuple := newPayload()
+	base, start, head := strings.Repeat("b", 40), strings.Repeat("c", 40), strings.Repeat("d", 40)
+	tuple.ImmutableRefs = []string{base, start, head}
+	tuple.Filters.Selection = "tuple:" + base + ":" + start + ":" + head
+	tuple.DiffWindow = &DiffWindowCont{V: DiffWindowSchemaDM1, Mode: "full_tuple", BaseSHA: base, StartSHA: start, HeadSHA: head, Total: 2, Offset: 1, FullDigest: sum, PerPage: 1}
+	if _, err := Encode(key, tuple); err != nil {
+		t.Fatal(err)
+	}
+	inc := newPayload()
+	from, to := strings.Repeat("e", 40), strings.Repeat("f", 40)
+	inc.ImmutableRefs = []string{from, to}
+	inc.Filters.Selection = "inc:" + from + ":" + to
+	inc.DiffWindow = &DiffWindowCont{V: DiffWindowSchemaDM1, Mode: "incremental", FromSHA: from, ToSHA: to, Straight: true, Total: 2, Offset: 1, FullDigest: sum, PerPage: 1}
+	if _, err := Encode(key, inc); err != nil {
+		t.Fatal(err)
+	}
+	bad := newPayload()
+	bad.ImmutableRefs = version.ImmutableRefs
+	bad.Filters.Selection = "version:1"
+	bad.DiffWindow = &DiffWindowCont{V: DiffWindowSchemaDM1, Mode: "nope", VersionID: 1, Total: 2, Offset: 1, FullDigest: sum, PerPage: 1}
+	if _, err := Encode(key, bad); err == nil {
+		t.Fatal("unknown diff window mode accepted")
+	}
+}
