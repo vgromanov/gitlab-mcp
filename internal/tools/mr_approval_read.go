@@ -115,6 +115,17 @@ type mrApprovalReadResult struct {
 	Section           readmeta.Section    `json:"section"`
 }
 
+func newApprovalReadResult(endpoint string, section readmeta.Section) mrApprovalReadResult {
+	return mrApprovalReadResult{
+		Endpoint:        endpoint,
+		Rules:           nil,
+		RulesLeft:       nil,
+		RulesCapability: rulesCapabilityUnknown,
+		RulesComplete:   readmeta.ContentCompleteUnknown,
+		Section:         section,
+	}
+}
+
 func newApprovalsSection(now time.Time) readmeta.Section {
 	return readmeta.Section{
 		RetrievedAt:         now.UTC().Format(time.RFC3339),
@@ -624,14 +635,7 @@ func chargeRetainedItems(ctx context.Context, n int) error {
 }
 
 func decodeApprovalStateRaw(ctx context.Context, raw []byte, section *readmeta.Section) (mrApprovalReadResult, error) {
-	out := mrApprovalReadResult{
-		Endpoint:        endpointApprovalState,
-		Rules:           nil,
-		RulesLeft:       nil,
-		RulesCapability: rulesCapabilityUnknown,
-		RulesComplete:   readmeta.ContentCompleteUnknown,
-		Section:         *section,
-	}
+	out := newApprovalReadResult(endpointApprovalState, *section)
 	if err := validateJSONObjectRoot(raw); err != nil {
 		return out, approvalSafeErr(readmeta.CodeHTTPError, "malformed approval_state payload")
 	}
@@ -756,14 +760,7 @@ func decodeRuleObs(raw json.RawMessage) (mrApprovalRuleObs, error) {
 }
 
 func decodeApprovalsLegacyRaw(ctx context.Context, raw []byte, section *readmeta.Section) (mrApprovalReadResult, error) {
-	out := mrApprovalReadResult{
-		Endpoint:        endpointApprovals,
-		Rules:           nil,
-		RulesLeft:       nil,
-		RulesCapability: rulesCapabilityUnknown,
-		RulesComplete:   readmeta.ContentCompleteUnknown,
-		Section:         *section,
-	}
+	out := newApprovalReadResult(endpointApprovals, *section)
 	if err := validateJSONObjectRoot(raw); err != nil {
 		return out, approvalSafeErr(readmeta.CodeHTTPError, "malformed approvals payload")
 	}

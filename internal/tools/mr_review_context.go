@@ -351,14 +351,19 @@ func (rt *reviewRuntime) sealRequested(item reviewContextItemIn, out *reviewCont
 		if _, ok := out.Sections[name]; ok {
 			continue
 		}
-		sec := unsupportedReviewSection(rt.now, name)
-		sec.ContentComplete = readmeta.ContentCompleteUnknown
-		sec.Consistency = readmeta.ConsistencyUnknown
-		sec.HeadSHA = nil
-		sec.NextCursor = nil
-		sec.Limitations = []readmeta.Limitation{}
-		if name == "metadata" || name == "approvals" {
-			sec.CapabilityVersion = capabilityReviewContextMetaV1
+		var sec readmeta.Section
+		if name == "approvals" {
+			sec = newApprovalsSection(rt.now)
+		} else {
+			sec = unsupportedReviewSection(rt.now, name)
+			sec.ContentComplete = readmeta.ContentCompleteUnknown
+			sec.Consistency = readmeta.ConsistencyUnknown
+			sec.HeadSHA = nil
+			sec.NextCursor = nil
+			sec.Limitations = []readmeta.Limitation{}
+			if name == "metadata" {
+				sec.CapabilityVersion = capabilityReviewContextMetaV1
+			}
 		}
 		out.Sections[name] = sec
 	}
@@ -1084,7 +1089,7 @@ func (rt *reviewRuntime) readApprovals(owner CanonicalProject, iid int64, out *r
 			sec.AddLimitation(readmeta.CodeUnsupported, msg)
 		}
 		dig, digErr := approvalFailureDigest(endpointApprovalState, code, sec.Limitations)
-		skeleton := mrApprovalReadResult{Endpoint: endpointApprovalState, Section: sec}
+		skeleton := newApprovalReadResult(endpointApprovalState, sec)
 		out.Approvals = &skeleton
 		out.Sections["approvals"] = sec
 		if digErr == nil {
