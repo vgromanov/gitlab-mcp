@@ -343,6 +343,40 @@ func TestReviewQueue_F5ResumableDiscussionBoundary(t *testing.T) {
 	}
 }
 
+func TestReviewQueue_R1IntentionalCallbackBudget(t *testing.T) {
+	for _, mode := range []string{"", "discovery", "noheader", "dupheader", "jump"} {
+		t.Run(mode, func(t *testing.T) {
+			d := repairDeps(t, &repairRT{mode: mode}, nil)
+			b := igl.DefaultBudget()
+			t.Cleanup(b.Cancel)
+			for n := 0; n < 100; n++ {
+				if err := b.AddItem(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			_, v, err := getMergeRequestReviewQueue(igl.WithBudget(context.Background(), b), nil, getMergeRequestReviewQueueIn{
+				GroupID: "9", Kinds: []string{"reviewer"}, PageSize: 20,
+			}, d)
+			if err != nil {
+				t.Fatal(err)
+			}
+			out := v.(map[string]any)
+			tok, _ := sectionMap(out)["next_cursor"].(string)
+			codes := limitationCodes(sectionMap(out))
+			valid := mode == "" || mode == "discovery"
+			if valid {
+				if tok == "" || hasCode(codes, readmeta.CodeProviderPageAmbiguous) {
+					t.Fatal("valid callback-budget stop was treated as a malformed page")
+				}
+				return
+			}
+			if tok != "" || !hasCode(codes, readmeta.CodeProviderPageAmbiguous) {
+				t.Fatal("known invalid header erased by callback-budget stop")
+			}
+		})
+	}
+}
+
 func TestReviewQueue_R1InvalidPageProofBudget(t *testing.T) {
 	for _, mode := range []string{"noheader", "dupheader", "jump", "truncated", "junk", ""} {
 		for _, where := range []string{"owner", "source_after_proved"} {

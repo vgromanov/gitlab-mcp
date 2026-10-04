@@ -792,7 +792,14 @@ func (st *queueRuntime) discoverKindStream(ctx context.Context, idx int) error {
 			return err
 		}
 		page, err := st.fetchGroupMRPage(ctx, kp)
-		if err != nil && len(page.ents) == 0 && isTypedBudget(err) {
+		if err != nil && len(page.ents) == 0 && (isTypedBudget(err) || errors.Is(err, errQueueCancelled)) {
+			// No element was retained, so an empty count must not turn a
+			// well-formed next or exhaustion header into ambiguity. A header
+			// that is already missing, duplicated, or non-canonical still closes.
+			if page.headerInvalid || queuePageFraming(err) {
+				st.terminalKnownInvalidPage(err)
+				return errQueueStop
+			}
 			return err
 		}
 		if err != nil && len(page.ents) == 0 && !queuePageFraming(err) && !page.ambiguous {
@@ -908,10 +915,11 @@ func (e mrPageEnt) replayFact() string {
 }
 
 type mrPageFetch struct {
-	ents      []mrPageEnt
-	next      int64
-	exhausted bool
-	ambiguous bool
+	ents          []mrPageEnt
+	next          int64
+	exhausted     bool
+	ambiguous     bool
+	headerInvalid bool
 }
 
 func (st *queueRuntime) fetchGroupMRPage(ctx context.Context, kp *cursor.QueueKindProg) (mrPageFetch, error) {
@@ -978,6 +986,9 @@ func (st *queueRuntime) fetchGroupMRPage(ctx context.Context, kp *cursor.QueueKi
 	fetched.next = obs.next
 	fetched.exhausted = obs.exhausted
 	fetched.ambiguous = obs.ambiguous
+	if resp != nil {
+		fetched.headerInvalid = observeQueuePage(kp.P, hdr, sdkNext, 1).ambiguous
+	}
 	if err != nil {
 		return fetched, err
 	}
@@ -1351,8 +1362,9 @@ func (st *queueRuntime) scanSeedParticipation(ctx context.Context, owner Canonic
 		}
 		obs := observeQueuePage(og.DP, hdr, sdkNext, len(page))
 		invalid := st.invalidPage(obs.ambiguous, err)
-		if err != nil && len(page) == 0 && isTypedBudget(err) {
-			if invalid {
+		headerInvalid := resp != nil && observeQueuePage(og.DP, hdr, sdkNext, 1).ambiguous
+		if err != nil && len(page) == 0 && (isTypedBudget(err) || errors.Is(err, errQueueCancelled)) {
+			if headerInvalid || queuePageFraming(err) {
 				st.terminalKnownInvalidPage(err)
 				return qualified, errQueueStop
 			}
