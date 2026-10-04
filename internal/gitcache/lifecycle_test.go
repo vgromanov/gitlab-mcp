@@ -163,6 +163,18 @@ func TestLifecyclePinLRUAndClose(t *testing.T) {
 	if err := r.WriteIndex(id, []byte("idx")); err != nil {
 		t.Fatal(err)
 	}
+	if err := r.WriteMeta(id, "HEAD", []byte(AllowedHEAD)); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.WriteMeta(id, "config", []byte(AllowedConfig)); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.WriteMeta(id, "provenance", []byte("p")); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.WriteMeta(id, "refs/heads/acquired", []byte("r")); err != nil {
+		t.Fatal(err)
+	}
 	ents, err := os.ReadDir(filepath.Join(root, id, "objects", "pack"))
 	if err != nil {
 		t.Fatal(err)
@@ -293,11 +305,8 @@ func TestLimitsAndQuiescence(t *testing.T) {
 	if !errors.As(coreErr, &coreExit) {
 		t.Fatalf("core exit %v", coreErr)
 	}
-	aborted := coreExit.ExitCode() == 2
-	if ws, ok := coreExit.Sys().(syscall.WaitStatus); ok && ws.Signaled() && ws.Signal() == syscall.SIGABRT {
-		aborted = true
-	}
-	if !aborted {
+	ws, ok := coreExit.Sys().(syscall.WaitStatus)
+	if !ok || !ws.Signaled() || ws.Signal() != syscall.SIGABRT {
 		t.Fatalf("core signal %v", coreErr)
 	}
 	ents, err := os.ReadDir(dir)
@@ -383,9 +392,10 @@ func TestGroupWaitIsNotQuiescence(t *testing.T) {
 	if err := syscall.Kill(-cmd.Process.Pid, 0); err != nil {
 		t.Fatalf("grandchild should still be reachable, kill probe %v", err)
 	}
-	if err := QuiesceGroup(cmd.Process.Pid, func() error { return nil }); err != nil {
-		t.Fatal(err)
+	if err := QuiesceGroup(cmd.Process.Pid, func() error { return nil }); err != ErrNotQuiescent {
+		t.Fatalf("nil wait result %v", err)
 	}
+	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 }
 
 func TestTokenCoreBeforeRead(t *testing.T) {

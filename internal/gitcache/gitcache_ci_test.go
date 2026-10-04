@@ -142,29 +142,71 @@ func nativeVersionAndIndex(t *testing.T, helper, git string, idn BuildIdentity, 
 	if err := r.WritePack(id2, pack); err != nil {
 		t.Fatal(err)
 	}
+	if err := r.WriteMeta(id2, "HEAD", []byte(AllowedHEAD)); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.WriteMeta(id2, "config", []byte(AllowedConfig)); err != nil {
+		t.Fatal(err)
+	}
+	if err := fillProof(r, id2); err != nil {
+		t.Fatal(err)
+	}
+	before, err := r.Used()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := r.Launch(RoleIndex, git, id2, "", idn, kernel, major); err != nil {
 		t.Fatal(err)
 	}
 	if err := r.Quiesce(id2); err != nil {
 		t.Fatal(err)
 	}
-	_, _, _, err = r.State(id2)
+	if err := r.Verify(id2); err != nil {
+		t.Fatal(err)
+	}
+	dest := strings.Repeat("ab", 16)
+	if err := r.Commit(id2, dest); err != nil {
+		t.Fatal(err)
+	}
+	after, err := r.Used()
 	if err != nil {
 		t.Fatal(err)
 	}
-	st, err := os.Stat(privateJoin(root, id2, "objects", "pack", "input.idx"))
+	st, err := os.Stat(privateJoin(root, dest, "objects", "pack", "input.idx"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if st.Mode().Perm() != 0444 && st.Mode().Perm() != 0600 {
 		t.Fatalf("idx mode %o", st.Mode().Perm())
 	}
-	if st.Size() == 0 {
-		t.Fatal("empty idx")
+	packSt, err := os.Stat(privateJoin(root, dest, "objects", "pack", "input.pack"))
+	if err != nil {
+		t.Fatal(err)
 	}
-	charge, err := CommittedCharge(uint64(len(pack)), uint64(st.Size()))
-	if err != nil || charge != uint64(len(pack))+uint64(st.Size())+MetaMax {
+	charge, err := CommittedCharge(uint64(packSt.Size()), uint64(st.Size()))
+	if err != nil || charge != uint64(packSt.Size())+uint64(st.Size())+MetaMax {
 		t.Fatalf("C %d %v", charge, err)
+	}
+	if after != before-Reserve+charge {
+		t.Fatalf("Used %d -> %d, want delta %d", before, after, charge-Reserve)
+	}
+	_, _, n, err := r.State(id2)
+	if err != nil || n != 1 {
+		t.Fatalf("publication %d %v", n, err)
+	}
+	r.CrashCut()
+	r, err = Open(root, helper, RootBytes+Reserve*2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	stt, frozen, _, err := r.State(id2)
+	if err != nil || frozen || stt != stateCommitted {
+		t.Fatalf("restart %d frozen %v %v", stt, frozen, err)
+	}
+	_, _, n, err = r.State(id2)
+	if err != nil || n != 1 {
+		t.Fatalf("restart pin %d %v", n, err)
 	}
 }
 

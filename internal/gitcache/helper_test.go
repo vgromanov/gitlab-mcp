@@ -3,6 +3,7 @@
 package gitcache
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"os/signal"
 	"syscall"
 	"testing"
+	"time"
 )
 
 func TestMain(m *testing.M) {
@@ -25,6 +27,21 @@ func dispatchHelper(role string) int {
 		return runFSHelper()
 	case "__gitcache_git":
 		return runGitLauncher()
+	case "__gitcache_as_over":
+		installASSeam("over")
+		return runGitLauncher()
+	case "__gitcache_as_get":
+		installASSeam("get")
+		return runGitLauncher()
+	case "__gitcache_as_under":
+		installASSeam("under")
+		return runGitLauncher()
+	case "__gitcache_as_probe":
+		installASSeam("probe")
+		return runGitLauncher()
+	case "__gitcache_as_ok":
+		installASSeam("ok")
+		return runGitLauncher()
 	case "__gitcache_git_failas":
 		enforceVirtualAS = func(uint64) error { return errASIneffective }
 		if err := enforceVirtualAS(LimitAS); errors.Is(err, errASIneffective) {
@@ -32,7 +49,31 @@ func dispatchHelper(role string) int {
 		}
 		return runGitLauncher()
 	case "__gitcache_reader":
-		select {}
+		b, err := os.ReadFile("ledger")
+		if err != nil || len(b) < 256+256 {
+			return 2
+		}
+		var best uint32
+		for i := 0; i < 64; i++ {
+			off := 256 + i*256 + 168
+			if off+4 > len(b) {
+				return 2
+			}
+			c := binary.LittleEndian.Uint32(b[off : off+4])
+			if c > best {
+				best = c
+			}
+		}
+		if best == 0 {
+			return 2
+		}
+		var buf [4]byte
+		binary.LittleEndian.PutUint32(buf[:], best)
+		if err := os.WriteFile("reader-pin", buf[:], 0600); err != nil {
+			return 2
+		}
+		time.Sleep(time.Hour)
+		return 0
 	case "__gitcache_fsize":
 		if err := EnforceFSIZE(4096); err != nil {
 			fmt.Fprintln(os.Stderr, err.Error())
@@ -88,8 +129,13 @@ func dispatchHelper(role string) int {
 		}
 		fmt.Fprintln(os.Stdout, "core-armed")
 		_ = os.Stdout.Sync()
-		_ = syscall.Kill(os.Getpid(), syscall.SIGABRT)
-		return 1
+		// A Go process cannot restore SIG_DFL for SIGABRT. Replace this
+		// process with a shell whose default disposition is abort.
+		if err := syscall.Exec("/bin/sh", []string{"sh", "-c", "kill -ABRT $$"}, os.Environ()); err != nil {
+			fmt.Fprintln(os.Stderr, "core-setup-failed")
+			return 2
+		}
+		return 2
 	case "__gitcache_as":
 		lim := syscall.Rlimit{Cur: LimitAS, Max: LimitAS}
 		if err := syscall.Setrlimit(syscall.RLIMIT_AS, &lim); err != nil {
@@ -145,12 +191,29 @@ func dispatchHelper(role string) int {
 		return 1
 	case "__gitcache_ack_bad":
 		_, _ = os.Stdout.Write([]byte("XXXXXXXX"))
-		return 0
+		_ = os.Stdout.Sync()
+		var one [1]byte
+		_, _ = os.Stdin.Read(one[:])
+		return 2
 	case "__gitcache_ack_short":
 		_, _ = os.Stdout.Write([]byte{0, 0})
-		return 0
+		_ = os.Stdout.Sync()
+		var one [1]byte
+		_, _ = os.Stdin.Read(one[:])
+		return 2
 	case "__gitcache_sleep":
-		select {}
+		time.Sleep(time.Hour)
+		return 0
+	case "__gitcache_launch_bad":
+		_, _ = syscall.Write(6, []byte("BADACK!!"))
+		time.Sleep(time.Hour)
+		return 0
+	case "__gitcache_launch_part":
+		_, _ = syscall.Write(6, []byte("BAD"))
+		time.Sleep(time.Hour)
+		return 0
+	case "__gitcache_launch_eof":
+		return 2
 	case "__gitcache_tree":
 		exe, err := os.Executable()
 		if err != nil {

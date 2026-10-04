@@ -35,23 +35,78 @@ func ApplyLimits(fsize uint64) error {
 	}
 	for _, w := range want {
 		lim := syscall.Rlimit{Cur: w.cur, Max: w.cur}
-		if err := syscall.Setrlimit(w.res, &lim); err != nil {
+		if err := limitSet(w.res, &lim); err != nil {
 			return ErrLimit
 		}
 		var got syscall.Rlimit
-		if err := syscall.Getrlimit(w.res, &got); err != nil {
+		if err := limitGet(w.res, &got); err != nil {
 			return ErrLimit
 		}
 		if got.Cur != w.cur || got.Max != w.cur {
+			if asNote != nil {
+				asNote("get-mismatch")
+			}
 			return ErrLimit
 		}
 	}
 	// getrlimit agreement is not the AS gate. The child must prove the
 	// mapping before it is allowed to ACK or Exec.
-	if err := enforceVirtualAS(LimitAS); err != nil {
+	if err := asGate(LimitAS); err != nil {
+		if asNote != nil {
+			asNote("map")
+		}
 		return ErrLimit
 	}
 	return nil
+}
+
+var limitSet = func(res int, lim *syscall.Rlimit) error {
+	return syscall.Setrlimit(res, lim)
+}
+
+var limitGet = func(res int, lim *syscall.Rlimit) error {
+	return syscall.Getrlimit(res, lim)
+}
+
+var asGate = func(limit uint64) error { return enforceVirtualAS(limit) }
+
+// asNote is nil in production. A test helper may set it to record which
+// ApplyLimits check ran, without changing the limit values.
+var asNote func(string)
+
+func installASSeam(kind string) {
+	saved := map[int]syscall.Rlimit{}
+	limitSet = func(res int, lim *syscall.Rlimit) error {
+		saved[res] = *lim
+		return nil
+	}
+	limitGet = func(res int, lim *syscall.Rlimit) error {
+		if kind == "get" && res == syscall.RLIMIT_AS {
+			lim.Cur, lim.Max = 1, 1
+			return nil
+		}
+		got, ok := saved[res]
+		if !ok {
+			return errors.New("unset")
+		}
+		*lim = got
+		return nil
+	}
+	asGate = func(uint64) error {
+		switch kind {
+		case "over":
+			return errASIneffective
+		case "under":
+			return ErrLimit
+		case "probe":
+			return errors.New("probe")
+		default:
+			return nil
+		}
+	}
+	asNote = func(string) {
+		_ = os.WriteFile("as-gate", []byte(kind), 0600)
+	}
 }
 
 // enforceVirtualAS is the AS gate used by ApplyLimits. Tests may replace it
@@ -84,28 +139,86 @@ func ReadToken(r io.Reader) ([]byte, error) {
 // Leader Wait alone is not enough: after SIGKILL and Wait, kill(-pgid, 0)
 // must return ESRCH. A setsid descendant is outside this proof; audited
 // argv must not call setsid. An unknown result fails closed.
+// awaitClose is the group closure used by a role. Tests may replace it to
+// observe an unknown Wait without changing production QuiesceGroup.
+var awaitClose = QuiesceGroup
+
 func QuiesceGroup(pgid int, wait func() error) error {
-	if pgid <= 1 {
+	if pgid <= 1 || wait == nil {
 		return ErrNotQuiescent
 	}
 	_ = syscall.Kill(-pgid, syscall.SIGKILL)
-	if wait != nil {
-		_ = wait()
+	done := make(chan error, 1)
+	go func() { done <- wait() }()
+	var waitErr error
+	select {
+	case waitErr = <-done:
+	case <-time.After(2 * time.Second):
+		return ErrNotQuiescent
 	}
-	// A killed child can remain a zombie until it is reaped. ESRCH after a
-	// short reap window is the positive result. A process that is still
-	// alive, or a result other than ESRCH, fails closed.
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		err := syscall.Kill(-pgid, 0)
-		if errors.Is(err, syscall.ESRCH) {
-			return nil
-		}
-		if !time.Now().Before(deadline) {
+	if !exitReceipt(waitErr) {
+		return ErrNotQuiescent
+	}
+	if err := syscall.Kill(-pgid, 0); !errors.Is(err, syscall.ESRCH) {
+		return ErrNotQuiescent
+	}
+	return nil
+}
+
+// exitReceipt accepts one owned Wait result: a natural exit, or a signal.
+// A nil function result is not a receipt. Callers that discarded the status
+// and returned nil are rejected here; exit 0 is observed via ProcessState.
+func exitReceipt(waitErr error) bool {
+	var exitErr *exec.ExitError
+	if !errors.As(waitErr, &exitErr) {
+		return false
+	}
+	ws, ok := exitErr.Sys().(syscall.WaitStatus)
+	if !ok {
+		return false
+	}
+	return ws.Exited() || ws.Signaled()
+}
+
+// reapOwned waits for the command that LaunchGit started. A natural exit is
+// the receipt. SIGKILL is only the bound when that wait does not finish.
+func reapOwned(cmd *exec.Cmd) error {
+	if cmd == nil || cmd.Process == nil || cmd.Process.Pid <= 1 || cmd.ProcessState != nil {
+		return ErrNotQuiescent
+	}
+	pid := cmd.Process.Pid
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	var waitErr error
+	select {
+	case waitErr = <-done:
+	case <-time.After(ackWait):
+		_ = syscall.Kill(-pid, syscall.SIGKILL)
+		select {
+		case waitErr = <-done:
+		case <-time.After(ackWait):
 			return ErrNotQuiescent
 		}
-		time.Sleep(10 * time.Millisecond)
 	}
+	if err := waitDrainsBounded(cmd, ackWait); err != nil {
+		return ErrNotQuiescent
+	}
+	if cmd.ProcessState == nil {
+		return ErrNotQuiescent
+	}
+	if waitErr == nil && !cmd.ProcessState.Success() {
+		return ErrNotQuiescent
+	}
+	if waitErr != nil && !exitReceipt(waitErr) {
+		return ErrNotQuiescent
+	}
+	if err := syscall.Kill(-pid, 0); !errors.Is(err, syscall.ESRCH) {
+		return ErrNotQuiescent
+	}
+	if launchReceipt != nil {
+		launchReceipt(cmd.ProcessState)
+	}
+	return nil
 }
 
 // Role selects the FSIZE cap applied before Exec.
@@ -192,6 +305,68 @@ func (b *launchBuf) finish() {
 	b.once.Do(func() { close(b.done) })
 }
 
+type drainPair struct {
+	out chan struct{}
+	err chan struct{}
+}
+
+var launchDrains sync.Map
+
+// launchReaped, when set by a test, observes a group that reached ESRCH.
+var launchReaped func(int)
+
+// launchReceipt, when set by a test, observes the owned ProcessState.
+var launchReceipt func(*os.ProcessState)
+
+// launchClosure, nil in production, lets a test deny closure after the
+// owned receipt. It does not change the failure lifecycle.
+var launchClosure func(*exec.Cmd) error
+
+func waitDrains(cmd *exec.Cmd) {
+	_ = waitDrainsBounded(cmd, 0)
+}
+
+func waitDrainsBounded(cmd *exec.Cmd, bound time.Duration) error {
+	v, ok := launchDrains.LoadAndDelete(cmd)
+	if !ok {
+		return nil
+	}
+	d := v.(drainPair)
+	wait := func(ch chan struct{}) error {
+		if bound <= 0 {
+			<-ch
+			return nil
+		}
+		select {
+		case <-ch:
+			return nil
+		case <-time.After(bound):
+			return ErrNotQuiescent
+		}
+	}
+	if err := wait(d.out); err != nil {
+		return err
+	}
+	return wait(d.err)
+}
+
+// reapLaunch collects the owned command. A natural exit closes the pipes.
+// A helper that ignores the deadline is killed only after that bound.
+func reapLaunch(cmd *exec.Cmd) error {
+	if err := reapOwned(cmd); err != nil {
+		return err
+	}
+	if launchClosure != nil {
+		if err := launchClosure(cmd); err != nil {
+			return err
+		}
+	}
+	if launchReaped != nil && cmd.Process != nil {
+		launchReaped(cmd.Process.Pid)
+	}
+	return nil
+}
+
 func LaunchGit(role Role, helper, git, genPath, tip string, root *os.File, lock *os.File) (*exec.Cmd, error) {
 	fsize, err := roleFSIZE(role)
 	if err != nil {
@@ -235,7 +410,13 @@ func LaunchGit(role Role, helper, git, genPath, tip string, root *os.File, lock 
 	}
 	reqR.Close()
 	ackW.Close()
-	go drainLimit(stderr, cmd.Process.Pid, 64<<10)
+	outDone := make(chan struct{})
+	errDone := make(chan struct{})
+	launchDrains.Store(cmd, drainPair{out: outDone, err: errDone})
+	go func() {
+		drainLimit(stderr, cmd.Process.Pid, 64<<10)
+		close(errDone)
+	}()
 	outLimit := 64 << 10
 	if role == RoleCatFile {
 		outLimit = CatFileStdoutMax
@@ -250,25 +431,32 @@ func LaunchGit(role Role, helper, git, genPath, tip string, root *os.File, lock 
 		if capBuf != nil {
 			capBuf.finish()
 		}
+		close(outDone)
 	}()
 	_ = fsize
 	_ = argv // rebuilt in the child from the role, the absolute git path, and the tip
 	payload := []byte(string(role) + "\x00" + git + "\x00" + genPath + "\x00" + tip)
-	if _, err := reqW.Write(payload); err != nil {
+	if err := writeFullDeadline(reqW, payload, ackWait); err != nil {
 		_ = reqW.Close()
-		_ = QuiesceGroup(cmd.Process.Pid, cmd.Wait)
 		ackR.Close()
+		if qerr := reapLaunch(cmd); qerr != nil {
+			return cmd, qerr
+		}
 		return nil, err
 	}
 	_ = reqW.Close()
 	ack := make([]byte, 8)
-	_ = ackR.SetReadDeadline(time.Now().Add(ackWait))
-	n, err := io.ReadFull(ackR, ack)
+	if err := readFullDeadline(ackR, ack, ackWait); err != nil {
+		ackR.Close()
+		if qerr := reapLaunch(cmd); qerr != nil {
+			return cmd, qerr
+		}
+		return nil, ErrLimit
+	}
 	ackR.Close()
-	if err != nil || n != 8 || string(ack) != "OKAY\x00\x00\x00\x00" {
-		_ = QuiesceGroup(cmd.Process.Pid, cmd.Wait)
-		if n >= 5 && string(ack[:5]) == "LIMIT" {
-			return nil, ErrLimit
+	if string(ack) != "OKAY\x00\x00\x00\x00" {
+		if qerr := reapLaunch(cmd); qerr != nil {
+			return cmd, qerr
 		}
 		return nil, ErrLimit
 	}
@@ -286,6 +474,17 @@ func closePipes(fs ...*os.File) {
 			f.Close()
 		}
 	}
+}
+
+func heldRoot(fd int) (uint64, error) {
+	var st syscall.Stat_t
+	if err := syscall.Fstat(fd, &st); err != nil {
+		return 0, err
+	}
+	if st.Mode&syscall.S_IFMT != syscall.S_IFDIR || st.Mode&0777 != 0700 || observedUID(&st) != uint32(os.Geteuid()) {
+		return 0, ErrPath
+	}
+	return uint64(st.Dev), nil
 }
 
 func runGitLauncher() int {
@@ -315,11 +514,15 @@ func runGitLauncher() int {
 	if rerr != nil || aerr != nil || !relativeGen(gen) {
 		return fail()
 	}
+	rootDev, err := heldRoot(rootfd)
+	if err != nil {
+		return fail()
+	}
 	if err := syscall.Fchdir(rootfd); err != nil {
 		return fail()
 	}
 	syscall.Close(rootfd)
-	if err := enterGen(gen); err != nil {
+	if err := enterGen(gen, rootDev); err != nil {
 		return fail()
 	}
 	if err := ApplyLimits(fsize); err != nil {
@@ -341,7 +544,7 @@ func runGitLauncher() int {
 	return 127
 }
 
-func enterGen(gen string) error {
+func enterGen(gen string, rootDev uint64) error {
 	// Caller is at the cache root. Walk without following links.
 	parts, err := splitRel(gen)
 	if err != nil || len(parts) == 0 {
@@ -356,6 +559,11 @@ func enterGen(gen string) error {
 		syscall.Close(fd)
 		if err != nil {
 			return err
+		}
+		var st syscall.Stat_t
+		if err := syscall.Fstat(next, &st); err != nil || uint64(st.Dev) != rootDev || st.Mode&syscall.S_IFMT != syscall.S_IFDIR || st.Mode&0777 != 0700 || observedUID(&st) != uint32(os.Geteuid()) {
+			syscall.Close(next)
+			return ErrPath
 		}
 		if err := syscall.Fchdir(next); err != nil {
 			syscall.Close(next)

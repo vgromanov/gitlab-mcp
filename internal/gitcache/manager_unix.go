@@ -18,30 +18,37 @@ import (
 
 // Root is one private cache directory. It is unreachable from production startup.
 type Root struct {
-	path      string
-	helper    string
-	quota     uint64
-	slots     []Slot
-	owned     map[int]bool
-	ownedPins map[int]uint32
-	meta      map[int]map[string]uint64
-	gitRole   Role
-	access    uint64
-	fs        *fsClient
-	rootFile  *os.File
-	lockFile  *os.File
-	git       *exec.Cmd
-	gitGen    string
-	gitDone   chan error
-	readers   map[int]*slotReader
-	draining  bool
-	closed    bool
-	mu        sync.Mutex
-	domains   [64]sync.Mutex
+	path         string
+	helper       string
+	quota        uint64
+	slots        []Slot
+	owned        map[int]bool
+	ownedPins    map[int]uint32
+	meta         map[int]map[string]uint64
+	gitRole      Role
+	access       uint64
+	fs           *fsClient
+	rootFile     *os.File
+	lockFile     *os.File
+	git          *exec.Cmd
+	gitGen       string
+	gitDone      chan error
+	readers      map[int]*slotReader
+	readerFailed map[int]bool
+	pinHold      bool
+	gitHold      bool
+	childSlot    int
+	draining     bool
+	closed       bool
+	mu           sync.Mutex
+	domains      [64]sync.Mutex
 }
 
 // roleWait bounds a normal Git role. Cancellation uses QuiesceGroup instead.
 const roleWait = 20 * time.Second
+
+// skipLaunchIdentity is a test seam. Production leaves it false.
+var skipLaunchIdentity bool
 
 // slotReader is the process holding one owned pin. Unpin waits for it.
 type slotReader struct {
@@ -62,20 +69,15 @@ func Open(path, helper string, quota uint64) (*Root, error) {
 	if err != nil {
 		return nil, err
 	}
-	lfd, err := openatNoFollow(int(rf.Fd()), "root.lock", syscall.O_RDWR|syscall.O_CREAT, 0600)
+	var rootSt syscall.Stat_t
+	if err := syscall.Fstat(int(rf.Fd()), &rootSt); err != nil {
+		rf.Close()
+		return nil, ErrPath
+	}
+	lfd, err := openRootLock(int(rf.Fd()), uint64(rootSt.Dev))
 	if err != nil {
 		rf.Close()
-		return nil, ErrPath
-	}
-	if err := syscall.Flock(lfd, syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		syscall.Close(lfd)
-		rf.Close()
-		return nil, ErrBusy
-	}
-	if err := syscall.Fchmod(lfd, 0600); err != nil {
-		syscall.Close(lfd)
-		rf.Close()
-		return nil, ErrPath
+		return nil, err
 	}
 	lock := os.NewFile(uintptr(lfd), "root.lock")
 	fs, err := startFS(helper, rf)
@@ -86,8 +88,9 @@ func Open(path, helper string, quota uint64) (*Root, error) {
 	}
 	r := &Root{
 		path: path, helper: helper, quota: quota,
-		owned: map[int]bool{}, ownedPins: map[int]uint32{}, readers: map[int]*slotReader{}, meta: map[int]map[string]uint64{},
-		fs: fs, rootFile: rf, lockFile: lock,
+		owned: map[int]bool{}, ownedPins: map[int]uint32{}, readers: map[int]*slotReader{}, readerFailed: map[int]bool{}, meta: map[int]map[string]uint64{},
+		childSlot: -1,
+		fs:        fs, rootFile: rf, lockFile: lock,
 	}
 	if err := r.load(); err != nil {
 		_ = fs.stop()
@@ -96,6 +99,50 @@ func Open(path, helper string, quota uint64) (*Root, error) {
 		return nil, err
 	}
 	return r, nil
+}
+
+func openRootLock(rootfd int, rootDev uint64) (int, error) {
+	lfd, err := openatNoFollow(rootfd, "root.lock", syscall.O_RDWR|syscall.O_NONBLOCK, 0)
+	created := false
+	if errors.Is(err, syscall.ENOENT) {
+		lfd, err = openatNoFollow(rootfd, "root.lock", syscall.O_RDWR|syscall.O_CREAT|syscall.O_EXCL|syscall.O_NONBLOCK, 0600)
+		created = true
+	}
+	if err != nil {
+		return -1, ErrPath
+	}
+	if err := lockAttributes(lfd, rootDev, created); err != nil {
+		syscall.Close(lfd)
+		return -1, err
+	}
+	if err := syscall.Flock(lfd, syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		syscall.Close(lfd)
+		return -1, ErrBusy
+	}
+	return lfd, nil
+}
+
+func lockAttributes(fd int, rootDev uint64, created bool) error {
+	var st syscall.Stat_t
+	if err := syscall.Fstat(fd, &st); err != nil {
+		return ErrPath
+	}
+	if st.Mode&syscall.S_IFMT != syscall.S_IFREG || st.Nlink != 1 || observedUID(&st) != uint32(os.Geteuid()) || uint64(st.Dev) != rootDev || st.Size != 0 {
+		return ErrCorrupt
+	}
+	if st.Mode&0777 == 0600 {
+		return nil
+	}
+	if !created {
+		return ErrCorrupt
+	}
+	if err := syscall.Fchmod(fd, 0600); err != nil {
+		return ErrPath
+	}
+	if err := syscall.Fstat(fd, &st); err != nil || st.Mode&0777 != 0600 {
+		return ErrCorrupt
+	}
+	return nil
 }
 
 func (r *Root) load() error {
@@ -216,25 +263,33 @@ func reconcileSlots(r *Root, slots []Slot, gens []string) error {
 			}
 			continue
 		}
-		// A non-committed record keeps full R. Two directories is ambiguous.
+		// A non-committed record keeps full R. Source or intended dest may
+		// exist, never both. The directory is not deleted or reclaimed.
+		srcOK, err := dirHere(r, s.ID)
+		if err != nil {
+			return err
+		}
+		destOK := false
 		if s.DestID != "" {
-			if _, err := r.lstat(s.DestID); err == nil {
-				return ErrCorrupt
-			} else if !errors.Is(err, ErrAbsent) {
+			destOK, err = dirHere(r, s.DestID)
+			if err != nil {
 				return err
 			}
 		}
-		if s.State == stateReserved {
-			continue
-		}
-		st, err := r.lstat(s.ID)
-		if err != nil {
+		if srcOK && destOK {
 			return ErrCorrupt
 		}
-		if st[0]&uint64(syscall.S_IFMT) != uint64(syscall.S_IFDIR) || st[0]&0777 != 0700 {
+		if !srcOK && !destOK {
+			if s.State == stateReserved {
+				continue
+			}
 			return ErrCorrupt
 		}
-		if err := r.boundStage(s.ID); err != nil {
+		dir := s.ID
+		if destOK {
+			dir = s.DestID
+		}
+		if err := r.boundStage(dir); err != nil {
 			return err
 		}
 	}
@@ -246,29 +301,73 @@ func reconcileSlots(r *Root, slots []Slot, gens []string) error {
 	return nil
 }
 
+func dirHere(r *Root, name string) (bool, error) {
+	st, err := r.lstat(name)
+	if errors.Is(err, ErrAbsent) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if st[0]&uint64(syscall.S_IFMT) != uint64(syscall.S_IFDIR) || st[0]&0777 != 0700 {
+		return false, ErrCorrupt
+	}
+	return true, nil
+}
+
 func (r *Root) boundStage(id string) error {
 	if err := r.auditGen(id); err != nil {
 		return err
 	}
-	pack, err := r.lstat(id + "/objects/pack/input.pack")
-	if err != nil && !errors.Is(err, ErrAbsent) {
-		return err
+	files := []struct {
+		rel string
+		cap uint64
+		idx bool
+	}{
+		{id + "/objects/pack/input.pack", PackMax, false},
+		{id + "/objects/pack/input.idx", IndexMax, true},
+		{id + "/config", MetaConfig, false},
+		{id + "/config.tmp", MetaConfig, false},
+		{id + "/HEAD", MetaHEAD, false},
+		{id + "/HEAD.tmp", MetaHEAD, false},
+		{id + "/provenance", MetaProvenance, false},
+		{id + "/provenance.tmp", MetaProvenance, false},
+		{id + "/manifest", MetaManifest, false},
+		{id + "/manifest.tmp", MetaManifest, false},
+		{id + "/refs/heads/acquired", MetaRef, false},
+		{id + "/refs/heads/acquired.tmp", MetaRef, false},
 	}
-	if err == nil && (pack[2] > PackMax || pack[0]&uint64(syscall.S_IFMT) != uint64(syscall.S_IFREG)) {
-		return ErrCorrupt
-	}
-	idx, err := r.lstat(id + "/objects/pack/input.idx")
-	if err != nil && !errors.Is(err, ErrAbsent) {
-		return err
-	}
-	if err == nil && (idx[2] > IndexMax || idx[0]&uint64(syscall.S_IFMT) != uint64(syscall.S_IFREG)) {
-		return ErrCorrupt
+	for _, f := range files {
+		st, err := r.openStat(f.rel)
+		if errors.Is(err, ErrAbsent) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if st[0]&uint64(syscall.S_IFMT) != uint64(syscall.S_IFREG) || st[1] != 1 || st[2] > f.cap {
+			return ErrCorrupt
+		}
+		mode := st[0] & 0777
+		if f.idx {
+			if mode != 0600 && mode != 0444 {
+				return ErrCorrupt
+			}
+			continue
+		}
+		if mode != 0600 {
+			return ErrCorrupt
+		}
 	}
 	return nil
 }
 
 func (r *Root) matchCommitted(s Slot) error {
-	if err := r.auditGen(s.DestID); err != nil {
+	return r.matchTree(s.DestID, s)
+}
+
+func (r *Root) matchTree(dir string, s Slot) error {
+	if err := r.auditGen(dir); err != nil {
 		return err
 	}
 	metas := []struct {
@@ -282,32 +381,37 @@ func (r *Root) matchCommitted(s Slot) error {
 		{"refs/heads/acquired", MetaRef},
 	}
 	for _, m := range metas {
-		if err := r.metaLen(s.DestID+"/"+m.name, m.cap); err != nil {
+		if err := r.metaRequired(dir+"/"+m.name, m.cap); err != nil {
 			return err
 		}
-		if err := r.metaLen(s.DestID+"/"+m.name+".tmp", m.cap); err != nil {
+		if err := r.metaLen(dir+"/"+m.name+".tmp", m.cap); err != nil {
 			return err
 		}
 	}
-	pack, err := r.fileLen(s.DestID+"/objects/pack/input.pack", s.Pack, 0600)
+	pack, err := r.fileLen(dir+"/objects/pack/input.pack", s.Pack, 0600)
 	if err != nil || pack != s.Pack {
 		return ErrCorrupt
 	}
-	st, err := r.openStat(s.DestID + "/objects/pack/input.idx")
-	if errors.Is(err, ErrAbsent) {
-		if s.Index != 0 {
-			return ErrCorrupt
-		}
-		return nil
-	}
+	st, err := r.openStat(dir + "/objects/pack/input.idx")
 	if err != nil {
-		return err
+		return ErrCorrupt
 	}
 	mode := st[0] & 0777
 	if mode != 0600 && mode != 0444 {
 		return ErrCorrupt
 	}
 	if st[1] != 1 || st[2] != s.Index {
+		return ErrCorrupt
+	}
+	return nil
+}
+
+func (r *Root) metaRequired(rel string, cap uint64) error {
+	st, err := r.openStat(rel)
+	if err != nil {
+		return ErrCorrupt
+	}
+	if st[0]&uint64(syscall.S_IFMT) != uint64(syscall.S_IFREG) || st[1] != 1 || st[0]&0777 != 0600 || st[2] == 0 || st[2] > cap {
 		return ErrCorrupt
 	}
 	return nil
@@ -330,9 +434,6 @@ func (r *Root) metaLen(rel string, cap uint64) error {
 func (r *Root) fileLen(rel string, want, mode uint64) (uint64, error) {
 	st, err := r.openStat(rel)
 	if errors.Is(err, ErrAbsent) {
-		if want == 0 {
-			return 0, nil
-		}
 		return 0, ErrCorrupt
 	}
 	if err != nil {
@@ -595,6 +696,8 @@ func (r *Root) Quiesce(id string) error {
 	role := r.gitRole
 	gen := r.gitGen
 	if err := r.awaitGit(id); err != nil {
+		r.slots[i].Frozen = true
+		_ = r.persist()
 		return err
 	}
 	if had && role == RoleIndex && gen == id {
@@ -627,43 +730,61 @@ func (r *Root) awaitGit(id string) error {
 	}
 	pid := r.git.Process.Pid
 	done := r.gitDone
+	wait := r.git.Wait
+	if done != nil {
+		wait = func() error { return <-done }
+	}
 	if r.gitGen != id {
-		wait := r.git.Wait
-		if done != nil {
-			wait = func() error { return <-done }
+		owner := r.gitGen
+		if qerr := awaitClose(pid, wait); qerr != nil {
+			r.gitHold = true
+			if oi, err := r.index(owner); err == nil {
+				r.slots[oi].Frozen = true
+				_ = r.persist()
+			}
+			return qerr
 		}
-		_ = QuiesceGroup(pid, wait)
 		r.clearGit()
+		if oi, err := r.index(owner); err == nil {
+			r.slots[oi].Frozen = true
+			_ = r.persist()
+		}
 		return ErrState
 	}
 	if done == nil {
 		done = make(chan error, 1)
-		go func() { done <- r.git.Wait() }()
+		go func() { done <- wait() }()
+		r.gitDone = done
 	}
 	var waitErr error
 	select {
 	case waitErr = <-done:
 	case <-time.After(roleWait):
-		qerr := QuiesceGroup(pid, func() error {
+		qerr := awaitClose(pid, func() error {
 			waitErr = <-done
 			return waitErr
 		})
-		r.clearGit()
 		if qerr != nil {
+			r.gitHold = true
 			return qerr
 		}
+		r.clearGit()
 		return ErrNotQuiescent
 	}
 	if waitErr != nil {
 		_ = syscall.Kill(-pid, syscall.SIGKILL)
+		if kerr := syscall.Kill(-pid, 0); !errors.Is(kerr, syscall.ESRCH) {
+			r.gitHold = true
+			return ErrNotQuiescent
+		}
 		r.clearGit()
 		return waitErr
 	}
-	err := syscall.Kill(-pid, 0)
-	r.clearGit()
-	if !errors.Is(err, syscall.ESRCH) {
+	if err := syscall.Kill(-pid, 0); !errors.Is(err, syscall.ESRCH) {
+		r.gitHold = true
 		return ErrNotQuiescent
 	}
+	r.clearGit()
 	return nil
 }
 
@@ -724,6 +845,12 @@ func (r *Root) Commit(id, dest string) error {
 	if r.slots[i].Frozen || r.slots[i].State != stateVerified || !hex32(dest) || dest == id {
 		return ErrState
 	}
+	if r.leaseCount() >= MaxLeases {
+		return ErrBusy
+	}
+	if err := r.matchTree(id, r.slots[i]); err != nil {
+		return err
+	}
 	r.slots[i].DestID = dest
 	if err := r.persist(); err != nil {
 		r.slots[i].DestID = ""
@@ -764,11 +891,7 @@ func (r *Root) Pin(id string) error {
 	if r.slots[i].State != stateCommitted || r.slots[i].Frozen {
 		return ErrState
 	}
-	var leases uint32
-	for _, s := range r.slots {
-		leases += s.ReadCount
-	}
-	if leases >= MaxLeases+1 {
+	if r.leaseCount() >= MaxLeases {
 		return ErrBusy
 	}
 	r.slots[i].ReadCount++
@@ -778,6 +901,8 @@ func (r *Root) Pin(id string) error {
 	if err := r.persist(); err != nil {
 		r.slots[i].ReadCount--
 		r.ownedPins[i]--
+		r.slots[i].Frozen = true
+		r.pinHold = true
 		return err
 	}
 	r.slots[i].PinSync = true
@@ -798,20 +923,42 @@ func (r *Root) Unpin(id string) error {
 	if err != nil {
 		return err
 	}
+	if r.pinHold || r.readerFailed[i] {
+		return ErrNotQuiescent
+	}
 	if r.ownedPins[i] == 0 || r.slots[i].ReadCount == 0 {
 		return ErrState
 	}
 	if err := r.readerFinished(i); err != nil {
 		return err
 	}
+	if r.childSlot == i {
+		r.childSlot = -1
+	}
 	r.slots[i].ReadCount--
 	r.ownedPins[i]--
 	if err := r.persist(); err != nil {
 		r.slots[i].ReadCount++
 		r.ownedPins[i]++
+		if r.childSlot < 0 {
+			r.childSlot = i
+		}
+		r.slots[i].Frozen = true
+		r.pinHold = true
 		return err
 	}
 	return nil
+}
+
+func (r *Root) leaseCount() uint32 {
+	var n uint32
+	for _, s := range r.slots {
+		n += s.ReadCount
+	}
+	if r.childSlot >= 0 && n > 0 {
+		n--
+	}
+	return n
 }
 
 // StartReader starts the process that holds an owned pin. The pin must
@@ -826,13 +973,32 @@ func (r *Root) StartReader(id string) error {
 	if err != nil {
 		return err
 	}
-	if r.ownedPins[i] == 0 || r.readers[i] != nil {
+	if r.ownedPins[i] == 0 || r.readers[i] != nil || r.childSlot >= 0 {
 		return ErrState
+	}
+	var pins uint32
+	for _, s := range r.slots {
+		pins += s.ReadCount
+	}
+	if pins >= MaxLeases+1 {
+		return ErrBusy
+	}
+	// The additional child pin is durable before the process exists.
+	r.slots[i].ReadCount++
+	r.ownedPins[i]++
+	r.childSlot = i
+	if err := r.persist(); err != nil {
+		r.slots[i].Frozen = true
+		r.pinHold = true
+		return err
 	}
 	cmd := exec.Command(r.helper, "__gitcache_reader")
 	cmd.Env = AllowEnv()
+	cmd.Dir = r.path
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
+		r.slots[i].Frozen = true
+		r.pinHold = true
 		return err
 	}
 	done := make(chan error, 1)
@@ -848,10 +1014,20 @@ func (r *Root) readerFinished(i int) error {
 	}
 	select {
 	case err := <-rd.done:
-		delete(r.readers, i)
+		pid := rd.cmd.Process.Pid
 		if err != nil {
+			_ = syscall.Kill(-pid, syscall.SIGKILL)
+			if kerr := syscall.Kill(-pid, 0); !errors.Is(kerr, syscall.ESRCH) {
+				return ErrNotQuiescent
+			}
+			r.readerFailed[i] = true
+			delete(r.readers, i)
 			return err
 		}
+		if kerr := syscall.Kill(-pid, 0); !errors.Is(kerr, syscall.ESRCH) {
+			return ErrNotQuiescent
+		}
+		delete(r.readers, i)
 		return nil
 	default:
 		return ErrBusy
@@ -864,8 +1040,10 @@ func (r *Root) Launch(role Role, git, id, tip string, idn BuildIdentity, kernel 
 	if err := r.admit(); err != nil {
 		return err
 	}
-	if err := IdentityOK(idn, kernel, darwinMajor); err != nil {
-		return err
+	if !skipLaunchIdentity {
+		if err := IdentityOK(idn, kernel, darwinMajor); err != nil {
+			return err
+		}
 	}
 	if r.git != nil {
 		return ErrBusy
@@ -879,10 +1057,19 @@ func (r *Root) Launch(role Role, git, id, tip string, idn BuildIdentity, kernel 
 	}
 	cmd, err := LaunchGit(role, r.helper, git, id, tip, r.rootFile, r.lockFile)
 	if err != nil {
+		if cmd != nil {
+			r.retainGit(cmd, role, id)
+			r.gitHold = true
+			r.slots[i].Frozen = true
+			_ = r.persist()
+		}
 		return err
 	}
 	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
+	go func() {
+		waitDrains(cmd)
+		done <- cmd.Wait()
+	}()
 	r.git = cmd
 	r.gitRole = role
 	r.gitGen = id
@@ -934,6 +1121,9 @@ func (r *Root) Close() error {
 		return ErrClosed
 	}
 	r.draining = true
+	if r.pinHold || r.gitHold {
+		return ErrNotQuiescent
+	}
 	if r.git != nil {
 		pid := r.git.Process.Pid
 		done := r.gitDone
@@ -941,7 +1131,8 @@ func (r *Root) Close() error {
 		if done != nil {
 			wait = func() error { return <-done }
 		}
-		if err := QuiesceGroup(pid, wait); err != nil {
+		if err := awaitClose(pid, wait); err != nil {
+			r.gitHold = true
 			return err
 		}
 		r.clearGit()
@@ -1003,7 +1194,22 @@ func (r *Root) Close() error {
 	return nil
 }
 
+func (r *Root) retainGit(cmd *exec.Cmd, role Role, id string) {
+	done := make(chan error, 1)
+	go func() {
+		waitDrains(cmd)
+		done <- cmd.Wait()
+	}()
+	r.git = cmd
+	r.gitRole = role
+	r.gitGen = id
+	r.gitDone = done
+}
+
 func (r *Root) admit() error {
+	if r.pinHold || r.gitHold {
+		return ErrNotQuiescent
+	}
 	if r.closed || r.draining {
 		return ErrClosed
 	}
@@ -1024,6 +1230,12 @@ func (r *Root) CrashCut() {
 		}
 		_ = QuiesceGroup(pid, wait)
 		r.clearGit()
+	}
+	for _, rd := range r.readers {
+		if rd == nil || rd.cmd == nil || rd.cmd.Process == nil {
+			continue
+		}
+		_ = QuiesceGroup(rd.cmd.Process.Pid, func() error { return <-rd.done })
 	}
 	r.fs.crash()
 	r.lockFile.Close()

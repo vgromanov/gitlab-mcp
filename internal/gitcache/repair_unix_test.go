@@ -61,6 +61,12 @@ func TestUnknownPinCannotUnpin(t *testing.T) {
 	if err := r.WriteMeta(id, "config", []byte(AllowedConfig)); err != nil {
 		t.Fatal(err)
 	}
+	if err := r.WritePack(id, []byte{1, 2, 3, 4}); err != nil {
+		t.Fatal(err)
+	}
+	if err := fillProof(r, id); err != nil {
+		t.Fatal(err)
+	}
 	if err := r.Quiesce(id); err != nil {
 		t.Fatal(err)
 	}
@@ -388,8 +394,8 @@ func TestWriteAndPinFreeze(t *testing.T) {
 	if err != nil || n != 1 {
 		t.Fatalf("pin rollback %d %v", n, err)
 	}
-	if err := r.Close(); err != nil {
-		t.Fatal(err)
+	if err := r.Close(); err != ErrNotQuiescent {
+		t.Fatalf("close after uncertain pin %v", err)
 	}
 }
 
@@ -472,6 +478,9 @@ func commitPacked(t *testing.T, root, helper, dest string) (*Root, string) {
 	if err := r.WriteMeta(id, "config", []byte(AllowedConfig)); err != nil {
 		t.Fatal(err)
 	}
+	if err := fillProof(r, id); err != nil {
+		t.Fatal(err)
+	}
 	if err := r.Quiesce(id); err != nil {
 		t.Fatal(err)
 	}
@@ -482,4 +491,13 @@ func commitPacked(t *testing.T, root, helper, dest string) (*Root, string) {
 		t.Fatal(err)
 	}
 	return r, id
+}
+
+func fillProof(r *Root, id string) error {
+	for _, meta := range []string{"provenance", "manifest", "refs/heads/acquired"} {
+		if err := r.WriteMeta(id, meta, []byte("x")); err != nil {
+			return err
+		}
+	}
+	return r.WriteIndex(id, []byte("idx"))
 }

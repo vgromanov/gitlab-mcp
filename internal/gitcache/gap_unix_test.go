@@ -293,6 +293,9 @@ func TestGapCommitDropsChargeOnPersistFail(t *testing.T) {
 	if err := r.WriteMeta(id, "config", []byte(AllowedConfig)); err != nil {
 		t.Fatal(err)
 	}
+	if err := fillProof(r, id); err != nil {
+		t.Fatal(err)
+	}
 	if err := r.Quiesce(id); err != nil {
 		t.Fatal(err)
 	}
@@ -331,9 +334,19 @@ func TestGapCommitDropsChargeOnPersistFail(t *testing.T) {
 		t.Fatalf("charge %d -> %d %v", before, after, aerr)
 	}
 	r.CrashCut()
-	if _, err := Open(root, h, QuotaMin); err == nil {
-		t.Fatal("reopen accepted the ambiguous commit")
+	r, err = Open(root, h, QuotaMin)
+	if err != nil {
+		t.Fatalf("dest-only reservation denied: %v", err)
 	}
+	st, frozen, _, err := r.State(id)
+	if err != nil || !frozen || st == stateCommitted {
+		t.Fatalf("reopen state %d frozen %v %v", st, frozen, err)
+	}
+	used, uerr := r.Used()
+	if uerr != nil || used < Reserve {
+		t.Fatalf("reopen charge %d %v", used, uerr)
+	}
+	r.CrashCut()
 	if _, err := os.Stat(filepath.Join(root, dest, "config")); err != nil {
 		t.Fatal(err)
 	}
@@ -796,10 +809,10 @@ func cpuTerminationOK(code int, text string, signaledKill bool, cpuTime time.Dur
 	if !strings.Contains(text, "cpu-ready") {
 		return false
 	}
-	if code == 1 && strings.Contains(text, "cpu-enforced SIGXCPU") {
+	if code == 1 && strings.Contains(text, "cpu-enforced SIGXCPU") && !signaledKill {
 		return true
 	}
-	if signaledKill && cpuTime > 0 {
+	if signaledKill && strings.Contains(text, "hard=8") && cpuTime >= 8*time.Second {
 		return true
 	}
 	return false

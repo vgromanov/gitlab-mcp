@@ -150,7 +150,11 @@ func TestHelperOpsAndProcessBranches(t *testing.T) {
 	}
 	closePipes(nil)
 
-	if err := enterGen("no-such"); err == nil {
+	var rootSt syscall.Stat_t
+	if err := syscall.Stat(root, &rootSt); err != nil {
+		t.Fatal(err)
+	}
+	if err := enterGen("no-such", uint64(rootSt.Dev)); err == nil {
 		t.Fatal("enter missing")
 	}
 	if err := os.Mkdir(filepath.Join(root, "stage"), 0700); err != nil {
@@ -159,7 +163,7 @@ func TestHelperOpsAndProcessBranches(t *testing.T) {
 	if err := syscall.Chdir(root); err != nil {
 		t.Fatal(err)
 	}
-	if err := enterGen("stage"); err != nil {
+	if err := enterGen("stage", uint64(rootSt.Dev)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -301,6 +305,12 @@ func TestEdgeCoverage(t *testing.T) {
 	if err := r.WriteMeta(id, "nope", []byte("z")); err == nil {
 		t.Fatal("unknown meta")
 	}
+	if err := r.WriteMeta(id, "HEAD", []byte(AllowedHEAD)); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.WriteMeta(id, "config", []byte(AllowedConfig)); err != nil {
+		t.Fatal(err)
+	}
 	if err := r.WriteMeta(id, "provenance", []byte("p")); err != nil {
 		t.Fatal(err)
 	}
@@ -311,6 +321,9 @@ func TestEdgeCoverage(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := r.WriteIndex(id, []byte("idx")); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.WritePack(id, []byte{1, 2, 3, 4}); err != nil {
 		t.Fatal(err)
 	}
 	if err := r.Quiesce("missing"); err == nil {
@@ -341,7 +354,7 @@ func TestEdgeCoverage(t *testing.T) {
 	if err := r.Unpin(id); err == nil {
 		t.Fatal("unpin zero")
 	}
-	for i := 0; i < MaxLeases+1; i++ {
+	for i := 0; i < MaxLeases; i++ {
 		if err := r.Pin(id); err != nil {
 			t.Fatal(err)
 		}
@@ -357,7 +370,7 @@ func TestEdgeCoverage(t *testing.T) {
 		t.Fatal(err)
 	}
 	r.draining = false
-	for i := 0; i < MaxLeases+1; i++ {
+	for i := 0; i < MaxLeases; i++ {
 		if err := r.Unpin(id); err != nil {
 			t.Fatal(err)
 		}
@@ -445,9 +458,10 @@ func TestDenseBranches(t *testing.T) {
 	var hdr [8]byte
 	binary.LittleEndian.PutUint32(hdr[4:], 1<<20+1)
 	c := &fsClient{in: &memWriteCloser{}, out: frame(hdr[:])}
-	if _, err := c.call(2, nil); err != ErrCorrupt {
+	if _, err := c.call(2, nil); err != ErrNotQuiescent {
 		t.Fatal(err)
 	}
+	c = &fsClient{in: &memWriteCloser{}}
 	binary.LittleEndian.PutUint32(hdr[:4], 2)
 	binary.LittleEndian.PutUint32(hdr[4:], 0)
 	c.out = frame(hdr[:])
@@ -591,7 +605,7 @@ func TestDenseBranches(t *testing.T) {
 	if err := EnforceVirtualAS(1 << 20); err != ErrLimit {
 		t.Fatal(err)
 	}
-	if err := enterGen(""); err == nil {
+	if err := enterGen("", 0); err == nil {
 		t.Fatal("empty gen")
 	}
 	r, err := Open(privateRoot(t), helperBin(t), QuotaMin)
