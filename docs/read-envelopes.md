@@ -200,3 +200,7 @@ Absent/null `collapsed`/`too_large` presence keeps `content_complete` unknown ev
 `inaccessible`, `unsupported`, `partial`, `inconsistent`, `collapsed`, `too_large`,
 `budget_items`, `budget_bytes`, `budget_elapsed`, `budget_requests`,
 `http_error`, `cancelled`, `unknown_count`, `authz_denied`, `identity_unresolved`
+
+## Diff manifest
+
+`get_merge_request_diff_window` and review-context `diff_manifest` share one provider. `manifest_coverage=full` only after the version proof (`state=collected`, canonical `real_size` equals the full path count, closing re-read of head, base, and start). `patch_coverage` stays `unknown`. Missing or malformed state, count, or diffs array stays `content_complete=unknown`. A non-final local window stays `content_complete=false` with `next_cursor` set even when coverage, file count, and the full-sequence digest are already proved. The final page is `content_complete=true`, pagination exhausted, and `next_cursor` null. Compare results stay partial. The direct tool needs `GITLAB_MCP_CURSOR_KEY`; continuation is `dm1` ([cursors.md](cursors.md)), with `resync_required` and a fixed 2h TTL. Review-context `diff_manifest` has no `next_cursor`. The version list walks at most 20 pages and then fails closed as `provider_page_ambiguous`; that cap is not raised.

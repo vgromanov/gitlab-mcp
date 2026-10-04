@@ -237,8 +237,8 @@ func TestShouldRegister_behaviorMatrix(t *testing.T) {
 
 func TestReviewReadTools_exact28(t *testing.T) {
 	got := ReviewReadTools()
-	if len(got) != 28 {
-		t.Fatalf("len=%d want 28", len(got))
+	if len(got) != 29 {
+		t.Fatalf("len=%d want 29", len(got))
 	}
 	seen := map[string]struct{}{}
 	for _, n := range got {
@@ -247,8 +247,8 @@ func TestReviewReadTools_exact28(t *testing.T) {
 		}
 		seen[n] = struct{}{}
 	}
-	if len(ProfileTools("review_write")) != 28 {
-		t.Fatal("review_write must share 28 ceiling")
+	if len(ProfileTools("review_write")) != 29 {
+		t.Fatal("review_write must share 29 ceiling")
 	}
 	if ProfileTools("nope") != nil {
 		t.Fatal("unknown profile ceiling must be nil")
