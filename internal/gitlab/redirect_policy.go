@@ -2,6 +2,7 @@ package gitlab
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -12,7 +13,14 @@ import (
 // to the authorized canonical project/path/ref (immutable commit SHA).
 var ErrRawProvenance = fmt.Errorf("raw_provenance")
 
+// ErrExactReadRedirect is returned when an opt-in exact-read request would
+// follow a hop whose origin, escaped path, or query is not the original request.
+// The hop is refused before the destination is contacted.
+var ErrExactReadRedirect = errors.New("exact_read_redirect")
+
 type rawProvenanceKey struct{}
+
+type exactReadKey struct{}
 
 // RawProvenance activates immutable raw redirect/response binding on a request
 // context. Opt-in only; legacy tools leave the context unset so safeCheckRedirect
@@ -27,6 +35,23 @@ func WithRawProvenance(ctx context.Context, p RawProvenance) context.Context {
 		ctx = context.Background()
 	}
 	return context.WithValue(ctx, rawProvenanceKey{}, p)
+}
+
+// WithExactReadProvenance opts this context's redirects into exact URL identity.
+// Legacy callers leave the marker unset. RawProvenance is unchanged.
+func WithExactReadProvenance(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, exactReadKey{}, true)
+}
+
+func exactReadFromContext(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	on, _ := ctx.Value(exactReadKey{}).(bool)
+	return on
 }
 
 func rawProvenanceFromContext(ctx context.Context) (RawProvenance, bool) {
@@ -52,6 +77,10 @@ func SafeCheckRedirectForTest(req *http.Request, via []*http.Request) error {
 // preserve the trusted original request's exact origin, escaped path, and sole
 // ref=<verifiedSHA> query. Exact same authorized URL hops remain allowed and
 // still charge every hop via the budget transport.
+//
+// When exact-read provenance is present, a hop must keep the original origin,
+// escaped path, and exact query before it is followed. Unset leaves legacy
+// redirect behavior unchanged.
 func safeCheckRedirect(req *http.Request, via []*http.Request) error {
 	if len(via) >= 10 {
 		return fmt.Errorf("stopped after 10 redirects")
@@ -76,7 +105,48 @@ func safeCheckRedirect(req *http.Request, via []*http.Request) error {
 			return err
 		}
 	}
+	if exactReadFromContext(req.Context()) {
+		if err := bindExactReadURL(orig.URL, req.URL); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// bindExactReadURL refuses a hop unless origin, escaped path, and raw query
+// match the request that was authorized. It does not apply the raw-file sole-ref rule.
+func bindExactReadURL(authorized, next *url.URL) error {
+	if authorized == nil || next == nil {
+		return fmt.Errorf("%w: missing url", ErrExactReadRedirect)
+	}
+	if crossOrigin(authorized, next) {
+		return fmt.Errorf("%w: cross-origin redirect", ErrExactReadRedirect)
+	}
+	if userinfo(authorized) != userinfo(next) {
+		return fmt.Errorf("%w: userinfo changed", ErrExactReadRedirect)
+	}
+	authPath := trustedEscapedPath(authorized)
+	nextPath := trustedEscapedPath(next)
+	if authPath == "" || nextPath == "" || authPath != nextPath {
+		return fmt.Errorf("%w: path changed", ErrExactReadRedirect)
+	}
+	if _, err := url.ParseQuery(authorized.RawQuery); err != nil {
+		return fmt.Errorf("%w: malformed query", ErrExactReadRedirect)
+	}
+	if _, err := url.ParseQuery(next.RawQuery); err != nil {
+		return fmt.Errorf("%w: malformed query", ErrExactReadRedirect)
+	}
+	if authorized.RawQuery != next.RawQuery {
+		return fmt.Errorf("%w: query changed", ErrExactReadRedirect)
+	}
+	return nil
+}
+
+func userinfo(u *url.URL) string {
+	if u == nil || u.User == nil {
+		return ""
+	}
+	return u.User.String()
 }
 
 // bindRawURL requires next to match the trusted authorized request identity:

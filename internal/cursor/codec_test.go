@@ -606,3 +606,212 @@ func TestQueueCont_rejectsBadCandidatesKeysBitsAndProgress(t *testing.T) {
 		})
 	}
 }
+
+func observedLive(p Payload) ReviewLiveRefs {
+	c := p.ContextRef
+	return ReviewLiveRefs{
+		OwnerProjectID: c.OwnerProjectID, SourceProjectID: c.SourceProjectID, TargetProjectID: c.TargetProjectID,
+		SourceBranch: c.SourceBranch, TargetBranch: c.TargetBranch,
+		SourceSHA: c.SourceSHA, TargetSHA: c.TargetSHA, VersionID: c.VersionID,
+		VersionHead: c.VersionHead, VersionBase: c.VersionBase, VersionStart: c.VersionStart,
+	}
+}
+
+func reviewContextPayload(now time.Time) Payload {
+	iid := int64(7)
+	head := strings.Repeat("a", 40)
+	base := strings.Repeat("b", 40)
+	start := strings.Repeat("c", 40)
+	target := strings.Repeat("d", 40)
+	ret := now.UTC().Format(time.RFC3339)
+	return Payload{
+		SchemaVersion: SchemaV1,
+		Instance:      "https://gitlab.example/api/v4",
+		ActorID:       7,
+		PolicyFP:      "policyfp",
+		Tool:          ToolReviewContext,
+		Section:       SectionReviewContext,
+		Scope:         Scope{Kind: ScopeReviewContext, ProjectID: "42", MergeRequestIID: &iid},
+		Filters:       Filters{Selection: "metadata", Until: ret, PerPage: 1},
+		UpperBound:    ret,
+		ExpiresAt:     now.UTC().Add(DefaultTTL).Format(time.RFC3339),
+		ContextRef: &ContextRef{
+			OwnerProjectID: 42, SourceProjectID: 42, TargetProjectID: 43,
+			SourceBranch: "feature", TargetBranch: "main",
+			SourceSHA: head, TargetSHA: target, VersionID: 5,
+			VersionHead: head, VersionBase: base, VersionStart: start,
+			Requested: []string{"metadata"}, Complete: []string{"metadata"}, Excluded: []string{},
+			Digests:           map[string]string{"metadata": strings.Repeat("ab", 32)},
+			RetrievedAt:       ret,
+			WriteFreshUntil:   now.UTC().Add(ReviewWriteFresh).Format(time.RFC3339),
+			BracketConsistent: true,
+		},
+	}
+}
+
+func TestReviewContextToken(t *testing.T) {
+	key := []byte("0123456789abcdef0123456789abcdef")
+	now := time.Date(2026, 10, 4, 12, 0, 0, 0, time.UTC)
+	p := reviewContextPayload(now)
+	tok, err := Encode(key, p)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	got, err := Decode(key, tok, now)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if err := VerifyContextBinding(got, p.Instance, p.ActorID, p.PolicyFP, p.Tool, p.Section, p.Scope, p.Filters, p.UpperBound, observedLive(p), []string{"metadata"}); err != nil {
+		t.Fatalf("verify metadata: %v", err)
+	}
+	if err := VerifyContextBinding(got, p.Instance, p.ActorID, p.PolicyFP, p.Tool, p.Section, p.Scope, p.Filters, p.UpperBound, observedLive(p), []string{"approvals"}); err == nil {
+		t.Fatal("metadata-only token satisfied an approvals demand")
+	}
+	if err := VerifyContextBinding(got, p.Instance, p.ActorID, p.PolicyFP, p.Tool, p.Section, p.Scope, p.Filters, p.UpperBound, observedLive(p), []string{"metadata", "approvals"}); err == nil {
+		t.Fatal("metadata-only token satisfied a full review demand")
+	}
+	if ContextWriteFresh(got, now.Add(ReviewWriteFresh)) {
+		t.Fatal("write freshness must be exclusive at the boundary")
+	}
+	if !ContextWriteFresh(got, now.Add(time.Minute)) {
+		t.Fatal("write freshness inside the window")
+	}
+	if err := VerifyContextBinding(got, p.Instance, 8, p.PolicyFP, p.Tool, p.Section, p.Scope, p.Filters, p.UpperBound, observedLive(p), []string{"metadata"}); err == nil {
+		t.Fatal("actor mismatch")
+	}
+
+	bad := []struct {
+		name string
+		mut  func(*Payload)
+	}{
+		{"overlap", func(p *Payload) {
+			p.ContextRef.Excluded = []string{"metadata"}
+			p.ContextRef.Requested = []string{"metadata"}
+		}},
+		{"excluded digest", func(p *Payload) {
+			p.ContextRef.Digests["approvals"] = strings.Repeat("cd", 32)
+		}},
+		{"unsupported complete", func(p *Payload) {
+			p.ContextRef.Complete = []string{"unsupported"}
+			p.ContextRef.Requested = []string{"unsupported"}
+			p.ContextRef.Excluded = []string{}
+			p.ContextRef.Digests = map[string]string{"unsupported": strings.Repeat("ab", 32)}
+			p.Filters.Selection = "unsupported"
+		}},
+		{"non-positive iid", func(p *Payload) {
+			zero := int64(0)
+			p.Scope.MergeRequestIID = &zero
+		}},
+		{"bracket false with complete", func(p *Payload) { p.ContextRef.BracketConsistent = false }},
+		{"owner id", func(p *Payload) { p.ContextRef.OwnerProjectID = 0 }},
+		{"source id", func(p *Payload) { p.ContextRef.SourceProjectID = 0 }},
+		{"target id", func(p *Payload) { p.ContextRef.TargetProjectID = 0 }},
+		{"version id", func(p *Payload) { p.ContextRef.VersionID = 0 }},
+		{"scope project", func(p *Payload) { p.Scope.ProjectID = "99" }},
+		{"blank source branch", func(p *Payload) { p.ContextRef.SourceBranch = "  " }},
+		{"padded source branch", func(p *Payload) { p.ContextRef.SourceBranch = " feature" }},
+		{"blank target branch", func(p *Payload) { p.ContextRef.TargetBranch = "" }},
+		{"padded target branch", func(p *Payload) { p.ContextRef.TargetBranch = "main " }},
+		{"source sha", func(p *Payload) { p.ContextRef.SourceSHA = "abc"; p.ContextRef.VersionHead = "abc" }},
+		{"target sha", func(p *Payload) { p.ContextRef.TargetSHA = strings.Repeat("A", 40) }},
+		{"version base", func(p *Payload) { p.ContextRef.VersionBase = strings.Repeat("g", 40) }},
+		{"version start", func(p *Payload) { p.ContextRef.VersionStart = "" }},
+		{"head differs from source", func(p *Payload) { p.ContextRef.VersionHead = strings.Repeat("e", 40) }},
+		{"unsorted mask", func(p *Payload) {
+			p.ContextRef.Requested = []string{"metadata", "approvals"}
+			p.ContextRef.Complete = []string{"approvals"}
+			p.ContextRef.Excluded = []string{"metadata"}
+			p.ContextRef.Digests = map[string]string{"approvals": strings.Repeat("ab", 32)}
+			p.Filters.Selection = "metadata,approvals"
+		}},
+		{"duplicate complete", func(p *Payload) {
+			p.ContextRef.Requested = []string{"metadata"}
+			p.ContextRef.Complete = []string{"metadata", "metadata"}
+			p.ContextRef.Excluded = []string{}
+		}},
+		{"union short", func(p *Payload) {
+			p.ContextRef.Requested = []string{"approvals", "metadata"}
+			p.ContextRef.Complete = []string{"metadata"}
+			p.ContextRef.Excluded = []string{}
+			p.Filters.Selection = "approvals,metadata"
+		}},
+		{"digest shape", func(p *Payload) { p.ContextRef.Digests["metadata"] = "zz" }},
+		{"missing digest", func(p *Payload) { p.ContextRef.Digests = map[string]string{} }},
+		{"retrieved at", func(p *Payload) { p.ContextRef.RetrievedAt = "yesterday" }},
+		{"write fresh", func(p *Payload) { p.ContextRef.WriteFreshUntil = "tomorrow" }},
+		{"expires window", func(p *Payload) { p.ExpiresAt = now.Add(time.Hour).UTC().Format(time.RFC3339) }},
+		{"upper bound", func(p *Payload) { p.UpperBound = now.Add(time.Minute).UTC().Format(time.RFC3339) }},
+		{"selection", func(p *Payload) { p.Filters.Selection = "approvals" }},
+		{"immutable refs", func(p *Payload) { p.ImmutableRefs = []string{strings.Repeat("a", 40)} }},
+		{"per page", func(p *Payload) { p.Filters.PerPage = 2 }},
+		{"nil ref", func(p *Payload) { p.ContextRef = nil }},
+		{"group scope", func(p *Payload) { p.Scope.GroupID = "9" }},
+		{"pipeline scope", func(p *Payload) {
+			id := int64(9)
+			p.Scope.PipelineID = &id
+		}},
+		{"page state", func(p *Payload) { p.PageState.Page = 1 }},
+	}
+	for _, tc := range bad {
+		t.Run(tc.name, func(t *testing.T) {
+			cp := reviewContextPayload(now)
+			tc.mut(&cp)
+			if _, err := Encode(key, cp); err == nil {
+				t.Fatal("expected reject")
+			}
+			raw, err := json.Marshal(cp)
+			if err != nil {
+				t.Fatal(err)
+			}
+			signed := signRaw(t, key, raw)
+			if _, err := Decode(key, signed, now); !errorsIsResync(err) {
+				t.Fatalf("hmac-valid semantic reject: %v", err)
+			}
+		})
+	}
+
+	fresh := reviewContextPayload(now)
+	fresh.ContextRef.WriteFreshUntil = now.Add(3 * time.Hour).UTC().Format(time.RFC3339)
+	raw, err := json.Marshal(fresh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Decode(key, signRaw(t, key, raw), now); !errorsIsResync(err) {
+		t.Fatal("freshness after expiry must fail")
+	}
+	corrupt := tok[:len(tok)-1] + "A"
+	if _, err := Decode(key, corrupt, now); !errorsIsResync(err) {
+		t.Fatal("corrupt hmac")
+	}
+	if _, err := Decode(key, tok, now.Add(DefaultTTL)); !errorsIsResync(err) {
+		t.Fatal("expired token")
+	}
+
+	legacyNow := time.Date(2026, 10, 3, 13, 0, 0, 0, time.UTC)
+	legacy := basePayload()
+	ltok, err := Encode(key, legacy)
+	if err != nil {
+		t.Fatalf("list_commits: %v", err)
+	}
+	if _, err := Decode(key, ltok, legacyNow); err != nil {
+		t.Fatalf("list_commits round trip: %v", err)
+	}
+	pipe := int64(55)
+	pipePayload := basePayload()
+	pipePayload.Scope = Scope{Kind: ScopePipeline, ProjectID: "1", PipelineID: &pipe}
+	ptok, err := Encode(key, pipePayload)
+	if err != nil {
+		t.Fatalf("pipeline: %v", err)
+	}
+	if _, err := Decode(key, ptok, legacyNow); err != nil {
+		t.Fatalf("pipeline round trip: %v", err)
+	}
+	qp := queuePayloadOK()
+	qtok, err := Encode(key, qp)
+	if err != nil {
+		t.Fatalf("rq2: %v", err)
+	}
+	if _, err := Decode(key, qtok, legacyNow); err != nil {
+		t.Fatalf("rq2 round trip: %v", err)
+	}
+}

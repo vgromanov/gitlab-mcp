@@ -38,6 +38,12 @@ const (
 	SectionReviewQueue = "review_queue"
 	// QueueContSchemaRQ2 is the locked typed queue continuation schema.
 	QueueContSchemaRQ2 = "rq2"
+	// ToolReviewContext is the batch review-context aggregate tool binding.
+	ToolReviewContext = "get_merge_request_review_context"
+	// SectionReviewContext is the review-context token section binding.
+	SectionReviewContext = "review_context"
+	// ReviewWriteFresh is the absolute write-freshness window from retrieved_at.
+	ReviewWriteFresh = 5 * time.Minute
 	// ResyncRequired is the uniform fail-closed continuation error token.
 	ResyncRequired = "resync_required"
 	// MaxImmutableRefs caps plural immutable ref bindings (e.g. MR base+head).
@@ -50,10 +56,20 @@ const (
 type ScopeKind string
 
 const (
-	ScopeProject    ScopeKind = "project"
-	ScopeGroupQueue ScopeKind = "group_queue"
-	ScopePipeline   ScopeKind = "pipeline"
+	ScopeProject       ScopeKind = "project"
+	ScopeGroupQueue    ScopeKind = "group_queue"
+	ScopePipeline      ScopeKind = "pipeline"
+	ScopeReviewContext ScopeKind = "review_context"
 )
+
+// ReviewContextSections is the closed section vocabulary for a review-context token.
+var ReviewContextSections = []string{
+	"metadata",
+	"approvals",
+	"discussions",
+	"pipeline_graph",
+	"diff_manifest",
+}
 
 // ErrResyncRequired is returned for tamper/expiry/rotation/binding/malformed failures.
 var ErrResyncRequired = errors.New(ResyncRequired)
@@ -121,19 +137,43 @@ type Scope struct {
 // while list_commits pins a single tip SHA as a one-element slice.
 // QueueCont is omitempty and valid only for group_queue + review-queue tool/section.
 type Payload struct {
-	SchemaVersion string     `json:"schema_version"`
-	Instance      string     `json:"instance"`
-	ActorID       int64      `json:"actor_id"`
-	PolicyFP      string     `json:"policy_fingerprint"`
-	Tool          string     `json:"tool"`
-	Section       string     `json:"section"`
-	Scope         Scope      `json:"scope"`
-	Filters       Filters    `json:"filters"`
-	ImmutableRefs []string   `json:"immutable_refs"`
-	UpperBound    string     `json:"upper_bound"`
-	ExpiresAt     string     `json:"expires_at"`
-	PageState     PageState  `json:"page_state"`
-	QueueCont     *QueueCont `json:"queue_cont,omitempty"`
+	SchemaVersion string      `json:"schema_version"`
+	Instance      string      `json:"instance"`
+	ActorID       int64       `json:"actor_id"`
+	PolicyFP      string      `json:"policy_fingerprint"`
+	Tool          string      `json:"tool"`
+	Section       string      `json:"section"`
+	Scope         Scope       `json:"scope"`
+	Filters       Filters     `json:"filters"`
+	ImmutableRefs []string    `json:"immutable_refs"`
+	UpperBound    string      `json:"upper_bound"`
+	ExpiresAt     string      `json:"expires_at"`
+	PageState     PageState   `json:"page_state"`
+	QueueCont     *QueueCont  `json:"queue_cont,omitempty"`
+	ContextRef    *ContextRef `json:"context_ref,omitempty"`
+}
+
+// ContextRef is one merge request's signed review evidence.
+// It is not a batch scope and does not claim a sibling was read.
+type ContextRef struct {
+	OwnerProjectID    int64             `json:"owner_project_id"`
+	SourceProjectID   int64             `json:"source_project_id"`
+	TargetProjectID   int64             `json:"target_project_id"`
+	SourceBranch      string            `json:"source_branch"`
+	TargetBranch      string            `json:"target_branch"`
+	SourceSHA         string            `json:"source_sha"`
+	TargetSHA         string            `json:"target_sha"`
+	VersionID         int64             `json:"version_id"`
+	VersionHead       string            `json:"version_head"`
+	VersionBase       string            `json:"version_base"`
+	VersionStart      string            `json:"version_start"`
+	Requested         []string          `json:"requested"`
+	Complete          []string          `json:"complete"`
+	Excluded          []string          `json:"excluded"`
+	Digests           map[string]string `json:"digests"`
+	RetrievedAt       string            `json:"retrieved_at"`
+	WriteFreshUntil   string            `json:"write_fresh_until"`
+	BracketConsistent bool              `json:"bracket_consistent"`
 }
 
 // QueueCont is the typed rq2 continuation for the review-queue aggregate.
@@ -314,10 +354,24 @@ func validatePayload(p *Payload) error {
 	}
 
 	isQueue := p.Scope.Kind == ScopeGroupQueue && p.Tool == ToolReviewQueue && p.Section == SectionReviewQueue
+	isReview := p.Scope.Kind == ScopeReviewContext && p.Tool == ToolReviewContext && p.Section == SectionReviewContext
 	if p.QueueCont != nil && !isQueue {
 		return ErrResyncRequired
 	}
-	if isQueue {
+	if p.ContextRef != nil && !isReview {
+		return ErrResyncRequired
+	}
+	if isReview {
+		if len(p.ImmutableRefs) != 0 || p.Filters.PerPage != 1 {
+			return ErrResyncRequired
+		}
+		if err := validateQueuePageStateEmpty(p.PageState); err != nil {
+			return err
+		}
+		if err := validateContextRef(p); err != nil {
+			return err
+		}
+	} else if isQueue {
 		if len(p.ImmutableRefs) != 0 {
 			return ErrResyncRequired
 		}
@@ -366,6 +420,16 @@ func validatePayload(p *Payload) error {
 			return ErrResyncRequired
 		}
 		if p.Scope.GroupID != "" || p.Scope.MergeRequestIID != nil {
+			return ErrResyncRequired
+		}
+	case ScopeReviewContext:
+		if !isReview {
+			return ErrResyncRequired
+		}
+		if strings.TrimSpace(p.Scope.ProjectID) == "" || p.Scope.MergeRequestIID == nil || *p.Scope.MergeRequestIID < 1 {
+			return ErrResyncRequired
+		}
+		if p.Scope.GroupID != "" || p.Scope.PipelineID != nil {
 			return ErrResyncRequired
 		}
 	default:
@@ -774,6 +838,226 @@ func SequenceDigest(shas []string) string {
 		_, _ = h.Write([]byte(strings.TrimSpace(s)))
 	}
 	return fmt.Sprintf("%x", h.Sum(nil))
+}
+
+func validateContextRef(p *Payload) error {
+	if p == nil || p.ContextRef == nil {
+		return ErrResyncRequired
+	}
+	ref := p.ContextRef
+	if ref.OwnerProjectID < 1 || ref.SourceProjectID < 1 || ref.TargetProjectID < 1 || ref.VersionID < 1 {
+		return ErrResyncRequired
+	}
+	if p.Scope.ProjectID != strconv.FormatInt(ref.OwnerProjectID, 10) {
+		return ErrResyncRequired
+	}
+	if strings.TrimSpace(ref.SourceBranch) == "" || ref.SourceBranch != strings.TrimSpace(ref.SourceBranch) {
+		return ErrResyncRequired
+	}
+	if strings.TrimSpace(ref.TargetBranch) == "" || ref.TargetBranch != strings.TrimSpace(ref.TargetBranch) {
+		return ErrResyncRequired
+	}
+	if !isGitSHA(ref.SourceSHA) || !isGitSHA(ref.TargetSHA) || !isGitSHA(ref.VersionHead) || !isGitSHA(ref.VersionBase) || !isGitSHA(ref.VersionStart) {
+		return ErrResyncRequired
+	}
+	if ref.SourceSHA != ref.VersionHead {
+		return ErrResyncRequired
+	}
+	if !ref.BracketConsistent || len(ref.Complete) == 0 {
+		return ErrResyncRequired
+	}
+	if !validSectionMask(ref.Requested) || !validCompleteMask(ref.Complete) || !validSectionMask(ref.Excluded) {
+		return ErrResyncRequired
+	}
+	seen := map[string]struct{}{}
+	for _, name := range ref.Complete {
+		if _, ok := seen[name]; ok {
+			return ErrResyncRequired
+		}
+		seen[name] = struct{}{}
+	}
+	for _, name := range ref.Excluded {
+		if _, ok := seen[name]; ok {
+			return ErrResyncRequired
+		}
+		seen[name] = struct{}{}
+	}
+	if len(seen) != len(ref.Requested) {
+		return ErrResyncRequired
+	}
+	for _, name := range ref.Requested {
+		if _, ok := seen[name]; !ok {
+			return ErrResyncRequired
+		}
+		delete(seen, name)
+	}
+	if len(seen) != 0 {
+		return ErrResyncRequired
+	}
+	if len(ref.Digests) != len(ref.Complete) {
+		return ErrResyncRequired
+	}
+	for _, name := range ref.Complete {
+		sum, ok := ref.Digests[name]
+		if !ok || !isHexSHA256(sum) {
+			return ErrResyncRequired
+		}
+	}
+	for name := range ref.Digests {
+		if !containsString(ref.Complete, name) {
+			return ErrResyncRequired
+		}
+	}
+	ret, err := time.Parse(time.RFC3339, ref.RetrievedAt)
+	if err != nil {
+		return ErrResyncRequired
+	}
+	fresh, err := time.Parse(time.RFC3339, ref.WriteFreshUntil)
+	if err != nil {
+		return ErrResyncRequired
+	}
+	exp, err := time.Parse(time.RFC3339, p.ExpiresAt)
+	if err != nil {
+		return ErrResyncRequired
+	}
+	if p.UpperBound != ref.RetrievedAt || p.Filters.Selection != strings.Join(ref.Requested, ",") {
+		return ErrResyncRequired
+	}
+	if !fresh.Equal(ret.Add(ReviewWriteFresh)) || !exp.Equal(ret.Add(DefaultTTL)) || !fresh.Before(exp) {
+		return ErrResyncRequired
+	}
+	return nil
+}
+
+func validSectionMask(names []string) bool {
+	return validNameMask(names, reviewSectionName)
+}
+
+func validCompleteMask(names []string) bool {
+	return validNameMask(names, reviewCompleteEvidence)
+}
+
+func validNameMask(names []string, allow func(string) bool) bool {
+	if names == nil {
+		return false
+	}
+	for i, name := range names {
+		if !allow(name) {
+			return false
+		}
+		if i > 0 && names[i] <= names[i-1] {
+			return false
+		}
+	}
+	return true
+}
+
+func reviewSectionName(name string) bool {
+	switch name {
+	case "metadata", "approvals", "discussions", "pipeline_graph", "diff_manifest":
+		return true
+	default:
+		return false
+	}
+}
+
+func reviewCompleteEvidence(name string) bool {
+	return name == "metadata" || name == "approvals"
+}
+
+// ReviewLiveRefs is an independently observed provenance tuple.
+// A zero value is not an observation and fails closed.
+type ReviewLiveRefs struct {
+	OwnerProjectID  int64
+	SourceProjectID int64
+	TargetProjectID int64
+	SourceBranch    string
+	TargetBranch    string
+	SourceSHA       string
+	TargetSHA       string
+	VersionID       int64
+	VersionHead     string
+	VersionBase     string
+	VersionStart    string
+}
+
+func (r ReviewLiveRefs) proved() bool {
+	if r.OwnerProjectID < 1 || r.SourceProjectID < 1 || r.TargetProjectID < 1 || r.VersionID < 1 {
+		return false
+	}
+	if r.SourceBranch == "" || r.SourceBranch != strings.TrimSpace(r.SourceBranch) {
+		return false
+	}
+	if r.TargetBranch == "" || r.TargetBranch != strings.TrimSpace(r.TargetBranch) {
+		return false
+	}
+	if !isGitSHA(r.SourceSHA) || !isGitSHA(r.TargetSHA) || !isGitSHA(r.VersionHead) || !isGitSHA(r.VersionBase) || !isGitSHA(r.VersionStart) {
+		return false
+	}
+	return r.SourceSHA == r.VersionHead
+}
+
+func containsString(ss []string, want string) bool {
+	for _, s := range ss {
+		if s == want {
+			return true
+		}
+	}
+	return false
+}
+
+func isGitSHA(s string) bool {
+	if len(s) != 40 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= '0' && c <= '9':
+		case c >= 'a' && c <= 'f':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// VerifyContextBinding checks a decoded review-context token against the live
+// caller binding, an independently supplied provenance tuple, and the demanded
+// complete sections. It performs no I/O. A missing observation fails closed.
+// A metadata-only token fails a demand for approvals.
+func VerifyContextBinding(p Payload, instance string, actorID int64, policyFP, tool, section string, scope Scope, filters Filters, upperBound string, live ReviewLiveRefs, demand []string) error {
+	if err := MatchBinding(p, instance, actorID, policyFP, tool, section, scope, filters, nil, upperBound); err != nil {
+		return err
+	}
+	if p.ContextRef == nil || !p.ContextRef.BracketConsistent || len(demand) == 0 || !live.proved() {
+		return ErrResyncRequired
+	}
+	ref := p.ContextRef
+	if ref.OwnerProjectID != live.OwnerProjectID || ref.SourceProjectID != live.SourceProjectID || ref.TargetProjectID != live.TargetProjectID ||
+		ref.SourceBranch != live.SourceBranch || ref.TargetBranch != live.TargetBranch ||
+		ref.SourceSHA != live.SourceSHA || ref.TargetSHA != live.TargetSHA ||
+		ref.VersionID != live.VersionID || ref.VersionHead != live.VersionHead || ref.VersionBase != live.VersionBase || ref.VersionStart != live.VersionStart {
+		return ErrResyncRequired
+	}
+	for _, name := range demand {
+		if !containsString(ref.Complete, name) {
+			return ErrResyncRequired
+		}
+	}
+	return nil
+}
+
+// ContextWriteFresh reports whether now is still inside the token's absolute write window.
+func ContextWriteFresh(p Payload, now time.Time) bool {
+	if p.ContextRef == nil {
+		return false
+	}
+	fresh, err := time.Parse(time.RFC3339, p.ContextRef.WriteFreshUntil)
+	if err != nil {
+		return false
+	}
+	return now.UTC().Before(fresh.UTC())
 }
 
 // MatchBinding compares resume request bindings against a decoded payload.
