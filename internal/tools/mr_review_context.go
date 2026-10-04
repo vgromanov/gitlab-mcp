@@ -40,11 +40,13 @@ type reviewContextCursorIn struct {
 }
 
 type reviewContextItemIn struct {
-	ProjectID       string                  `json:"project_id"`
-	MergeRequestIID int64                   `json:"merge_request_iid"`
-	ExpectedHead    *string                 `json:"expected_head,omitempty"`
-	Sections        []string                `json:"sections"`
-	Cursors         []reviewContextCursorIn `json:"cursors,omitempty"`
+	ProjectID           string                  `json:"project_id"`
+	MergeRequestIID     int64                   `json:"merge_request_iid"`
+	ExpectedHead        *string                 `json:"expected_head,omitempty"`
+	Sections            []string                `json:"sections"`
+	Cursors             []reviewContextCursorIn `json:"cursors,omitempty"`
+	DiscussionSelection discussionSelection     `json:"discussion_selection,omitempty" jsonschema:"semantic or all; omit for semantic"`
+	discResume          *cursor.Payload         `json:"-"`
 }
 
 type getMergeRequestReviewContextIn struct {
@@ -87,6 +89,7 @@ type reviewContextItemOut struct {
 	Metadata                 *metadataOut                `json:"metadata"`
 	Approvals                *mrApprovalReadResult       `json:"approvals"`
 	ApprovalDigest           *string                     `json:"approval_digest,omitempty"`
+	Discussions              *discussionsView            `json:"discussions,omitempty"`
 	Sections                 map[string]readmeta.Section `json:"sections"`
 	Cause                    string                      `json:"cause,omitempty"`
 }
@@ -114,16 +117,19 @@ type reviewBracket struct {
 }
 
 type reviewRuntime struct {
-	d         Deps
-	ctx       context.Context
-	budget    *igl.Budget
-	actorID   int64
-	instance  string
-	policyFP  string
-	now       time.Time
-	projects  map[int64]CanonicalProject
-	allowProj map[int64]struct{}
-	allowGrp  map[int64]struct{}
+	d            Deps
+	ctx          context.Context
+	budget       *igl.Budget
+	actorID      int64
+	instance     string
+	policyFP     string
+	now          time.Time
+	elapsed      time.Duration
+	fail         error
+	discDeadline time.Time
+	projects     map[int64]CanonicalProject
+	allowProj    map[int64]struct{}
+	allowGrp     map[int64]struct{}
 }
 
 func registerMergeRequestReviewContext(s *mcp.Server, d Deps) {
@@ -162,7 +168,7 @@ func getMergeRequestReviewContext(ctx context.Context, _ *mcp.CallToolRequest, i
 	}
 	rt := &reviewRuntime{
 		d: d, ctx: ctx, budget: budget, actorID: actor, instance: instance,
-		policyFP: d.Config.PolicyFingerprint(), now: d.now(),
+		policyFP: d.Config.PolicyFingerprint(), now: d.now(), elapsed: elapsed,
 		projects: map[int64]CanonicalProject{},
 	}
 	if err := rt.loadAllowlist(); err != nil {
@@ -171,6 +177,9 @@ func getMergeRequestReviewContext(ctx context.Context, _ *mcp.CallToolRequest, i
 	out := reviewContextOut{AtomicSnapshot: false, SignatureAttestsReview: false}
 	for _, item := range norm {
 		out.Items = append(out.Items, rt.one(item))
+		if rt.fail != nil {
+			return nil, nil, rt.fail
+		}
 	}
 	return nil, out, nil
 }
@@ -240,6 +249,11 @@ func normalizeReviewContextInput(in getMergeRequestReviewContextIn) ([]reviewCon
 		}
 		sort.Strings(sections)
 		item.Sections = sections
+		switch string(item.DiscussionSelection) {
+		case "", "semantic", "all":
+		default:
+			return nil, 0, reviewCaps{}, fmt.Errorf("discussion_selection must be semantic or all")
+		}
 		for _, c := range item.Cursors {
 			if strings.TrimSpace(c.Cursor) != c.Cursor || strings.TrimSpace(c.Section) != c.Section {
 				return nil, 0, reviewCaps{}, fmt.Errorf("%s: malformed cursor", cursor.ResyncRequired)
@@ -260,16 +274,39 @@ func reviewSectionAllowed(name string) bool {
 }
 
 func rejectReviewCursors(d Deps, items []reviewContextItemIn, now time.Time) error {
-	for _, item := range items {
+	for i, item := range items {
+		var resume *cursor.Payload
 		for _, c := range item.Cursors {
 			if c.Cursor == "" {
 				continue
 			}
-			if _, err := cursor.Decode(d.Config.CursorKey, c.Cursor, now); err != nil {
+			if strings.TrimSpace(c.Cursor) != c.Cursor || strings.TrimSpace(c.Section) != c.Section {
+				return fmt.Errorf("%s: malformed cursor", cursor.ResyncRequired)
+			}
+			decoded, err := cursor.Decode(d.Config.CursorKey, c.Cursor, now)
+			if err != nil {
 				return fmt.Errorf("%s: cursor validation failed", cursor.ResyncRequired)
 			}
-			return fmt.Errorf("%s: review context does not resume section cursors", cursor.ResyncRequired)
+			if decoded.Tool != cursor.ToolReviewContext || decoded.Section != cursor.SectionReviewDiscussions || decoded.DiscussionsCont == nil {
+				return fmt.Errorf("%s: review context does not resume section cursors", cursor.ResyncRequired)
+			}
+			if !itemWants(item, "discussions") || c.Section != "discussions" {
+				return fmt.Errorf("%s: review context does not resume section cursors", cursor.ResyncRequired)
+			}
+			if resume != nil {
+				return fmt.Errorf("%s: review context does not resume section cursors", cursor.ResyncRequired)
+			}
+			if decoded.Filters.Selection != itemDiscSelection(item) {
+				return fmt.Errorf("%s: discussion cursor selection", cursor.ResyncRequired)
+			}
+			if decoded.Scope.MergeRequestIID == nil || *decoded.Scope.MergeRequestIID != item.MergeRequestIID {
+				return fmt.Errorf("%s: discussion cursor binding", cursor.ResyncRequired)
+			}
+			copyDecoded := decoded
+			resume = &copyDecoded
 		}
+		item.discResume = resume
+		items[i] = item
 	}
 	return nil
 }
@@ -521,6 +558,7 @@ func (rt *reviewRuntime) one(item reviewContextItemIn) reviewContextItemOut {
 		ObservationalConsistency: readmeta.ConsistencyUnknown,
 		Sections:                 map[string]readmeta.Section{},
 	}
+	rt.discDeadline = time.Time{}
 	rt.fillUnsupported(item, &out)
 	defer rt.sealRequested(item, &out)
 	if err := rt.phaseErr("proof"); err != nil {
@@ -557,6 +595,11 @@ func (rt *reviewRuntime) one(item reviewContextItemIn) reviewContextItemOut {
 		return out
 	}
 	if !first.proved {
+		if item.discResume != nil {
+			rt.fail = fmt.Errorf("%s: discussion cursor", cursor.ResyncRequired)
+			out.Cause = cursor.ResyncRequired
+			return out
+		}
 		out.Cause = first.cause
 		out.ObservationalConsistency = first.consistency
 		if itemWants(item, "approvals") && first.cause != readmeta.CodeInconsistent {
@@ -578,10 +621,30 @@ func (rt *reviewRuntime) one(item reviewContextItemIn) reviewContextItemOut {
 			return out
 		}
 	}
+	if itemWants(item, "discussions") {
+		if err := rt.readDiscussions(item, owner, first.bracket, &out); err != nil {
+			if errors.Is(err, errDiscResync) {
+				rt.fail = fmt.Errorf("%s: discussion cursor", cursor.ResyncRequired)
+				out.Cause = cursor.ResyncRequired
+			}
+			rt.finalizeDiscBound(&out)
+			return out
+		}
+		if !rt.discDeadline.IsZero() {
+			parent := rt.ctx
+			child, cancel := discBoundContext(parent, rt.d.now(), rt.discDeadline)
+			rt.ctx = child
+			defer func() {
+				cancel()
+				rt.ctx = parent
+			}()
+		}
+	}
 	if err := rt.phaseErr("bracket"); err != nil {
 		out.Cause = reviewClassify(err)
 		out.ContextRef = nil
 		out.ReviewClean = false
+		rt.finalizeDiscBound(&out)
 		return out
 	}
 	secondDetail, cause2, consistency2, serr := rt.readDetail(owner, item.MergeRequestIID)
@@ -589,6 +652,7 @@ func (rt *reviewRuntime) one(item reviewContextItemIn) reviewContextItemOut {
 		out.Cause = causeOf(serr)
 		out.ContextRef = nil
 		out.Metadata = nil
+		rt.finalizeDiscBound(&out)
 		return out
 	}
 	if cause2 != "" || !sameBracketIdentity(first.bracket, secondDetail) {
@@ -603,6 +667,7 @@ func (rt *reviewRuntime) one(item reviewContextItemIn) reviewContextItemOut {
 		out.Metadata = nil
 		out.ContextRef = nil
 		rt.markSection(&out, "metadata", readmeta.ContentCompleteUnknown, out.ObservationalConsistency)
+		rt.finalizeDiscBound(&out)
 		return out
 	}
 	second, serr2 := rt.finishBracket(secondDetail, item.MergeRequestIID)
@@ -610,6 +675,7 @@ func (rt *reviewRuntime) one(item reviewContextItemIn) reviewContextItemOut {
 		out.Cause = causeOf(serr2)
 		out.ContextRef = nil
 		out.Metadata = nil
+		rt.finalizeDiscBound(&out)
 		return out
 	}
 	if !second.proved || !bracketsEqual(first.bracket, second.bracket) {
@@ -627,9 +693,14 @@ func (rt *reviewRuntime) one(item reviewContextItemIn) reviewContextItemOut {
 		out.Metadata = nil
 		out.ContextRef = nil
 		rt.markSection(&out, "metadata", readmeta.ContentCompleteUnknown, out.ObservationalConsistency)
+		rt.finalizeDiscBound(&out)
 		return out
 	}
 	agreed := second.bracket
+	rt.finalizeDiscBound(&out)
+	if itemWants(item, "discussions") {
+		finishDiscussionClaim(&out, agreed.Head)
+	}
 	match := expectedMatch(item.ExpectedHead, agreed.Head)
 	out.ExpectedHeadMatch = match
 	metaComplete := false
@@ -660,17 +731,17 @@ func (rt *reviewRuntime) one(item reviewContextItemIn) reviewContextItemOut {
 		if name == "metadata" || name == "approvals" {
 			continue
 		}
+		if name == "discussions" && out.Sections["discussions"].ContentComplete == readmeta.ContentCompleteTrue {
+			complete = append(complete, "discussions")
+			continue
+		}
 		excluded = append(excluded, name)
 	}
 	sort.Strings(complete)
 	sort.Strings(excluded)
-	clean := len(excluded) == 0 && len(complete) == len(item.Sections) && (match == nil || *match)
-	out.ReviewClean = clean
-	if clean {
-		out.ObservationalConsistency = readmeta.ConsistencyConsistent
-	} else if out.ObservationalConsistency == "" {
-		out.ObservationalConsistency = readmeta.ConsistencyUnknown
-	}
+	rt.finalizeDiscBound(&out)
+	complete, excluded = dropUnprovedDiscussions(item, &out, complete, excluded)
+	setReviewClean(&out, complete, excluded, match, len(item.Sections))
 	if len(complete) == 0 {
 		out.ContextRef = nil
 		return out
@@ -680,12 +751,21 @@ func (rt *reviewRuntime) one(item reviewContextItemIn) reviewContextItemOut {
 		out.Cause = reviewClassify(err)
 		out.ContextRef = nil
 		out.ReviewClean = false
+		rt.finalizeDiscBound(&out)
 		return out
 	}
 	if err := budgetAllowsNext(rt.ctx); err != nil {
 		out.Cause = causeOf(err)
 		out.ContextRef = nil
 		out.ReviewClean = false
+		rt.finalizeDiscBound(&out)
+		return out
+	}
+	rt.finalizeDiscBound(&out)
+	complete, excluded = dropUnprovedDiscussions(item, &out, complete, excluded)
+	setReviewClean(&out, complete, excluded, match, len(item.Sections))
+	if len(complete) == 0 {
+		out.ContextRef = nil
 		return out
 	}
 	ref, err := rt.mint(owner, item, agreed, complete, excluded, metaDigestOf(out))
@@ -693,10 +773,55 @@ func (rt *reviewRuntime) one(item reviewContextItemIn) reviewContextItemOut {
 		out.Cause = causeOf(err)
 		out.ContextRef = nil
 		out.ReviewClean = false
+		rt.finalizeDiscBound(&out)
 		return out
 	}
 	out.ContextRef = &ref
 	return out
+}
+
+func setReviewClean(out *reviewContextItemOut, complete, excluded []string, match *bool, sections int) {
+	if out == nil {
+		return
+	}
+	out.ReviewClean = len(excluded) == 0 && len(complete) == sections && (match == nil || *match)
+	if out.ReviewClean {
+		out.ObservationalConsistency = readmeta.ConsistencyConsistent
+	} else if out.ObservationalConsistency == "" {
+		out.ObservationalConsistency = readmeta.ConsistencyUnknown
+	}
+}
+
+func dropUnprovedDiscussions(item reviewContextItemIn, out *reviewContextItemOut, complete, excluded []string) ([]string, []string) {
+	if out == nil || !itemWants(item, "discussions") {
+		return complete, excluded
+	}
+	if out.Sections["discussions"].ContentComplete == readmeta.ContentCompleteTrue {
+		return complete, excluded
+	}
+	nextC := complete[:0]
+	seen := false
+	for _, name := range complete {
+		if name == "discussions" {
+			seen = true
+			continue
+		}
+		nextC = append(nextC, name)
+	}
+	complete = nextC
+	for _, name := range excluded {
+		if name == "discussions" {
+			sort.Strings(complete)
+			sort.Strings(excluded)
+			return complete, excluded
+		}
+	}
+	if seen || itemWants(item, "discussions") {
+		excluded = append(excluded, "discussions")
+	}
+	sort.Strings(complete)
+	sort.Strings(excluded)
+	return complete, excluded
 }
 
 type reviewMintHookKey struct{}
@@ -881,6 +1006,9 @@ func (rt *reviewRuntime) rawGET(path string, opt any) ([]byte, http.Header, erro
 	}
 	var buf bytes.Buffer
 	resp, err := rt.d.Client.Do(req, &buf)
+	if errors.Is(rt.ctx.Err(), context.DeadlineExceeded) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, igl.ErrBudgetElapsed) {
+		return nil, nil, fmt.Errorf("%s", readmeta.CodeBudgetElapsed)
+	}
 	if readErr := bodyCap.capturedReadErr(); readErr != nil {
 		return nil, nil, reviewTransportErr(readErr)
 	}
@@ -1184,6 +1312,11 @@ func metaDigestOf(out reviewContextItemOut) map[string]string {
 	}
 	if out.Approvals != nil && out.ApprovalDigest != nil && out.Approvals.Section.ContentComplete == readmeta.ContentCompleteTrue && out.Approvals.Section.Consistency == readmeta.ConsistencyConsistent {
 		dig["approvals"] = *out.ApprovalDigest
+	}
+	if out.Discussions != nil && out.Discussions.evidence != "" {
+		if sec, ok := out.Sections["discussions"]; ok && sec.ContentComplete == readmeta.ContentCompleteTrue && sec.Consistency == readmeta.ConsistencyConsistent {
+			dig["discussions"] = out.Discussions.evidence
+		}
 	}
 	return dig
 }

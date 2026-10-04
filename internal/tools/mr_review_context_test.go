@@ -91,6 +91,8 @@ type reviewScript struct {
 	sourceSHA           string
 	targetSHA           string
 	secondTgt           string
+	discussions         func(http.ResponseWriter, *http.Request)
+	discStatus          int
 }
 
 func (s *reviewScript) serve(w http.ResponseWriter, r *http.Request) {
@@ -134,6 +136,18 @@ func (s *reviewScript) serve(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, `{"rules":[]}`)
 	case strings.Contains(path, "/versions"):
 		s.writeVersions(w, r)
+	case strings.Contains(path, "/discussions"):
+		if s.discussions != nil {
+			s.discussions(w, r)
+			return
+		}
+		if s.discStatus != 0 {
+			w.WriteHeader(s.discStatus)
+			_, _ = io.WriteString(w, `{"message":"nope"}`)
+			return
+		}
+		w.Header().Set("X-Next-Page", "")
+		_, _ = io.WriteString(w, `[]`)
 	case strings.Contains(path, "/merge_requests/"):
 		s.writeDetail(w, r)
 	case strings.Contains(path, "/projects/"):
@@ -851,13 +865,17 @@ func TestReviewContext_registeredMatrix(t *testing.T) {
 		if ap["content_complete"] == readmeta.ContentCompleteTrue || ap["consistency"] == readmeta.ConsistencyConsistent {
 			t.Fatalf("approval promoted: %#v", ap)
 		}
-		for _, name := range []string{"discussions", "pipeline_graph", "diff_manifest"} {
+		for _, name := range []string{"pipeline_graph", "diff_manifest"} {
 			sec := asMap(t, asMap(t, item["sections"])[name])
 			if sec["content_complete"] != readmeta.ContentCompleteUnknown || sec["head_sha"] != nil || sec["next_cursor"] != nil {
 				t.Fatalf("%s filler: %#v", name, sec)
 			}
 		}
-		if log.count("/approval_state") != 1 {
+		disc := asMap(t, asMap(t, item["sections"])["discussions"])
+		if disc["content_complete"] == readmeta.ContentCompleteTrue || disc["next_cursor"] != nil {
+			t.Fatalf("semantic discussions must not be complete evidence: %#v", disc)
+		}
+		if log.count("/discussions") != 1 || log.count("/approval_state") != 1 {
 			t.Fatalf("approval calls %d", log.count("/approval_state"))
 		}
 	})

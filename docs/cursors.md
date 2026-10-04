@@ -112,10 +112,8 @@ only for complete sections. `retrieved_at + 5m` is `write_fresh_until`; `retriev
 structure. `VerifyContextBinding` checks the live instance, actor, policy, scope,
 and selection, then an independently supplied live ref tuple: owner, source, and
 target project ids and branches, source and target SHAs, and the version id,
-head, base, and start. A missing observation fails closed. Only `metadata` and
-`approvals` are complete evidence in this revision; `discussions`,
-`pipeline_graph`, and `diff_manifest` may be requested or excluded, and a token
-that marks one of them complete is rejected. A metadata-only token fails a
-demand for `approvals`. Missing `GITLAB_MCP_CURSOR_KEY`
+head, base, and start. A missing observation fails closed. `metadata`, `approvals`, and `discussions` are complete evidence. `discussions` is complete only when `Digests["discussions"]` is the SHA-256 of the `discussions.evidence.v1` bundle for one fresh exhaustive `all` walk. `pipeline_graph` and `diff_manifest` may be requested or excluded, and a token that marks either complete is rejected. A metadata-only token fails a demand for `approvals`. Missing `GITLAB_MCP_CURSOR_KEY`
 is the same class of configuration error as the queue. The signature does not
 attest that a human reviewed the change.
+
+`dc1` continues `get_merge_request_review_context` section `discussions` on a project scope and IID. It is not a context ref: `context_ref` is nil, `page_state` is empty, `per_page` is 20, order is `provider`, and selection is `semantic` or `all`. Five immutable refs are source, target, version head, base, and start, with source equal to version head. `upper_bound` and `until` are the reconciliation deadline copied forward. `expires_at` is the first page's `now+2h`, copied forward. Fields `p`, `di`, `ni`, `did`, `dp`, and `nd` store the next discussion and note coordinates and prefix hashes only, never bodies or timestamps. Resume re-reads the bracket and those refs before a discussions GET. A resumed tail never mints `Digests["discussions"]`.
