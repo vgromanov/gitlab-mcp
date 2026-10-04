@@ -739,15 +739,9 @@ func (rt *reviewRuntime) one(item reviewContextItemIn) reviewContextItemOut {
 	}
 	sort.Strings(complete)
 	sort.Strings(excluded)
-	clean := len(excluded) == 0 && len(complete) == len(item.Sections) && (match == nil || *match)
-	out.ReviewClean = clean
-	if clean {
-		out.ObservationalConsistency = readmeta.ConsistencyConsistent
-	} else if out.ObservationalConsistency == "" {
-		out.ObservationalConsistency = readmeta.ConsistencyUnknown
-	}
 	rt.finalizeDiscBound(&out)
 	complete, excluded = dropUnprovedDiscussions(item, &out, complete, excluded)
+	setReviewClean(&out, complete, excluded, match, len(item.Sections))
 	if len(complete) == 0 {
 		out.ContextRef = nil
 		return out
@@ -769,6 +763,7 @@ func (rt *reviewRuntime) one(item reviewContextItemIn) reviewContextItemOut {
 	}
 	rt.finalizeDiscBound(&out)
 	complete, excluded = dropUnprovedDiscussions(item, &out, complete, excluded)
+	setReviewClean(&out, complete, excluded, match, len(item.Sections))
 	if len(complete) == 0 {
 		out.ContextRef = nil
 		return out
@@ -783,6 +778,18 @@ func (rt *reviewRuntime) one(item reviewContextItemIn) reviewContextItemOut {
 	}
 	out.ContextRef = &ref
 	return out
+}
+
+func setReviewClean(out *reviewContextItemOut, complete, excluded []string, match *bool, sections int) {
+	if out == nil {
+		return
+	}
+	out.ReviewClean = len(excluded) == 0 && len(complete) == sections && (match == nil || *match)
+	if out.ReviewClean {
+		out.ObservationalConsistency = readmeta.ConsistencyConsistent
+	} else if out.ObservationalConsistency == "" {
+		out.ObservationalConsistency = readmeta.ConsistencyUnknown
+	}
 }
 
 func dropUnprovedDiscussions(item reviewContextItemIn, out *reviewContextItemOut, complete, excluded []string) ([]string, []string) {

@@ -1630,3 +1630,122 @@ func TestDiscussionN2Int64Identity(t *testing.T) {
 		t.Error("author id max+1 minted digests")
 	}
 }
+
+func f8Call(t *testing.T, sections []string, elapsed int64, hook bool, expected *string) (Deps, reviewContextItemOut) {
+	t.Helper()
+	clock := time.Date(2026, 10, 4, 12, 0, 0, int(500*time.Millisecond), time.UTC)
+	page := "[" + discObj("d", noteObj(1, "x", "")) + "]"
+	script := &reviewScript{discussions: discPages(map[int]string{1: page}, map[int]string{1: ""})}
+	var d Deps
+	d = newReviewDeps(t, http.HandlerFunc(script.serve))
+	d.Clock = &cursor.FakeClock{T: clock}
+	b := reviewBudget(128)
+	item := metaItem("42", 1, sections...)
+	item.DiscussionSelection = "all"
+	item.ExpectedHead = expected
+	ctx := igl.WithBudget(context.Background(), b)
+	if hook {
+		ctx = withReviewMintHook(ctx, func() {
+			d.Clock.(*cursor.FakeClock).Advance(200 * time.Millisecond)
+		})
+	}
+	_, raw, err := getMergeRequestReviewContext(ctx, nil, getMergeRequestReviewContextIn{Items: []reviewContextItemIn{item}, MaxElapsedMS: ptr64(elapsed)}, d)
+	if err != nil {
+		t.Fatalf("fixture call: %v", err)
+	}
+	return d, raw.(reviewContextOut).Items[0]
+}
+
+func f8Ref(t *testing.T, d Deps, token string) *cursor.ContextRef {
+	t.Helper()
+	payload, err := cursor.Decode(d.Config.CursorKey, token, time.Date(2026, 10, 4, 12, 30, 0, 0, time.UTC))
+	if err != nil || payload.ContextRef == nil {
+		t.Fatalf("context ref err=%v", err)
+	}
+	return payload.ContextRef
+}
+
+func TestDiscussionF8ReviewClean(t *testing.T) {
+	t.Run("late_hook_clears_clean", func(t *testing.T) {
+		d, got := f8Call(t, []string{"metadata", "discussions"}, 200, true, nil)
+		sec := got.Sections["discussions"]
+		disc := got.Discussions
+		if got.ReviewClean || got.Cause != "" || got.ContextRef == nil {
+			t.Errorf("clean=%v cause=%q ref=%v", got.ReviewClean, got.Cause, got.ContextRef != nil)
+		}
+		if sec.ContentComplete == readmeta.ContentCompleteTrue || sec.NextCursor != nil {
+			t.Errorf("discussions still complete cursor=%v complete=%v", sec.NextCursor != nil, sec.ContentComplete)
+		}
+		if disc == nil || disc.SemanticFeedbackDigest != nil || disc.PositionDigest != nil || disc.FullRevisionDigest != nil {
+			t.Errorf("hashes %#v", disc)
+		}
+		if len(sec.Limitations) == 0 || sec.Limitations[0].Code != readmeta.CodeBudgetElapsed {
+			t.Errorf("lim %#v", sec.Limitations)
+		}
+		if got.Metadata == nil || got.Metadata.Digest == "" {
+			t.Fatal("metadata dropped")
+		}
+		ref := f8Ref(t, d, *got.ContextRef)
+		if len(ref.Complete) != 1 || ref.Complete[0] != "metadata" || len(ref.Excluded) != 1 || ref.Excluded[0] != "discussions" {
+			t.Errorf("masks complete=%#v excluded=%#v", ref.Complete, ref.Excluded)
+		}
+		sum, ok := ref.Digests["metadata"]
+		if !ok || len(sum) != 64 || len(ref.Digests) != len(ref.Complete) {
+			t.Errorf("digests %#v", ref.Digests)
+		}
+		if _, ok := ref.Digests["discussions"]; ok {
+			t.Errorf("discussions digest present")
+		}
+	})
+	t.Run("before_bound_all_clean", func(t *testing.T) {
+		d, got := f8Call(t, []string{"metadata", "discussions"}, 200, false, nil)
+		sec := got.Sections["discussions"]
+		if !got.ReviewClean || got.Cause != "" || got.ContextRef == nil || sec.ContentComplete != readmeta.ContentCompleteTrue {
+			t.Fatalf("before-bound clean=%v cause=%q complete=%v ref=%v", got.ReviewClean, got.Cause, sec.ContentComplete, got.ContextRef != nil)
+		}
+		disc := got.Discussions
+		if disc == nil || disc.SemanticFeedbackDigest == nil || disc.PositionDigest == nil || disc.FullRevisionDigest == nil {
+			t.Fatalf("bundle %#v", disc)
+		}
+		ref := f8Ref(t, d, *got.ContextRef)
+		if len(ref.Complete) != 2 || len(ref.Digests) != 2 || ref.Digests["discussions"] == "" || ref.Digests["metadata"] == "" {
+			t.Fatalf("full masks %#v %#v", ref.Complete, ref.Digests)
+		}
+	})
+	t.Run("metadata_only_stays_clean", func(t *testing.T) {
+		d, got := f8Call(t, []string{"metadata"}, 200, true, nil)
+		if !got.ReviewClean || got.Cause != "" || got.ContextRef == nil {
+			t.Fatalf("metadata-only clean=%v cause=%q ref=%v", got.ReviewClean, got.Cause, got.ContextRef != nil)
+		}
+		ref := f8Ref(t, d, *got.ContextRef)
+		if len(ref.Complete) != 1 || ref.Complete[0] != "metadata" || len(ref.Digests) != 1 || ref.Digests["metadata"] == "" {
+			t.Fatalf("metadata ref %#v %#v", ref.Complete, ref.Digests)
+		}
+	})
+	t.Run("discussions_only_late_drop", func(t *testing.T) {
+		_, got := f8Call(t, []string{"discussions"}, 200, true, nil)
+		sec := got.Sections["discussions"]
+		if got.ReviewClean || got.ContextRef != nil || got.Cause != "" {
+			t.Errorf("discussions-only clean=%v cause=%q ref=%v", got.ReviewClean, got.Cause, got.ContextRef != nil)
+		}
+		if sec.ContentComplete == readmeta.ContentCompleteTrue || sec.NextCursor != nil || len(sec.Limitations) == 0 || sec.Limitations[0].Code != readmeta.CodeBudgetElapsed {
+			t.Errorf("discussions-only sec=%+v", sec)
+		}
+	})
+	t.Run("expected_head", func(t *testing.T) {
+		head := shaN(1)
+		other := shaN(9)
+		_, match := f8Call(t, []string{"metadata", "discussions"}, 200, false, &head)
+		if !match.ReviewClean || match.ExpectedHeadMatch == nil || !*match.ExpectedHeadMatch {
+			t.Fatalf("matching head clean=%v match=%v", match.ReviewClean, match.ExpectedHeadMatch)
+		}
+		_, miss := f8Call(t, []string{"metadata", "discussions"}, 200, false, &other)
+		if miss.ReviewClean || miss.ExpectedHeadMatch == nil || *miss.ExpectedHeadMatch {
+			t.Fatalf("mismatched head clean=%v match=%v", miss.ReviewClean, miss.ExpectedHeadMatch)
+		}
+		_, late := f8Call(t, []string{"metadata", "discussions"}, 200, true, &head)
+		if late.ReviewClean || late.ExpectedHeadMatch == nil || !*late.ExpectedHeadMatch {
+			t.Errorf("late drop with matching head clean=%v match=%v", late.ReviewClean, late.ExpectedHeadMatch)
+		}
+	})
+}
