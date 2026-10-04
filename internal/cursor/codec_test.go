@@ -953,16 +953,65 @@ func TestDiffManifestEvidenceKeyset(t *testing.T) {
 	p.ContextRef.Digests = map[string]string{"diff_manifest": strings.Repeat("ab", 32), "metadata": strings.Repeat("cd", 32)}
 	p.ContextRef.Evidence = map[string]string{"diff_manifest": DiffManifestEvidenceV1}
 	p.Filters.Selection = "diff_manifest,metadata"
-	if _, err := Encode(key, p); err != nil {
+	tok, err := Encode(key, p)
+	if err != nil {
 		t.Fatal(err)
 	}
-	p.ContextRef.Evidence = map[string]string{"diff_manifest": "nope"}
+	got, err := Decode(key, tok, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.ContextRef.Evidence) != 1 || got.ContextRef.Evidence["diff_manifest"] != DiffManifestEvidenceV1 {
+		t.Fatalf("evidence=%v", got.ContextRef.Evidence)
+	}
+	p.ContextRef.Evidence = map[string]string{"diff_manifest": "diff_manifest.v2"}
 	if _, err := Encode(key, p); err == nil {
-		t.Fatal("bad evidence accepted")
+		t.Fatal("unknown evidence version accepted")
+	}
+	p.ContextRef.Evidence = map[string]string{"diff_manifest": DiffManifestEvidenceV1, "metadata": "extra"}
+	if _, err := Encode(key, p); err == nil {
+		t.Fatal("extra evidence key accepted")
 	}
 	p.ContextRef.Evidence = nil
 	if _, err := Encode(key, p); err == nil {
 		t.Fatal("complete diff_manifest without evidence accepted")
+	}
+	excluded := reviewContextPayload(now)
+	excluded.ContextRef.Requested = []string{"diff_manifest", "metadata"}
+	excluded.ContextRef.Complete = []string{"metadata"}
+	excluded.ContextRef.Excluded = []string{"diff_manifest"}
+	excluded.ContextRef.Digests = map[string]string{"metadata": strings.Repeat("cd", 32)}
+	excluded.ContextRef.Evidence = map[string]string{"diff_manifest": DiffManifestEvidenceV1}
+	excluded.Filters.Selection = "diff_manifest,metadata"
+	if _, err := Encode(key, excluded); err == nil {
+		t.Fatal("evidence on excluded diff_manifest accepted")
+	}
+	metaTok, err := Encode(key, reviewContextPayload(now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Decode(key, metaTok, now); err != nil {
+		t.Fatal(err)
+	}
+	approvals := reviewContextPayload(now)
+	approvals.ContextRef.Requested = []string{"approvals"}
+	approvals.ContextRef.Complete = []string{"approvals"}
+	approvals.ContextRef.Excluded = []string{}
+	approvals.ContextRef.Digests = map[string]string{"approvals": strings.Repeat("ab", 32)}
+	approvals.Filters.Selection = "approvals"
+	apTok, err := Encode(key, approvals)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Decode(key, apTok, now); err != nil {
+		t.Fatal(err)
+	}
+	discTok, err := Encode(key, discussionsCursorPayload(now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Decode(key, discTok, now); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -1003,7 +1052,11 @@ func TestDiffWindowCursorModes(t *testing.T) {
 	tuple.ImmutableRefs = []string{base, start, head}
 	tuple.Filters.Selection = "tuple:" + base + ":" + start + ":" + head
 	tuple.DiffWindow = &DiffWindowCont{V: DiffWindowSchemaDM1, Mode: "full_tuple", BaseSHA: base, StartSHA: start, HeadSHA: head, Total: 2, Offset: 1, FullDigest: sum, PerPage: 1}
-	if _, err := Encode(key, tuple); err != nil {
+	tupleTok, err := Encode(key, tuple)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Decode(key, tupleTok, now); err != nil {
 		t.Fatal(err)
 	}
 	inc := newPayload()
@@ -1011,7 +1064,11 @@ func TestDiffWindowCursorModes(t *testing.T) {
 	inc.ImmutableRefs = []string{from, to}
 	inc.Filters.Selection = "inc:" + from + ":" + to
 	inc.DiffWindow = &DiffWindowCont{V: DiffWindowSchemaDM1, Mode: "incremental", FromSHA: from, ToSHA: to, Straight: true, Total: 2, Offset: 1, FullDigest: sum, PerPage: 1}
-	if _, err := Encode(key, inc); err != nil {
+	incTok, err := Encode(key, inc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Decode(key, incTok, now); err != nil {
 		t.Fatal(err)
 	}
 	bad := newPayload()
@@ -1021,4 +1078,23 @@ func TestDiffWindowCursorModes(t *testing.T) {
 	if _, err := Encode(key, bad); err == nil {
 		t.Fatal("unknown diff window mode accepted")
 	}
+	reject := func(name string, mut func(*Payload)) {
+		t.Helper()
+		p := version
+		w := *version.DiffWindow
+		p.DiffWindow = &w
+		p.ImmutableRefs = append([]string(nil), version.ImmutableRefs...)
+		mut(&p)
+		if _, err := Encode(key, p); err == nil {
+			t.Fatalf("%s accepted", name)
+		}
+	}
+	reject("selection", func(p *Payload) { p.Filters.Selection = "version:2" })
+	reject("bind", func(p *Payload) { p.DiffWindow.HeadSHA = strings.Repeat("b", 40) })
+	reject("absolute ttl", func(p *Payload) { p.ExpiresAt = now.Add(time.Hour).Format(time.RFC3339) })
+	reject("ref", func(p *Payload) { p.ImmutableRefs = []string{strings.Repeat("a", 40), strings.Repeat("a", 40)} })
+	reject("window", func(p *Payload) {
+		p.DiffWindow.Offset = 2
+		p.DiffWindow.Total = 4
+	})
 }
