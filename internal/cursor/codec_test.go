@@ -942,3 +942,26 @@ func fmtSHA(b []byte) string {
 	}
 	return string(out)
 }
+
+func TestDiffManifestEvidenceKeyset(t *testing.T) {
+	key := []byte("0123456789abcdef0123456789abcdef")
+	now := time.Date(2026, 10, 4, 12, 0, 0, 0, time.UTC)
+	p := reviewContextPayload(now)
+	p.ContextRef.Requested = []string{"diff_manifest", "metadata"}
+	p.ContextRef.Complete = []string{"diff_manifest", "metadata"}
+	p.ContextRef.Excluded = []string{}
+	p.ContextRef.Digests = map[string]string{"diff_manifest": strings.Repeat("ab", 32), "metadata": strings.Repeat("cd", 32)}
+	p.ContextRef.Evidence = map[string]string{"diff_manifest": DiffManifestEvidenceV1}
+	p.Filters.Selection = "diff_manifest,metadata"
+	if _, err := Encode(key, p); err != nil {
+		t.Fatal(err)
+	}
+	p.ContextRef.Evidence = map[string]string{"diff_manifest": "nope"}
+	if _, err := Encode(key, p); err == nil {
+		t.Fatal("bad evidence accepted")
+	}
+	p.ContextRef.Evidence = nil
+	if _, err := Encode(key, p); err == nil {
+		t.Fatal("complete diff_manifest without evidence accepted")
+	}
+}

@@ -90,8 +90,10 @@ type reviewContextItemOut struct {
 	Approvals                *mrApprovalReadResult       `json:"approvals"`
 	ApprovalDigest           *string                     `json:"approval_digest,omitempty"`
 	Discussions              *discussionsView            `json:"discussions,omitempty"`
+	DiffManifest             *diffWindowOut              `json:"diff_manifest,omitempty"`
 	Sections                 map[string]readmeta.Section `json:"sections"`
 	Cause                    string                      `json:"cause,omitempty"`
+	diffManifestDigest       string
 }
 
 type reviewContextOut struct {
@@ -640,6 +642,15 @@ func (rt *reviewRuntime) one(item reviewContextItemIn) reviewContextItemOut {
 			}()
 		}
 	}
+	if itemWants(item, "diff_manifest") {
+		if err := rt.attachDiffManifest(owner, item.MergeRequestIID, first.bracket, &out); err != nil {
+			out.Cause = reviewClassify(err)
+			out.ContextRef = nil
+			out.ReviewClean = false
+			rt.finalizeDiscBound(&out)
+			return out
+		}
+	}
 	if err := rt.phaseErr("bracket"); err != nil {
 		out.Cause = reviewClassify(err)
 		out.ContextRef = nil
@@ -666,6 +677,7 @@ func (rt *reviewRuntime) one(item reviewContextItemIn) reviewContextItemOut {
 		}
 		out.Metadata = nil
 		out.ContextRef = nil
+		rt.dropDiffManifestClaim(&out, readmeta.CodeInconsistent, "bracket")
 		rt.markSection(&out, "metadata", readmeta.ContentCompleteUnknown, out.ObservationalConsistency)
 		rt.finalizeDiscBound(&out)
 		return out
@@ -692,6 +704,7 @@ func (rt *reviewRuntime) one(item reviewContextItemIn) reviewContextItemOut {
 		}
 		out.Metadata = nil
 		out.ContextRef = nil
+		rt.dropDiffManifestClaim(&out, readmeta.CodeInconsistent, "bracket")
 		rt.markSection(&out, "metadata", readmeta.ContentCompleteUnknown, out.ObservationalConsistency)
 		rt.finalizeDiscBound(&out)
 		return out
@@ -735,6 +748,10 @@ func (rt *reviewRuntime) one(item reviewContextItemIn) reviewContextItemOut {
 			complete = append(complete, "discussions")
 			continue
 		}
+		if name == "diff_manifest" && diffManifestComplete(out) {
+			complete = append(complete, "diff_manifest")
+			continue
+		}
 		excluded = append(excluded, name)
 	}
 	sort.Strings(complete)
@@ -751,6 +768,7 @@ func (rt *reviewRuntime) one(item reviewContextItemIn) reviewContextItemOut {
 		out.Cause = reviewClassify(err)
 		out.ContextRef = nil
 		out.ReviewClean = false
+		rt.dropDiffManifestClaim(&out, readmeta.CodeCancelled, "mint")
 		rt.finalizeDiscBound(&out)
 		return out
 	}
@@ -830,6 +848,70 @@ type reviewMintHookKey struct{}
 // Tests use it to cancel the current item without starting another read.
 func withReviewMintHook(ctx context.Context, fn func()) context.Context {
 	return context.WithValue(ctx, reviewMintHookKey{}, fn)
+}
+
+func diffManifestComplete(out reviewContextItemOut) bool {
+	sec, ok := out.Sections["diff_manifest"]
+	return ok && out.diffManifestDigest != "" && sec.ContentComplete == readmeta.ContentCompleteTrue && sec.Consistency == readmeta.ConsistencyConsistent && sec.NextCursor == nil
+}
+
+func (rt *reviewRuntime) attachDiffManifest(owner CanonicalProject, iid int64, b reviewBracket, out *reviewContextItemOut) error {
+	if b.VersionID < 1 || b.MRID < 1 {
+		sec := unsupportedReviewSection(rt.now, "diff_manifest")
+		sec.AddLimitation(readmeta.CodeIdentityUnresolved, "diff manifest")
+		out.Sections["diff_manifest"] = sec
+		return nil
+	}
+	got, err := readBoundedDiffManifest(rt.ctx, rt.d, diffQuery{
+		OwnerID: owner.ID, IID: iid, MRID: b.MRID, SourceProjectID: b.SourceID, TargetProjectID: b.TargetID,
+		Selection: diffSelection{
+			ProjectID: strconv.FormatInt(owner.ID, 10), IID: iid, Mode: diffModeVersion, VersionID: b.VersionID, PerPage: 20,
+			Head: b.Head, Base: b.Base, Start: b.Start,
+		},
+		Full: true, Now: rt.now,
+	})
+	if err != nil {
+		if passthroughTypedProviderErr(err) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return err
+		}
+		sec := newDiffSection(rt.now)
+		sec = stampDiffFailure(sec, readmeta.CodeHTTPError)
+		out.Sections["diff_manifest"] = sec
+		return nil
+	}
+	got.Section.NextCursor = nil
+	got.Section.PaginationExhausted = got.Section.ContentComplete == readmeta.ContentCompleteTrue
+	out.Sections["diff_manifest"] = got.Section
+	out.DiffManifest = &got
+	if got.Digest != nil && got.Section.ContentComplete == readmeta.ContentCompleteTrue && got.Section.Consistency == readmeta.ConsistencyConsistent {
+		out.diffManifestDigest = *got.Digest
+	}
+	return nil
+}
+
+func (rt *reviewRuntime) dropDiffManifestClaim(out *reviewContextItemOut, code, msg string) {
+	if out == nil {
+		return
+	}
+	claimed := out.diffManifestDigest != ""
+	out.diffManifestDigest = ""
+	sec, ok := out.Sections["diff_manifest"]
+	if !ok || !claimed {
+		return
+	}
+	sec.ContentComplete = readmeta.ContentCompleteUnknown
+	sec.Consistency = readmeta.ConsistencyUnknown
+	sec.ManifestCoverage = readmeta.CoverageUnknown
+	sec.PaginationExhausted = false
+	sec.NextCursor = nil
+	sec.HeadSHA = nil
+	sec.AddLimitation(code, msg)
+	out.Sections["diff_manifest"] = sec
+	if out.DiffManifest != nil {
+		out.DiffManifest.Digest = nil
+		out.DiffManifest.Section = sec
+	}
+	out.ReviewClean = false
 }
 
 func (rt *reviewRuntime) beforeMint() {
@@ -1318,6 +1400,11 @@ func metaDigestOf(out reviewContextItemOut) map[string]string {
 			dig["discussions"] = out.Discussions.evidence
 		}
 	}
+	if out.diffManifestDigest != "" {
+		if sec, ok := out.Sections["diff_manifest"]; ok && sec.ContentComplete == readmeta.ContentCompleteTrue && sec.Consistency == readmeta.ConsistencyConsistent {
+			dig["diff_manifest"] = out.diffManifestDigest
+		}
+	}
 	return dig
 }
 
@@ -1404,6 +1491,11 @@ func (rt *reviewRuntime) mint(owner CanonicalProject, item reviewContextItemIn, 
 			WriteFreshUntil:   fresh,
 			BracketConsistent: true,
 		},
+	}
+	for _, name := range complete {
+		if name == "diff_manifest" {
+			payload.ContextRef.Evidence = map[string]string{"diff_manifest": cursor.DiffManifestEvidenceV1}
+		}
 	}
 	tok, err := cursor.Encode(rt.d.Config.CursorKey, payload)
 	if err != nil {

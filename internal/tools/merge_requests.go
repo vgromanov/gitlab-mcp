@@ -32,6 +32,7 @@ func RegisterMergeRequests(s *mcp.Server, d Deps) {
 	AddTool(s, d, true, "", &mcp.Tool{Name: "approve_merge_request", Description: "Approve a merge request"}, approveMergeRequest)
 	AddTool(s, d, true, "", &mcp.Tool{Name: "unapprove_merge_request", Description: "Remove your approval from an MR"}, unapproveMergeRequest)
 	AddTool(s, d, false, "", &mcp.Tool{Name: "get_merge_request_approval_state", Description: "Get MR approval state"}, getMergeRequestApprovalState)
+	AddTool(s, d, false, "", &mcp.Tool{Name: "get_merge_request_diff_window", Description: "Read one bounded immutable merge request diff manifest window"}, getMergeRequestDiffWindow)
 	registerMergeRequestReviewQueue(s, d)
 	registerMergeRequestReviewContext(s, d)
 }
@@ -88,24 +89,33 @@ func (p pidMR) resolveLegacy(d Deps) (string, error) {
 // When policy is inactive, preserves legacy ResolveProjectID + checkAllowedProject
 // without extra GetProject/GetMR (empty-both allow-all compatibility).
 func authorizeMROwnerAndForks(ctx context.Context, d Deps, projectID string, mrIID int64) (CanonicalProject, error) {
+	owner, _, err := loadAuthorizedMR(ctx, d, projectID, mrIID)
+	return owner, err
+}
+
+func loadAuthorizedMR(ctx context.Context, d Deps, projectID string, mrIID int64) (CanonicalProject, *gitlab.MergeRequest, error) {
 	if mrIID < 1 {
-		return CanonicalProject{}, fmt.Errorf("merge_request_iid must be >= 1")
+		return CanonicalProject{}, nil, fmt.Errorf("merge_request_iid must be >= 1")
 	}
 	if !policyActive(d.Config) {
-		return legacyOwnerProjection(d, projectID)
+		owner, err := legacyOwnerProjection(d, projectID)
+		return owner, nil, err
 	}
 	owner, err := AuthorizeCanonicalProject(ctx, d, projectID)
 	if err != nil {
-		return CanonicalProject{}, err
+		return CanonicalProject{}, nil, err
 	}
 	mr, _, err := d.Client.MergeRequests.GetMergeRequest(owner.ID, mrIID, nil, gitlab.WithContext(ctx))
 	if err != nil {
-		return CanonicalProject{}, fmt.Errorf("%s: merge request metadata", readmeta.CodeHTTPError)
+		if passthroughTypedProviderErr(err) {
+			return CanonicalProject{}, nil, err
+		}
+		return CanonicalProject{}, nil, fmt.Errorf("%s: merge request metadata", readmeta.CodeHTTPError)
 	}
 	if err := requireProvenMRForkProjects(ctx, d, owner, mr); err != nil {
-		return CanonicalProject{}, err
+		return CanonicalProject{}, nil, err
 	}
-	return owner, nil
+	return owner, mr, nil
 }
 
 func legacyOwnerProjection(d Deps, projectID string) (CanonicalProject, error) {

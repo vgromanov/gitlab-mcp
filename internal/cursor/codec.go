@@ -46,6 +46,14 @@ const (
 	SectionReviewDiscussions = "discussions"
 	// DiscussionsContSchemaDC1 is the locked discussions note-continuation schema.
 	DiscussionsContSchemaDC1 = "dc1"
+	// ToolDiffWindow is the immutable diff-manifest window tool.
+	ToolDiffWindow = "get_merge_request_diff_window"
+	// SectionDiffManifest is the diff manifest section binding.
+	SectionDiffManifest = "diff_manifest"
+	// DiffWindowSchemaDM1 is the window continuation schema.
+	DiffWindowSchemaDM1 = "dm1"
+	// DiffManifestEvidenceV1 is the only complete-manifest evidence version.
+	DiffManifestEvidenceV1 = "diff_manifest.v1"
 	// ReviewWriteFresh is the absolute write-freshness window from retrieved_at.
 	ReviewWriteFresh = 5 * time.Minute
 	// ResyncRequired is the uniform fail-closed continuation error token.
@@ -156,6 +164,24 @@ type Payload struct {
 	QueueCont       *QueueCont       `json:"queue_cont,omitempty"`
 	ContextRef      *ContextRef      `json:"context_ref,omitempty"`
 	DiscussionsCont *DiscussionsCont `json:"discussions_cont,omitempty"`
+	DiffWindow      *DiffWindowCont  `json:"diff_window,omitempty"`
+}
+
+// DiffWindowCont binds one diff-manifest window. It stores no patch text.
+type DiffWindowCont struct {
+	V          string `json:"v"`
+	Mode       string `json:"mode"`
+	VersionID  int64  `json:"version_id,omitempty"`
+	BaseSHA    string `json:"base_sha,omitempty"`
+	StartSHA   string `json:"start_sha,omitempty"`
+	HeadSHA    string `json:"head_sha,omitempty"`
+	FromSHA    string `json:"from_sha,omitempty"`
+	ToSHA      string `json:"to_sha,omitempty"`
+	Straight   bool   `json:"straight,omitempty"`
+	Total      int    `json:"total"`
+	Offset     int    `json:"offset"`
+	FullDigest string `json:"full_digest"`
+	PerPage    int    `json:"per_page"`
 }
 
 // DiscussionsCont is the dc1 note continuation for review-context discussions.
@@ -188,6 +214,7 @@ type ContextRef struct {
 	Complete          []string          `json:"complete"`
 	Excluded          []string          `json:"excluded"`
 	Digests           map[string]string `json:"digests"`
+	Evidence          map[string]string `json:"evidence,omitempty"`
 	RetrievedAt       string            `json:"retrieved_at"`
 	WriteFreshUntil   string            `json:"write_fresh_until"`
 	BracketConsistent bool              `json:"bracket_consistent"`
@@ -373,7 +400,11 @@ func validatePayload(p *Payload) error {
 	isQueue := p.Scope.Kind == ScopeGroupQueue && p.Tool == ToolReviewQueue && p.Section == SectionReviewQueue
 	isReview := p.Scope.Kind == ScopeReviewContext && p.Tool == ToolReviewContext && p.Section == SectionReviewContext
 	isDisc := p.Tool == ToolReviewContext && p.Section == SectionReviewDiscussions
+	isDiff := p.Tool == ToolDiffWindow && p.Section == SectionDiffManifest
 	if p.QueueCont != nil && !isQueue {
+		return ErrResyncRequired
+	}
+	if p.DiffWindow != nil && !isDiff {
 		return ErrResyncRequired
 	}
 	if p.ContextRef != nil && !isReview {
@@ -407,6 +438,22 @@ func validatePayload(p *Payload) error {
 		}
 	} else if isDisc {
 		if err := validateDiscussionsCursor(p); err != nil {
+			return err
+		}
+	} else if isDiff {
+		if p.DiffWindow == nil || p.ContextRef != nil || p.QueueCont != nil || p.DiscussionsCont != nil {
+			return ErrResyncRequired
+		}
+		if p.Scope.Kind != ScopeProject || strings.TrimSpace(p.Scope.ProjectID) == "" || p.Scope.MergeRequestIID == nil || *p.Scope.MergeRequestIID < 1 {
+			return ErrResyncRequired
+		}
+		if err := validateImmutableRefs(p.ImmutableRefs); err != nil {
+			return err
+		}
+		if err := validatePageState(p.PageState, p.Filters.PerPage); err != nil {
+			return err
+		}
+		if err := validateDiffWindow(p); err != nil {
 			return err
 		}
 	} else {
@@ -951,7 +998,94 @@ func validateContextRef(p *Payload) error {
 	if !fresh.Equal(ret.Add(ReviewWriteFresh)) || !exp.Equal(ret.Add(DefaultTTL)) || !fresh.Before(exp) {
 		return ErrResyncRequired
 	}
+	return validateDiffManifestEvidence(ref)
+}
+
+func validateDiffManifestEvidence(ref *ContextRef) error {
+	if ref == nil {
+		return ErrResyncRequired
+	}
+	inComplete := containsString(ref.Complete, "diff_manifest")
+	inExcluded := containsString(ref.Excluded, "diff_manifest")
+	if inComplete && inExcluded {
+		return ErrResyncRequired
+	}
+	if !inComplete {
+		if len(ref.Evidence) != 0 {
+			return ErrResyncRequired
+		}
+		return nil
+	}
+	if len(ref.Evidence) != 1 || ref.Evidence["diff_manifest"] != DiffManifestEvidenceV1 {
+		return ErrResyncRequired
+	}
 	return nil
+}
+
+func validateDiffWindow(p *Payload) error {
+	if p == nil || p.DiffWindow == nil {
+		return ErrResyncRequired
+	}
+	w := p.DiffWindow
+	if w.V != DiffWindowSchemaDM1 || w.PerPage != p.Filters.PerPage || w.PerPage < 1 || w.PerPage > 50 {
+		return ErrResyncRequired
+	}
+	if w.Total < 1 || w.Offset < 1 || w.Offset >= w.Total || w.Offset%w.PerPage != 0 {
+		return ErrResyncRequired
+	}
+	if !isHexSHA256(w.FullDigest) || p.PageState.SequenceDigest != p.PageState.LastSHA || !isHexSHA256(p.PageState.SequenceDigest) {
+		return ErrResyncRequired
+	}
+	if p.PageState.Page < 1 || w.Offset != p.PageState.Page*w.PerPage {
+		return ErrResyncRequired
+	}
+	if p.PageState.ItemsOnPage != w.PerPage || p.PageState.ProviderNextPage != int64(p.PageState.Page)+1 {
+		return ErrResyncRequired
+	}
+	if p.Filters.Selection != diffWindowSelection(w) || p.Filters.Until != p.UpperBound {
+		return ErrResyncRequired
+	}
+	ub, err := time.Parse(time.RFC3339, p.UpperBound)
+	if err != nil {
+		return ErrResyncRequired
+	}
+	exp, err := time.Parse(time.RFC3339, p.ExpiresAt)
+	if err != nil || !exp.Equal(ub.Add(DefaultTTL)) {
+		return ErrResyncRequired
+	}
+	switch w.Mode {
+	case "full_version":
+		if w.VersionID < 1 || w.BaseSHA != "" || w.StartSHA != "" || w.HeadSHA != "" || w.FromSHA != "" || w.ToSHA != "" || w.Straight {
+			return ErrResyncRequired
+		}
+	case "full_tuple":
+		if w.VersionID != 0 || !isGitSHA(w.BaseSHA) || !isGitSHA(w.StartSHA) || !isGitSHA(w.HeadSHA) || w.FromSHA != "" || w.ToSHA != "" || w.Straight {
+			return ErrResyncRequired
+		}
+	case "incremental":
+		if w.VersionID != 0 || w.BaseSHA != "" || w.StartSHA != "" || w.HeadSHA != "" || !isGitSHA(w.FromSHA) || !isGitSHA(w.ToSHA) || !w.Straight {
+			return ErrResyncRequired
+		}
+	default:
+		return ErrResyncRequired
+	}
+	return nil
+}
+
+func diffWindowSelection(w *DiffWindowCont) string {
+	if w == nil {
+		return ""
+	}
+	switch w.Mode {
+	case "full_version":
+		return fmt.Sprintf("version:%d", w.VersionID)
+	case "full_tuple":
+		return "tuple:" + w.BaseSHA + ":" + w.StartSHA + ":" + w.HeadSHA
+	case "incremental":
+		return "inc:" + w.FromSHA + ":" + w.ToSHA
+	default:
+		return ""
+	}
 }
 
 func validSectionMask(names []string) bool {
@@ -987,7 +1121,7 @@ func reviewSectionName(name string) bool {
 }
 
 func reviewCompleteEvidence(name string) bool {
-	return name == "metadata" || name == "approvals" || name == "discussions"
+	return name == "metadata" || name == "approvals" || name == "discussions" || name == "diff_manifest"
 }
 
 func validateDiscussionsCursor(p *Payload) error {

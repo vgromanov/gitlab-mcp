@@ -2,12 +2,14 @@ package tools
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"strconv"
 	"strings"
 
 	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/config"
+	igl "gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/gitlab"
 	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/tools/readmeta"
 
 	gitlab "gitlab.com/gitlab-org/api/client-go/v2"
@@ -35,6 +37,17 @@ func policyActive(cfg *config.Config) bool {
 
 func identityErr(detail string) error {
 	return fmt.Errorf("%s: %s", readmeta.CodeIdentityUnresolved, detail)
+}
+
+// passthroughTypedProviderErr keeps budget, cancel, and deadline errors intact.
+// Other failures stay on their existing identity or HTTP mapping.
+func passthroughTypedProviderErr(err error) bool {
+	return errors.Is(err, igl.ErrBudgetRequests) ||
+		errors.Is(err, igl.ErrBudgetBytes) ||
+		errors.Is(err, igl.ErrBudgetItems) ||
+		errors.Is(err, igl.ErrBudgetElapsed) ||
+		errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded)
 }
 
 func authzDenied(detail string) error {
@@ -75,6 +88,9 @@ func getProjectSafe(ctx context.Context, d Deps, pid string) (*gitlab.Project, e
 	wantNumeric, isNumeric := parseStrictPositiveID(tok)
 	p, _, err := d.Client.Projects.GetProject(tok, nil, gitlab.WithContext(ctx))
 	if err != nil {
+		if passthroughTypedProviderErr(err) {
+			return nil, err
+		}
 		return nil, identityErr("resolve project identity")
 	}
 	if p == nil || p.ID <= 0 {

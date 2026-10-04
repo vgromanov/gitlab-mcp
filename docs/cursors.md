@@ -112,7 +112,7 @@ only for complete sections. `retrieved_at + 5m` is `write_fresh_until`; `retriev
 structure. `VerifyContextBinding` checks the live instance, actor, policy, scope,
 and selection, then an independently supplied live ref tuple: owner, source, and
 target project ids and branches, source and target SHAs, and the version id,
-head, base, and start. A missing observation fails closed. `metadata`, `approvals`, and `discussions` are complete evidence. `discussions` is complete only when `Digests["discussions"]` is the SHA-256 of the `discussions.evidence.v1` bundle for one fresh exhaustive `all` walk. `pipeline_graph` and `diff_manifest` may be requested or excluded, and a token that marks either complete is rejected. A metadata-only token fails a demand for `approvals`. Missing `GITLAB_MCP_CURSOR_KEY`
+head, base, and start. A missing observation fails closed. `metadata`, `approvals`, and `discussions` are complete evidence. `discussions` is complete only when `Digests["discussions"]` is the SHA-256 of the `discussions.evidence.v1` bundle for one fresh exhaustive `all` walk. `pipeline_graph` may be requested or excluded, and a token that marks it complete is rejected. `diff_manifest` may be requested, excluded, or complete only when `evidence` is exactly `{"diff_manifest":"diff_manifest.v1"}`. A complete `diff_manifest` without that version, or evidence on any other section, is rejected. Old metadata, approvals, and discussions tokens stay valid. A metadata-only token fails a demand for `approvals`. Missing `GITLAB_MCP_CURSOR_KEY`
 is the same class of configuration error as the queue. The signature does not
 attest that a human reviewed the change.
 
