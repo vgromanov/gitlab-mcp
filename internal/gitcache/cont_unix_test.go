@@ -475,17 +475,15 @@ func TestContASGateInsideLimits(t *testing.T) {
 }
 
 func TestContApplyLimitsSeams(t *testing.T) {
-	wd, err := os.Getwd()
-	if err != nil {
-		t.Fatal(err)
-	}
+	anchor := anchorCWD(t)
 	if err := os.Chdir(t.TempDir()); err != nil {
+		_ = syscall.Close(anchor.fd)
 		t.Fatal(err)
 	}
+	anchor.bind(t)
 	oldSet, oldGet, oldGate, oldNote := limitSet, limitGet, asGate, asNote
 	t.Cleanup(func() {
 		limitSet, limitGet, asGate, asNote = oldSet, oldGet, oldGate, oldNote
-		_ = os.Chdir(wd)
 	})
 	for _, kind := range []string{"get", "under", "probe", "over"} {
 		installASSeam(kind)
@@ -887,14 +885,12 @@ func TestContGenUsesRootDevice(t *testing.T) {
 	if err := os.Mkdir(filepath.Join(root, "g"), 0700); err != nil {
 		t.Fatal(err)
 	}
-	wd, err := os.Getwd()
-	if err != nil {
-		t.Fatal(err)
-	}
+	anchor := anchorCWD(t)
 	if err := os.Chdir(root); err != nil {
+		_ = syscall.Close(anchor.fd)
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.Chdir(wd) })
+	anchor.bind(t)
 	var st syscall.Stat_t
 	if err := syscall.Lstat("g", &st); err != nil {
 		t.Fatal(err)
@@ -923,6 +919,87 @@ func TestContForeignUID(t *testing.T) {
 	t.Cleanup(func() { observedUID = old })
 	if err := fstatHeld(int(rf.Fd()), uint64(st.Dev), true, 0700); err == nil {
 		t.Fatal("foreign uid accepted")
+	}
+}
+
+func TestContHelperCWDSurvivesCleanup(t *testing.T) {
+	anchorFD, err := syscall.Open(".", syscall.O_RDONLY|syscall.O_DIRECTORY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Close(anchorFD)
+	var anchor syscall.Stat_t
+	if err := syscall.Fstat(anchorFD, &anchor); err != nil {
+		t.Fatal(err)
+	}
+	t.Run("fifo-openStat", func(t *testing.T) {
+		root := privateRoot(t)
+		rf, err := walkRoot(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rf.Close()
+		var st syscall.Stat_t
+		if err := syscall.Fstat(int(rf.Fd()), &st); err != nil {
+			t.Fatal(err)
+		}
+		if err := syscall.Mkfifo(filepath.Join(root, "pipe"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		h := &fsHelper{root: int(rf.Fd()), dev: uint64(st.Dev)}
+		done := make(chan uint32, 1)
+		go func() {
+			code, _ := h.openStat([]byte("pipe"))
+			done <- code
+		}()
+		select {
+		case code := <-done:
+			if code == 0 {
+				t.Errorf("fifo stat succeeded")
+			}
+		case <-time.After(time.Second):
+			t.Errorf("fifo open blocked before type check")
+		}
+	})
+	t.Run("missing-openStat", func(t *testing.T) {
+		root := privateRoot(t)
+		rf, err := walkRoot(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rf.Close()
+		var st syscall.Stat_t
+		if err := syscall.Fstat(int(rf.Fd()), &st); err != nil {
+			t.Fatal(err)
+		}
+		h := &fsHelper{root: int(rf.Fd()), dev: uint64(st.Dev)}
+		if code, _ := h.openStat([]byte("missing")); code == 0 {
+			t.Errorf("missing stat succeeded")
+		}
+	})
+	if _, err := os.Getwd(); err != nil {
+		t.Fatalf("cwd lost after helper cleanup: %v", err)
+	}
+	cwd, err := syscall.Open(".", syscall.O_RDONLY|syscall.O_DIRECTORY, 0)
+	if err != nil {
+		t.Fatalf("cwd open after helper cleanup: %v", err)
+	}
+	defer syscall.Close(cwd)
+	var st syscall.Stat_t
+	if err := syscall.Fstat(cwd, &st); err != nil {
+		t.Fatal(err)
+	}
+	if st.Dev != anchor.Dev || st.Ino != anchor.Ino {
+		t.Fatalf("cwd identity changed dev %d/%d ino %d/%d", st.Dev, anchor.Dev, st.Ino, anchor.Ino)
+	}
+	probe, err := os.CreateTemp(".", "cwd-access-")
+	if err != nil {
+		t.Fatalf("filesystem access after helper cleanup: %v", err)
+	}
+	name := probe.Name()
+	probe.Close()
+	if err := os.Remove(name); err != nil {
+		t.Fatal(err)
 	}
 }
 

@@ -18,11 +18,7 @@ import (
 
 func saveWD(t *testing.T) {
 	t.Helper()
-	wd, err := os.Getwd()
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chdir(wd) })
+	anchorCWD(t).bind(t)
 }
 
 func writePayload(rel string, max, off uint64, data []byte) []byte {

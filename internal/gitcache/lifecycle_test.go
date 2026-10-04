@@ -15,16 +15,45 @@ import (
 	"time"
 )
 
+// cwdAnchor is a file descriptor for the process directory.
+// Open it before any Fchdir. bind registers restoration after temporary
+// directories so the descriptor is restored before those directories are removed.
+type cwdAnchor struct {
+	fd int
+}
+
+func anchorCWD(t *testing.T) cwdAnchor {
+	t.Helper()
+	fd, err := syscall.Open(".", syscall.O_RDONLY|syscall.O_DIRECTORY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cwdAnchor{fd: fd}
+}
+
+func (a cwdAnchor) bind(t *testing.T) {
+	t.Helper()
+	fd := a.fd
+	t.Cleanup(func() {
+		_ = syscall.Fchdir(fd)
+		_ = syscall.Close(fd)
+	})
+}
+
 func privateRoot(t *testing.T) string {
 	t.Helper()
+	anchor := anchorCWD(t)
 	real, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
+		_ = syscall.Close(anchor.fd)
 		t.Fatal(err)
 	}
 	root := filepath.Join(real, "cache")
 	if err := os.Mkdir(root, 0700); err != nil {
+		_ = syscall.Close(anchor.fd)
 		t.Fatal(err)
 	}
+	anchor.bind(t)
 	return root
 }
 

@@ -137,18 +137,15 @@ func dispatchHelper(role string) int {
 		}
 		return 2
 	case "__gitcache_as":
+		writeHelperASDiag(os.Stderr)
 		lim := syscall.Rlimit{Cur: LimitAS, Max: LimitAS}
 		if err := syscall.Setrlimit(syscall.RLIMIT_AS, &lim); err != nil {
+			fmt.Fprintf(os.Stderr, "as-errno=%d %s\n", errnoNum(err), errnoSym(err))
 			fmt.Fprintln(os.Stderr, "as-branch=setter")
 			fmt.Fprintln(os.Stderr, "as-reject")
-			err = EnforceVirtualAS(LimitAS)
-			switch {
-			case err == nil:
-				fmt.Fprintln(os.Stderr, "as-map=enforced")
-			case errors.Is(err, errASIneffective):
-				fmt.Fprintln(os.Stderr, "as-map=ineffective")
-			default:
-				fmt.Fprintln(os.Stderr, "as-map=error")
+			if asMapOnSetterFail != nil {
+				fmt.Fprintln(os.Stderr, "as-map-invoked")
+				_ = asMapOnSetterFail(LimitAS)
 			}
 			return 3
 		}

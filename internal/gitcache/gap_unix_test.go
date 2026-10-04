@@ -476,15 +476,41 @@ func TestGapDeadlineSetupIgnored(t *testing.T) {
 	}
 }
 
+func asSetterDiag(text string) bool {
+	inherit, vsize, setter := false, false, false
+	for _, ln := range strings.Split(text, "\n") {
+		switch {
+		case strings.HasPrefix(ln, "as-inherit soft=") && strings.Contains(ln, " hard="):
+			inherit = true
+		case strings.HasPrefix(ln, "as-inherit unavailable errno="):
+			inherit = true
+		case strings.HasPrefix(ln, "as-vsize unavailable errno="):
+			vsize = true
+		case strings.HasPrefix(ln, "as-vsize "):
+			rest := strings.TrimPrefix(ln, "as-vsize ")
+			if rest != "" && rest[0] >= '0' && rest[0] <= '9' {
+				vsize = true
+			}
+		case strings.HasPrefix(ln, "as-errno="):
+			fields := strings.Fields(ln)
+			if len(fields) == 2 && strings.HasPrefix(fields[0], "as-errno=") && fields[1] != "" {
+				setter = true
+			}
+		}
+	}
+	return inherit && vsize && setter
+}
+
 func TestGapASBranchMasked(t *testing.T) {
 	cmd := exec.Command(helperBin(t), "__gitcache_as")
 	cmd.Env = AllowEnv()
-	out, _ := cmd.CombinedOutput()
+	out, err := cmd.CombinedOutput()
 	text := string(out)
 	switch {
 	case bytes.Contains(out, []byte("as-branch=setter")):
-		if !bytes.Contains(out, []byte("as-map=")) || !bytes.Contains(out, []byte("as-reject")) {
-			t.Fatalf("setter reject masked the map probe: %s", text)
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) || exitErr.ExitCode() != 3 || !bytes.Contains(out, []byte("as-reject")) || !asSetterDiag(text) || bytes.Contains(out, []byte("as-map")) {
+			t.Fatalf("setter failure diagnostics: %v %s", err, text)
 		}
 	case bytes.Contains(out, []byte("as-enforced")), bytes.Contains(out, []byte("as-ineffective")):
 	default:
