@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -28,8 +29,13 @@ func TestReviewQueue_resumeRejectsChangedBounds(t *testing.T) {
 			_, _ = io.WriteString(w, `{"id":9,"full_path":"g","parent_id":0}`)
 		case strings.HasPrefix(r.URL.Path, "/api/v4/groups/") && strings.HasSuffix(r.URL.Path, "/merge_requests"):
 			untilQ.Store(r.URL.Query().Get("updated_before"))
-			// Force discover continuation with a non-exhausted page needing resume.
-			w.Header().Set("X-Next-Page", "2")
+			page := 1
+			if p := r.URL.Query().Get("page"); p != "" {
+				if n, err := strconv.Atoi(p); err == nil && n > 0 {
+					page = n
+				}
+			}
+			w.Header().Set("X-Next-Page", strconv.Itoa(page+1))
 			_, _ = io.WriteString(w, `[{"iid":1,"project_id":42,"updated_at":"2026-10-03T11:00:00Z","sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]`)
 		case strings.HasSuffix(r.URL.Path, "/merge_requests/1"):
 			_, _ = io.WriteString(w, `{"id":1,"iid":1,"project_id":42,"state":"opened","source_project_id":42,"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","updated_at":"2026-10-03T11:00:00Z"}`)
@@ -83,7 +89,13 @@ func TestReviewQueue_pinUntilDefaultAndFutureAndResume(t *testing.T) {
 			_, _ = io.WriteString(w, `{"id":9,"full_path":"g","parent_id":0}`)
 		case strings.HasPrefix(r.URL.Path, "/api/v4/groups/") && strings.HasSuffix(r.URL.Path, "/merge_requests"):
 			seen = append(seen, r.URL.Query().Get("updated_before"))
-			w.Header().Set("X-Next-Page", "2")
+			page := 1
+			if p := r.URL.Query().Get("page"); p != "" {
+				if n, err := strconv.Atoi(p); err == nil && n > 0 {
+					page = n
+				}
+			}
+			w.Header().Set("X-Next-Page", strconv.Itoa(page+1))
 			_, _ = io.WriteString(w, `[{"iid":1,"project_id":42,"updated_at":"2026-10-03T11:00:00Z","sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]`)
 		case strings.HasSuffix(r.URL.Path, "/merge_requests/1"):
 			_, _ = io.WriteString(w, `{"id":1,"iid":1,"project_id":42,"state":"opened","source_project_id":42,"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","updated_at":"2026-10-03T11:00:00Z"}`)
@@ -362,6 +374,10 @@ func TestReviewQueue_movingUnknownAndAmbiguousNoCursor(t *testing.T) {
 		}
 		if sec["content_complete"] != readmeta.ContentCompleteFalse {
 			t.Fatalf("%v", sec["content_complete"])
+		}
+		items, _ := out["items"].([]any)
+		if len(items) != 1 {
+			t.Fatalf("valid authorized prefix must survive ambiguity, items=%d", len(items))
 		}
 	})
 }
@@ -682,11 +698,25 @@ func TestReviewQueue_capacityTerminalNoCursor(t *testing.T) {
 		}
 	})
 	d := queueDeps(t, h, &config.Config{AllowedGroupIDs: []string{"9"}})
-	out, err := callReviewQueue(t, d, map[string]any{
+	args := map[string]any{
 		"group_id": "9", "kinds": []any{"reviewer"}, "page_size": 50, "states": []any{"opened"},
-	})
-	if err != nil {
-		t.Fatal(err)
+	}
+	var out map[string]any
+	var err error
+	for i := 0; i < 40; i++ {
+		out, err = callReviewQueue(t, d, args)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sec := sectionMap(out)
+		if hasCode(limitationCodes(sec), readmeta.CodeDedupeCapacity) {
+			break
+		}
+		nc, _ := sec["next_cursor"].(string)
+		if nc == "" {
+			t.Fatalf("stopped before dedupe_capacity: %v", sec["limitations"])
+		}
+		args["cursor"] = nc
 	}
 	sec := sectionMap(out)
 	if nc, _ := sec["next_cursor"].(string); nc != "" {

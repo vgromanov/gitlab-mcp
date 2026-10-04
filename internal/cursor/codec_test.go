@@ -507,14 +507,14 @@ func queuePayloadOK() Payload {
 		KI:    2,
 		KP: []QueueKindProg{
 			{Kind: "authored", State: "opened", P: 1, N: 0, E: true, CN: 0, PD: "", PSz: 20},
-			{Kind: "reviewer", State: "opened", P: 2, N: 3, E: false, CN: 1, PD: SequenceDigest([]string{"42:1|u|h"}), PSz: 20},
+			{Kind: "reviewer", State: "opened", P: 1, N: 0, E: true, CN: 0, PD: "", PSz: 20},
 		},
 		CM: []QueueCandidate{{
 			K: "42:1", B: 5, U: "2026-10-03T11:00:00.123456789Z", H: &head,
 		}},
 		EI:   0,
-		Lim:  []string{"dedupe_capacity"},
-		Term: true,
+		Lim:  nil,
+		Term: false,
 	}
 	return p
 }

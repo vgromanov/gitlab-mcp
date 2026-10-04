@@ -88,25 +88,33 @@ func getMergeRequestReviewQueue(ctx context.Context, _ *mcp.CallToolRequest, in 
 	policyFP := d.Config.PolicyFingerprint()
 
 	var resume *cursor.Payload
-	if tok := strings.TrimSpace(ptrStr(in.Cursor)); tok != "" {
-		p, err := cursor.Decode(d.Config.CursorKey, tok, now)
-		if err != nil {
-			return nil, nil, fmt.Errorf("%s: cursor validation failed", cursor.ResyncRequired)
+	if in.Cursor != nil {
+		rawCursor := *in.Cursor
+		// Omitted cursor is nil or empty. Whitespace-only and padded tokens are malformed,
+		// not a page-one fallback.
+		if rawCursor != "" && strings.TrimSpace(rawCursor) != rawCursor {
+			return nil, nil, fmt.Errorf("%s: malformed cursor", cursor.ResyncRequired)
 		}
-		resume = &p
-		// Local signature/expiry/structure already enforced by Decode. Compare
-		// normalized input + config bindings BEFORE any SDK/identity transport.
-		preflightActor := resume.ActorID
-		if in.ActorID != nil {
-			preflightActor = *in.ActorID
-		}
-		preflightFilters := buildQueueFilters(norm, preflightActor)
-		if err := preflightQueueResumeLocal(*resume, instance, policyFP, preflightFilters, norm); err != nil {
-			return nil, nil, err
+		if rawCursor != "" {
+			p, err := cursor.Decode(d.Config.CursorKey, rawCursor, now)
+			if err != nil {
+				return nil, nil, fmt.Errorf("%s: cursor validation failed", cursor.ResyncRequired)
+			}
+			resume = &p
+			// Local signature/expiry/structure already enforced by Decode. Compare
+			// normalized input + config bindings BEFORE any SDK/identity transport.
+			preflightActor := resume.ActorID
+			if in.ActorID != nil {
+				preflightActor = *in.ActorID
+			}
+			preflightFilters := buildQueueFilters(norm, preflightActor)
+			if err := preflightQueueResumeLocal(*resume, instance, policyFP, preflightFilters, norm); err != nil {
+				return nil, nil, err
+			}
 		}
 	}
 
-	authActor, err := resolveCursorActor(ctx, d)
+	authActor, err := queueResolvePrincipal(ctx, d)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -117,7 +125,7 @@ func getMergeRequestReviewQueue(ctx context.Context, _ *mcp.CallToolRequest, in 
 
 	discoveryActor := authActor
 	if in.ActorID != nil {
-		discoveryActor, err = resolveDiscoveryActor(ctx, d, *in.ActorID)
+		discoveryActor, err = queueResolveDiscoveryActor(ctx, d, *in.ActorID)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -127,7 +135,7 @@ func getMergeRequestReviewQueue(ctx context.Context, _ *mcp.CallToolRequest, in 
 	// cursor Since/CallerUntil/Until over request filters before MatchBinding.
 	filters := buildQueueFilters(norm, discoveryActor)
 
-	group, err := AuthorizeCanonicalGroup(ctx, d, norm.groupID)
+	group, err := queueAuthorizeCanonicalGroup(ctx, d, norm.groupID)
 	if err != nil {
 		return nil, nil, sanitizeQueueErr(err)
 	}
@@ -160,7 +168,7 @@ func getMergeRequestReviewQueue(ctx context.Context, _ *mcp.CallToolRequest, in 
 		authActor: authActor, discoveryActor: discoveryActor,
 		norm: norm, filters: filters, section: &section,
 		qc: qc, instance: instance, policyFP: policyFP,
-		upper: upper, expires: expires, now: now,
+		upper: upper, expires: expires, now: now, ctx: ctx,
 	}
 	st.reapplyPersistedLimitations()
 	// Review-queue discovery is a moving window: never claim snapshot consistency.
@@ -172,6 +180,8 @@ func getMergeRequestReviewQueue(ctx context.Context, _ *mcp.CallToolRequest, in 
 			if err := st.runDiscover(ctx); err != nil && !errors.Is(err, errQueueStop) {
 				if isTypedBudget(err) {
 					st.noteBudget(err)
+				} else if errors.Is(err, errQueueCancelled) {
+					st.persistLimitation(readmeta.CodeCancelled, "invocation cancelled")
 				} else if !st.handleProviderFail(err) {
 					return nil, nil, sanitizeQueueErr(err)
 				}
@@ -192,6 +202,8 @@ func getMergeRequestReviewQueue(ctx context.Context, _ *mcp.CallToolRequest, in 
 		if err != nil && !errors.Is(err, errQueueStop) {
 			if isTypedBudget(err) {
 				st.noteBudget(err)
+			} else if errors.Is(err, errQueueCancelled) {
+				st.persistLimitation(readmeta.CodeCancelled, "invocation cancelled")
 			} else {
 				return nil, nil, sanitizeQueueErr(err)
 			}
@@ -345,8 +357,11 @@ func normalizeReviewQueueInput(in getMergeRequestReviewQueueIn) (normalizedQueue
 	}
 	n.after, n.before = after, before
 
+	if in.PageSize < 0 {
+		return n, fmt.Errorf("page_size must be 1..50")
+	}
 	n.pageSize = in.PageSize
-	if n.pageSize < 1 {
+	if n.pageSize == 0 {
 		n.pageSize = 20
 	}
 	if n.pageSize > 50 {
@@ -405,7 +420,7 @@ func pinUntil(filters *cursor.Filters, now time.Time, before *time.Time) {
 	if before != nil && before.Before(u) {
 		u = before.UTC()
 	}
-	filters.Until = u.Format(time.RFC3339)
+	filters.Until = u.Format(time.RFC3339Nano)
 }
 
 // preflightQueueResumeLocal compares resume bindings that need no SDK transport:
@@ -510,7 +525,63 @@ func validateQueueContProgress(qc *cursor.QueueCont, norm normalizedQueue) error
 	if qc.EI < 0 || qc.EI > len(qc.CM) {
 		return errQueueStop
 	}
+	want := expectedQueueStreams(norm)
+	if len(qc.KP) != len(want) {
+		return errQueueStop
+	}
+	for i := range want {
+		if qc.KP[i].Kind != want[i].Kind || qc.KP[i].State != want[i].State {
+			return errQueueStop
+		}
+		if qc.KP[i].E && (qc.KP[i].CN != 0 || qc.KP[i].PD != "" || qc.KP[i].N != 0) {
+			return errQueueStop
+		}
+	}
+	for i := 0; i < qc.KI && i < len(qc.KP); i++ {
+		if !qc.KP[i].E {
+			return errQueueStop
+		}
+	}
+	if qc.Phase == "emit" {
+		if qc.KI != len(qc.KP) {
+			return errQueueStop
+		}
+		for _, kp := range qc.KP {
+			if !kp.E {
+				return errQueueStop
+			}
+		}
+		if norm.wantOng && (qc.OG == nil || !qc.OG.E) {
+			return errQueueStop
+		}
+	}
+	if norm.wantOng && qc.OG != nil && qc.OG.E && len(norm.seeds) > 0 && qc.OG.SI != len(norm.seeds) {
+		return errQueueStop
+	}
+	if norm.wantOng && qc.OG != nil && qc.OG.E && (qc.OG.CN != 0 || qc.OG.PD != "") {
+		return errQueueStop
+	}
+	seenLim := map[string]struct{}{}
+	for _, code := range qc.Lim {
+		if _, dup := seenLim[code]; dup {
+			return errQueueStop
+		}
+		seenLim[code] = struct{}{}
+	}
 	return nil
+}
+
+func expectedQueueStreams(n normalizedQueue) []cursor.QueueKindProg {
+	var kp []cursor.QueueKindProg
+	for _, kind := range n.kinds {
+		if kind == "ongoing" {
+			continue
+		}
+		for _, state := range n.states {
+			kp = append(kp, cursor.QueueKindProg{Kind: kind, State: state})
+		}
+	}
+	return kp
 }
 
 func parsePinnedBound(s string) (*time.Time, error) {
@@ -570,25 +641,34 @@ func newQueueCont(n normalizedQueue) *cursor.QueueCont {
 var errQueueStop = errors.New("queue_stop")
 
 type queueRuntime struct {
-	d                Deps
-	budget           *igl.Budget
-	group            CanonicalGroup
-	groupID          string
-	authActor        int64
-	discoveryActor   int64
-	norm             normalizedQueue
-	filters          cursor.Filters
-	section          *readmeta.Section
-	qc               *cursor.QueueCont
-	instance         string
-	policyFP         string
-	upper, expires   string
-	now              time.Time
-	cmFull           bool
-	membershipIncomp bool
-	movingDiscovery  bool
-	returnedOmit     int
-	dateUnknown      bool
+	d                    Deps
+	budget               *igl.Budget
+	group                CanonicalGroup
+	groupID              string
+	authActor            int64
+	discoveryActor       int64
+	norm                 normalizedQueue
+	filters              cursor.Filters
+	section              *readmeta.Section
+	qc                   *cursor.QueueCont
+	instance             string
+	policyFP             string
+	upper, expires       string
+	now                  time.Time
+	cmFull               bool
+	membershipIncomp     bool
+	movingDiscovery      bool
+	returnedOmit         int
+	dateUnknown          bool
+	outputLimitBytes     int
+	selectionCache       map[string]int64
+	selectionIDs         map[int64]struct{}
+	selectionReady       bool
+	allowedProjects      map[int64]struct{}
+	allowedGroups        map[int64]struct{}
+	unobservedMembership *int
+	seedlessOngoing      bool
+	ctx                  context.Context
 }
 
 func (st *queueRuntime) persistLimitation(code, message string) {
@@ -657,6 +737,7 @@ func (st *queueRuntime) runDiscover(ctx context.Context) error {
 	}
 	if st.norm.wantOng {
 		if len(st.norm.seeds) == 0 {
+			st.seedlessOngoing = true
 			st.persistLimitation(readmeta.CodeUnsupported, "known_mrs required for ongoing")
 			if st.qc.OG != nil {
 				st.qc.OG.E = true
@@ -689,63 +770,95 @@ func (st *queueRuntime) discoverKindStream(ctx context.Context, idx int) error {
 		bit = queueBitAuthored
 	}
 	for !kp.E {
-		if err := ctx.Err(); err != nil {
+		if err := queueContextStop(ctx); err != nil {
 			return err
 		}
-		pageKeys, next, exhausted, err := st.fetchGroupMRPage(ctx, kp)
-		if err != nil {
-			if isTypedBudget(err) {
-				return err
-			}
-			if st.handleProviderFail(err) {
-				st.qc.Term = true
-				return errQueueStop
-			}
+		page, err := st.fetchGroupMRPage(ctx, kp)
+		if err != nil && len(page.ents) == 0 && isTypedBudget(err) {
 			return err
 		}
-		keys := make([]string, len(pageKeys))
-		for i := range pageKeys {
-			keys[i] = pageKeys[i].replayFact()
+		if err != nil && len(page.ents) == 0 && !queuePageFraming(err) && !page.ambiguous {
+			return err
 		}
-		// replay guard binds membership/update/head facts, not key alone
+		keys := make([]string, len(page.ents))
+		for i := range page.ents {
+			keys[i] = page.ents[i].replayFact()
+		}
+		// Consumed-prefix guard runs before any resumed entry is accepted.
 		if kp.CN > 0 {
 			if len(keys) < kp.CN || prefixDigest(keys[:kp.CN]) != kp.PD {
 				st.markTerminal(readmeta.CodeProviderPageAmbiguous, "provider page prefix drift")
 				return errQueueStop
 			}
 		}
-		for i := kp.CN; i < len(pageKeys); i++ {
-			ent := pageKeys[i]
-			if err := st.noteCandidate(ctx, ent, bit); err != nil {
-				if errors.Is(err, errQueueStop) || isTypedBudget(err) {
+		for i := kp.CN; i < len(page.ents); i++ {
+			ent := page.ents[i]
+			if nerr := st.noteCandidate(ctx, ent, bit); nerr != nil {
+				if errors.Is(nerr, errQueueStop) || isTypedBudget(nerr) || errors.Is(nerr, errQueueCancelled) {
 					kp.CN = i
-					kp.PD = prefixDigest(keys[:i])
-					kp.N = next
-					return err
+					if i == 0 {
+						kp.PD = ""
+					} else {
+						kp.PD = prefixDigest(keys[:i])
+					}
+					return nerr
 				}
-				return err
+				return nerr
 			}
 			kp.CN = i + 1
 			kp.PD = prefixDigest(keys[:kp.CN])
+			if st.qc.Term {
+				return errQueueStop
+			}
+			// Leave later provider entries as a progress index until they are proved.
+			// Their key/update/head/membership facts stay out of the returned cursor.
+			// An ambiguous or truncated page cannot be resumed: keep the proved prefix
+			// and terminalize instead of minting a continuation.
+			if len(st.qc.CM)-st.qc.EI >= st.norm.pageSize && i+1 < len(page.ents) {
+				if page.ambiguous || queuePageFraming(err) {
+					st.markTerminal(readmeta.CodeProviderPageAmbiguous, "provider page incomplete")
+				}
+				if isTypedBudget(err) || errors.Is(err, errQueueCancelled) {
+					return err
+				}
+				return errQueueStop
+			}
 		}
-		if exhausted {
+		if isTypedBudget(err) || errors.Is(err, errQueueCancelled) {
+			return err
+		}
+		if err != nil || page.ambiguous {
+			st.markTerminal(readmeta.CodeProviderPageAmbiguous, "provider page incomplete")
+			return errQueueStop
+		}
+		if page.exhausted {
 			kp.E = true
 			kp.N = 0
 			kp.CN = 0
 			kp.PD = ""
 			return nil
 		}
-		if next <= 0 {
+		if page.next <= 0 {
 			st.markTerminal(readmeta.CodeProviderPageAmbiguous, "paging metadata unavailable")
 			return errQueueStop
 		}
-		kp.P = int(next)
-		kp.N = next
+		kp.P = int(page.next)
+		kp.N = page.next
 		kp.CN = 0
 		kp.PD = ""
-		// Continue to next provider page within same invocation when budget allows.
 	}
 	return nil
+}
+
+func queuePageFraming(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "stream array") ||
+		strings.Contains(msg, readmeta.CodeProviderPageAmbiguous) ||
+		strings.Contains(msg, cursor.ResyncRequired) ||
+		strings.Contains(msg, "malformed")
 }
 
 type mrPageEnt struct {
@@ -765,7 +878,14 @@ func (e mrPageEnt) replayFact() string {
 	return e.Key + "|" + e.Updated + "|" + h
 }
 
-func (st *queueRuntime) fetchGroupMRPage(ctx context.Context, kp *cursor.QueueKindProg) ([]mrPageEnt, int64, bool, error) {
+type mrPageFetch struct {
+	ents      []mrPageEnt
+	next      int64
+	exhausted bool
+	ambiguous bool
+}
+
+func (st *queueRuntime) fetchGroupMRPage(ctx context.Context, kp *cursor.QueueKindProg) (mrPageFetch, error) {
 	opt := &gitlab.ListGroupMergeRequestsOptions{
 		ListOptions: gitlab.ListOptions{Page: int64(kp.P), PerPage: int64(kp.PSz)},
 		State:       gitlab.Ptr(kp.State),
@@ -780,14 +900,14 @@ func (st *queueRuntime) fetchGroupMRPage(ctx context.Context, kp *cursor.QueueKi
 	}
 	after, before, err := st.pinnedUpdatedBounds()
 	if err != nil {
-		return nil, 0, false, err
+		return mrPageFetch{}, err
 	}
 	var reqOpts []gitlab.RequestOptionFunc
 	if after != nil || before != nil {
 		reqOpts = append(reqOpts, igl.WithUpdatedBounds(after, before))
 	}
 	path := fmt.Sprintf("groups/%s/merge_requests", gitlab.PathEscape(st.groupID))
-	var ents []mrPageEnt
+	var fetched mrPageFetch
 	resp, err := igl.StreamJSONArrayQueue(ctx, st.d.Client, http.MethodGet, path, opt, func(raw json.RawMessage) error {
 		if err := st.budget.AddItem(); err != nil {
 			return err
@@ -811,15 +931,12 @@ func (st *queueRuntime) fetchGroupMRPage(ctx context.Context, kp *cursor.QueueKi
 			hh := h
 			head = &hh
 		}
-		ents = append(ents, mrPageEnt{
+		fetched.ents = append(fetched.ents, mrPageEnt{
 			Key:       strconv.FormatInt(mr.ProjectID, 10) + ":" + strconv.FormatInt(mr.IID, 10),
 			ProjectID: mr.ProjectID, IID: mr.IID, Updated: u, Head: head,
 		})
 		return nil
 	}, reqOpts...)
-	if err != nil {
-		return ents, 0, false, err
-	}
 	var hdr http.Header
 	var sdkNext int64
 	if resp != nil {
@@ -828,22 +945,18 @@ func (st *queueRuntime) fetchGroupMRPage(ctx context.Context, kp *cursor.QueueKi
 			hdr = resp.Response.Header
 		}
 	}
-	obs := readmeta.ObservePaging(hdr, sdkNext)
-	if obs.ExhaustedObserved {
-		return ents, 0, true, nil
+	obs := observeQueuePage(kp.P, hdr, sdkNext, len(fetched.ents))
+	fetched.next = obs.next
+	fetched.exhausted = obs.exhausted
+	fetched.ambiguous = obs.ambiguous
+	if err != nil {
+		return fetched, err
 	}
-	if obs.PagingKnown && sdkNext > 0 {
-		return ents, sdkNext, false, nil
+	if obs.ambiguous {
+		fetched.ambiguous = true
+		return fetched, fmt.Errorf("%s: paging metadata unavailable", readmeta.CodeProviderPageAmbiguous)
 	}
-	if !obs.PagingKnown {
-		// Missing X-Next-Page must never be inferred exhausted (even for small pages).
-		return ents, 0, false, fmt.Errorf("%s: paging metadata unavailable", readmeta.CodeProviderPageAmbiguous)
-	}
-	if sdkNext > 0 {
-		return ents, sdkNext, false, nil
-	}
-	// Header present but unusable / conflicting with SDK next.
-	return ents, 0, false, fmt.Errorf("%s: paging metadata unavailable", readmeta.CodeProviderPageAmbiguous)
+	return fetched, nil
 }
 
 func (st *queueRuntime) noteCandidate(ctx context.Context, ent mrPageEnt, bit int) error {
@@ -851,29 +964,47 @@ func (st *queueRuntime) noteCandidate(ctx context.Context, ent mrPageEnt, bit in
 		st.persistLimitation(readmeta.CodeIdentityUnresolved, "missing project_id")
 		return nil
 	}
-	if len(st.norm.projectSet) > 0 {
-		tok := strconv.FormatInt(ent.ProjectID, 10)
-		if _, ok := st.norm.projectSet[tok]; !ok {
-			inScope, err := st.projectInScope(ctx, ent.ProjectID)
-			if err != nil {
-				return err
-			}
-			if !inScope {
-				return nil
-			}
+	selected, err := st.projectSelected(ctx, ent.ProjectID)
+	if err != nil {
+		return err
+	}
+	if !selected {
+		return nil
+	}
+	// Owner, group policy, exact MR, and source/downstream proof happen before any
+	// key, timestamp, head, or membership bit is stored in the returned map.
+	meta, err := st.verifyMR(ctx, ent.ProjectID, ent.IID)
+	if err != nil {
+		if isTypedBudget(err) || errors.Is(err, errQueueCancelled) {
+			return err
+		}
+		msg := err.Error()
+		switch {
+		case strings.HasPrefix(msg, readmeta.CodeAuthzDenied), strings.HasPrefix(msg, readmeta.CodeIdentityUnresolved), strings.HasPrefix(msg, readmeta.CodeUnsupported):
+			st.persistLimitation(strings.Split(msg, ":")[0], "candidate not confirmed")
+			return nil
+		default:
+			return err
 		}
 	}
-	// Discovery stores observed list facts only. Exact MR/source/downstream proof
-	// is lazy on emit (shared budget; no unbounded up-front reauth of ≤64 keys).
-	if ent.Updated == "" {
+	if meta.updated == "" {
 		st.dateUnknown = true
 		st.persistLimitation(readmeta.CodePartial, "updated_at unknown")
 		return nil
 	}
+	ent.Key = strconv.FormatInt(ent.ProjectID, 10) + ":" + strconv.FormatInt(ent.IID, 10)
+	ent.Updated = meta.updated
+	ent.Head = meta.head
+	return st.insertProvenCandidate(ent, bit)
+}
+
+func (st *queueRuntime) insertProvenCandidate(ent mrPageEnt, bit int) error {
 	for i := range st.qc.CM {
 		if st.qc.CM[i].K == ent.Key {
 			st.qc.CM[i].B |= bit
-			st.qc.CM[i].U = ent.Updated
+			if ent.Updated != "" {
+				st.qc.CM[i].U = ent.Updated
+			}
 			if ent.Head != nil {
 				st.qc.CM[i].H = ent.Head
 			}
@@ -891,35 +1022,15 @@ func (st *queueRuntime) noteCandidate(ctx context.Context, ent mrPageEnt, bit in
 	return nil
 }
 
-func (st *queueRuntime) projectInScope(ctx context.Context, id int64) (bool, error) {
-	for _, p := range st.norm.projects {
-		c, err := AuthorizeCanonicalProject(ctx, st.d, p)
-		if err != nil {
-			if isTypedBudget(err) {
-				return false, err
-			}
-			msg := err.Error()
-			if strings.HasPrefix(msg, readmeta.CodeAuthzDenied) || strings.HasPrefix(msg, readmeta.CodeIdentityUnresolved) {
-				continue
-			}
-			return false, err
-		}
-		if c.ID == id {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
 func (st *queueRuntime) authorizeGroupProject(ctx context.Context, projectID string) (CanonicalProject, error) {
-	c, err := AuthorizeCanonicalProject(ctx, st.d, projectID)
+	c, err := st.queueAuthorizeProject(ctx, projectID)
 	if err != nil {
 		return CanonicalProject{}, err
 	}
 	if c.NamespaceKind != "group" {
 		return CanonicalProject{}, authzDenied("project namespace not under group")
 	}
-	ok, err := groupAncestryContains(ctx, st.d, c.NamespaceID, map[int64]struct{}{st.group.ID: {}})
+	ok, err := queueGroupAncestryContains(ctx, st.d, c.NamespaceID, map[int64]struct{}{st.group.ID: {}})
 	if err != nil {
 		return CanonicalProject{}, err
 	}
@@ -999,10 +1110,7 @@ func (st *queueRuntime) verifyMR(ctx context.Context, projectID, iid int64) (see
 		extra = append(extra, strconv.FormatInt(mr.ProjectID, 10))
 	}
 	if len(extra) > 0 {
-		if _, err := AuthorizeAdditionalProjects(ctx, st.d, extra...); err != nil {
-			if isTypedBudget(err) {
-				return meta, err
-			}
+		if err := st.queueAuthorizeAdditional(ctx, extra...); err != nil {
 			return meta, err
 		}
 	}
@@ -1021,6 +1129,31 @@ func (st *queueRuntime) discoverOngoing(ctx context.Context) error {
 			og.DP = 1
 		}
 		seed := st.norm.seeds[og.SI]
+		seedID, serr := st.canonicalSelectionID(ctx, seed.ProjectID)
+		if serr != nil {
+			if isTypedBudget(serr) || errors.Is(serr, errQueueCancelled) {
+				return serr
+			}
+			st.persistLimitation(readmeta.CodeIdentityUnresolved, "seed project")
+			og.SI++
+			og.DP = 1
+			og.CN = 0
+			og.PD = ""
+			og.E = false
+			continue
+		}
+		selected, serr := st.projectSelected(ctx, seedID)
+		if serr != nil {
+			return serr
+		}
+		if !selected {
+			og.SI++
+			og.DP = 1
+			og.CN = 0
+			og.PD = ""
+			og.E = false
+			continue
+		}
 		owner, mrMeta, err := st.loadSeedMR(ctx, seed)
 		if err != nil {
 			msg := err.Error()
@@ -1056,7 +1189,7 @@ func (st *queueRuntime) discoverOngoing(ctx context.Context) error {
 			key := strconv.FormatInt(owner.ID, 10) + ":" + strconv.FormatInt(seed.MergeRequestIID, 10)
 			ent := mrPageEnt{Key: key, ProjectID: owner.ID, IID: seed.MergeRequestIID, Updated: mrMeta.updated, Head: mrMeta.head}
 			// Candidate already verified via loadSeedMR; OR ongoing bit without re-Get when facts known.
-			if err := st.noteOngoingCandidate(ent); err != nil {
+			if err := st.insertProvenCandidate(ent, queueBitOngoing); err != nil {
 				return err
 			}
 		}
@@ -1067,33 +1200,6 @@ func (st *queueRuntime) discoverOngoing(ctx context.Context) error {
 		og.E = false
 	}
 	og.E = true
-	return nil
-}
-
-func (st *queueRuntime) noteOngoingCandidate(ent mrPageEnt) error {
-	if ent.Updated == "" {
-		st.dateUnknown = true
-		st.persistLimitation(readmeta.CodePartial, "updated_at unknown")
-		return nil
-	}
-	for i := range st.qc.CM {
-		if st.qc.CM[i].K == ent.Key {
-			st.qc.CM[i].B |= queueBitOngoing
-			st.qc.CM[i].U = ent.Updated
-			if ent.Head != nil {
-				st.qc.CM[i].H = ent.Head
-			}
-			return nil
-		}
-	}
-	if len(st.qc.CM) >= queueMaxCandidates {
-		st.cmFull = true
-		st.membershipIncomp = true
-		st.markTerminal(readmeta.CodeDedupeCapacity, "canonical candidate map capacity reached")
-		st.persistLimitation(readmeta.CodeMembershipIncomplete, "unobserved memberships beyond capacity")
-		return errQueueStop
-	}
-	st.qc.CM = append(st.qc.CM, cursor.QueueCandidate{K: ent.Key, B: queueBitOngoing, U: ent.Updated, H: ent.Head})
 	return nil
 }
 
@@ -1172,7 +1278,7 @@ func (st *queueRuntime) loadSeedMR(ctx context.Context, seed knownMRSeed) (Canon
 		extra = append(extra, strconv.FormatInt(mr.ProjectID, 10))
 	}
 	if len(extra) > 0 {
-		if _, err := AuthorizeAdditionalProjects(ctx, st.d, extra...); err != nil {
+		if err := st.queueAuthorizeAdditional(ctx, extra...); err != nil {
 			return CanonicalProject{}, meta, err
 		}
 	}
@@ -1182,18 +1288,16 @@ func (st *queueRuntime) loadSeedMR(ctx context.Context, seed knownMRSeed) (Canon
 func (st *queueRuntime) scanSeedParticipation(ctx context.Context, owner CanonicalProject, meta seedMRMeta, og *cursor.QueueOngoingProg) (bool, error) {
 	iid := mustIIDFromOG(st, og)
 	key := strconv.FormatInt(owner.ID, 10) + ":" + strconv.FormatInt(iid, 10)
-	// Resume-safe: qualification may already live in cm from a prior page/budget stop.
 	qualified := st.cmHasBit(key, queueBitOngoing)
 	for !og.E {
+		if err := queueContextStop(ctx); err != nil {
+			return qualified, err
+		}
 		opt := &gitlab.ListMergeRequestDiscussionsOptions{
 			ListOptions: gitlab.ListOptions{Page: int64(og.DP), PerPage: int64(og.PSz)},
 		}
 		path := fmt.Sprintf("projects/%s/merge_requests/%d/discussions", gitlab.PathEscape(strconv.FormatInt(owner.ID, 10)), iid)
-		type discEnt struct {
-			fact  string
-			notes []json.RawMessage
-		}
-		var page []discEnt
+		var page []queueDisc
 		resp, err := igl.StreamJSONArrayQueue(ctx, st.d.Client, http.MethodGet, path, opt, func(raw json.RawMessage) error {
 			if err := st.budget.AddItem(); err != nil {
 				return err
@@ -1205,45 +1309,31 @@ func (st *queueRuntime) scanSeedParticipation(ctx context.Context, owner Canonic
 			if err := json.Unmarshal(raw, &d); err != nil || d.ID == "" {
 				return fmt.Errorf("%s: malformed discussion", cursor.ResyncRequired)
 			}
-			page = append(page, discEnt{fact: discussionReplayFact(d.ID, d.Notes, st.discoveryActor), notes: d.Notes})
+			page = append(page, queueDisc{id: d.ID, notes: d.Notes})
 			return nil
 		})
-		if err != nil {
-			if isTypedBudget(err) {
-				return qualified, err
-			}
+		if err != nil && len(page) == 0 && isTypedBudget(err) {
 			return qualified, err
 		}
-		facts := make([]string, len(page))
-		for i := range page {
-			facts[i] = page[i].fact
-		}
-		if og.CN > 0 {
-			if len(facts) < og.CN || prefixDigest(facts[:og.CN]) != og.PD {
-				st.markTerminal(readmeta.CodeProviderPageAmbiguous, "discussion page prefix drift")
-				return qualified, errQueueStop
-			}
-		}
-		for i := og.CN; i < len(page); i++ {
-			for _, nraw := range page[i].notes {
-				if err := st.budget.AddItem(); err != nil {
-					og.CN = i
-					og.PD = prefixDigest(facts[:i])
-					return qualified, err
-				}
-				if noteQualifiesOngoingRaw(nraw, st.discoveryActor) {
-					qualified = true
-					// Persist immediately so budget/page continuation cannot lose qualification.
-					ent := mrPageEnt{Key: key, ProjectID: owner.ID, IID: iid, Updated: meta.updated, Head: meta.head}
-					if err := st.noteOngoingCandidate(ent); err != nil {
-						og.CN = i
-						og.PD = prefixDigest(facts[:i])
-						return qualified, err
-					}
+		if err != nil && len(page) == 0 && !queuePageFraming(err) {
+			var hdr http.Header
+			var sdkNext int64
+			if resp != nil {
+				sdkNext = resp.NextPage
+				if resp.Response != nil {
+					hdr = resp.Response.Header
 				}
 			}
-			og.CN = i + 1
-			og.PD = prefixDigest(facts[:og.CN])
+			if !observeQueuePage(og.DP, hdr, sdkNext, 0).ambiguous {
+				return qualified, err
+			}
+		}
+		qualified, stop, serr := st.walkDiscussionPage(ctx, page, og, key, owner.ID, iid, meta)
+		if serr != nil {
+			return qualified, serr
+		}
+		if stop || st.qc.Term {
+			return qualified, errQueueStop
 		}
 		var hdr http.Header
 		var sdkNext int64
@@ -1253,22 +1343,153 @@ func (st *queueRuntime) scanSeedParticipation(ctx context.Context, owner Canonic
 				hdr = resp.Response.Header
 			}
 		}
-		obs := readmeta.ObservePaging(hdr, sdkNext)
-		if obs.ExhaustedObserved {
+		obs := observeQueuePage(og.DP, hdr, sdkNext, len(page))
+		if isTypedBudget(err) || errors.Is(err, errQueueCancelled) {
+			return qualified, err
+		}
+		if err != nil || obs.ambiguous {
+			st.markTerminal(readmeta.CodeProviderPageAmbiguous, "discussion page incomplete")
+			return qualified, errQueueStop
+		}
+		if obs.exhausted {
 			og.E = true
 			og.CN = 0
 			og.PD = ""
 			break
 		}
-		if !obs.PagingKnown || sdkNext <= 0 {
-			st.markTerminal(readmeta.CodeProviderPageAmbiguous, "discussion paging metadata unavailable")
-			return qualified, errQueueStop
-		}
-		og.DP = int(sdkNext)
+		og.DP = int(obs.next)
 		og.CN = 0
 		og.PD = ""
 	}
 	return qualified, nil
+}
+
+// walkDiscussionPage charges every note, including replayed prefixes, before reading fields.
+// rq2 stores a discussion index only. A stop after any note of the current discussion has
+// been inspected cannot be resumed safely, so that case is an explicit terminal omission.
+type queueDisc struct {
+	id    string
+	notes []json.RawMessage
+}
+
+func (st *queueRuntime) walkDiscussionPage(ctx context.Context, page []queueDisc, og *cursor.QueueOngoingProg, key string, projectID, iid int64, meta seedMRMeta) (qualified bool, stop bool, err error) {
+	_ = ctx
+	qualified = st.cmHasBit(key, queueBitOngoing)
+	if og.CN > 0 && len(page) < og.CN {
+		st.markTerminal(readmeta.CodeProviderPageAmbiguous, "discussion page prefix drift")
+		return qualified, true, nil
+	}
+	facts := make([]string, len(page))
+	for i := 0; i < og.CN && i < len(page); i++ {
+		fact, _, ferr := st.chargeDiscussionNotes(page[i], key, projectID, iid, meta, false)
+		if ferr != nil {
+			if isTypedBudget(ferr) || errors.Is(ferr, errQueueCancelled) {
+				rem := remainingNotes(page, i, noteFailIndex(ferr))
+				if noteFailIndex(ferr) > 0 {
+					st.terminalMidDiscussion(rem)
+					return qualified, true, nil
+				}
+				return qualified, false, ferr
+			}
+			return qualified, false, ferr
+		}
+		facts[i] = fact
+	}
+	if og.CN > 0 && prefixDigest(facts[:og.CN]) != og.PD {
+		st.markTerminal(readmeta.CodeProviderPageAmbiguous, "discussion page prefix drift")
+		return qualified, true, nil
+	}
+	for i := og.CN; i < len(page); i++ {
+		fact, qual, ferr := st.chargeDiscussionNotes(page[i], key, projectID, iid, meta, true)
+		if qual {
+			qualified = true
+		}
+		if ferr != nil {
+			if isTypedBudget(ferr) || errors.Is(ferr, errQueueCancelled) {
+				if noteFailIndex(ferr) > 0 {
+					st.terminalMidDiscussion(remainingNotes(page, i, noteFailIndex(ferr)))
+					return qualified, true, nil
+				}
+				return qualified, false, ferr
+			}
+			if errors.Is(ferr, errQueueStop) {
+				return qualified, true, nil
+			}
+			return qualified, false, ferr
+		}
+		facts[i] = fact
+		og.CN = i + 1
+		og.PD = prefixDigest(facts[:og.CN])
+	}
+	return qualified, false, nil
+}
+
+type noteChargeError struct {
+	index int
+	err   error
+}
+
+func (e *noteChargeError) Error() string { return e.err.Error() }
+func (e *noteChargeError) Unwrap() error { return e.err }
+
+func noteFailIndex(err error) int {
+	var n *noteChargeError
+	if errors.As(err, &n) {
+		return n.index
+	}
+	return 0
+}
+
+func remainingNotes(page []queueDisc, discIdx, noteIdx int) int {
+	if discIdx < 0 || discIdx >= len(page) {
+		return 0
+	}
+	n := len(page[discIdx].notes) - noteIdx
+	if n < 0 {
+		n = 0
+	}
+	for i := discIdx + 1; i < len(page); i++ {
+		n += len(page[i].notes)
+	}
+	return n
+}
+
+func (st *queueRuntime) chargeDiscussionNotes(d queueDisc, key string, projectID, iid int64, meta seedMRMeta, admit bool) (string, bool, error) {
+	parts := make([]string, 0, len(d.notes)+1)
+	parts = append(parts, d.id)
+	qualified := false
+	for i, raw := range d.notes {
+		if err := st.budget.AddItem(); err != nil {
+			return "", qualified, &noteChargeError{index: i, err: err}
+		}
+		parts = append(parts, noteReplayFact(raw, st.discoveryActor))
+		if !noteQualifiesOngoingRaw(raw, st.discoveryActor) {
+			continue
+		}
+		qualified = true
+		if !admit || meta.updated == "" {
+			if meta.updated == "" {
+				st.dateUnknown = true
+				st.persistLimitation(readmeta.CodePartial, "updated_at unknown")
+			}
+			continue
+		}
+		ent := mrPageEnt{Key: key, ProjectID: projectID, IID: iid, Updated: meta.updated, Head: meta.head}
+		if err := st.insertProvenCandidate(ent, queueBitOngoing); err != nil {
+			return strings.Join(parts, ";"), true, err
+		}
+	}
+	return strings.Join(parts, ";"), qualified, nil
+}
+
+func (st *queueRuntime) terminalMidDiscussion(remaining int) {
+	st.markTerminal(readmeta.CodeBudgetItems, "note inspection stopped inside a discussion")
+	st.persistLimitation(readmeta.CodePartial, "rq2 has no within-discussion note index; forward progress cannot be represented")
+	st.persistLimitation(readmeta.CodeMembershipIncomplete, "unscanned discussion notes were not skipped")
+	if remaining >= 0 {
+		n := remaining
+		st.unobservedMembership = &n
+	}
 }
 
 func (st *queueRuntime) cmHasBit(key string, bit int) bool {
@@ -1278,15 +1499,6 @@ func (st *queueRuntime) cmHasBit(key string, bit int) bool {
 		}
 	}
 	return false
-}
-
-func discussionReplayFact(id string, notes []json.RawMessage, actor int64) string {
-	parts := make([]string, 0, len(notes)+1)
-	parts = append(parts, id)
-	for _, n := range notes {
-		parts = append(parts, noteReplayFact(n, actor))
-	}
-	return strings.Join(parts, ";")
 }
 
 func noteReplayFact(raw json.RawMessage, actor int64) string {
@@ -1416,9 +1628,31 @@ func (st *queueRuntime) runEmit(ctx context.Context) ([]reviewQueueItem, error) 
 			st.qc.EI++
 			continue
 		}
+		selected, serr := st.projectSelected(ctx, pid)
+		if serr != nil {
+			if st.terminalProjection() && (isTypedBudget(serr) || errors.Is(serr, errQueueCancelled)) {
+				if item, ok := projectStoredCandidate(c, st.norm); ok {
+					items = append(items, item)
+					st.qc.EI++
+					continue
+				}
+			}
+			return items, serr
+		}
+		if !selected {
+			st.qc.EI++
+			continue
+		}
 		meta, err := st.verifyMR(ctx, pid, iid)
 		if err != nil {
-			if isTypedBudget(err) {
+			if isTypedBudget(err) || errors.Is(err, errQueueCancelled) {
+				if st.terminalProjection() {
+					if item, ok := projectStoredCandidate(c, st.norm); ok {
+						items = append(items, item)
+						st.qc.EI++
+						continue
+					}
+				}
 				// Preserve unprocessed progress: do not advance EI for this candidate.
 				return items, err
 			}
@@ -1447,16 +1681,20 @@ func (st *queueRuntime) runEmit(ctx context.Context) ([]reviewQueueItem, error) 
 			HeadSHA:   head,
 		})
 		st.qc.EI++
-		raw, _ := json.Marshal(items)
-		if len(raw) > queueReturnedJSONCapBytes {
-			items = items[:len(items)-1]
-			st.qc.EI--
-			st.markTerminal(readmeta.CodeCursorCapacity, "returned projection byte cap")
-			st.returnedOmit = len(st.qc.CM) - st.qc.EI
-			break
-		}
 	}
 	return items, nil
+}
+
+func (st *queueRuntime) terminalProjection() bool {
+	return st.qc != nil && (st.qc.Term || st.cmFull || st.membershipIncomp)
+}
+
+func projectStoredCandidate(c cursor.QueueCandidate, n normalizedQueue) (reviewQueueItem, bool) {
+	pid, iid := splitKey(c.K)
+	if pid < 1 || iid < 1 {
+		return reviewQueueItem{}, false
+	}
+	return reviewQueueItem{ProjectID: pid, IID: iid, Kinds: bitsToKinds(c.B, n), HeadSHA: c.H}, true
 }
 
 func bitsToKinds(b int, n normalizedQueue) []string {
@@ -1484,50 +1722,205 @@ func splitKey(k string) (int64, int64) {
 }
 
 func (st *queueRuntime) finalize(items []reviewQueueItem) (map[string]any, error) {
-	// Moving queue: always unknown consistency + limitation; never snapshot-consistent.
+	ctx := st.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	st.movingDiscovery = true
 	st.persistLimitation(readmeta.CodeInconsistent, "moving discovery window")
 	st.section.Consistency = readmeta.ConsistencyUnknown
 	st.section.ContentComplete = readmeta.ContentCompleteFalse
+	st.section.PaginationExhausted = false
 
-	var next *string
 	terminal := st.qc != nil && (st.qc.Term || st.cmFull || st.membershipIncomp)
 	drainedEmit := st.qc.Phase == "emit" && st.qc.EI >= len(st.qc.CM)
-
-	switch {
-	case terminal:
-		// Capacity / ambiguous / encoding overflow: preserve partial successes, no cursor.
-		next = nil
-	case st.qc.Phase == "discover":
+	var next *string
+	if !terminal && (st.qc.Phase == "discover" || !drainedEmit) {
 		tok, err := st.mintCursor()
 		if err != nil {
 			st.markTerminal(readmeta.CodeCursorCapacity, "cursor encoding overflow")
-			next = nil
+			terminal = true
+			if len(items) == 0 && st.qc != nil && st.qc.EI < len(st.qc.CM) {
+				st.qc.Phase = "emit"
+				emitted, eerr := st.runEmit(ctx)
+				if isTypedBudget(eerr) {
+					st.noteBudget(eerr)
+				} else if errors.Is(eerr, errQueueCancelled) {
+					st.persistLimitation(readmeta.CodeCancelled, "invocation cancelled")
+				}
+				items = emitted
+			}
 		} else {
 			next = &tok
 		}
-	case !drainedEmit:
-		tok, err := st.mintCursor()
-		if err != nil {
-			st.markTerminal(readmeta.CodeCursorCapacity, "cursor encoding overflow")
-			next = nil
-		} else {
-			next = &tok
-		}
-	default:
-		// Emit drained after discovery. Moving queue: no exhaustion=>complete inference.
-		next = nil
 	}
+	items, next = st.fitOutput(items, next, &terminal)
+	if terminal {
+		next = nil
+		if st.qc != nil {
+			st.qc.Term = true
+		}
+	}
+	return st.assemble(items, next, terminal), nil
+}
 
-	st.section.PaginationExhausted = false
+func (st *queueRuntime) outputLimit() int {
+	if st.outputLimitBytes > 0 {
+		return st.outputLimitBytes
+	}
+	return queueReturnedJSONCapBytes
+}
+
+func (st *queueRuntime) fitOutput(items []reviewQueueItem, next *string, terminal *bool) ([]reviewQueueItem, *string) {
+	limit := st.outputLimit()
+	for {
+		raw, err := json.Marshal(st.assemble(items, next, *terminal))
+		if err != nil || len(raw) <= limit {
+			return items, next
+		}
+		if !*terminal {
+			st.markTerminal(readmeta.CodeCursorCapacity, "returned projection byte cap")
+			*terminal = true
+			next = nil
+			continue
+		}
+		if len(items) == 0 {
+			return items, nil
+		}
+		items = items[:len(items)-1]
+		if st.qc != nil && st.qc.EI > 0 {
+			st.qc.EI--
+		}
+	}
+}
+
+type queueCountBody struct {
+	ConfirmedCandidates       int  `json:"confirmed_candidates"`
+	ReturnedItems             int  `json:"returned_items"`
+	KnownTerminalOmitted      int  `json:"known_terminal_omitted"`
+	UnobservedMembershipCount *int `json:"unobserved_membership_count"`
+}
+
+func (st *queueRuntime) assemble(items []reviewQueueItem, next *string, terminal bool) map[string]any {
 	st.section.NextCursor = next
+	st.section.PaginationExhausted = false
 	nItems := len(items)
 	st.section.Counts.Items = &nItems
-
+	sections := map[string]readmeta.Section{}
+	for _, kind := range st.norm.kinds {
+		sections[kind] = st.kindSection(kind)
+	}
+	omitted := 0
+	if terminal && st.qc != nil {
+		omitted = len(st.qc.CM) - st.qc.EI
+		if omitted < 0 {
+			omitted = 0
+		}
+	}
 	return map[string]any{
-		"items":   items,
-		"section": st.section,
-	}, nil
+		"items":    items,
+		"section":  st.section,
+		"sections": sections,
+		"queue_counts": queueCountBody{
+			ConfirmedCandidates:       len(st.qc.CM),
+			ReturnedItems:             len(items),
+			KnownTerminalOmitted:      omitted,
+			UnobservedMembershipCount: st.unobservedMembership,
+		},
+	}
+}
+
+func (st *queueRuntime) kindSection(kind string) readmeta.Section {
+	sec := newReviewQueueSection(st.now)
+	sec.Consistency = readmeta.ConsistencyUnknown
+	sec.ContentComplete = readmeta.ContentCompleteFalse
+	sec.PaginationExhausted = st.kindExhausted(kind)
+	sec.HeadSHA = nil
+	sec.AddLimitation(readmeta.CodeInconsistent, "moving discovery window")
+	for _, lim := range st.section.Limitations {
+		if lim.Code == readmeta.CodeInconsistent {
+			continue
+		}
+		if lim.Code == readmeta.CodeUnsupported && kind != "ongoing" {
+			continue
+		}
+		sec.AddLimitation(lim.Code, lim.Message)
+	}
+	if st.kindScanned(kind) {
+		n := st.confirmedKind(kind)
+		sec.Counts.Items = &n
+	}
+	return sec
+}
+
+func (st *queueRuntime) confirmedKind(kind string) int {
+	bit := queueBitReviewer
+	switch kind {
+	case "authored":
+		bit = queueBitAuthored
+	case "ongoing":
+		bit = queueBitOngoing
+	}
+	n := 0
+	if st.qc == nil {
+		return 0
+	}
+	for _, c := range st.qc.CM {
+		if c.B&bit != 0 {
+			n++
+		}
+	}
+	return n
+}
+
+func (st *queueRuntime) kindExhausted(kind string) bool {
+	if st.qc == nil {
+		return false
+	}
+	if kind == "ongoing" {
+		if st.seedlessOngoing || st.qc.OG == nil {
+			return false
+		}
+		return st.qc.OG.E
+	}
+	any := false
+	for _, kp := range st.qc.KP {
+		if kp.Kind != kind {
+			continue
+		}
+		any = true
+		if !kp.E {
+			return false
+		}
+	}
+	return any
+}
+
+func (st *queueRuntime) kindScanned(kind string) bool {
+	if st.qc == nil {
+		return false
+	}
+	if st.qc.Phase == "emit" || st.qc.Term {
+		return true
+	}
+	if kind == "ongoing" {
+		if st.seedlessOngoing {
+			return true
+		}
+		if st.qc.OG == nil {
+			return false
+		}
+		return st.qc.OG.E || st.qc.OG.SI > 0 || st.qc.OG.CN > 0
+	}
+	for i, kp := range st.qc.KP {
+		if kp.Kind != kind {
+			continue
+		}
+		if kp.E || kp.CN > 0 || kp.P > 1 || i < st.qc.KI {
+			return true
+		}
+	}
+	return false
 }
 
 func (st *queueRuntime) mintCursor() (string, error) {
@@ -1623,17 +2016,6 @@ func newReviewQueueSection(now time.Time) readmeta.Section {
 	}
 }
 
-func resolveDiscoveryActor(ctx context.Context, d Deps, id int64) (int64, error) {
-	if id < 1 {
-		return 0, identityErr("discovery actor")
-	}
-	u, _, err := d.Client.Users.GetUser(id, nil, gitlab.WithContext(ctx))
-	if err != nil || u == nil || u.ID != id {
-		return 0, identityErr("discovery actor")
-	}
-	return u.ID, nil
-}
-
 func sanitizeQueueErr(err error) error {
 	if err == nil {
 		return nil
@@ -1658,6 +2040,8 @@ func sanitizeQueueErr(err error) error {
 		return fmt.Errorf("%s", cursor.ResyncRequired)
 	case strings.HasPrefix(msg, readmeta.CodeProviderPageAmbiguous):
 		return fmt.Errorf("%s", readmeta.CodeProviderPageAmbiguous)
+	case errors.Is(err, errQueueCancelled), strings.HasPrefix(msg, readmeta.CodeCancelled):
+		return fmt.Errorf("%s", readmeta.CodeCancelled)
 	case strings.HasPrefix(msg, readmeta.CodeHTTPError):
 		return fmt.Errorf("%s: request failed", readmeta.CodeHTTPError)
 	case strings.HasPrefix(msg, "GITLAB_MCP_CURSOR_KEY"):
@@ -1675,11 +2059,4 @@ func isTypedBudget(err error) bool {
 
 func prefixDigest(keys []string) string {
 	return cursor.SequenceDigest(keys)
-}
-
-func ptrStr(p *string) string {
-	if p == nil {
-		return ""
-	}
-	return *p
 }

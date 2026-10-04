@@ -251,6 +251,9 @@ func Decode(key []byte, token string, now time.Time) (Payload, error) {
 	if !hmac.Equal(sig, mac.Sum(nil)) {
 		return zero, ErrResyncRequired
 	}
+	if err := rejectDuplicateJSONKeys(raw); err != nil {
+		return zero, ErrResyncRequired
+	}
 	var p Payload
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
@@ -299,7 +302,8 @@ func validatePayload(p *Payload) error {
 	if strings.TrimSpace(p.UpperBound) == "" || strings.TrimSpace(p.ExpiresAt) == "" {
 		return ErrResyncRequired
 	}
-	if _, err := time.Parse(time.RFC3339, p.UpperBound); err != nil {
+	// Pinned until may carry fractional seconds. RFC3339Nano accepts both forms.
+	if _, err := time.Parse(time.RFC3339Nano, p.UpperBound); err != nil {
 		return ErrResyncRequired
 	}
 	if _, err := time.Parse(time.RFC3339, p.ExpiresAt); err != nil {
@@ -419,6 +423,11 @@ func validateQueueCont(qc *QueueCont, filterPerPage int) error {
 	if qc.Phase == "discover" && qc.EI != 0 {
 		return ErrResyncRequired
 	}
+	if qc.Phase == "emit" {
+		if qc.KI != len(qc.KP) {
+			return ErrResyncRequired
+		}
+	}
 	seenKey := map[string]struct{}{}
 	wantBits := 0
 	for _, k := range qc.Kinds {
@@ -462,9 +471,24 @@ func validateQueueCont(qc *QueueCont, filterPerPage int) error {
 		if err := validateReplayProg(kp.P, kp.N, kp.E, kp.CN, kp.PD, kp.PSz, filterPerPage); err != nil {
 			return err
 		}
+		if kp.E && (kp.CN != 0 || kp.PD != "" || kp.N != 0) {
+			return ErrResyncRequired
+		}
 	}
-	// Every non-ongoing requested kind must have exactly the requested state streams present
-	// (validated loosely here: kp kinds subset of requested; stream count checked by tool).
+	for i := 0; i < qc.KI && i < len(qc.KP); i++ {
+		if !qc.KP[i].E {
+			return ErrResyncRequired
+		}
+	}
+	if qc.Phase == "emit" {
+		for _, kp := range qc.KP {
+			if !kp.E {
+				return ErrResyncRequired
+			}
+		}
+	}
+	// Exact kind×state product is checked again by the tool against the normalized request.
+	// Here, streams must be sorted and each non-ongoing kind must share one state set.
 	if wantOngoing {
 		if qc.OG == nil {
 			return ErrResyncRequired
@@ -475,13 +499,70 @@ func validateQueueCont(qc *QueueCont, filterPerPage int) error {
 		if err := validateReplayProg(qc.OG.DP, 0, qc.OG.E, qc.OG.CN, qc.OG.PD, qc.OG.PSz, filterPerPage); err != nil {
 			return err
 		}
+		if qc.OG.E && (qc.OG.CN != 0 || qc.OG.PD != "") {
+			return ErrResyncRequired
+		}
+		if qc.Phase == "emit" && !qc.OG.E {
+			return ErrResyncRequired
+		}
 	} else if qc.OG != nil {
 		return ErrResyncRequired
 	}
-	for _, code := range qc.Lim {
-		if strings.TrimSpace(code) == "" {
+	if err := validateQueueLim(qc.Lim); err != nil {
+		return err
+	}
+	if err := validateQueueStreamOrder(qc.KP); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateQueueStreamOrder(kp []QueueKindProg) error {
+	for i := 1; i < len(kp); i++ {
+		if kp[i-1].Kind > kp[i].Kind {
 			return ErrResyncRequired
 		}
+		if kp[i-1].Kind == kp[i].Kind && kp[i-1].State >= kp[i].State {
+			return ErrResyncRequired
+		}
+	}
+	return nil
+}
+
+// queueLimitationCodes is the closed set persisted in rq2 lim. It mirrors the
+// readmeta code list so the codec can fail closed without importing tools.
+var queueLimitationCodes = map[string]struct{}{
+	"inaccessible":            {},
+	"unsupported":             {},
+	"partial":                 {},
+	"inconsistent":            {},
+	"collapsed":               {},
+	"too_large":               {},
+	"budget_items":            {},
+	"budget_bytes":            {},
+	"budget_elapsed":          {},
+	"budget_requests":         {},
+	"http_error":              {},
+	"cancelled":               {},
+	"unknown_count":           {},
+	"authz_denied":            {},
+	"identity_unresolved":     {},
+	"dedupe_capacity":         {},
+	"membership_incomplete":   {},
+	"cursor_capacity":         {},
+	"provider_page_ambiguous": {},
+}
+
+func validateQueueLim(codes []string) error {
+	seen := map[string]struct{}{}
+	for _, code := range codes {
+		if _, ok := queueLimitationCodes[code]; !ok {
+			return ErrResyncRequired
+		}
+		if _, dup := seen[code]; dup {
+			return ErrResyncRequired
+		}
+		seen[code] = struct{}{}
 	}
 	return nil
 }
@@ -503,10 +584,9 @@ func validateReplayProg(page int, next int64, exhausted bool, cn int, pd string,
 	} else if !isHexSHA256(pd) {
 		return ErrResyncRequired
 	}
-	if exhausted && next != 0 {
+	if exhausted && (next != 0 || cn != 0 || pd != "") {
 		return ErrResyncRequired
 	}
-	_ = exhausted
 	return nil
 }
 
@@ -546,7 +626,73 @@ func validQueueKey(k string) bool {
 	}
 	pid, err1 := strconv.ParseInt(parts[0], 10, 64)
 	iid, err2 := strconv.ParseInt(parts[1], 10, 64)
-	return err1 == nil && err2 == nil && pid > 0 && iid > 0
+	if err1 != nil || err2 != nil || pid <= 0 || iid <= 0 {
+		return false
+	}
+	// Reject padded numerics (042:1) so distinct spellings cannot bypass duplicate detection.
+	return parts[0] == strconv.FormatInt(pid, 10) && parts[1] == strconv.FormatInt(iid, 10)
+}
+
+func rejectDuplicateJSONKeys(raw []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	return walkJSONNoDup(dec)
+}
+
+func walkJSONNoDup(dec *json.Decoder) error {
+	tok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	delim, ok := tok.(json.Delim)
+	if !ok {
+		return nil
+	}
+	switch delim {
+	case '{':
+		seen := map[string]struct{}{}
+		for dec.More() {
+			keyTok, err := dec.Token()
+			if err != nil {
+				return err
+			}
+			key, ok := keyTok.(string)
+			if !ok {
+				return ErrResyncRequired
+			}
+			if _, dup := seen[key]; dup {
+				return ErrResyncRequired
+			}
+			seen[key] = struct{}{}
+			if err := walkJSONNoDup(dec); err != nil {
+				return err
+			}
+		}
+		end, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		if d, ok := end.(json.Delim); !ok || d != '}' {
+			return ErrResyncRequired
+		}
+		return nil
+	case '[':
+		for dec.More() {
+			if err := walkJSONNoDup(dec); err != nil {
+				return err
+			}
+		}
+		end, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		if d, ok := end.(json.Delim); !ok || d != ']' {
+			return ErrResyncRequired
+		}
+		return nil
+	default:
+		return ErrResyncRequired
+	}
 }
 
 func validateImmutableRefs(refs []string) error {

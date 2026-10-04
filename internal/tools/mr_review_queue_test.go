@@ -3,9 +3,11 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -386,36 +388,50 @@ func TestReviewQueue_unknownActorZeroList(t *testing.T) {
 
 func drainQueue(t *testing.T, d Deps, args map[string]any) map[string]any {
 	t.Helper()
-	out, err := callReviewQueue(t, d, args)
-	if err != nil {
-		t.Fatal(err)
+	const maxResume = 40
+	seen := map[string]string{}
+	var accumulated []any
+	var out map[string]any
+	var err error
+	args2 := map[string]any{}
+	for k, v := range args {
+		args2[k] = v
 	}
-	var lastWithItems map[string]any
-	for i := 0; i < 8; i++ {
-		sec := sectionMap(out)
-		items, _ := out["items"].([]any)
-		if len(items) > 0 {
-			lastWithItems = out
-		}
-		nc, _ := sec["next_cursor"].(string)
-		if nc == "" {
-			if lastWithItems != nil {
-				return lastWithItems
-			}
-			return out
-		}
-		args2 := map[string]any{}
-		for k, v := range args {
-			args2[k] = v
-		}
-		args2["cursor"] = nc
+	for i := 0; i < maxResume; i++ {
 		out, err = callReviewQueue(t, d, args2)
 		if err != nil {
 			t.Fatal(err)
 		}
+		rawItems, _ := out["items"].([]any)
+		for _, item := range rawItems {
+			m := item.(map[string]any)
+			key := strconv.FormatInt(int64(m["project_id"].(float64)), 10) + ":" + strconv.FormatInt(int64(m["iid"].(float64)), 10)
+			labels := kindLabel(m["kinds"])
+			if prev, ok := seen[key]; ok && prev != labels {
+				t.Fatalf("canonical key %s changed labels %s -> %s", key, prev, labels)
+			}
+			if _, ok := seen[key]; ok {
+				t.Fatalf("duplicate canonical key %s", key)
+			}
+			seen[key] = labels
+			accumulated = append(accumulated, item)
+		}
+		nc, _ := sectionMap(out)["next_cursor"].(string)
+		if nc == "" {
+			out["items"] = accumulated
+			return out
+		}
+		args2["cursor"] = nc
 	}
-	if lastWithItems != nil {
-		return lastWithItems
+	t.Fatalf("review queue did not reach a terminal page within %d resumes", maxResume)
+	return nil
+}
+
+func kindLabel(v any) string {
+	items, _ := v.([]any)
+	parts := make([]string, 0, len(items))
+	for _, it := range items {
+		parts = append(parts, fmt.Sprint(it))
 	}
-	return out
+	return strings.Join(parts, ",")
 }

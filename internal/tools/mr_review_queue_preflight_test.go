@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -45,7 +46,13 @@ func (t *countingQueueTransport) RoundTrip(r *http.Request) (*http.Response, err
 		body = `{"id":9,"full_path":"g","parent_id":0}`
 	case strings.HasPrefix(r.URL.Path, "/api/v4/groups/") && strings.HasSuffix(r.URL.Path, "/merge_requests"):
 		t.listHits.Add(1)
-		hdr.Set("X-Next-Page", "2")
+		page := 1
+		if p := r.URL.Query().Get("page"); p != "" {
+			if n, err := strconv.Atoi(p); err == nil && n > 0 {
+				page = n
+			}
+		}
+		hdr.Set("X-Next-Page", strconv.Itoa(page+1))
 		body = `[{"iid":1,"project_id":42,"updated_at":"2026-10-03T11:00:00Z","sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]`
 	case strings.HasSuffix(r.URL.Path, "/merge_requests/1"):
 		body = `{"id":1,"iid":1,"project_id":42,"state":"opened","source_project_id":42,"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","updated_at":"2026-10-03T11:00:00Z"}`
