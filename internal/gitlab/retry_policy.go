@@ -5,6 +5,12 @@ import (
 	"net/http"
 )
 
+// SafeReadCheckRetry is the production NewClient retry policy.
+// The unexported wrapper remains so existing client construction is unchanged.
+func SafeReadCheckRetry(ctx context.Context, resp *http.Response, err error) (bool, error) {
+	return safeReadCheckRetry(ctx, resp, err)
+}
+
 // safeReadCheckRetry is the production NewClient retry policy.
 //
 // Legacy SDK default (retryHTTPCheck) retried 429/5xx for every HTTP method,
