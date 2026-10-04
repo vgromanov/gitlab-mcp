@@ -262,4 +262,120 @@ func TestDiffAnchorRepair_F4_malformedProofAndTables(t *testing.T) {
 			t.Fatalf("err=%v", err)
 		}
 	})
+	t.Run("wrong_mr", func(t *testing.T) {
+		a := good
+		a.MergeRequestIID = 2
+		_, err := validateDiffAnchor(baseProof, a)
+		if err == nil || err.(diffAnchorRejection).Code != diffAnchorRejectBinding {
+			t.Fatalf("err=%v", err)
+		}
+	})
+	t.Run("wrong_kind", func(t *testing.T) {
+		a := good
+		a.Kind = diffModeTuple
+		_, err := validateDiffAnchor(baseProof, a)
+		if err == nil || err.(diffAnchorRejection).Code != diffAnchorRejectBinding {
+			t.Fatalf("err=%v", err)
+		}
+	})
+	t.Run("wrong_ref_head", func(t *testing.T) {
+		a := good
+		a.HeadSHA = shaN(9)
+		_, err := validateDiffAnchor(baseProof, a)
+		if err == nil || err.(diffAnchorRejection).Code != diffAnchorRejectBinding {
+			t.Fatalf("err=%v", err)
+		}
+	})
+	t.Run("noncanonical_ref", func(t *testing.T) {
+		a := good
+		a.HeadSHA = "not-a-sha"
+		_, err := validateDiffAnchor(baseProof, a)
+		if err == nil {
+			t.Fatal("accepted noncanonical ref")
+		}
+	})
+	t.Run("unknown_kind", func(t *testing.T) {
+		a := good
+		a.Kind = "nope"
+		_, err := validateDiffAnchor(baseProof, a)
+		if err == nil {
+			t.Fatal("accepted unknown kind")
+		}
+	})
+	t.Run("deletion_with_new_coord", func(t *testing.T) {
+		p := baseProof
+		w := p.Windows[0]
+		lines := append([]diffContentLine(nil), w.Lines...)
+		o, n := 2, 9
+		lines[1] = diffContentLine{Kind: diffLineKindDeletion, Text: "-deleted", OldLine: &o, NewLine: &n}
+		w.Lines = lines
+		p.Windows = []diffContentWindow{w}
+		_, err := validateDiffAnchor(p, good)
+		if err == nil || err.(diffAnchorRejection).Code != diffAnchorRejectMalformed {
+			t.Fatalf("err=%v", err)
+		}
+	})
+	t.Run("context_missing_new", func(t *testing.T) {
+		p := baseProof
+		w := p.Windows[0]
+		lines := append([]diffContentLine(nil), w.Lines...)
+		o := 1
+		lines[0] = diffContentLine{Kind: diffLineKindContext, Text: " context-a", OldLine: &o}
+		w.Lines = lines
+		p.Windows = []diffContentWindow{w}
+		a := good
+		a.Side, a.Line = "old", 1
+		_, err := validateDiffAnchor(p, a)
+		if err == nil || err.(diffAnchorRejection).Code != diffAnchorRejectMalformed {
+			t.Fatalf("err=%v", err)
+		}
+	})
+	t.Run("inconsistent_flag", func(t *testing.T) {
+		p := baseProof
+		p.Consistent = false
+		_, err := validateDiffAnchor(p, good)
+		if err == nil {
+			t.Fatal("trusted inconsistent proof")
+		}
+	})
+	t.Run("version_id_only_selector_allowed_when_refs_match_proof", func(t *testing.T) {
+		// Version-ID-only selector remains allowed; trusted proof still carries exact observed refs.
+		a := good
+		a.HeadSHA, a.BaseSHA, a.StartSHA = "", "", ""
+		pos, err := validateDiffAnchor(baseProof, a)
+		if err != nil || pos.Kind != diffLineKindAddition {
+			t.Fatalf("version-id-only against proved refs should bind: pos=%#v err=%v", pos, err)
+		}
+	})
+	t.Run("version_id_only_rejected_when_proof_refs_missing", func(t *testing.T) {
+		p := baseProof
+		p.HeadSHA, p.BaseSHA, p.StartSHA = "", "", ""
+		a := good
+		a.HeadSHA, a.BaseSHA, a.StartSHA = "", "", ""
+		_, err := validateDiffAnchor(p, a)
+		if err == nil || err.(diffAnchorRejection).Code != diffAnchorRejectMalformed {
+			t.Fatalf("proof without refs must not trust version-id-only: err=%v", err)
+		}
+	})
+	t.Run("off_window_line", func(t *testing.T) {
+		a := good
+		a.Line = 99
+		_, err := validateDiffAnchor(baseProof, a)
+		if err == nil || err.(diffAnchorRejection).Code != diffAnchorRejectLine {
+			t.Fatalf("err=%v", err)
+		}
+	})
+	t.Run("duplicate_coordinate_in_proof_shape", func(t *testing.T) {
+		p := baseProof
+		w := p.Windows[0]
+		lines := append([]diffContentLine(nil), w.Lines...)
+		n := 2
+		lines = append(lines, diffContentLine{Kind: diffLineKindAddition, Text: "+dup", NewLine: &n})
+		w.Lines = lines
+		p.Windows = []diffContentWindow{w}
+		_, err := validateDiffAnchor(p, good)
+		if err == nil || err.(diffAnchorRejection).Code != diffAnchorRejectMalformed {
+			t.Fatalf("duplicate new mapping must fail proof shape: err=%v", err)
+		}
+	})
 }

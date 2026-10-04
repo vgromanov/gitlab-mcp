@@ -143,13 +143,13 @@ func validateProofShape(proof diffContentProof) error {
 				return diffAnchorRejection{Code: diffAnchorRejectMalformed, Message: "line shape"}
 			}
 			if ln.OldLine != nil {
-				if prev, ok := seenOld[*ln.OldLine]; ok && prev != ln.Kind {
+				if _, ok := seenOld[*ln.OldLine]; ok {
 					return diffAnchorRejection{Code: diffAnchorRejectMalformed, Message: "duplicate old mapping"}
 				}
 				seenOld[*ln.OldLine] = ln.Kind
 			}
 			if ln.NewLine != nil {
-				if prev, ok := seenNew[*ln.NewLine]; ok && prev != ln.Kind {
+				if _, ok := seenNew[*ln.NewLine]; ok {
 					return diffAnchorRejection{Code: diffAnchorRejectMalformed, Message: "duplicate new mapping"}
 				}
 				seenNew[*ln.NewLine] = ln.Kind
