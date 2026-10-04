@@ -63,7 +63,7 @@ var dailyTools = []string{
 }
 
 // reviewReadTools is the GITLAB_TOOL_PROFILE=review_read|review_write
-// ceiling (exact 26 safe reads). review_write adds no guarded writes here.
+// ceiling (exact 27 safe reads). review_write adds no guarded writes here.
 var reviewReadTools = []string{
 	"get_project",
 	"get_merge_request",
@@ -91,6 +91,7 @@ var reviewReadTools = []string{
 	"list_pipeline_trigger_jobs",
 	"get_pipeline_job",
 	"get_pipeline_job_output",
+	"get_merge_request_review_queue",
 }
 
 // familyTools maps gated family ids to their tool names (mirrors AddTool tags).

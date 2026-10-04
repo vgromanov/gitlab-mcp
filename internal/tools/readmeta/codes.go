@@ -3,21 +3,25 @@ package readmeta
 
 // Stable limitation/error codes for this foundation slice (closed set).
 const (
-	CodeInaccessible       = "inaccessible"
-	CodeUnsupported        = "unsupported"
-	CodePartial            = "partial"
-	CodeInconsistent       = "inconsistent"
-	CodeCollapsed          = "collapsed"
-	CodeTooLarge           = "too_large"
-	CodeBudgetItems        = "budget_items"
-	CodeBudgetBytes        = "budget_bytes"
-	CodeBudgetElapsed      = "budget_elapsed"
-	CodeBudgetRequests     = "budget_requests"
-	CodeHTTPError          = "http_error"
-	CodeCancelled          = "cancelled"
-	CodeUnknownCount       = "unknown_count"
-	CodeAuthzDenied        = "authz_denied"
-	CodeIdentityUnresolved = "identity_unresolved"
+	CodeInaccessible          = "inaccessible"
+	CodeUnsupported           = "unsupported"
+	CodePartial               = "partial"
+	CodeInconsistent          = "inconsistent"
+	CodeCollapsed             = "collapsed"
+	CodeTooLarge              = "too_large"
+	CodeBudgetItems           = "budget_items"
+	CodeBudgetBytes           = "budget_bytes"
+	CodeBudgetElapsed         = "budget_elapsed"
+	CodeBudgetRequests        = "budget_requests"
+	CodeHTTPError             = "http_error"
+	CodeCancelled             = "cancelled"
+	CodeUnknownCount          = "unknown_count"
+	CodeAuthzDenied           = "authz_denied"
+	CodeIdentityUnresolved    = "identity_unresolved"
+	CodeDedupeCapacity        = "dedupe_capacity"
+	CodeMembershipIncomplete  = "membership_incomplete"
+	CodeCursorCapacity        = "cursor_capacity"
+	CodeProviderPageAmbiguous = "provider_page_ambiguous"
 )
 
 // AllCodes is the closed initial code set for tests and docs.
@@ -37,4 +41,8 @@ var AllCodes = []string{
 	CodeUnknownCount,
 	CodeAuthzDenied,
 	CodeIdentityUnresolved,
+	CodeDedupeCapacity,
+	CodeMembershipIncomplete,
+	CodeCursorCapacity,
+	CodeProviderPageAmbiguous,
 }

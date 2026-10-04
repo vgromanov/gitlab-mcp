@@ -22,9 +22,9 @@ import (
 	gitlab "gitlab.com/gitlab-org/api/client-go/v2"
 )
 
-// literalExpectedReview26 is the independent AC oracle for review profiles
+// literalExpectedReview27 is the independent AC oracle for review profiles
 // (not derived from production ReviewReadTools()).
-var literalExpectedReview26 = []string{
+var literalExpectedReview27 = []string{
 	"get_project",
 	"get_merge_request",
 	"list_merge_requests",
@@ -51,6 +51,7 @@ var literalExpectedReview26 = []string{
 	"list_pipeline_trigger_jobs",
 	"get_pipeline_job",
 	"get_pipeline_job_output",
+	"get_merge_request_review_queue",
 }
 
 var reviewForbiddenTools = []string{
@@ -90,7 +91,7 @@ func TestRegisterAll_toolProfiles(t *testing.T) {
 	})
 	for _, profile := range []string{"review_read", "review_write"} {
 		profile := profile
-		t.Run(profile+"_exact_26", func(t *testing.T) {
+		t.Run(profile+"_exact_27", func(t *testing.T) {
 			names := registerNames(t, &config.Config{
 				Token:         "x",
 				ToolProfile:   profile,
@@ -98,9 +99,9 @@ func TestRegisterAll_toolProfiles(t *testing.T) {
 				EnabledTools:  []string{"execute_graphql", "list_issues"},
 				UseDailyTools: true,
 			})
-			assertExactToolSet(t, names, literalExpectedReview26)
-			if len(ReviewReadTools()) != 26 {
-				t.Fatal("production ReviewReadTools must stay len 26")
+			assertExactToolSet(t, names, literalExpectedReview27)
+			if len(ReviewReadTools()) != 27 {
+				t.Fatal("production ReviewReadTools must stay len 27")
 			}
 			for _, bad := range reviewForbiddenTools {
 				if names[bad] {
@@ -118,8 +119,8 @@ func TestRegisterAll_toolProfiles(t *testing.T) {
 		if names["list_pipelines"] {
 			t.Fatal("disabled list_pipelines must be absent")
 		}
-		if len(names) != 25 {
-			t.Fatalf("got %d want 24", len(names))
+		if len(names) != 26 {
+			t.Fatalf("got %d want 26", len(names))
 		}
 	})
 }
@@ -205,7 +206,7 @@ func TestRegisterAll_annotationProbes(t *testing.T) {
 }
 
 // reviewAuthzPath documents the 018 authorization entry for each review tool.
-// Map keys are the independent literal 26-tool oracle.
+// Map keys are the independent literal 27-tool oracle.
 var reviewAuthzPath = map[string]string{
 	"get_project":                      "resolveProjectAuthz",
 	"get_merge_request":                "pidMR.resolve",
@@ -233,27 +234,28 @@ var reviewAuthzPath = map[string]string{
 	"list_pipeline_trigger_jobs":       "resolvePipelineProject",
 	"get_pipeline_job":                 "resolvePipelineProject",
 	"get_pipeline_job_output":          "resolvePipelineProject",
+	"get_merge_request_review_queue":   "AuthorizeCanonicalGroup|authorizeGroupProject|AuthorizeAdditionalProjects",
 }
 
-func TestReviewProfile_authzPathTableExact26(t *testing.T) {
-	if len(literalExpectedReview26) != 26 || len(reviewAuthzPath) != 26 {
-		t.Fatalf("literal want 26; list=%d map=%d", len(literalExpectedReview26), len(reviewAuthzPath))
+func TestReviewProfile_authzPathTableExact27(t *testing.T) {
+	if len(literalExpectedReview27) != 27 || len(reviewAuthzPath) != 27 {
+		t.Fatalf("literal want 27; list=%d map=%d", len(literalExpectedReview27), len(reviewAuthzPath))
 	}
-	for _, name := range literalExpectedReview26 {
+	for _, name := range literalExpectedReview27 {
 		if reviewAuthzPath[name] == "" {
 			t.Fatalf("missing 018 authz path for literal %q", name)
 		}
 	}
 	for name := range reviewAuthzPath {
 		found := false
-		for _, n := range literalExpectedReview26 {
+		for _, n := range literalExpectedReview27 {
 			if n == name {
 				found = true
 				break
 			}
 		}
 		if !found {
-			t.Fatalf("authz map has extra key %q not in literal expected26", name)
+			t.Fatalf("authz map has extra key %q not in literal expected27", name)
 		}
 	}
 	// Production helper must match the independent literal set.
@@ -264,7 +266,7 @@ func TestReviewProfile_authzPathTableExact26(t *testing.T) {
 			m[n] = true
 		}
 		return m
-	}(), literalExpectedReview26)
+	}(), literalExpectedReview27)
 }
 
 func TestReviewProfiles_handlerPolicyProbes(t *testing.T) {
@@ -281,7 +283,7 @@ func TestReviewProfiles_handlerPolicyProbes(t *testing.T) {
 			cs := testutil.MCPConnect(t, srv)
 
 			names := testutil.ToolNames(t, cs)
-			assertExactToolSet(t, names, literalExpectedReview26)
+			assertExactToolSet(t, names, literalExpectedReview27)
 
 			call := func(name string, args map[string]any) *mcp.CallToolResult {
 				t.Helper()

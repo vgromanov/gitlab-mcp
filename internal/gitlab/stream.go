@@ -25,6 +25,20 @@ import (
 // byte-cap; typed onItem errors (e.g. ErrBudgetItems) are preserved over
 // generic io.ErrClosedPipe from the writer side.
 func StreamJSONArray(ctx context.Context, client *gitlab.Client, method, path string, opt any, onItem func(json.RawMessage) error) (*gitlab.Response, error) {
+	return streamJSONArray(ctx, client, method, path, opt, onItem, true)
+}
+
+// StreamJSONArrayQueue is the queue-owned stream entry: callback/decode stop
+// cancels only the derived child context and closes the pipe/reader. It never
+// calls Budget.Cancel on an attached shared budget; transport still charges
+// the same BudgetFromContext counters. Optional RequestOptionFunc values are
+// applied first; the derived child WithContext is applied LAST so a caller
+// gitlab.WithContext(parent) cannot override the cancellable child.
+func StreamJSONArrayQueue(ctx context.Context, client *gitlab.Client, method, path string, opt any, onItem func(json.RawMessage) error, opts ...gitlab.RequestOptionFunc) (*gitlab.Response, error) {
+	return streamJSONArray(ctx, client, method, path, opt, onItem, false, opts...)
+}
+
+func streamJSONArray(ctx context.Context, client *gitlab.Client, method, path string, opt any, onItem func(json.RawMessage) error, cancelBudget bool, opts ...gitlab.RequestOptionFunc) (*gitlab.Response, error) {
 	if client == nil {
 		return nil, io.ErrUnexpectedEOF
 	}
@@ -32,7 +46,10 @@ func StreamJSONArray(ctx context.Context, client *gitlab.Client, method, path st
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	req, err := client.NewRequest(method, path, opt, []gitlab.RequestOptionFunc{gitlab.WithContext(ctx)})
+	// Caller options first (bounds, headers, …); authoritative child context last.
+	reqOpts := append([]gitlab.RequestOptionFunc{}, opts...)
+	reqOpts = append(reqOpts, gitlab.WithContext(ctx))
+	req, err := client.NewRequest(method, path, opt, reqOpts)
 	if err != nil {
 		return nil, err
 	}
@@ -47,8 +64,10 @@ func StreamJSONArray(ctx context.Context, client *gitlab.Client, method, path st
 		stopOnce.Do(func() {
 			decodeErr = mapBudgetContextErr(ctx, cause)
 			cancel()
-			if b := BudgetFromContext(ctx); b != nil {
-				b.Cancel()
+			if cancelBudget {
+				if b := BudgetFromContext(ctx); b != nil {
+					b.Cancel()
+				}
 			}
 			// Closing the reader fails subsequent pipe writes (ErrClosedPipe),
 			// stopping Client.Do Copy and limiting deferred Discard drain.

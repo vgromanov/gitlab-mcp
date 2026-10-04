@@ -171,7 +171,7 @@ func TestContentCompleteRejectsBoolInFixtureSense(t *testing.T) {
 }
 
 func TestAllCodesClosed(t *testing.T) {
-	if len(AllCodes) != 15 {
+	if len(AllCodes) != 19 {
 		t.Fatalf("closed set size=%d", len(AllCodes))
 	}
 }
