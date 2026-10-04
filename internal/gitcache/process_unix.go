@@ -180,6 +180,38 @@ func exitReceipt(waitErr error) bool {
 	return ws.Exited() || ws.Signaled()
 }
 
+// ownedWaitReceipt is one consumed Wait whose error matches that command's
+// ProcessState and pid. A generic error, a missing state, or a different
+// status is not a receipt. ESRCH is not a receipt by itself.
+func ownedWaitReceipt(cmd *exec.Cmd, waitErr error) bool {
+	if cmd == nil || cmd.Process == nil || cmd.Process.Pid <= 1 || cmd.ProcessState == nil {
+		return false
+	}
+	st := cmd.ProcessState
+	if st.Pid() != cmd.Process.Pid {
+		return false
+	}
+	if waitErr == nil {
+		return st.Success()
+	}
+	if st.Success() {
+		return false
+	}
+	var exitErr *exec.ExitError
+	if !errors.As(waitErr, &exitErr) || exitErr.ProcessState == nil {
+		return false
+	}
+	if exitErr.Pid() != st.Pid() || exitErr.Success() != st.Success() || exitErr.ExitCode() != st.ExitCode() {
+		return false
+	}
+	ws, ok := exitErr.Sys().(syscall.WaitStatus)
+	got, ok2 := st.Sys().(syscall.WaitStatus)
+	if !ok || !ok2 || ws != got {
+		return false
+	}
+	return ws.Exited() || ws.Signaled()
+}
+
 // reapOwned waits for the command that LaunchGit started. A natural exit is
 // the receipt. SIGKILL is only the bound when that wait does not finish.
 func reapOwned(cmd *exec.Cmd) error {

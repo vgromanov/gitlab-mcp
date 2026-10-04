@@ -771,21 +771,27 @@ func (r *Root) awaitGit(id string) error {
 		r.clearGit()
 		return ErrNotQuiescent
 	}
-	if waitErr != nil {
-		_ = syscall.Kill(-pid, syscall.SIGKILL)
-		if kerr := syscall.Kill(-pid, 0); !errors.Is(kerr, syscall.ESRCH) {
-			r.gitHold = true
-			return ErrNotQuiescent
-		}
-		r.clearGit()
-		return waitErr
+	if !ownedWaitReceipt(r.git, waitErr) {
+		r.holdGit(id)
+		return ErrNotQuiescent
 	}
-	if err := syscall.Kill(-pid, 0); !errors.Is(err, syscall.ESRCH) {
-		r.gitHold = true
+	if kerr := syscall.Kill(-pid, 0); !errors.Is(kerr, syscall.ESRCH) {
+		r.holdGit(id)
 		return ErrNotQuiescent
 	}
 	r.clearGit()
+	if waitErr != nil {
+		return waitErr
+	}
 	return nil
+}
+
+func (r *Root) holdGit(id string) {
+	r.gitHold = true
+	if oi, err := r.index(id); err == nil {
+		r.slots[oi].Frozen = true
+		_ = r.persist()
+	}
 }
 
 func (r *Root) measureIndex(i int) error {
@@ -1014,20 +1020,20 @@ func (r *Root) readerFinished(i int) error {
 	}
 	select {
 	case err := <-rd.done:
-		pid := rd.cmd.Process.Pid
-		if err != nil {
-			_ = syscall.Kill(-pid, syscall.SIGKILL)
-			if kerr := syscall.Kill(-pid, 0); !errors.Is(kerr, syscall.ESRCH) {
-				return ErrNotQuiescent
-			}
-			r.readerFailed[i] = true
-			delete(r.readers, i)
-			return err
+		if !ownedWaitReceipt(rd.cmd, err) {
+			r.pinHold = true
+			return ErrNotQuiescent
 		}
+		pid := rd.cmd.Process.Pid
 		if kerr := syscall.Kill(-pid, 0); !errors.Is(kerr, syscall.ESRCH) {
+			r.pinHold = true
 			return ErrNotQuiescent
 		}
 		delete(r.readers, i)
+		if err != nil {
+			r.readerFailed[i] = true
+			return err
+		}
 		return nil
 	default:
 		return ErrBusy

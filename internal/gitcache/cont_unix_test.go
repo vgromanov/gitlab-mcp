@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -922,5 +923,285 @@ func TestContForeignUID(t *testing.T) {
 	t.Cleanup(func() { observedUID = old })
 	if err := fstatHeld(int(rf.Fd()), uint64(st.Dev), true, 0700); err == nil {
 		t.Fatal("foreign uid accepted")
+	}
+}
+
+// reapedChild is a real process that has already been waited. The group is ESRCH.
+// The returned error is that Wait result.
+func reapedChild(t *testing.T, code int) (*exec.Cmd, error) {
+	t.Helper()
+	cmd := exec.Command("/bin/sh", "-c", "exit "+strconv.Itoa(code))
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	waitErr := cmd.Wait()
+	if code == 0 && waitErr != nil {
+		t.Fatal(waitErr)
+	}
+	if code != 0 && waitErr == nil {
+		t.Fatal("expected a nonzero exit")
+	}
+	if kerr := syscall.Kill(-cmd.Process.Pid, 0); !errors.Is(kerr, syscall.ESRCH) {
+		t.Fatalf("group still present %v", kerr)
+	}
+	return cmd, waitErr
+}
+
+func TestContUnknownGitWaitDropsSingleton(t *testing.T) {
+	for _, mode := range []string{"generic", "absent", "mismatch"} {
+		t.Run(mode, func(t *testing.T) {
+			h := helperBin(t)
+			root := privateRoot(t)
+			r, err := Open(root, h, QuotaMin+Reserve)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { r.CrashCut() })
+			id1, err := r.Reserve("dom", "tip")
+			if err != nil {
+				t.Fatal(err)
+			}
+			id2, err := r.Reserve("dom2", "tip")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := r.Activate(id1); err != nil || r.Activate(id2) != nil {
+				t.Fatal(err)
+			}
+			used, err := r.Used()
+			if err != nil {
+				t.Fatal(err)
+			}
+			cmd, _ := reapedChild(t, 1)
+			done := make(chan error, 1)
+			switch mode {
+			case "generic":
+				done <- errors.New("unknown wait")
+			case "absent":
+				cmd.ProcessState = nil
+				done <- errors.New("unknown wait")
+			case "mismatch":
+				other, oerr := reapedChild(t, 2)
+				if oerr == nil {
+					t.Fatal("mismatch child had no status")
+				}
+				done <- &exec.ExitError{ProcessState: other.ProcessState}
+			}
+			r.git = cmd
+			r.gitRole = RoleVersion
+			r.gitGen = id1
+			r.gitDone = done
+			if err := r.Quiesce(id1); err == nil {
+				t.Error("unknown wait quiesced the role")
+			}
+			if r.git == nil || !r.gitHold {
+				t.Errorf("unknown wait cleared the child")
+			}
+			if err := r.Quiesce(id1); err == nil || r.git == nil || !r.gitHold {
+				t.Errorf("retry dropped the unknown child %v", err)
+			}
+			oldArg := gitLaunchArg
+			gitLaunchArg = "__gitcache_launch_eof"
+			skipLaunchIdentity = true
+			t.Cleanup(func() {
+				gitLaunchArg = oldArg
+				skipLaunchIdentity = false
+			})
+			if err := r.Launch(RoleVersion, h, id2, "", BuildIdentity{}, "", 0); err != ErrNotQuiescent || r.git != cmd {
+				t.Errorf("unknown wait allowed a second launch: %v", err)
+			}
+			if err := r.Close(); err != ErrNotQuiescent {
+				t.Errorf("unknown wait Close released capacity: %v", err)
+			}
+			if got, gerr := r.Used(); gerr != nil || got != used {
+				t.Errorf("unknown wait changed Used %d -> %d %v", used, got, gerr)
+			}
+		})
+	}
+}
+
+func TestContKnownNonzeroGitAllowsOtherWork(t *testing.T) {
+	h := helperBin(t)
+	root := privateRoot(t)
+	r, err := Open(root, h, QuotaMin+Reserve)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { r.CrashCut() })
+	id1, err := r.Reserve("dom", "tip")
+	if err != nil {
+		t.Fatal(err)
+	}
+	id2, err := r.Reserve("dom2", "tip")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Activate(id1); err != nil || r.Activate(id2) != nil {
+		t.Fatal(err)
+	}
+	cmd, waitErr := reapedChild(t, 1)
+	done := make(chan error, 1)
+	done <- waitErr
+	r.git = cmd
+	r.gitRole = RoleVersion
+	r.gitGen = id1
+	r.gitDone = done
+	if err := r.Quiesce(id1); err == nil {
+		t.Fatal("known nonzero role quiesced")
+	}
+	st, frozen, _, err := r.State(id1)
+	if err != nil || !frozen || st == stateQuiescent || st == stateCommitted {
+		t.Fatalf("known failure was promoted state %d frozen %v %v", st, frozen, err)
+	}
+	if r.git != nil || r.gitHold {
+		t.Fatal("known nonzero exit kept the singleton")
+	}
+	if err := r.Quiesce(id1); err == nil {
+		t.Fatal("retry promoted a known failed role")
+	}
+	oldArg := gitLaunchArg
+	gitLaunchArg = "__gitcache_launch_eof"
+	skipLaunchIdentity = true
+	t.Cleanup(func() {
+		gitLaunchArg = oldArg
+		skipLaunchIdentity = false
+	})
+	if err := r.Launch(RoleVersion, h, id2, "", BuildIdentity{}, "", 0); err == ErrNotQuiescent {
+		t.Fatal("known closed child blocked other work")
+	}
+}
+
+func TestContUnknownReaderWaitReleasesOnClose(t *testing.T) {
+	for _, mode := range []string{"generic", "absent", "mismatch"} {
+		t.Run(mode, func(t *testing.T) {
+			h := helperBin(t)
+			root := privateRoot(t)
+			dest := strings.Repeat("ab", 16)
+			r, id := commitPacked(t, root, h, dest)
+			t.Cleanup(func() { r.CrashCut() })
+			i := -1
+			for n := range r.slots {
+				if r.slots[n].ID == id {
+					i = n
+				}
+			}
+			if i < 0 {
+				t.Fatal("slot")
+			}
+			r.slots[i].ReadCount++
+			r.ownedPins[i]++
+			r.childSlot = i
+			if err := r.persist(); err != nil {
+				t.Fatal(err)
+			}
+			_, _, before, err := r.State(id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			used, err := r.Used()
+			if err != nil {
+				t.Fatal(err)
+			}
+			pack := filepath.Join(root, dest, "objects/pack/input.pack")
+			payload, err := os.ReadFile(pack)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cmd, _ := reapedChild(t, 1)
+			done := make(chan error, 1)
+			switch mode {
+			case "generic":
+				done <- errors.New("unknown wait")
+			case "absent":
+				cmd.ProcessState = nil
+				done <- errors.New("unknown wait")
+			case "mismatch":
+				other, oerr := reapedChild(t, 2)
+				if oerr == nil {
+					t.Fatal("mismatch child had no status")
+				}
+				done <- &exec.ExitError{ProcessState: other.ProcessState}
+			}
+			r.readers[i] = &slotReader{cmd: cmd, done: done}
+			if err := r.Unpin(id); err == nil {
+				t.Fatal("unknown reader unpin succeeded")
+			}
+			if err := r.Unpin(id); err == nil {
+				t.Fatal("retry unpin released an unknown reader")
+			}
+			if _, _, n, err := r.State(id); err != nil || n != before {
+				t.Fatalf("unpin changed ReadCount %d -> %d %v", before, n, err)
+			}
+			if err := r.Close(); err != ErrNotQuiescent {
+				t.Errorf("unknown reader Close released the pin: %v", err)
+			}
+			if _, _, n, err := r.State(id); err != nil || n != before {
+				t.Errorf("ReadCount %d want %d (%v)", n, before, err)
+			}
+			if got, gerr := r.Used(); gerr != nil || got != used {
+				t.Errorf("Used %d -> %d %v", used, got, gerr)
+			}
+			if got, rerr := os.ReadFile(pack); rerr != nil || string(got) != string(payload) {
+				t.Errorf("payload changed %v", rerr)
+			}
+			if err := r.StartReader(id); err == nil {
+				t.Error("unknown reader allowed a new child")
+			}
+			if _, err := r.EvictLRU(); err == nil {
+				t.Error("unknown reader eviction released the slot")
+			}
+			if got, rerr := os.ReadFile(pack); rerr != nil || string(got) != string(payload) {
+				t.Errorf("payload after retry %v", rerr)
+			}
+			if _, _, n, err := r.State(id); err != nil || n != before {
+				t.Errorf("retry ReadCount %d want %d (%v)", n, before, err)
+			}
+		})
+	}
+}
+
+func TestContReaderKnownExitClose(t *testing.T) {
+	h := helperBin(t)
+	root := privateRoot(t)
+	dest := strings.Repeat("cd", 16)
+	r, id := commitPacked(t, root, h, dest)
+	defer r.Close()
+	i := -1
+	for n := range r.slots {
+		if r.slots[n].ID == id {
+			i = n
+		}
+	}
+	if i < 0 {
+		t.Fatal("slot")
+	}
+	_, _, before, err := r.State(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pack := filepath.Join(root, dest, "objects/pack/input.pack")
+	payload, err := os.ReadFile(pack)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd, waitErr := reapedChild(t, 1)
+	done := make(chan error, 1)
+	done <- waitErr
+	r.readers[i] = &slotReader{cmd: cmd, done: done}
+	if err := r.Unpin(id); err == nil {
+		t.Fatal("known nonzero reader unpin succeeded")
+	}
+	if _, _, n, err := r.State(id); err != nil || n != before {
+		t.Fatalf("unpin dropped a known reader %d %v", n, err)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, n, err := r.State(id); err != nil || n != before-1 {
+		t.Fatalf("known exit was not released at Close %d %v", n, err)
+	}
+	if got, rerr := os.ReadFile(pack); rerr != nil || string(got) != string(payload) {
+		t.Fatalf("known exit removed payload %v", rerr)
 	}
 }
