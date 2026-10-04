@@ -6,7 +6,7 @@ func TestDiffAnchor_tables(t *testing.T) {
 	patch := samplePatchAdditionDeletionContext()
 	parsed := parseUnifiedDiff(patch)
 	budget := &contentEmitBudget{maxLines: 1000, maxBytes: 262144}
-	wins, ok, _ := selectDiffWindows(parsed, 1, budget)
+	wins, ok, _, _ := selectDiffWindows(parsed, 1, budget)
 	if !ok || len(wins) != 1 {
 		t.Fatalf("wins=%v", wins)
 	}
@@ -20,6 +20,7 @@ func TestDiffAnchor_tables(t *testing.T) {
 	t.Run("addition", func(t *testing.T) {
 		pos, err := validateDiffAnchor(proof, diffAnchor{
 			ProjectID: "42", MergeRequestIID: 1, Kind: diffModeVersion, VersionID: 9,
+			HeadSHA: shaN(1), BaseSHA: shaN(2), StartSHA: shaN(3),
 			OldPath: "old.go", NewPath: "new.go", Side: "new", Line: 2,
 		})
 		if err != nil || pos.Kind != diffLineKindAddition || pos.NewLine == nil || *pos.NewLine != 2 || pos.OldLine != nil {
@@ -29,6 +30,7 @@ func TestDiffAnchor_tables(t *testing.T) {
 	t.Run("deletion", func(t *testing.T) {
 		pos, err := validateDiffAnchor(proof, diffAnchor{
 			ProjectID: "42", MergeRequestIID: 1, Kind: diffModeVersion, VersionID: 9,
+			HeadSHA: shaN(1), BaseSHA: shaN(2), StartSHA: shaN(3),
 			OldPath: "old.go", NewPath: "new.go", Side: "old", Line: 2,
 		})
 		if err != nil || pos.Kind != diffLineKindDeletion || pos.OldLine == nil || *pos.OldLine != 2 || pos.NewLine != nil {
@@ -38,6 +40,7 @@ func TestDiffAnchor_tables(t *testing.T) {
 	t.Run("context", func(t *testing.T) {
 		pos, err := validateDiffAnchor(proof, diffAnchor{
 			ProjectID: "42", MergeRequestIID: 1, Kind: diffModeVersion, VersionID: 9,
+			HeadSHA: shaN(1), BaseSHA: shaN(2), StartSHA: shaN(3),
 			OldPath: "old.go", NewPath: "new.go", Side: "old", Line: 1,
 		})
 		if err != nil || pos.Kind != diffLineKindContext || pos.Side != "context" || pos.OldLine == nil || pos.NewLine == nil {
@@ -47,6 +50,7 @@ func TestDiffAnchor_tables(t *testing.T) {
 	t.Run("rename paths", func(t *testing.T) {
 		_, err := validateDiffAnchor(proof, diffAnchor{
 			ProjectID: "42", MergeRequestIID: 1, Kind: diffModeVersion, VersionID: 9,
+			HeadSHA: shaN(1), BaseSHA: shaN(2), StartSHA: shaN(3),
 			OldPath: "wrong", NewPath: "new.go", Side: "new", Line: 2,
 		})
 		if err == nil || err.(diffAnchorRejection).Code != diffAnchorRejectPath {
@@ -56,6 +60,7 @@ func TestDiffAnchor_tables(t *testing.T) {
 	t.Run("wrong version", func(t *testing.T) {
 		_, err := validateDiffAnchor(proof, diffAnchor{
 			ProjectID: "42", MergeRequestIID: 1, Kind: diffModeVersion, VersionID: 8,
+			HeadSHA: shaN(1), BaseSHA: shaN(2), StartSHA: shaN(3),
 			OldPath: "old.go", NewPath: "new.go", Side: "new", Line: 2,
 		})
 		if err == nil || err.(diffAnchorRejection).Code != diffAnchorRejectBinding {
@@ -63,17 +68,37 @@ func TestDiffAnchor_tables(t *testing.T) {
 		}
 	})
 	t.Run("wrong side for addition", func(t *testing.T) {
+		// Addition at new line 2 must reject old-side request for that addition coordinate.
 		_, err := validateDiffAnchor(proof, diffAnchor{
 			ProjectID: "42", MergeRequestIID: 1, Kind: diffModeVersion, VersionID: 9,
-			OldPath: "old.go", NewPath: "new.go", Side: "old", Line: 99,
+			HeadSHA: shaN(1), BaseSHA: shaN(2), StartSHA: shaN(3),
+			OldPath: "old.go", NewPath: "new.go", Side: "old", Line: 2,
 		})
-		if err == nil || err.(diffAnchorRejection).Code != diffAnchorRejectLine {
+		// Line 2 old is the deletion; requesting old side at addition's new-line is off-window or side.
+		// Use addition-only patch for true side rejection:
+		addOnly := "@@ -0,0 +1 @@\n+only\n"
+		parsed := parseUnifiedDiff(addOnly)
+		budget := &contentEmitBudget{maxLines: 100, maxBytes: 10000}
+		wins, ok, _, _ := selectDiffWindows(parsed, 0, budget)
+		if !ok || len(wins) != 1 {
+			t.Fatalf("setup wins=%v", wins)
+		}
+		f := diffContentFile{OldPath: strPtr("f"), NewPath: strPtr("f"), Status: diffFileStatusText, Windows: wins}
+		pr := proofFromContentFile(sel, f, true)
+		pr.HeadSHA, pr.BaseSHA, pr.StartSHA = shaN(1), shaN(2), shaN(3)
+		_, err = validateDiffAnchor(pr, diffAnchor{
+			ProjectID: "42", MergeRequestIID: 1, Kind: diffModeVersion, VersionID: 9,
+			HeadSHA: shaN(1), BaseSHA: shaN(2), StartSHA: shaN(3),
+			OldPath: "f", NewPath: "f", Side: "old", Line: 1,
+		})
+		if err == nil || err.(diffAnchorRejection).Code != diffAnchorRejectSide && err.(diffAnchorRejection).Code != diffAnchorRejectLine {
 			t.Fatalf("err=%v", err)
 		}
 	})
 	t.Run("zero line", func(t *testing.T) {
 		_, err := validateDiffAnchor(proof, diffAnchor{
 			ProjectID: "42", MergeRequestIID: 1, Kind: diffModeVersion, VersionID: 9,
+			HeadSHA: shaN(1), BaseSHA: shaN(2), StartSHA: shaN(3),
 			OldPath: "old.go", NewPath: "new.go", Side: "new", Line: 0,
 		})
 		if err == nil || err.(diffAnchorRejection).Code != diffAnchorRejectLine {
@@ -85,6 +110,7 @@ func TestDiffAnchor_tables(t *testing.T) {
 		bad.Available = false
 		_, err := validateDiffAnchor(bad, diffAnchor{
 			ProjectID: "42", MergeRequestIID: 1, Kind: diffModeVersion, VersionID: 9,
+			HeadSHA: shaN(1), BaseSHA: shaN(2), StartSHA: shaN(3),
 			OldPath: "old.go", NewPath: "new.go", Side: "new", Line: 2,
 		})
 		if err == nil || err.(diffAnchorRejection).Code != diffAnchorRejectUnavailable {
@@ -95,15 +121,16 @@ func TestDiffAnchor_tables(t *testing.T) {
 		p := "@@ -1 +1 @@\n-old\n+new\n\\ No newline at end of file\n"
 		parsed := parseUnifiedDiff(p)
 		budget := &contentEmitBudget{maxLines: 100, maxBytes: 10000}
-		wins, ok, _ := selectDiffWindows(parsed, 0, budget)
+		wins, ok, _, _ := selectDiffWindows(parsed, 0, budget)
 		if !ok {
 			t.Fatal("parse")
 		}
 		f := diffContentFile{OldPath: strPtr("f"), NewPath: strPtr("f"), Status: diffFileStatusText, Windows: wins}
-		pr := proofFromContentFile(diffContentSelectionOut{ProjectID: "42", MergeRequestIID: 1, Kind: diffModeVersion, VersionID: int64Ptr(1)}, f, true)
-		// Valid addition still works; marker itself has no coordinates.
+		pr := proofFromContentFile(sel, f, true)
+		pr.HeadSHA, pr.BaseSHA, pr.StartSHA = shaN(1), shaN(2), shaN(3)
 		_, err := validateDiffAnchor(pr, diffAnchor{
-			ProjectID: "42", MergeRequestIID: 1, Kind: diffModeVersion, VersionID: 1,
+			ProjectID: "42", MergeRequestIID: 1, Kind: diffModeVersion, VersionID: 9,
+			HeadSHA: shaN(1), BaseSHA: shaN(2), StartSHA: shaN(3),
 			OldPath: "f", NewPath: "f", Side: "new", Line: 1,
 		})
 		if err != nil {
@@ -114,19 +141,125 @@ func TestDiffAnchor_tables(t *testing.T) {
 		delPatch := "@@ -1 +0,0 @@\n-gone\n"
 		parsed := parseUnifiedDiff(delPatch)
 		budget := &contentEmitBudget{maxLines: 100, maxBytes: 10000}
-		wins, ok, _ := selectDiffWindows(parsed, 0, budget)
+		wins, ok, _, _ := selectDiffWindows(parsed, 0, budget)
 		if !ok || len(wins) != 1 {
 			t.Fatalf("wins=%v", wins)
 		}
 		f := diffContentFile{OldPath: strPtr("gone.go"), NewPath: strPtr("gone.go"), Status: diffFileStatusText, Windows: wins, DeletedFile: boolPtr(true)}
 		pr := proofFromContentFile(sel, f, true)
 		pr.OldPath, pr.NewPath = "gone.go", "gone.go"
+		pr.HeadSHA, pr.BaseSHA, pr.StartSHA = shaN(1), shaN(2), shaN(3)
 		pos, err := validateDiffAnchor(pr, diffAnchor{
 			ProjectID: "42", MergeRequestIID: 1, Kind: diffModeVersion, VersionID: 9,
+			HeadSHA: shaN(1), BaseSHA: shaN(2), StartSHA: shaN(3),
 			OldPath: "gone.go", NewPath: "gone.go", Side: "old", Line: 1,
 		})
 		if err != nil || pos.Kind != diffLineKindDeletion {
 			t.Fatalf("pos=%#v err=%v", pos, err)
+		}
+	})
+}
+
+func TestDiffAnchorRepair_F4_malformedProofAndTables(t *testing.T) {
+	patch := samplePatchAdditionDeletionContext()
+	parsed := parseUnifiedDiff(patch)
+	budget := &contentEmitBudget{maxLines: 1000, maxBytes: 262144}
+	wins, ok, _, _ := selectDiffWindows(parsed, 1, budget)
+	if !ok || len(wins) != 1 {
+		t.Fatalf("setup wins=%v ok=%v", wins, ok)
+	}
+	baseProof := diffContentProof{
+		ProjectID: "42", MergeRequestIID: 1, Kind: diffModeVersion, VersionID: 9,
+		HeadSHA: shaN(1), BaseSHA: shaN(2), StartSHA: shaN(3),
+		OldPath: "old.go", NewPath: "new.go", Windows: wins, Consistent: true, Available: true,
+	}
+	good := diffAnchor{
+		ProjectID: "42", MergeRequestIID: 1, Kind: diffModeVersion, VersionID: 9,
+		HeadSHA: shaN(1), BaseSHA: shaN(2), StartSHA: shaN(3),
+		OldPath: "old.go", NewPath: "new.go", Side: "new", Line: 2,
+	}
+	t.Run("positive_version", func(t *testing.T) {
+		pos, err := validateDiffAnchor(baseProof, good)
+		if err != nil || pos.Kind != diffLineKindAddition {
+			t.Fatalf("pos=%#v err=%v", pos, err)
+		}
+	})
+	t.Run("missing_proof_refs", func(t *testing.T) {
+		p := baseProof
+		p.HeadSHA, p.BaseSHA, p.StartSHA = "", "", ""
+		_, err := validateDiffAnchor(p, good)
+		if err == nil || err.(diffAnchorRejection).Code != diffAnchorRejectMalformed {
+			t.Fatalf("err=%v", err)
+		}
+	})
+	t.Run("unknown_line_kind", func(t *testing.T) {
+		p := baseProof
+		w := p.Windows[0]
+		lines := append([]diffContentLine(nil), w.Lines...)
+		n := 2
+		lines[2] = diffContentLine{Kind: "unsupported", Text: "+added", NewLine: &n}
+		w.Lines = lines
+		p.Windows = []diffContentWindow{w}
+		_, err := validateDiffAnchor(p, good)
+		if err == nil || err.(diffAnchorRejection).Code != diffAnchorRejectMalformed {
+			t.Fatalf("err=%v", err)
+		}
+	})
+	t.Run("addition_with_old_coord", func(t *testing.T) {
+		p := baseProof
+		w := p.Windows[0]
+		lines := append([]diffContentLine(nil), w.Lines...)
+		o, n := 9, 2
+		lines[2] = diffContentLine{Kind: diffLineKindAddition, Text: "+added", OldLine: &o, NewLine: &n}
+		w.Lines = lines
+		p.Windows = []diffContentWindow{w}
+		_, err := validateDiffAnchor(p, good)
+		if err == nil || err.(diffAnchorRejection).Code != diffAnchorRejectMalformed {
+			t.Fatalf("err=%v", err)
+		}
+	})
+	t.Run("available_true_insufficient", func(t *testing.T) {
+		p := baseProof
+		p.ProjectID = ""
+		p.Available = true
+		_, err := validateDiffAnchor(p, good)
+		if err == nil {
+			t.Fatal("trusted Available alone")
+		}
+	})
+	t.Run("tuple_positive", func(t *testing.T) {
+		p := baseProof
+		p.Kind = diffModeTuple
+		p.VersionID = 0
+		a := good
+		a.Kind = diffModeTuple
+		a.VersionID = 0
+		pos, err := validateDiffAnchor(p, a)
+		if err != nil || pos.Kind != diffLineKindAddition {
+			t.Fatalf("pos=%#v err=%v", pos, err)
+		}
+	})
+	t.Run("straight_positive", func(t *testing.T) {
+		p := baseProof
+		p.Kind = diffModeIncremental
+		p.FromSHA, p.ToSHA, p.Straight = shaN(4), shaN(5), true
+		p.HeadSHA, p.BaseSHA, p.StartSHA, p.VersionID = "", "", "", 0
+		a := diffAnchor{
+			ProjectID: "42", MergeRequestIID: 1, Kind: diffModeIncremental,
+			FromSHA: shaN(4), ToSHA: shaN(5), Straight: true,
+			OldPath: "old.go", NewPath: "new.go", Side: "new", Line: 2,
+		}
+		pos, err := validateDiffAnchor(p, a)
+		if err != nil || pos.Kind != diffLineKindAddition {
+			t.Fatalf("pos=%#v err=%v", pos, err)
+		}
+	})
+	t.Run("wrong_project", func(t *testing.T) {
+		a := good
+		a.ProjectID = "99"
+		_, err := validateDiffAnchor(baseProof, a)
+		if err == nil || err.(diffAnchorRejection).Code != diffAnchorRejectBinding {
+			t.Fatalf("err=%v", err)
 		}
 	})
 }

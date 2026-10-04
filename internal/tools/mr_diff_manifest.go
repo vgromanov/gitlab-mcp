@@ -45,11 +45,11 @@ type diffWindowIn struct {
 	Straight        *bool    `json:"straight,omitempty"`
 	PerPage         *int     `json:"per_page,omitempty"`
 	Cursor          *string  `json:"cursor,omitempty"`
-	Mode            *string  `json:"mode,omitempty"`
-	Paths           []string `json:"paths,omitempty"`
-	ContextLines    *int     `json:"context_lines,omitempty"`
-	MaxLines        *int     `json:"max_lines,omitempty"`
-	MaxContentBytes *int     `json:"max_content_bytes,omitempty"`
+	Mode            *string  `json:"mode,omitempty" jsonschema:"manifest (default) or content"`
+	Paths           []string `json:"paths,omitempty" jsonschema:"content mode: 1..per_page distinct repository-relative paths"`
+	ContextLines    *int     `json:"context_lines,omitempty" jsonschema:"content mode: 0..20, default 3"`
+	MaxLines        *int     `json:"max_lines,omitempty" jsonschema:"content mode: 1..10000, default 1000"`
+	MaxContentBytes *int     `json:"max_content_bytes,omitempty" jsonschema:"content mode: 1..1048576, default 262144"`
 	MaxItems        *int     `json:"max_items,omitempty"`
 	MaxBytes        *int64   `json:"max_bytes,omitempty"`
 	MaxRequests     *int     `json:"max_requests,omitempty"`
@@ -1137,11 +1137,12 @@ type objectStream struct {
 }
 
 type streamedPatch struct {
-	text     string
-	retained bool
-	overCap  bool
-	dupKey   bool
-	absent   bool
+	text      string
+	retained  bool
+	overCap   bool
+	dupKey    bool
+	wrongType bool
+	absent    bool
 }
 
 type patchCollect struct {
@@ -1254,6 +1255,7 @@ func decodeProviderObject(dec *json.Decoder, onEntry func(diffManifestEntry) err
 		return objectStream{}, fmt.Errorf("stream object: expected '{'")
 	}
 	st := objectStream{fields: map[string]json.RawMessage{}}
+	seen := map[string]struct{}{}
 	for dec.More() {
 		keyTok, err := dec.Token()
 		if err != nil {
@@ -1263,6 +1265,10 @@ func decodeProviderObject(dec *json.Decoder, onEntry func(diffManifestEntry) err
 		if !ok {
 			return objectStream{}, fmt.Errorf("stream object: key")
 		}
+		if _, dup := seen[key]; dup {
+			return objectStream{}, fmt.Errorf("stream object: duplicate key %q", key)
+		}
+		seen[key] = struct{}{}
 		if key == "diffs" {
 			entries, patches, okDiff, bad, err := decodeDiffArray(dec, onEntry, collect)
 			if err != nil {
@@ -1399,15 +1405,26 @@ func decodeEntry(dec *json.Decoder, collect *patchCollect) (diffManifestEntry, s
 				}
 				continue
 			}
-			var raw string
+			var raw json.RawMessage
 			if err := dec.Decode(&raw); err != nil {
 				return diffManifestEntry{}, streamedPatch{}, false, err
 			}
+			trimmed := bytes.TrimSpace(raw)
+			if len(trimmed) == 0 || string(trimmed) == "null" {
+				patch.absent = true
+				continue
+			}
+			var s string
+			if json.Unmarshal(trimmed, &s) != nil {
+				patch.wrongType = true
+				patch.absent = false
+				continue
+			}
 			patch.absent = false
-			if len(raw) > collect.maxCandidate {
+			if len(s) > collect.maxCandidate {
 				patch.overCap = true
 			} else {
-				patch.text = raw
+				patch.text = s
 			}
 			continue
 		}
@@ -1432,7 +1449,7 @@ func decodeEntry(dec *json.Decoder, collect *patchCollect) (diffManifestEntry, s
 		patch.text = ""
 	}
 	entry, bad := entryFromRaw(env)
-	if collect != nil && !patch.dupKey && !patch.absent && !patch.overCap && patch.text != "" && collect.wanted(entry) {
+	if collect != nil && !patch.dupKey && !patch.wrongType && !patch.absent && !patch.overCap && collect.wanted(entry) {
 		if collect.selectedUsed+len(patch.text) > collect.maxSelected {
 			patch.overCap = true
 			patch.text = ""

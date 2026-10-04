@@ -1,6 +1,10 @@
 package tools
 
-import "fmt"
+import (
+	"fmt"
+	"strconv"
+	"strings"
+)
 
 const (
 	diffAnchorRejectUnavailable  = "unavailable"
@@ -71,19 +75,103 @@ func (r diffAnchorRejection) Error() string {
 	return fmt.Sprintf("%s: %s", r.Code, r.Message)
 }
 
+func canonicalProjectID(s string) (string, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "", false
+	}
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil || n < 1 || strconv.FormatInt(n, 10) != s {
+		return "", false
+	}
+	return s, true
+}
+
+func proofLineValid(ln diffContentLine) bool {
+	switch ln.Kind {
+	case diffLineKindAddition:
+		return ln.NewLine != nil && *ln.NewLine > 0 && ln.OldLine == nil
+	case diffLineKindDeletion:
+		return ln.OldLine != nil && *ln.OldLine > 0 && ln.NewLine == nil
+	case diffLineKindContext:
+		return ln.OldLine != nil && ln.NewLine != nil && *ln.OldLine > 0 && *ln.NewLine > 0
+	default:
+		return false
+	}
+}
+
+func validateProofShape(proof diffContentProof) error {
+	if _, ok := canonicalProjectID(proof.ProjectID); !ok {
+		return diffAnchorRejection{Code: diffAnchorRejectMalformed, Message: "project"}
+	}
+	if proof.MergeRequestIID < 1 {
+		return diffAnchorRejection{Code: diffAnchorRejectMalformed, Message: "mr"}
+	}
+	switch proof.Kind {
+	case diffModeVersion:
+		if proof.VersionID < 1 {
+			return diffAnchorRejection{Code: diffAnchorRejectMalformed, Message: "version"}
+		}
+		if !isFortyHex(proof.HeadSHA) || !isFortyHex(proof.BaseSHA) || !isFortyHex(proof.StartSHA) {
+			return diffAnchorRejection{Code: diffAnchorRejectMalformed, Message: "version refs"}
+		}
+	case diffModeTuple:
+		if !isFortyHex(proof.HeadSHA) || !isFortyHex(proof.BaseSHA) || !isFortyHex(proof.StartSHA) {
+			return diffAnchorRejection{Code: diffAnchorRejectMalformed, Message: "tuple refs"}
+		}
+	case diffModeIncremental:
+		if !isFortyHex(proof.FromSHA) || !isFortyHex(proof.ToSHA) || !proof.Straight {
+			return diffAnchorRejection{Code: diffAnchorRejectMalformed, Message: "incremental refs"}
+		}
+	default:
+		return diffAnchorRejection{Code: diffAnchorRejectMalformed, Message: "selection kind"}
+	}
+	if proof.OldPath == "" && proof.NewPath == "" {
+		return diffAnchorRejection{Code: diffAnchorRejectMalformed, Message: "path pair"}
+	}
+	if len(proof.Windows) == 0 {
+		return diffAnchorRejection{Code: diffAnchorRejectUnavailable, Message: "no windows"}
+	}
+	seenOld := map[int]string{}
+	seenNew := map[int]string{}
+	for _, w := range proof.Windows {
+		for _, ln := range w.Lines {
+			if ln.Kind == diffLineKindMarker {
+				return diffAnchorRejection{Code: diffAnchorRejectMalformed, Message: "marker line"}
+			}
+			if !proofLineValid(ln) {
+				return diffAnchorRejection{Code: diffAnchorRejectMalformed, Message: "line shape"}
+			}
+			if ln.OldLine != nil {
+				if prev, ok := seenOld[*ln.OldLine]; ok && prev != ln.Kind {
+					return diffAnchorRejection{Code: diffAnchorRejectMalformed, Message: "duplicate old mapping"}
+				}
+				seenOld[*ln.OldLine] = ln.Kind
+			}
+			if ln.NewLine != nil {
+				if prev, ok := seenNew[*ln.NewLine]; ok && prev != ln.Kind {
+					return diffAnchorRejection{Code: diffAnchorRejectMalformed, Message: "duplicate new mapping"}
+				}
+				seenNew[*ln.NewLine] = ln.Kind
+			}
+		}
+	}
+	return nil
+}
+
 // validateDiffAnchor returns a canonical text position or a typed rejection.
 // Markers are never anchors. Context lines return both coordinates.
 func validateDiffAnchor(proof diffContentProof, anchor diffAnchor) (diffTextPosition, error) {
+	if err := validateProofShape(proof); err != nil {
+		return diffTextPosition{}, err
+	}
 	if !proof.Available {
 		return diffTextPosition{}, diffAnchorRejection{Code: diffAnchorRejectUnavailable, Message: "proof unavailable"}
 	}
 	if !proof.Consistent {
 		return diffTextPosition{}, diffAnchorRejection{Code: diffAnchorRejectInconsistent, Message: "proof inconsistent"}
 	}
-	if len(proof.Windows) == 0 {
-		return diffTextPosition{}, diffAnchorRejection{Code: diffAnchorRejectUnavailable, Message: "no windows"}
-	}
-	if anchor.ProjectID != proof.ProjectID || anchor.MergeRequestIID != proof.MergeRequestIID {
+	if ap, ok := canonicalProjectID(anchor.ProjectID); !ok || ap != proof.ProjectID || anchor.MergeRequestIID != proof.MergeRequestIID {
 		return diffTextPosition{}, diffAnchorRejection{Code: diffAnchorRejectBinding, Message: "project or mr"}
 	}
 	if anchor.Kind != proof.Kind {
@@ -91,12 +179,12 @@ func validateDiffAnchor(proof diffContentProof, anchor diffAnchor) (diffTextPosi
 	}
 	switch proof.Kind {
 	case diffModeVersion:
-		if anchor.VersionID != proof.VersionID || proof.VersionID < 1 {
+		if anchor.VersionID != proof.VersionID {
 			return diffTextPosition{}, diffAnchorRejection{Code: diffAnchorRejectBinding, Message: "version"}
 		}
-		if proof.HeadSHA != "" && (anchor.HeadSHA != "" && anchor.HeadSHA != proof.HeadSHA ||
-			anchor.BaseSHA != "" && anchor.BaseSHA != proof.BaseSHA ||
-			anchor.StartSHA != "" && anchor.StartSHA != proof.StartSHA) {
+		if (anchor.HeadSHA != "" && anchor.HeadSHA != proof.HeadSHA) ||
+			(anchor.BaseSHA != "" && anchor.BaseSHA != proof.BaseSHA) ||
+			(anchor.StartSHA != "" && anchor.StartSHA != proof.StartSHA) {
 			return diffTextPosition{}, diffAnchorRejection{Code: diffAnchorRejectBinding, Message: "refs"}
 		}
 	case diffModeTuple:
@@ -110,8 +198,6 @@ func validateDiffAnchor(proof diffContentProof, anchor diffAnchor) (diffTextPosi
 		if anchor.FromSHA != proof.FromSHA || anchor.ToSHA != proof.ToSHA || anchor.Straight != proof.Straight || !proof.Straight {
 			return diffTextPosition{}, diffAnchorRejection{Code: diffAnchorRejectBinding, Message: "incremental refs"}
 		}
-	default:
-		return diffTextPosition{}, diffAnchorRejection{Code: diffAnchorRejectMalformed, Message: "selection kind"}
 	}
 	if anchor.OldPath != proof.OldPath || anchor.NewPath != proof.NewPath {
 		return diffTextPosition{}, diffAnchorRejection{Code: diffAnchorRejectPath, Message: "path pair"}
@@ -127,9 +213,6 @@ func validateDiffAnchor(proof diffContentProof, anchor diffAnchor) (diffTextPosi
 	}
 	for _, w := range proof.Windows {
 		for _, ln := range w.Lines {
-			if ln.Kind == diffLineKindMarker {
-				continue
-			}
 			switch side {
 			case "old":
 				if ln.OldLine == nil || *ln.OldLine != anchor.Line {
@@ -164,7 +247,6 @@ func canonicalPosition(proof diffContentProof, ln diffContentLine, side string, 
 		NewLine: cloneIntPtr(ln.NewLine),
 	}
 	if ln.Kind == diffLineKindContext {
-		// Canonical context position exposes both coordinates.
 		pos.Side = "context"
 	}
 	return pos
@@ -180,7 +262,6 @@ func proofFromContentFile(sel diffContentSelectionOut, file diffContentFile, con
 		NewPath:         pathStr(file.NewPath),
 		Windows:         file.Windows,
 		Consistent:      consistent,
-		Available:       file.Status == diffFileStatusText && len(file.Windows) > 0,
 	}
 	if sel.VersionID != nil {
 		p.VersionID = *sel.VersionID
@@ -203,5 +284,6 @@ func proofFromContentFile(sel diffContentSelectionOut, file diffContentFile, con
 	if sel.Straight != nil {
 		p.Straight = *sel.Straight
 	}
+	p.Available = file.Status == diffFileStatusText && len(file.Windows) > 0 && validateProofShape(p) == nil
 	return p
 }

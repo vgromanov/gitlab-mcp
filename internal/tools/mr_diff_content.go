@@ -1,12 +1,14 @@
 package tools
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -41,10 +43,12 @@ const (
 	diffFileStatusUnavailable = "unavailable"
 	diffFileStatusMetadata    = "metadata"
 
-	diffSelectorMatched   = "matched"
-	diffSelectorAbsent    = "absent"
-	diffSelectorAmbiguous = "ambiguous"
-	diffSelectorCoalesced = "coalesced"
+	diffSelectorMatched     = "matched"
+	diffSelectorAbsent      = "absent"
+	diffSelectorAmbiguous   = "ambiguous"
+	diffSelectorCoalesced   = "coalesced"
+	diffSelectorUnobserved  = "unobserved"
+	diffSelectorUnavailable = "unavailable"
 
 	diffLineKindContext  = "context"
 	diffLineKindAddition = "addition"
@@ -138,6 +142,7 @@ type retainedDiffFile struct {
 	patchOK    bool
 	overCap    bool
 	dupKey     bool
+	wrongType  bool
 	pathBad    bool
 	sourceHash string
 }
@@ -184,10 +189,17 @@ func (b *contentEmitBudget) add(lineCount, byteCount int) {
 }
 
 func normalizeDiffWindowMode(in diffWindowIn) (string, diffContentOpts, error) {
+	if in.Cursor != nil && strings.TrimSpace(*in.Cursor) == "" {
+		return "", diffContentOpts{}, fmt.Errorf("cursor must not be blank")
+	}
 	mode := diffModeManifest
 	if in.Mode != nil {
-		switch strings.TrimSpace(*in.Mode) {
-		case "", diffModeManifest:
+		m := strings.TrimSpace(*in.Mode)
+		if m == "" {
+			return "", diffContentOpts{}, fmt.Errorf("mode must be manifest or content")
+		}
+		switch m {
+		case diffModeManifest:
 			mode = diffModeManifest
 		case diffModeContent:
 			mode = diffModeContent
@@ -195,7 +207,7 @@ func normalizeDiffWindowMode(in diffWindowIn) (string, diffContentOpts, error) {
 			return "", diffContentOpts{}, fmt.Errorf("mode must be manifest or content")
 		}
 	}
-	hasContentFields := len(in.Paths) > 0 || in.ContextLines != nil || in.MaxLines != nil || in.MaxContentBytes != nil
+	hasContentFields := in.Paths != nil || in.ContextLines != nil || in.MaxLines != nil || in.MaxContentBytes != nil
 	if mode == diffModeManifest {
 		if hasContentFields {
 			return "", diffContentOpts{}, fmt.Errorf("content fields are only valid when mode=content")
@@ -366,14 +378,17 @@ func splitDiffSourceLines(patch string) []diffSourceLine {
 }
 
 func parseHunkHeader(header string) (oldStart, oldCount, newStart, newCount int, ok bool) {
-	rest := strings.TrimSpace(header)
-	if !strings.HasPrefix(rest, "@@") {
+	raw := strings.TrimRight(header, "\r\n")
+	if !strings.HasPrefix(raw, "@@") {
 		return 0, 0, 0, 0, false
 	}
-	rest = strings.TrimSpace(strings.TrimPrefix(rest, "@@"))
+	rest := strings.TrimPrefix(raw, "@@")
 	parts := strings.SplitN(rest, "@@", 2)
+	if len(parts) < 2 {
+		return 0, 0, 0, 0, false
+	}
 	ranges := strings.Fields(strings.TrimSpace(parts[0]))
-	if len(ranges) < 2 {
+	if len(ranges) != 2 {
 		return 0, 0, 0, 0, false
 	}
 	oStart, oCount, ook := parseDiffRange(ranges[0], '-')
@@ -389,19 +404,49 @@ func parseDiffRange(tok string, sign byte) (start, count int, ok bool) {
 		return 0, 0, false
 	}
 	body := tok[1:]
+	var s, c int
 	if i := strings.IndexByte(body, ','); i >= 0 {
-		s, err1 := strconv.Atoi(body[:i])
-		c, err2 := strconv.Atoi(body[i+1:])
+		var err1, err2 error
+		s, err1 = strconv.Atoi(body[:i])
+		c, err2 = strconv.Atoi(body[i+1:])
 		if err1 != nil || err2 != nil || s < 0 || c < 0 {
 			return 0, 0, false
 		}
-		return s, c, true
+	} else {
+		var err error
+		s, err = strconv.Atoi(body)
+		if err != nil || s < 0 {
+			return 0, 0, false
+		}
+		c = 1
 	}
-	s, err := strconv.Atoi(body)
-	if err != nil || s < 0 {
+	if s == 0 && c > 0 {
 		return 0, 0, false
 	}
-	return s, 1, true
+	if c > 0 && s > math.MaxInt-c+1 {
+		return 0, 0, false
+	}
+	return s, c, true
+}
+
+func checkedInc(pos int) (int, bool) {
+	if pos == math.MaxInt {
+		return 0, false
+	}
+	return pos + 1, true
+}
+
+func isDiffFramingLine(line string) bool {
+	switch {
+	case strings.HasPrefix(line, "--- "), strings.HasPrefix(line, "+++ "), strings.HasPrefix(line, "diff "),
+		strings.HasPrefix(line, "index "), strings.HasPrefix(line, "old mode "), strings.HasPrefix(line, "new mode "),
+		strings.HasPrefix(line, "similarity index "), strings.HasPrefix(line, "rename from "), strings.HasPrefix(line, "rename to "),
+		strings.HasPrefix(line, "new file mode "), strings.HasPrefix(line, "deleted file mode "),
+		line == "GIT binary patch", strings.HasPrefix(line, "Binary files "):
+		return true
+	default:
+		return false
+	}
 }
 
 func parseUnifiedDiff(patch string) diffParsedPatch {
@@ -413,30 +458,41 @@ func parseUnifiedDiff(patch string) diffParsedPatch {
 	}
 	lines := splitDiffSourceLines(patch)
 	var hunks []diffParsedHunk
+	var lastOldEnd, lastNewEnd int
+	haveOldEnd, haveNewEnd := false, false
 	i := 0
 	for i < len(lines) {
 		line := lines[i].text
-		switch {
-		case strings.HasPrefix(line, "--- "), strings.HasPrefix(line, "+++ "), strings.HasPrefix(line, "diff "),
-			strings.HasPrefix(line, "index "), strings.HasPrefix(line, "old mode "), strings.HasPrefix(line, "new mode "),
-			strings.HasPrefix(line, "similarity index "), strings.HasPrefix(line, "rename from "), strings.HasPrefix(line, "rename to "),
-			strings.HasPrefix(line, "Binary files "), strings.HasPrefix(line, "GIT binary patch"),
-			strings.HasPrefix(line, "new file mode "), strings.HasPrefix(line, "deleted file mode "):
+		if isDiffFramingLine(line) {
 			i++
 			continue
 		}
 		if !strings.HasPrefix(line, "@@") {
-			i++
-			continue
+			return diffParsedPatch{ok: false}
 		}
 		oldStart, oldCount, newStart, newCount, ok := parseHunkHeader(line)
 		if !ok {
 			return diffParsedPatch{ok: false}
 		}
+		if oldCount > 0 {
+			if haveOldEnd && oldStart < lastOldEnd {
+				return diffParsedPatch{ok: false}
+			}
+			lastOldEnd = oldStart + oldCount
+			haveOldEnd = true
+		}
+		if newCount > 0 {
+			if haveNewEnd && newStart < lastNewEnd {
+				return diffParsedPatch{ok: false}
+			}
+			lastNewEnd = newStart + newCount
+			haveNewEnd = true
+		}
 		h := diffParsedHunk{header: lines[i].raw, oldStart: oldStart, oldCount: oldCount, newStart: newStart, newCount: newCount}
 		i++
 		oldPos, newPos := oldStart, newStart
 		oldSeen, newSeen := 0, 0
+		sawMarker := false
 		for i < len(lines) {
 			cur := lines[i]
 			body := cur.text
@@ -444,14 +500,19 @@ func parseUnifiedDiff(patch string) diffParsedPatch {
 				break
 			}
 			if body == `\ No newline at end of file` {
-				if len(h.lines) == 0 {
+				if len(h.lines) == 0 || h.lines[len(h.lines)-1].kind == diffLineKindMarker {
+					return diffParsedPatch{ok: false}
+				}
+				if sawMarker {
 					return diffParsedPatch{ok: false}
 				}
 				h.lines[len(h.lines)-1].noNewline = true
 				h.lines = append(h.lines, diffParsedLine{kind: diffLineKindMarker, text: body, raw: cur.raw})
+				sawMarker = true
 				i++
 				continue
 			}
+			sawMarker = false
 			var pl diffParsedLine
 			pl.raw = cur.raw
 			switch {
@@ -461,7 +522,11 @@ func parseUnifiedDiff(patch string) diffParsedPatch {
 				pl.text = body
 				pl.newLine = &n
 				pl.changed = true
-				newPos++
+				var okInc bool
+				newPos, okInc = checkedInc(newPos)
+				if !okInc {
+					return diffParsedPatch{ok: false}
+				}
 				newSeen++
 			case strings.HasPrefix(body, "-"):
 				o := oldPos
@@ -469,20 +534,24 @@ func parseUnifiedDiff(patch string) diffParsedPatch {
 				pl.text = body
 				pl.oldLine = &o
 				pl.changed = true
-				oldPos++
+				var okInc bool
+				oldPos, okInc = checkedInc(oldPos)
+				if !okInc {
+					return diffParsedPatch{ok: false}
+				}
 				oldSeen++
-			case strings.HasPrefix(body, " ") || body == "":
+			case strings.HasPrefix(body, " "):
 				o, n := oldPos, newPos
 				pl.kind = diffLineKindContext
-				if body == "" {
-					pl.text = " "
-				} else {
-					pl.text = body
-				}
+				pl.text = body
 				pl.oldLine = &o
 				pl.newLine = &n
-				oldPos++
-				newPos++
+				var okOld, okNew bool
+				oldPos, okOld = checkedInc(oldPos)
+				newPos, okNew = checkedInc(newPos)
+				if !okOld || !okNew {
+					return diffParsedPatch{ok: false}
+				}
 				oldSeen++
 				newSeen++
 			default:
@@ -535,19 +604,32 @@ func changedRanges(lines []diffParsedLine, contextLines int) []lineRange {
 }
 
 func expandRange(lines []diffParsedLine, start, end, contextLines int) lineRange {
-	s := start - contextLines
-	if s < 0 {
-		s = 0
+	// Expand by source-line context (markers do not consume context budget).
+	s := start
+	need := contextLines
+	for s > 0 && need > 0 {
+		s--
+		if lines[s].kind == diffLineKindMarker {
+			continue
+		}
+		need--
 	}
-	e := end + contextLines
-	if e >= len(lines) {
-		e = len(lines) - 1
+	for s > 0 && lines[s-1].kind == diffLineKindMarker {
+		s--
 	}
-	for s <= e && lines[s].kind == diffLineKindMarker {
-		s++
+	e := end
+	need = contextLines
+	for e+1 < len(lines) && need > 0 {
+		next := lines[e+1]
+		if next.kind == diffLineKindMarker {
+			e++
+			continue
+		}
+		e++
+		need--
 	}
-	for e >= s && lines[e].kind == diffLineKindMarker {
-		e--
+	for e+1 < len(lines) && lines[e+1].kind == diffLineKindMarker {
+		e++
 	}
 	if s > e {
 		return lineRange{start: start, end: end}
@@ -584,31 +666,28 @@ func buildWindow(hunk diffParsedHunk, rg lineRange, budget *contentEmitBudget) (
 
 	var lines []diffContentLine
 	truncated := false
-	for i := rg.start; i <= rg.end; i++ {
+	for i := rg.start; i <= rg.end; {
 		ln := hunk.lines[i]
 		if ln.kind == diffLineKindMarker {
-			if len(lines) == 0 {
-				continue
-			}
-			nb := len(ln.raw)
-			if !budget.can(1, nb) {
-				truncated = true
-				break
-			}
-			budget.add(1, nb)
-			b.WriteString(ln.raw)
-			lines[len(lines)-1].NoNewline = true
-			continue
+			return diffContentWindow{}, false, false // orphan/detached marker in range
 		}
-		nb := len(ln.raw)
-		if !budget.can(1, nb) {
+		unit := ln.raw
+		unitLines := 1
+		j := i + 1
+		for j <= rg.end && j < len(hunk.lines) && hunk.lines[j].kind == diffLineKindMarker {
+			unit += hunk.lines[j].raw
+			unitLines++
+			j++
+		}
+		if !budget.can(unitLines, len(unit)) {
 			truncated = true
 			break
 		}
-		budget.add(1, nb)
-		b.WriteString(ln.raw)
-		out := diffContentLine{Kind: ln.kind, Text: ln.text, OldLine: cloneIntPtr(ln.oldLine), NewLine: cloneIntPtr(ln.newLine), NoNewline: ln.noNewline}
+		budget.add(unitLines, len(unit))
+		b.WriteString(unit)
+		out := diffContentLine{Kind: ln.kind, Text: ln.text, OldLine: cloneIntPtr(ln.oldLine), NewLine: cloneIntPtr(ln.newLine), NoNewline: ln.noNewline || j > i+1}
 		lines = append(lines, out)
+		i = j
 	}
 	if len(lines) == 0 {
 		return diffContentWindow{}, false, truncated
@@ -628,40 +707,68 @@ func cloneIntPtr(v *int) *int {
 	return &x
 }
 
-func selectDiffWindows(parsed diffParsedPatch, contextLines int, budget *contentEmitBudget) ([]diffContentWindow, bool, bool) {
+func selectDiffWindows(parsed diffParsedPatch, contextLines int, budget *contentEmitBudget) ([]diffContentWindow, bool, bool, bool) {
 	if !parsed.ok {
-		return nil, false, false
+		return nil, false, false, false
 	}
 	var windows []diffContentWindow
 	truncated := false
+	omittedContext := false
 	for _, hunk := range parsed.hunks {
-		for _, rg := range changedRanges(hunk.lines, contextLines) {
+		ranges := changedRanges(hunk.lines, contextLines)
+		included := map[int]bool{}
+		for _, rg := range ranges {
+			for i := rg.start; i <= rg.end; i++ {
+				included[i] = true
+			}
+		}
+		for i, ln := range hunk.lines {
+			if ln.kind == diffLineKindContext && !included[i] {
+				omittedContext = true
+				break
+			}
+		}
+		for _, rg := range ranges {
 			w, ok, crop := buildWindow(hunk, rg, budget)
 			if !ok {
 				if crop {
-					return windows, true, true
+					return windows, true, true, omittedContext
 				}
 				continue
 			}
 			windows = append(windows, w)
 			if crop {
-				return windows, true, true
+				return windows, true, true, omittedContext
 			}
 		}
 	}
-	return windows, true, truncated
+	return windows, true, truncated, omittedContext
 }
 
 func boolVal(v *bool) bool { return v != nil && *v }
 
-func classifyDiffFile(entry diffManifestEntry, patch string, patchOK, overCap, dupKey, pathBad bool, parsed diffParsedPatch) (string, []string) {
-	if pathBad || dupKey {
+func isGitlinkMode(v *string) bool { return v != nil && *v == "160000" }
+
+func patchHasBinaryFraming(patch string) bool {
+	for _, ln := range splitDiffSourceLines(patch) {
+		if strings.HasPrefix(ln.text, "@@") {
+			return false
+		}
+		if ln.text == "GIT binary patch" || strings.HasPrefix(ln.text, "Binary files ") {
+			return true
+		}
+	}
+	return false
+}
+
+func classifyDiffFile(entry diffManifestEntry, patch string, patchOK, overCap, dupKey, pathBad, wrongType bool, parsed diffParsedPatch) (string, []string) {
+	if pathBad || dupKey || wrongType {
 		return diffFileStatusMalformed, []string{"malformed entry"}
 	}
-	if boolVal(entry.Binary) {
+	if boolVal(entry.Binary) || patchHasBinaryFraming(patch) {
 		return diffFileStatusBinary, []string{"binary"}
 	}
-	if boolVal(entry.Submodule) {
+	if boolVal(entry.Submodule) || isGitlinkMode(entry.AMode) || isGitlinkMode(entry.BMode) {
 		return diffFileStatusSubmodule, []string{"submodule"}
 	}
 	if boolVal(entry.Collapsed) {
@@ -673,14 +780,11 @@ func classifyDiffFile(entry diffManifestEntry, patch string, patchOK, overCap, d
 	if !patchOK {
 		return diffFileStatusUnavailable, []string{"patch unavailable"}
 	}
-	if strings.Contains(patch, "Binary files ") || strings.Contains(patch, "GIT binary patch") {
-		return diffFileStatusBinary, []string{"binary patch"}
-	}
 	if !parsed.ok {
 		return diffFileStatusMalformed, []string{"malformed patch"}
 	}
 	if parsed.empty {
-		if boolVal(entry.RenamedFile) || (pathStr(entry.AMode) != "" && pathStr(entry.BMode) != "" && pathStr(entry.AMode) != pathStr(entry.BMode) && patch == "") {
+		if boolVal(entry.RenamedFile) || (pathStr(entry.AMode) != "" && pathStr(entry.BMode) != "" && pathStr(entry.AMode) != pathStr(entry.BMode)) {
 			return diffFileStatusModeOnly, []string{"metadata only"}
 		}
 		if patch == "" {
@@ -691,7 +795,7 @@ func classifyDiffFile(entry diffManifestEntry, patch string, patchOK, overCap, d
 	return diffFileStatusText, nil
 }
 
-func matchSelectors(paths []string, files []retainedDiffFile) (outcomes []diffSelectorOutcome, selected []int) {
+func matchSelectors(paths []string, files []retainedDiffFile, completeManifest bool) (outcomes []diffSelectorOutcome, selected []int) {
 	type hit struct {
 		fileIdx int
 	}
@@ -709,7 +813,11 @@ func matchSelectors(paths []string, files []retainedDiffFile) (outcomes []diffSe
 		hits := bySelector[sel]
 		switch len(hits) {
 		case 0:
-			outcomes = append(outcomes, diffSelectorOutcome{Path: sel, Status: diffSelectorAbsent})
+			st := diffSelectorUnobserved
+			if completeManifest {
+				st = diffSelectorAbsent
+			}
+			outcomes = append(outcomes, diffSelectorOutcome{Path: sel, Status: st})
 		case 1:
 			idx := hits[0].fileIdx
 			if _, ok := seenFile[idx]; ok {
@@ -732,15 +840,16 @@ func matchSelectors(paths []string, files []retainedDiffFile) (outcomes []diffSe
 	return outcomes, selected
 }
 
-func buildDiffContentFiles(files []retainedDiffFile, selected []int, opts diffContentOpts) ([]diffContentFile, *diffContentHash, bool) {
+func buildDiffContentFiles(files []retainedDiffFile, selected []int, opts diffContentOpts) ([]diffContentFile, *diffContentHash, bool, bool) {
 	budget := &contentEmitBudget{maxLines: opts.MaxLines, maxBytes: opts.MaxContentBytes}
 	out := make([]diffContentFile, 0, len(selected))
 	var concat strings.Builder
 	cropped := false
+	knownOmit := false
 	for _, idx := range selected {
 		f := files[idx]
 		parsed := parseUnifiedDiff(f.patch)
-		status, lims := classifyDiffFile(f.entry, f.patch, f.patchOK, f.overCap, f.dupKey, f.pathBad, parsed)
+		status, lims := classifyDiffFile(f.entry, f.patch, f.patchOK, f.overCap, f.dupKey, f.pathBad, f.wrongType, parsed)
 		item := diffContentFile{
 			OldPath: f.entry.OldPath, NewPath: f.entry.NewPath, AMode: f.entry.AMode, BMode: f.entry.BMode,
 			NewFile: f.entry.NewFile, RenamedFile: f.entry.RenamedFile, DeletedFile: f.entry.DeletedFile,
@@ -748,10 +857,11 @@ func buildDiffContentFiles(files []retainedDiffFile, selected []int, opts diffCo
 			Binary: f.entry.Binary, Submodule: f.entry.Submodule, Status: status, Limitations: lims,
 		}
 		if status == diffFileStatusText {
-			wins, ok, trunc := selectDiffWindows(parsed, opts.ContextLines, budget)
+			wins, ok, trunc, omitted := selectDiffWindows(parsed, opts.ContextLines, budget)
 			if !ok {
 				item.Status = diffFileStatusMalformed
 				item.Limitations = append(item.Limitations, "malformed patch")
+				knownOmit = true
 			} else {
 				item.Windows = wins
 				for _, w := range wins {
@@ -761,7 +871,16 @@ func buildDiffContentFiles(files []retainedDiffFile, selected []int, opts diffCo
 					cropped = true
 					item.Limitations = append(item.Limitations, "cropped")
 				}
+				if omitted {
+					knownOmit = true
+					item.Limitations = append(item.Limitations, "omitted_context")
+					for i := range item.Windows {
+						item.Windows[i].Truncated = true
+					}
+				}
 			}
+		} else {
+			knownOmit = true
 		}
 		out = append(out, item)
 	}
@@ -770,13 +889,21 @@ func buildDiffContentFiles(files []retainedDiffFile, selected []int, opts diffCo
 		h := hashDiffContentText(diffContentReturnHashScope, concat.String())
 		retHash = &h
 	}
-	return out, retHash, cropped
+	return out, retHash, cropped, knownOmit
 }
 
 func absentAll(paths []string) []diffSelectorOutcome {
 	out := make([]diffSelectorOutcome, 0, len(paths))
 	for _, p := range paths {
 		out = append(out, diffSelectorOutcome{Path: p, Status: diffSelectorAbsent})
+	}
+	return out
+}
+
+func unobservedAll(paths []string) []diffSelectorOutcome {
+	out := make([]diffSelectorOutcome, 0, len(paths))
+	for _, p := range paths {
+		out = append(out, diffSelectorOutcome{Path: p, Status: diffSelectorUnobserved})
 	}
 	return out
 }
@@ -789,6 +916,7 @@ func retainedFromStream(st objectStream) []retainedDiffFile {
 			p := st.patches[i]
 			rf.dupKey = p.dupKey
 			rf.overCap = p.overCap
+			rf.wrongType = p.wrongType
 			if p.retained {
 				rf.patch = p.text
 				rf.patchOK = true
@@ -827,9 +955,10 @@ func readBoundedDiffContent(ctx context.Context, d Deps, q diffQuery, opts diffC
 }
 
 func emptyContent(sec readmeta.Section, q diffQuery, opts diffContentOpts) diffContentOut {
+	sec.PaginationExhausted = false
 	return diffContentOut{
 		Section: sec, Selection: selectionOutFrom(q, provedManifest{}, 0),
-		Files: []diffContentFile{}, Selectors: absentAll(opts.Paths), FullPatchHash: nil,
+		Files: []diffContentFile{}, Selectors: unobservedAll(opts.Paths), FullPatchHash: nil,
 	}
 }
 
@@ -849,10 +978,10 @@ func readVersionContent(ctx context.Context, d Deps, q diffQuery, sec readmeta.S
 			h := proved.Head
 			sec.HeadSHA = &h
 		}
-		return diffContentOut{Section: sec, Selection: sel, Files: []diffContentFile{}, Selectors: absentAll(opts.Paths)}, nil
+		return diffContentOut{Section: sec, Selection: sel, Files: []diffContentFile{}, Selectors: unobservedAll(opts.Paths)}, nil
 	}
-	outcomes, selected := matchSelectors(opts.Paths, files)
-	built, retHash, cropped := buildDiffContentFiles(files, selected, opts)
+	outcomes, selected := matchSelectors(opts.Paths, files, true)
+	built, retHash, cropped, knownOmit := buildDiffContentFiles(files, selected, opts)
 	sec.CapabilityVersion = capabilityDiffContentV1
 	head := proved.Head
 	sec.HeadSHA = &head
@@ -861,9 +990,14 @@ func readVersionContent(ctx context.Context, d Deps, q diffQuery, sec readmeta.S
 	sec.PatchCoverage = readmeta.CoveragePartial
 	sec.PaginationExhausted = true
 	sec.NextCursor = nil
-	if cropped {
+	if cropped || knownOmit {
 		sec.ContentComplete = readmeta.ContentCompleteFalse
-		sec.AddLimitation(readmeta.CodePartial, "content cropped")
+		if cropped {
+			sec.AddLimitation(readmeta.CodePartial, "content cropped")
+		}
+		if knownOmit {
+			sec.AddLimitation(readmeta.CodePartial, "known omission")
+		}
 	} else {
 		sec.ContentComplete = readmeta.ContentCompleteUnknown
 	}
@@ -883,6 +1017,7 @@ func readVersionContent(ctx context.Context, d Deps, q diffQuery, sec readmeta.S
 			sec.ContentComplete = readmeta.ContentCompleteFalse
 		case diffFileStatusBinary, diffFileStatusSubmodule, diffFileStatusUnsupported, diffFileStatusMalformed, diffFileStatusUnavailable, diffFileStatusModeOnly, diffFileStatusMetadata:
 			sec.AddLimitation(readmeta.CodePartial, f.Status)
+			sec.ContentComplete = readmeta.ContentCompleteFalse
 		}
 	}
 	items := len(built)
@@ -940,7 +1075,7 @@ func proveVersionContent(ctx context.Context, d Deps, q diffQuery, versionID int
 }
 
 func selectedSourceDigests(files []retainedDiffFile, paths []string) map[string]string {
-	_, selected := matchSelectors(paths, files)
+	_, selected := matchSelectors(paths, files, true)
 	out := make(map[string]string, len(selected))
 	for _, idx := range selected {
 		f := files[idx]
@@ -949,7 +1084,7 @@ func selectedSourceDigests(files []retainedDiffFile, paths []string) map[string]
 			out[key] = f.sourceHash
 		} else if f.overCap {
 			out[key] = "overcap"
-		} else if f.dupKey {
+		} else if f.dupKey || f.wrongType {
 			out[key] = "dup"
 		} else {
 			out[key] = "absent"
@@ -1029,8 +1164,8 @@ func readIncrementalContent(ctx context.Context, d Deps, q diffQuery, sec readme
 	if timeout := triBool(env["compare_timeout"]); timeout != nil && *timeout {
 		sec.AddLimitation(readmeta.CodePartial, "compare_timeout")
 	}
-	var commit map[string]json.RawMessage
-	if json.Unmarshal(env["commit"], &commit) != nil || reviewJSONString(commit["id"]) != q.Selection.To {
+	commitID, ok := parseCompareCommitID(env["commit"])
+	if !ok || commitID != q.Selection.To {
 		sec.Consistency = readmeta.ConsistencyInconsistent
 		return emptyContent(sec, q, opts), nil
 	}
@@ -1048,16 +1183,109 @@ func readIncrementalContent(ctx context.Context, d Deps, q diffQuery, sec readme
 		sec.Consistency = readmeta.ConsistencyInconsistent
 		return emptyContent(sec, q, opts), nil
 	}
-	files := retainedFromStream(st)
-	outcomes, selected := matchSelectors(opts.Paths, files)
-	built, retHash, cropped := buildDiffContentFiles(files, selected, opts)
-	if cropped {
-		sec.AddLimitation(readmeta.CodePartial, "content cropped")
+	firstFiles := retainedFromStream(st)
+	firstDigests := selectedSourceDigests(firstFiles, opts.Paths)
+	firstMeta := selectedPathMeta(firstFiles, opts.Paths)
+
+	collect2 := newPatchCollect(opts.Paths)
+	st2, _, err := streamDiffObject(ctx, d.Client, path, &compareOpt{From: q.Selection.From, To: q.Selection.To, Straight: true}, nil, collect2)
+	if err != nil {
+		if passthroughTypedProviderErr(err) {
+			return diffContentOut{}, err
+		}
+		sec.Consistency = readmeta.ConsistencyInconsistent
+		sec.AddLimitation(readmeta.CodeHTTPError, "compare closing")
+		return emptyContent(sec, q, opts), nil
 	}
+	if timeout := triBool(st2.fields["compare_timeout"]); timeout != nil && *timeout {
+		sec.Consistency = readmeta.ConsistencyInconsistent
+		return emptyContent(sec, q, opts), nil
+	}
+	commitID2, ok2 := parseCompareCommitID(st2.fields["commit"])
+	if !ok2 || commitID2 != q.Selection.To {
+		sec.Consistency = readmeta.ConsistencyInconsistent
+		return emptyContent(sec, q, opts), nil
+	}
+	secondFiles := retainedFromStream(st2)
+	if !sameStringMap(firstDigests, selectedSourceDigests(secondFiles, opts.Paths)) || !sameStringMap(firstMeta, selectedPathMeta(secondFiles, opts.Paths)) {
+		sec.Consistency = readmeta.ConsistencyInconsistent
+		return emptyContent(sec, q, opts), nil
+	}
+	outcomes, selected := matchSelectors(opts.Paths, firstFiles, false)
+	built, retHash, cropped, knownOmit := buildDiffContentFiles(firstFiles, selected, opts)
+	if cropped || knownOmit {
+		sec.AddLimitation(readmeta.CodePartial, "content cropped or omitted")
+	}
+	sec.Consistency = readmeta.ConsistencyConsistent
 	items := len(built)
 	sec.Counts.Items = &items
 	return diffContentOut{
 		Section: sec, Selection: selectionOutFrom(q, provedManifest{}, 0),
 		Files: built, Selectors: outcomes, ReturnedContentHash: retHash, FullPatchHash: nil,
 	}, nil
+}
+
+func parseCompareCommitID(raw json.RawMessage) (string, bool) {
+	if len(bytes.TrimSpace(raw)) == 0 || string(bytes.TrimSpace(raw)) == "null" {
+		return "", false
+	}
+	dec := json.NewDecoder(strings.NewReader(string(raw)))
+	dec.UseNumber()
+	tok, err := dec.Token()
+	if err != nil {
+		return "", false
+	}
+	if d, ok := tok.(json.Delim); !ok || d != '{' {
+		return "", false
+	}
+	seen := map[string]struct{}{}
+	var id string
+	var haveID bool
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return "", false
+		}
+		key, ok := keyTok.(string)
+		if !ok {
+			return "", false
+		}
+		if _, dup := seen[key]; dup {
+			return "", false
+		}
+		seen[key] = struct{}{}
+		var val json.RawMessage
+		if err := dec.Decode(&val); err != nil {
+			return "", false
+		}
+		if key == "id" {
+			if haveID {
+				return "", false
+			}
+			id = reviewJSONString(val)
+			haveID = true
+		}
+	}
+	end, err := dec.Token()
+	if err != nil {
+		return "", false
+	}
+	if d, ok := end.(json.Delim); !ok || d != '}' {
+		return "", false
+	}
+	if !haveID || id == "" {
+		return "", false
+	}
+	return id, true
+}
+
+func selectedPathMeta(files []retainedDiffFile, paths []string) map[string]string {
+	_, selected := matchSelectors(paths, files, false)
+	out := make(map[string]string, len(selected))
+	for _, idx := range selected {
+		f := files[idx]
+		key := pathStr(f.entry.OldPath) + "\x00" + pathStr(f.entry.NewPath)
+		out[key] = pathStr(f.entry.AMode) + "\x00" + pathStr(f.entry.BMode) + "\x00" + flagKey(f.entry)
+	}
+	return out
 }
