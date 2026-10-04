@@ -103,14 +103,64 @@ func getProjectSafe(ctx context.Context, d Deps, pid string) (*gitlab.Project, e
 	return p, nil
 }
 
+func groupBudgetPreflight(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return groupContextCause(ctx, err)
+	}
+	b := igl.BudgetFromContext(ctx)
+	if b == nil {
+		return nil
+	}
+	if b.ElapsedExceeded() {
+		return igl.ErrBudgetElapsed
+	}
+	_, _, items := b.Stats()
+	if b.MaxItems > 0 && items >= b.MaxItems {
+		return igl.ErrBudgetItems
+	}
+	return nil
+}
+
+// groupContextCause keeps parent cancellation and an earlier parent deadline
+// distinct from the budget clock. ErrBudgetElapsed is only the MaxElapsed expiry.
+func groupContextCause(ctx context.Context, err error) error {
+	if errors.Is(ctx.Err(), context.Canceled) || errors.Is(err, context.Canceled) {
+		return context.Canceled
+	}
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.Is(err, context.DeadlineExceeded) {
+		if b := igl.BudgetFromContext(ctx); b != nil && b.ElapsedExceeded() {
+			return igl.ErrBudgetElapsed
+		}
+		return context.DeadlineExceeded
+	}
+	if errors.Is(err, igl.ErrBudgetElapsed) {
+		if b := igl.BudgetFromContext(ctx); b != nil && b.ElapsedExceeded() {
+			return igl.ErrBudgetElapsed
+		}
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return context.DeadlineExceeded
+		}
+	}
+	return err
+}
+
 func getGroupSafe(ctx context.Context, d Deps, gid string) (*gitlab.Group, error) {
 	tok := normalizeIdentityToken(gid)
 	if tok == "" {
 		return nil, identityErr("resolve group identity")
 	}
 	wantNumeric, isNumeric := parseStrictPositiveID(tok)
+	if err := groupBudgetPreflight(ctx); err != nil {
+		return nil, err
+	}
 	g, _, err := d.Client.Groups.GetGroup(tok, nil, gitlab.WithContext(ctx))
 	if err != nil {
+		if cause := groupContextCause(ctx, err); errors.Is(cause, context.Canceled) || errors.Is(cause, context.DeadlineExceeded) || errors.Is(cause, igl.ErrBudgetElapsed) {
+			return nil, cause
+		}
+		if passthroughTypedProviderErr(err) {
+			return nil, err
+		}
 		return nil, identityErr("resolve group identity")
 	}
 	if g == nil || g.ID <= 0 {
@@ -188,6 +238,9 @@ func groupAncestryContains(ctx context.Context, d Deps, startNamespaceID int64, 
 		seen[cur] = struct{}{}
 		g, err := getGroupSafe(ctx, d, strconv.FormatInt(cur, 10))
 		if err != nil {
+			if passthroughTypedProviderErr(err) {
+				return false, err
+			}
 			// Namespace may be a user namespace (Groups.GetGroup fails) — not a group member.
 			return false, nil
 		}

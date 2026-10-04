@@ -163,6 +163,52 @@ func requireProvenMRForkProjects(ctx context.Context, d Deps, owner CanonicalPro
 	return err
 }
 
+// loadDiffIdentity always reads canonical owner, merge request, source, and target
+// identity for the diff-window tool, including allow-all policy. loadAuthorizedMR
+// stays the legacy helper for older callers.
+func loadDiffIdentity(ctx context.Context, d Deps, projectID string, mrIID int64) (CanonicalProject, *gitlab.MergeRequest, error) {
+	if mrIID < 1 {
+		return CanonicalProject{}, nil, fmt.Errorf("merge_request_iid must be >= 1")
+	}
+	owner, err := AuthorizeCanonicalProject(ctx, d, projectID)
+	if err != nil {
+		return CanonicalProject{}, nil, err
+	}
+	mr, _, err := d.Client.MergeRequests.GetMergeRequest(owner.ID, mrIID, nil, gitlab.WithContext(ctx))
+	if err != nil {
+		if passthroughTypedProviderErr(err) {
+			return CanonicalProject{}, nil, err
+		}
+		return CanonicalProject{}, nil, fmt.Errorf("%s: merge request metadata", readmeta.CodeHTTPError)
+	}
+	if err := bindDiffMR(owner, mrIID, mr); err != nil {
+		return CanonicalProject{}, nil, err
+	}
+	if err := requireProvenMRForkProjects(ctx, d, owner, mr); err != nil {
+		return CanonicalProject{}, nil, err
+	}
+	return owner, mr, nil
+}
+
+func bindDiffMR(owner CanonicalProject, iid int64, mr *gitlab.MergeRequest) error {
+	if mr == nil || mr.ID < 1 {
+		return identityErr("merge request metadata missing")
+	}
+	if mr.IID != iid {
+		return identityErr("merge request iid mismatch")
+	}
+	if owner.ID < 1 || mr.ProjectID != owner.ID {
+		return identityErr("merge request owner mismatch")
+	}
+	if mr.SourceProjectID < 1 {
+		return identityErr("unproven merge request source project")
+	}
+	if mr.TargetProjectID < 0 || (mr.TargetProjectID > 0 && mr.TargetProjectID != owner.ID) {
+		return identityErr("merge request target mismatch")
+	}
+	return nil
+}
+
 type mergeMergeRequestIn struct {
 	pidMR
 	MergeCommitMessage       *string `json:"merge_commit_message,omitempty"`

@@ -58,7 +58,7 @@ func callDiffWindow(t *testing.T, d Deps, srvCtx context.Context, args map[strin
 }
 
 func versionObject(id, mrID int64, head, base, start, state string, realSize string, diffs string) string {
-	return fmt.Sprintf(`{"id":%d,"merge_request_id":%d,"head_commit_sha":%q,"base_commit_sha":%q,"start_commit_sha":%q,"state":%q,"real_size":%s,"diffs":%s}`,
+	return fmt.Sprintf(`{"id":%d,"merge_request_id":%d,"head_commit_sha":%q,"base_commit_sha":%q,"start_commit_sha":%q,"state":%q,"real_size":%q,"diffs":%s}`,
 		id, mrID, head, base, start, state, realSize, diffs)
 }
 
@@ -277,7 +277,7 @@ func TestDiffWindow_malformedAndFlags(t *testing.T) {
 		{"missing-diffs", fmt.Sprintf(`{"id":1,"merge_request_id":5001,"head_commit_sha":%q,"base_commit_sha":%q,"start_commit_sha":%q,"state":"collected","real_size":1}`, head, base, start), readmeta.ContentCompleteUnknown},
 		{"null-diffs", versionObject(1, 5001, head, base, start, "collected", "1", "null"), readmeta.ContentCompleteUnknown},
 		{"null-state", fmt.Sprintf(`{"id":1,"merge_request_id":5001,"head_commit_sha":%q,"base_commit_sha":%q,"start_commit_sha":%q,"state":null,"real_size":1,"diffs":%s}`, head, base, start, oneDiff("a", "p")), readmeta.ContentCompleteUnknown},
-		{"plus-count", versionObject(1, 5001, head, base, start, "collected", `"100+"`, oneDiff("a", "p")), readmeta.ContentCompleteUnknown},
+		{"plus-count", versionObject(1, 5001, head, base, start, "collected", "100+", oneDiff("a", "p")), readmeta.ContentCompleteUnknown},
 		{"overflow", versionObject(1, 5001, head, base, start, "overflow", "1", oneDiff("a", "p")), readmeta.ContentCompleteFalse},
 		{"without-files", versionObject(1, 5001, head, base, start, "without_files", "1", "[]"), readmeta.ContentCompleteFalse},
 	}

@@ -139,6 +139,7 @@ func getMergeRequestDiffWindow(ctx context.Context, _ *mcp.CallToolRequest, in d
 	}
 	ctx, budget, release := ensureDiffBudget(ctx, caps)
 	defer release()
+	ctx = igl.WithExactReadProvenance(ctx)
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
 	}
@@ -156,7 +157,7 @@ func getMergeRequestDiffWindow(ctx context.Context, _ *mcp.CallToolRequest, in d
 	if err != nil {
 		return nil, nil, fmt.Errorf("%s: instance", cursor.ResyncRequired)
 	}
-	owner, mr, err := loadAuthorizedMR(ctx, d, sel.ProjectID, sel.IID)
+	owner, mr, err := loadDiffIdentity(ctx, d, sel.ProjectID, sel.IID)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -436,6 +437,11 @@ func walkVersionList(ctx context.Context, d Deps, projectID, iid int64) ([]versi
 		path := fmt.Sprintf("projects/%s/merge_requests/%d/versions", gitlab.PathEscape(strconv.FormatInt(projectID, 10)), iid)
 		var rawRows []json.RawMessage
 		resp, err := igl.StreamJSONArrayQueue(ctx, d.Client, http.MethodGet, path, &versionPageOpt{Page: page, PerPage: 100}, func(raw json.RawMessage) error {
+			if b := igl.BudgetFromContext(ctx); b != nil {
+				if err := b.AddItem(); err != nil {
+					return err
+				}
+			}
 			rawRows = append(rawRows, append(json.RawMessage(nil), raw...))
 			return nil
 		})
@@ -709,15 +715,22 @@ func jsonStringExact(raw json.RawMessage) (string, bool) {
 
 func jsonCanonicalInt(raw json.RawMessage) (int, bool) {
 	s := strings.TrimSpace(string(raw))
-	if s == "" || s == "null" || strings.ContainsAny(s, "\"eE.+- ") {
-		if s == "0" {
-			return 0, true
-		}
-		n, err := strconv.Atoi(s)
-		if err != nil || n < 0 || strconv.Itoa(n) != s {
+	if s == "" || s == "null" {
+		return 0, false
+	}
+	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
+		inner, err := strconv.Unquote(s)
+		if err != nil {
 			return 0, false
 		}
-		return n, true
+		return canonicalUncappedDecimal(inner)
+	}
+	return canonicalUncappedDecimal(s)
+}
+
+func canonicalUncappedDecimal(s string) (int, bool) {
+	if s == "" || strings.ContainsAny(s, "eE.+- ") {
+		return 0, false
 	}
 	n, err := strconv.Atoi(s)
 	if err != nil || n < 0 || strconv.Itoa(n) != s {
@@ -971,7 +984,12 @@ func readIncrementalManifest(ctx context.Context, d Deps, q diffQuery, sec readm
 		return diffWindowOut{Section: sec, Entries: []diffManifestEntry{}}, nil
 	}
 	path := fmt.Sprintf("projects/%s/repository/compare", gitlab.PathEscape(strconv.FormatInt(projectID, 10)))
-	st, _, err := streamDiffObject(ctx, d.Client, path, &compareOpt{From: q.Selection.From, To: q.Selection.To, Straight: true}, nil)
+	st, _, err := streamDiffObject(ctx, d.Client, path, &compareOpt{From: q.Selection.From, To: q.Selection.To, Straight: true}, func(diffManifestEntry) error {
+		if b := igl.BudgetFromContext(ctx); b != nil {
+			return b.AddItem()
+		}
+		return nil
+	})
 	if err != nil {
 		if passthroughTypedProviderErr(err) {
 			return diffWindowOut{}, err

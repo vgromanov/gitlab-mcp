@@ -409,6 +409,7 @@ func (rt *reviewRuntime) sealRequested(item reviewContextItemIn, out *reviewCont
 	if out.Cause != "" {
 		out.ReviewClean = false
 		out.ContextRef = nil
+		rt.dropDiffManifestClaim(out, out.Cause, "closing")
 	}
 }
 
@@ -652,19 +653,12 @@ func (rt *reviewRuntime) one(item reviewContextItemIn) reviewContextItemOut {
 		}
 	}
 	if err := rt.phaseErr("bracket"); err != nil {
-		out.Cause = reviewClassify(err)
-		out.ContextRef = nil
-		out.ReviewClean = false
-		rt.finalizeDiscBound(&out)
-		return out
+		return rt.failClosedManifest(&out, reviewClassify(err))
 	}
 	secondDetail, cause2, consistency2, serr := rt.readDetail(owner, item.MergeRequestIID)
 	if serr != nil {
-		out.Cause = causeOf(serr)
-		out.ContextRef = nil
 		out.Metadata = nil
-		rt.finalizeDiscBound(&out)
-		return out
+		return rt.failClosedManifest(&out, causeOf(serr))
 	}
 	if cause2 != "" || !sameBracketIdentity(first.bracket, secondDetail) {
 		out.Cause = cause2
@@ -684,11 +678,8 @@ func (rt *reviewRuntime) one(item reviewContextItemIn) reviewContextItemOut {
 	}
 	second, serr2 := rt.finishBracket(secondDetail, item.MergeRequestIID)
 	if serr2 != nil {
-		out.Cause = causeOf(serr2)
-		out.ContextRef = nil
 		out.Metadata = nil
-		rt.finalizeDiscBound(&out)
-		return out
+		return rt.failClosedManifest(&out, causeOf(serr2))
 	}
 	if !second.proved || !bracketsEqual(first.bracket, second.bracket) {
 		out.Cause = second.cause
@@ -765,19 +756,13 @@ func (rt *reviewRuntime) one(item reviewContextItemIn) reviewContextItemOut {
 	}
 	rt.beforeMint()
 	if err := rt.phaseErr("mint"); err != nil {
-		out.Cause = reviewClassify(err)
-		out.ContextRef = nil
-		out.ReviewClean = false
-		rt.dropDiffManifestClaim(&out, readmeta.CodeCancelled, "mint")
-		rt.finalizeDiscBound(&out)
-		return out
+		return rt.failClosedManifest(&out, reviewClassify(err))
 	}
 	if err := budgetAllowsNext(rt.ctx); err != nil {
-		out.Cause = causeOf(err)
-		out.ContextRef = nil
-		out.ReviewClean = false
-		rt.finalizeDiscBound(&out)
-		return out
+		return rt.failClosedManifest(&out, causeOf(err))
+	}
+	if err := reviewPreMintBudget(rt.ctx); err != nil {
+		return rt.failClosedManifest(&out, causeOf(err))
 	}
 	rt.finalizeDiscBound(&out)
 	complete, excluded = dropUnprovedDiscussions(item, &out, complete, excluded)
@@ -788,11 +773,7 @@ func (rt *reviewRuntime) one(item reviewContextItemIn) reviewContextItemOut {
 	}
 	ref, err := rt.mint(owner, item, agreed, complete, excluded, metaDigestOf(out))
 	if err != nil {
-		out.Cause = causeOf(err)
-		out.ContextRef = nil
-		out.ReviewClean = false
-		rt.finalizeDiscBound(&out)
-		return out
+		return rt.failClosedManifest(&out, causeOf(err))
 	}
 	out.ContextRef = &ref
 	return out
@@ -885,6 +866,41 @@ func (rt *reviewRuntime) attachDiffManifest(owner CanonicalProject, iid int64, b
 	out.DiffManifest = &got
 	if got.Digest != nil && got.Section.ContentComplete == readmeta.ContentCompleteTrue && got.Section.Consistency == readmeta.ConsistencyConsistent {
 		out.diffManifestDigest = *got.Digest
+	}
+	return nil
+}
+
+// failClosedManifest clears scalar and nested manifest claims on the value
+// that return will copy. A deferred seal runs too late to change those scalars.
+func (rt *reviewRuntime) failClosedManifest(out *reviewContextItemOut, cause string) reviewContextItemOut {
+	out.Cause = cause
+	out.ContextRef = nil
+	out.ReviewClean = false
+	rt.dropDiffManifestClaim(out, cause, "closing")
+	rt.finalizeDiscBound(out)
+	return *out
+}
+
+func reviewPreMintBudget(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			if b := igl.BudgetFromContext(ctx); b != nil && b.ElapsedExceeded() {
+				return igl.ErrBudgetElapsed
+			}
+			return err
+		}
+		return err
+	}
+	b := igl.BudgetFromContext(ctx)
+	if b == nil {
+		return nil
+	}
+	if b.ElapsedExceeded() {
+		return igl.ErrBudgetElapsed
+	}
+	_, _, items := b.Stats()
+	if b.MaxItems > 0 && items >= b.MaxItems {
+		return igl.ErrBudgetItems
 	}
 	return nil
 }
