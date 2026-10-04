@@ -42,6 +42,10 @@ const (
 	ToolReviewContext = "get_merge_request_review_context"
 	// SectionReviewContext is the review-context token section binding.
 	SectionReviewContext = "review_context"
+	// SectionReviewDiscussions is the discussions continuation section binding.
+	SectionReviewDiscussions = "discussions"
+	// DiscussionsContSchemaDC1 is the locked discussions note-continuation schema.
+	DiscussionsContSchemaDC1 = "dc1"
 	// ReviewWriteFresh is the absolute write-freshness window from retrieved_at.
 	ReviewWriteFresh = 5 * time.Minute
 	// ResyncRequired is the uniform fail-closed continuation error token.
@@ -137,20 +141,33 @@ type Scope struct {
 // while list_commits pins a single tip SHA as a one-element slice.
 // QueueCont is omitempty and valid only for group_queue + review-queue tool/section.
 type Payload struct {
-	SchemaVersion string      `json:"schema_version"`
-	Instance      string      `json:"instance"`
-	ActorID       int64       `json:"actor_id"`
-	PolicyFP      string      `json:"policy_fingerprint"`
-	Tool          string      `json:"tool"`
-	Section       string      `json:"section"`
-	Scope         Scope       `json:"scope"`
-	Filters       Filters     `json:"filters"`
-	ImmutableRefs []string    `json:"immutable_refs"`
-	UpperBound    string      `json:"upper_bound"`
-	ExpiresAt     string      `json:"expires_at"`
-	PageState     PageState   `json:"page_state"`
-	QueueCont     *QueueCont  `json:"queue_cont,omitempty"`
-	ContextRef    *ContextRef `json:"context_ref,omitempty"`
+	SchemaVersion   string           `json:"schema_version"`
+	Instance        string           `json:"instance"`
+	ActorID         int64            `json:"actor_id"`
+	PolicyFP        string           `json:"policy_fingerprint"`
+	Tool            string           `json:"tool"`
+	Section         string           `json:"section"`
+	Scope           Scope            `json:"scope"`
+	Filters         Filters          `json:"filters"`
+	ImmutableRefs   []string         `json:"immutable_refs"`
+	UpperBound      string           `json:"upper_bound"`
+	ExpiresAt       string           `json:"expires_at"`
+	PageState       PageState        `json:"page_state"`
+	QueueCont       *QueueCont       `json:"queue_cont,omitempty"`
+	ContextRef      *ContextRef      `json:"context_ref,omitempty"`
+	DiscussionsCont *DiscussionsCont `json:"discussions_cont,omitempty"`
+}
+
+// DiscussionsCont is the dc1 note continuation for review-context discussions.
+// Coordinates and prefix hashes only: no note bodies, timestamps, or unread ids.
+type DiscussionsCont struct {
+	V   string `json:"v"`
+	P   int    `json:"p"`
+	DI  int    `json:"di"`
+	NI  int    `json:"ni"`
+	DID string `json:"did,omitempty"`
+	DP  string `json:"dp,omitempty"`
+	ND  string `json:"nd,omitempty"`
 }
 
 // ContextRef is one merge request's signed review evidence.
@@ -355,10 +372,14 @@ func validatePayload(p *Payload) error {
 
 	isQueue := p.Scope.Kind == ScopeGroupQueue && p.Tool == ToolReviewQueue && p.Section == SectionReviewQueue
 	isReview := p.Scope.Kind == ScopeReviewContext && p.Tool == ToolReviewContext && p.Section == SectionReviewContext
+	isDisc := p.Tool == ToolReviewContext && p.Section == SectionReviewDiscussions
 	if p.QueueCont != nil && !isQueue {
 		return ErrResyncRequired
 	}
 	if p.ContextRef != nil && !isReview {
+		return ErrResyncRequired
+	}
+	if p.DiscussionsCont != nil && !isDisc {
 		return ErrResyncRequired
 	}
 	if isReview {
@@ -382,6 +403,10 @@ func validatePayload(p *Payload) error {
 			return ErrResyncRequired
 		}
 		if err := validateQueueCont(p.QueueCont, p.Filters.PerPage); err != nil {
+			return err
+		}
+	} else if isDisc {
+		if err := validateDiscussionsCursor(p); err != nil {
 			return err
 		}
 	} else {
@@ -962,7 +987,64 @@ func reviewSectionName(name string) bool {
 }
 
 func reviewCompleteEvidence(name string) bool {
-	return name == "metadata" || name == "approvals"
+	return name == "metadata" || name == "approvals" || name == "discussions"
+}
+
+func validateDiscussionsCursor(p *Payload) error {
+	if p == nil || p.DiscussionsCont == nil || p.Scope.Kind != ScopeProject {
+		return ErrResyncRequired
+	}
+	if strings.TrimSpace(p.Scope.ProjectID) == "" || p.Scope.GroupID != "" || p.Scope.PipelineID != nil {
+		return ErrResyncRequired
+	}
+	if p.Scope.MergeRequestIID == nil || *p.Scope.MergeRequestIID < 1 {
+		return ErrResyncRequired
+	}
+	if p.ContextRef != nil || p.QueueCont != nil {
+		return ErrResyncRequired
+	}
+	if err := validateQueuePageStateEmpty(p.PageState); err != nil {
+		return err
+	}
+	if p.Filters.PerPage != 20 || p.Filters.Order != "provider" {
+		return ErrResyncRequired
+	}
+	if p.Filters.Selection != "semantic" && p.Filters.Selection != "all" {
+		return ErrResyncRequired
+	}
+	if p.Filters.Until == "" || p.Filters.Until != p.UpperBound {
+		return ErrResyncRequired
+	}
+	if p.Filters.RefName != "" || p.Filters.Path != "" || p.Filters.Since != "" || p.Filters.CallerUntil != "" {
+		return ErrResyncRequired
+	}
+	if len(p.ImmutableRefs) != 5 || p.ImmutableRefs[0] != p.ImmutableRefs[2] {
+		return ErrResyncRequired
+	}
+	for _, ref := range p.ImmutableRefs {
+		if !isGitSHA(ref) {
+			return ErrResyncRequired
+		}
+	}
+	c := p.DiscussionsCont
+	if c.V != DiscussionsContSchemaDC1 || c.P < 1 || c.DI < 0 || c.NI < 0 {
+		return ErrResyncRequired
+	}
+	if c.DI == 0 {
+		if c.DP != "" {
+			return ErrResyncRequired
+		}
+	} else if !isHexSHA256(c.DP) {
+		return ErrResyncRequired
+	}
+	if c.NI == 0 {
+		if c.ND != "" || c.DID != "" {
+			return ErrResyncRequired
+		}
+	} else if c.DID == "" || !isHexSHA256(c.ND) {
+		return ErrResyncRequired
+	}
+	return nil
 }
 
 // ReviewLiveRefs is an independently observed provenance tuple.

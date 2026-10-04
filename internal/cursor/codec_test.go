@@ -815,3 +815,95 @@ func TestReviewContextToken(t *testing.T) {
 		t.Fatalf("rq2 round trip: %v", err)
 	}
 }
+
+func TestDiscussionsEvidenceAndDC1(t *testing.T) {
+	key := []byte("0123456789abcdef0123456789abcdef")
+	now := time.Date(2026, 10, 4, 12, 0, 0, 0, time.UTC)
+	sem := strings.Repeat("ab", 32)
+	pos := strings.Repeat("cd", 32)
+	full := strings.Repeat("ef", 32)
+	bundle := []byte(`{"schema":"discussions.evidence.v1","capability":"readmeta.review_context.discussions.v1","selection":"all","semantic_feedback_digest":"` + sem + `","position_digest":"` + pos + `","full_revision_digest":"` + full + `"}`)
+	sum := sha256.Sum256(bundle)
+	dig := fmtSHA(sum[:])
+	p := reviewContextPayload(now)
+	p.ContextRef.Requested = []string{"discussions", "metadata"}
+	p.ContextRef.Complete = []string{"discussions", "metadata"}
+	p.ContextRef.Excluded = []string{}
+	p.ContextRef.Digests = map[string]string{"discussions": dig, "metadata": strings.Repeat("12", 32)}
+	p.Filters.Selection = "discussions,metadata"
+	tok, err := Encode(key, p)
+	if err != nil {
+		t.Fatalf("discussions evidence encode: %v", err)
+	}
+	if _, err := Decode(key, tok, now); err != nil {
+		t.Fatalf("discussions evidence decode: %v", err)
+	}
+	p.ContextRef.Digests["pipeline_graph"] = strings.Repeat("34", 32)
+	if _, err := Encode(key, p); err == nil {
+		t.Fatal("extra digest key")
+	}
+	pipe := reviewContextPayload(now)
+	pipe.ContextRef.Requested = []string{"pipeline_graph"}
+	pipe.ContextRef.Complete = []string{"pipeline_graph"}
+	pipe.ContextRef.Excluded = []string{}
+	pipe.ContextRef.Digests = map[string]string{"pipeline_graph": strings.Repeat("ab", 32)}
+	pipe.Filters.Selection = "pipeline_graph"
+	if _, err := Encode(key, pipe); err == nil {
+		t.Fatal("pipeline_graph complete")
+	}
+	meta := reviewContextPayload(now)
+	if _, err := Encode(key, meta); err != nil {
+		t.Fatalf("metadata token: %v", err)
+	}
+	dc := discussionsCursorPayload(now)
+	dtok, err := Encode(key, dc)
+	if err != nil {
+		t.Fatalf("dc1 encode: %v", err)
+	}
+	if _, err := Decode(key, dtok, now); err != nil {
+		t.Fatalf("dc1 decode: %v", err)
+	}
+	qp := queuePayloadOK()
+	qp.DiscussionsCont = dc.DiscussionsCont
+	if _, err := Encode(key, qp); err == nil {
+		t.Fatal("dc1 on queue token")
+	}
+	lc := basePayload()
+	lc.DiscussionsCont = dc.DiscussionsCont
+	if _, err := Encode(key, lc); err == nil {
+		t.Fatal("dc1 on list_commits token")
+	}
+}
+
+func discussionsCursorPayload(now time.Time) Payload {
+	iid := int64(7)
+	head := strings.Repeat("a", 40)
+	target := strings.Repeat("d", 40)
+	base := strings.Repeat("b", 40)
+	start := strings.Repeat("c", 40)
+	bound := now.UTC().Format(time.RFC3339)
+	return Payload{
+		SchemaVersion:   SchemaV1,
+		Instance:        "https://gitlab.example/api/v4",
+		ActorID:         7,
+		PolicyFP:        "policyfp",
+		Tool:            ToolReviewContext,
+		Section:         SectionReviewDiscussions,
+		Scope:           Scope{Kind: ScopeProject, ProjectID: "42", MergeRequestIID: &iid},
+		Filters:         Filters{Until: bound, Order: "provider", Selection: "all", PerPage: 20},
+		ImmutableRefs:   []string{head, target, head, base, start},
+		UpperBound:      bound,
+		ExpiresAt:       now.UTC().Add(DefaultTTL).Format(time.RFC3339),
+		DiscussionsCont: &DiscussionsCont{V: DiscussionsContSchemaDC1, P: 1},
+	}
+}
+
+func fmtSHA(b []byte) string {
+	const hexdigits = "0123456789abcdef"
+	out := make([]byte, len(b)*2)
+	for i, c := range b {
+		out[i*2] = hexdigits[c>>4]
+		out[i*2+1] = hexdigits[c&0x0f]
+	}
+	return string(out)
+}
