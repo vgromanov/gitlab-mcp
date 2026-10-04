@@ -17,26 +17,31 @@ import (
 
 // Root is one private cache directory. It is unreachable from production startup.
 type Root struct {
-	path     string
-	helper   string
-	quota    uint64
-	slots    []Slot
-	owned    map[int]bool
-	meta     map[int]map[string]uint64
-	access   uint64
-	fs       *fsClient
-	rootFile *os.File
-	lockFile *os.File
-	git      *exec.Cmd
-	draining bool
-	closed   bool
-	mu       sync.Mutex
-	domains  [64]sync.Mutex
+	path      string
+	helper    string
+	quota     uint64
+	slots     []Slot
+	owned     map[int]bool
+	ownedPins map[int]uint32
+	meta      map[int]map[string]uint64
+	gitRole   Role
+	access    uint64
+	fs        *fsClient
+	rootFile  *os.File
+	lockFile  *os.File
+	git       *exec.Cmd
+	draining  bool
+	closed    bool
+	mu        sync.Mutex
+	domains   [64]sync.Mutex
 }
 
 // Open validates a private directory, takes the root lock, and loads the ledger.
 // Non-committed slots stay frozen and keep a full reservation.
 func Open(path, helper string, quota uint64) (*Root, error) {
+	if helper == "" || helper[0] != '/' {
+		return nil, ErrPath
+	}
 	if err := QuotaOK(quota); err != nil {
 		return nil, err
 	}
@@ -54,6 +59,11 @@ func Open(path, helper string, quota uint64) (*Root, error) {
 		rf.Close()
 		return nil, ErrBusy
 	}
+	if err := syscall.Fchmod(lfd, 0600); err != nil {
+		syscall.Close(lfd)
+		rf.Close()
+		return nil, ErrPath
+	}
 	lock := os.NewFile(uintptr(lfd), "root.lock")
 	fs, err := startFS(helper, rf)
 	if err != nil {
@@ -63,7 +73,7 @@ func Open(path, helper string, quota uint64) (*Root, error) {
 	}
 	r := &Root{
 		path: path, helper: helper, quota: quota,
-		owned: map[int]bool{}, meta: map[int]map[string]uint64{},
+		owned: map[int]bool{}, ownedPins: map[int]uint32{}, meta: map[int]map[string]uint64{},
 		fs: fs, rootFile: rf, lockFile: lock,
 	}
 	if err := r.load(); err != nil {
@@ -81,31 +91,50 @@ func (r *Root) load() error {
 		return err
 	}
 	haveLedger := false
+	var gens []string
+	lockOK := false
 	for _, n := range names {
 		if !allowedRootName(n) {
 			return ErrCorrupt
 		}
 		st, err := r.lstat(n)
 		if err != nil {
-			return ErrCorrupt
+			return err
 		}
 		kind := st[0] & uint64(syscall.S_IFMT)
+		mode := st[0] & 0777
 		if kind == uint64(syscall.S_IFLNK) {
 			return ErrPath
 		}
-		if kind == uint64(syscall.S_IFREG) && st[1] != 1 {
-			return ErrPath
-		}
-		if n == "ledger" {
-			haveLedger = true
-		}
-		if hex32(n) {
-			if kind != uint64(syscall.S_IFDIR) {
-				return ErrPath
+		switch n {
+		case "root.lock":
+			if kind != uint64(syscall.S_IFREG) || st[1] != 1 || st[2] != 0 || mode != 0600 {
+				return ErrCorrupt
 			}
+			lockOK = true
+		case "ledger":
+			if kind != uint64(syscall.S_IFREG) || st[1] != 1 || st[2] != LedgerLen || mode != 0600 {
+				return ErrCorrupt
+			}
+			haveLedger = true
+		case "ledger.tmp":
+			if kind != uint64(syscall.S_IFREG) || st[1] != 1 || st[2] > LedgerLen || mode != 0600 {
+				return ErrCorrupt
+			}
+		default:
+			if !hex32(n) || kind != uint64(syscall.S_IFDIR) || mode != 0700 {
+				return ErrCorrupt
+			}
+			gens = append(gens, n)
 		}
 	}
+	if !lockOK {
+		return ErrCorrupt
+	}
 	if !haveLedger {
+		if len(gens) != 0 {
+			return ErrCorrupt
+		}
 		r.slots = make([]Slot, MaxSlots)
 		return r.persist()
 	}
@@ -113,12 +142,109 @@ func (r *Root) load() error {
 	if err != nil {
 		return err
 	}
-	_, slots, err := parseLedger(buf)
+	hdr, slots, err := parseLedger(buf)
 	if err != nil {
+		return err
+	}
+	if hdr.Quota != r.quota {
+		return ErrQuota
+	}
+	if err := reconcileSlots(r, slots, gens); err != nil {
 		return err
 	}
 	r.slots = slots
 	return nil
+}
+
+func reconcileSlots(r *Root, slots []Slot, gens []string) error {
+	seen := map[string]bool{}
+	for i := range slots {
+		s := slots[i]
+		if s.State == stateEmpty {
+			continue
+		}
+		if seen[s.ID] {
+			return ErrCorrupt
+		}
+		seen[s.ID] = true
+		if s.State == stateCommitted {
+			if s.DestID == "" || s.DestID == s.ID || seen[s.DestID] {
+				return ErrCorrupt
+			}
+			seen[s.DestID] = true
+			if err := r.matchCommitted(s); err != nil {
+				return err
+			}
+		}
+	}
+	for _, g := range gens {
+		if !seen[g] {
+			return ErrCorrupt
+		}
+	}
+	for i := range slots {
+		s := slots[i]
+		if s.State == stateEmpty || s.State == stateReserved {
+			continue
+		}
+		name := s.ID
+		if s.State == stateCommitted {
+			name = s.DestID
+		}
+		st, err := r.lstat(name)
+		if err != nil {
+			return ErrCorrupt
+		}
+		if st[0]&uint64(syscall.S_IFMT) != uint64(syscall.S_IFDIR) || st[0]&0777 != 0700 {
+			return ErrCorrupt
+		}
+	}
+	return nil
+}
+
+func (r *Root) matchCommitted(s Slot) error {
+	pack, err := r.fileLen(s.DestID+"/objects/pack/input.pack", s.Pack, 0600)
+	if err != nil || pack != s.Pack {
+		return ErrCorrupt
+	}
+	idxMode := uint64(0600)
+	st, err := r.lstat(s.DestID + "/objects/pack/input.idx")
+	if errors.Is(err, ErrAbsent) {
+		if s.Index != 0 {
+			return ErrCorrupt
+		}
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	mode := st[0] & 0777
+	if mode != 0600 && mode != 0444 {
+		return ErrCorrupt
+	}
+	idxMode = mode
+	_ = idxMode
+	if st[1] != 1 || st[2] != s.Index {
+		return ErrCorrupt
+	}
+	return nil
+}
+
+func (r *Root) fileLen(rel string, want, mode uint64) (uint64, error) {
+	st, err := r.lstat(rel)
+	if errors.Is(err, ErrAbsent) {
+		if want == 0 {
+			return 0, nil
+		}
+		return 0, ErrCorrupt
+	}
+	if err != nil {
+		return 0, err
+	}
+	if st[0]&uint64(syscall.S_IFMT) != uint64(syscall.S_IFREG) || st[1] != 1 || (st[0]&0777) != mode || st[2] != want {
+		return 0, ErrCorrupt
+	}
+	return st[2], nil
 }
 
 func allowedRootName(name string) bool {
@@ -172,7 +298,7 @@ func (r *Root) Reserve(domain, tip string) (string, error) {
 	}
 	r.slots[idx] = Slot{ID: id, Domain: domain, Tip: tip, State: stateReserved}
 	if err := r.persist(); err != nil {
-		r.slots[idx] = Slot{}
+		r.slots[idx].Frozen = true
 		return "", err
 	}
 	r.owned[idx] = true
@@ -182,6 +308,9 @@ func (r *Root) Reserve(domain, tip string) (string, error) {
 func (r *Root) Activate(id string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if err := r.admit(); err != nil {
+		return err
+	}
 	i, err := r.index(id)
 	if err != nil {
 		return err
@@ -209,6 +338,9 @@ func (r *Root) Activate(id string) error {
 func (r *Root) WritePack(id string, data []byte) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if err := r.admit(); err != nil {
+		return err
+	}
 	i, err := r.index(id)
 	if err != nil {
 		return err
@@ -220,16 +352,31 @@ func (r *Root) WritePack(id string, data []byte) error {
 		return err
 	}
 	rel := id + "/objects/pack/input.pack"
-	if err := r.writeAt(rel, r.slots[i].Pack, PackMax, data); err != nil {
+	n, werr := r.writeAt(rel, r.slots[i].Pack, PackMax, data)
+	if n > 0 {
+		r.slots[i].Pack += n
+	}
+	if werr != nil || n != uint64(len(data)) {
+		r.slots[i].Frozen = true
+		_ = r.persist()
+		if werr != nil {
+			return werr
+		}
+		return ErrQuota
+	}
+	if err := r.persist(); err != nil {
+		r.slots[i].Frozen = true
 		return err
 	}
-	r.slots[i].Pack += uint64(len(data))
-	return r.persist()
+	return nil
 }
 
 func (r *Root) WriteMeta(id, name string, data []byte) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if err := r.admit(); err != nil {
+		return err
+	}
 	i, err := r.index(id)
 	if err != nil {
 		return err
@@ -250,10 +397,18 @@ func (r *Root) WriteMeta(id, name string, data []byte) error {
 	}
 	tmp := id + "/" + name + ".tmp"
 	final := id + "/" + name
-	if err := r.writeAt(tmp, 0, metaCap(name), data); err != nil {
-		return err
+	n, werr := r.writeAt(tmp, 0, metaCap(name), data)
+	if werr != nil || n != uint64(len(data)) {
+		r.slots[i].Frozen = true
+		_ = r.persist()
+		if werr != nil {
+			return werr
+		}
+		return ErrQuota
 	}
 	if _, err := r.fs.call(4, []byte(tmp+"\x00"+final)); err != nil {
+		r.slots[i].Frozen = true
+		_ = r.persist()
 		return err
 	}
 	if r.meta[i] == nil {
@@ -292,6 +447,9 @@ func metaSum(m map[string]uint64) uint64 {
 func (r *Root) WriteIndex(id string, data []byte) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if err := r.admit(); err != nil {
+		return err
+	}
 	i, err := r.index(id)
 	if err != nil {
 		return err
@@ -303,16 +461,32 @@ func (r *Root) WriteIndex(id string, data []byte) error {
 		return ErrQuota
 	}
 	rel := id + "/objects/pack/input.idx"
-	if err := r.writeAt(rel, 0, IndexMax, data); err != nil {
+	n, werr := r.writeAt(rel, 0, IndexMax, data)
+	if werr != nil || n != uint64(len(data)) {
+		if n > 0 {
+			r.slots[i].Index = n
+		}
+		r.slots[i].Frozen = true
+		_ = r.persist()
+		if werr != nil {
+			return werr
+		}
+		return ErrQuota
+	}
+	r.slots[i].Index = n
+	if err := r.persist(); err != nil {
+		r.slots[i].Frozen = true
 		return err
 	}
-	r.slots[i].Index = uint64(len(data))
-	return r.persist()
+	return nil
 }
 
 func (r *Root) Quiesce(id string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if err := r.admit(); err != nil {
+		return err
+	}
 	i, err := r.index(id)
 	if err != nil {
 		return err
@@ -326,13 +500,51 @@ func (r *Root) Quiesce(id string) error {
 		}
 		r.git = nil
 	}
+	if r.gitRole == RoleIndex {
+		if err := r.measureIndex(i); err != nil {
+			r.slots[i].Frozen = true
+			_ = r.persist()
+			return err
+		}
+	}
 	r.slots[i].State = stateQuiescent
-	return r.persist()
+	if err := r.persist(); err != nil {
+		r.slots[i].Frozen = true
+		return err
+	}
+	return nil
+}
+
+func (r *Root) measureIndex(i int) error {
+	id := r.slots[i].ID
+	pack, err := r.lstat(id + "/objects/pack/input.pack")
+	if err != nil && !errors.Is(err, ErrAbsent) {
+		return err
+	}
+	if err == nil {
+		if pack[0]&uint64(syscall.S_IFMT) != uint64(syscall.S_IFREG) || pack[1] != 1 || pack[2] > PackMax {
+			return ErrCorrupt
+		}
+		r.slots[i].Pack = pack[2]
+	}
+	idx, err := r.lstat(id + "/objects/pack/input.idx")
+	if err != nil {
+		return err
+	}
+	mode := idx[0] & 0777
+	if idx[0]&uint64(syscall.S_IFMT) != uint64(syscall.S_IFREG) || idx[1] != 1 || (mode != 0444 && mode != 0600) || idx[2] > IndexMax {
+		return ErrCorrupt
+	}
+	r.slots[i].Index = idx[2]
+	return nil
 }
 
 func (r *Root) Verify(id string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if err := r.admit(); err != nil {
+		return err
+	}
 	i, err := r.index(id)
 	if err != nil {
 		return err
@@ -350,6 +562,9 @@ func (r *Root) Verify(id string) error {
 func (r *Root) Commit(id, dest string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if err := r.admit(); err != nil {
+		return err
+	}
 	i, err := r.index(id)
 	if err != nil {
 		return err
@@ -377,11 +592,14 @@ func (r *Root) Commit(id, dest string) error {
 func (r *Root) Pin(id string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if err := r.admit(); err != nil {
+		return err
+	}
 	i, err := r.index(id)
 	if err != nil {
 		return err
 	}
-	if r.slots[i].State != stateCommitted {
+	if r.slots[i].State != stateCommitted || r.slots[i].Frozen {
 		return ErrState
 	}
 	var leases uint32
@@ -392,10 +610,12 @@ func (r *Root) Pin(id string) error {
 		return ErrBusy
 	}
 	r.slots[i].ReadCount++
+	r.ownedPins[i]++
 	r.access++
 	r.slots[i].Access = r.access
 	if err := r.persist(); err != nil {
 		r.slots[i].ReadCount--
+		r.ownedPins[i]--
 		return err
 	}
 	r.slots[i].PinSync = true
@@ -416,12 +636,14 @@ func (r *Root) Unpin(id string) error {
 	if err != nil {
 		return err
 	}
-	if r.slots[i].ReadCount == 0 {
+	if r.ownedPins[i] == 0 || r.slots[i].ReadCount == 0 {
 		return ErrState
 	}
 	r.slots[i].ReadCount--
+	r.ownedPins[i]--
 	if err := r.persist(); err != nil {
 		r.slots[i].ReadCount++
+		r.ownedPins[i]++
 		return err
 	}
 	return nil
@@ -430,6 +652,9 @@ func (r *Root) Unpin(id string) error {
 func (r *Root) Launch(role Role, git, id, tip string, idn BuildIdentity, kernel string, darwinMajor int) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if err := r.admit(); err != nil {
+		return err
+	}
 	if err := IdentityOK(idn, kernel, darwinMajor); err != nil {
 		return err
 	}
@@ -443,17 +668,21 @@ func (r *Root) Launch(role Role, git, id, tip string, idn BuildIdentity, kernel 
 	if r.slots[i].Frozen || r.slots[i].State != stateActive {
 		return ErrState
 	}
-	cmd, err := LaunchGit(role, git, id, tip, r.rootFile, r.lockFile)
+	cmd, err := LaunchGit(role, r.helper, git, id, tip, r.rootFile, r.lockFile)
 	if err != nil {
 		return err
 	}
 	r.git = cmd
+	r.gitRole = role
 	return nil
 }
 
 func (r *Root) EvictLRU() (string, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if err := r.admit(); err != nil {
+		return "", err
+	}
 	best := -1
 	var bestA uint64
 	for i := range r.slots {
@@ -471,12 +700,15 @@ func (r *Root) EvictLRU() (string, error) {
 	}
 	id := r.slots[best].ID
 	dir := r.dirOf(best)
+	old := r.slots[best]
 	if err := r.removeGen(dir); err != nil {
 		return "", err
 	}
 	r.slots[best] = Slot{}
 	delete(r.meta, best)
+	delete(r.ownedPins, best)
 	if err := r.persist(); err != nil {
+		r.slots[best] = old
 		return "", err
 	}
 	return id, nil
@@ -494,7 +726,6 @@ func (r *Root) Close() error {
 			return ErrPinned
 		}
 	}
-	r.closed = true
 	if r.git != nil {
 		if err := QuiesceGroup(r.git.Process.Pid, r.git.Wait); err != nil {
 			return err
@@ -508,18 +739,33 @@ func (r *Root) Close() error {
 		if r.slots[i].State == stateEmpty || r.slots[i].State == stateCommitted {
 			continue
 		}
+		old := r.slots[i]
 		if err := r.removeGen(r.slots[i].ID); err != nil {
 			return err
 		}
 		r.slots[i] = Slot{}
+		if err := r.persist(); err != nil {
+			r.slots[i] = old
+			return err
+		}
 	}
 	if err := r.persist(); err != nil {
 		return err
 	}
-	err := r.fs.stop()
+	if err := r.fs.stop(); err != nil {
+		return err
+	}
+	r.closed = true
 	r.lockFile.Close()
 	r.rootFile.Close()
-	return err
+	return nil
+}
+
+func (r *Root) admit() error {
+	if r.closed || r.draining {
+		return ErrClosed
+	}
+	return nil
 }
 
 // CrashCut kills the helper group without cleanup. Durable reservations remain.
@@ -568,7 +814,7 @@ func (r *Root) persist() error {
 	if err != nil {
 		return err
 	}
-	if err := r.writeAt("ledger.tmp", 0, uint64(len(buf)), buf); err != nil {
+	if _, err := r.writeAt("ledger.tmp", 0, uint64(len(buf)), buf); err != nil {
 		return err
 	}
 	if _, err := r.fs.call(4, []byte("ledger.tmp\x00ledger")); err != nil {
@@ -578,11 +824,12 @@ func (r *Root) persist() error {
 	return err
 }
 
-func (r *Root) writeAt(rel string, off, max uint64, data []byte) error {
+func (r *Root) writeAt(rel string, off, max uint64, data []byte) (uint64, error) {
 	if uint64(len(data)) > max || off > max-uint64(len(data)) {
-		return ErrQuota
+		return 0, ErrQuota
 	}
 	const chunk = 256 << 10
+	var wrote uint64
 	for len(data) > 0 {
 		n := len(data)
 		if n > chunk {
@@ -597,16 +844,21 @@ func (r *Root) writeAt(rel string, off, max uint64, data []byte) error {
 		payload = append(payload, num[:]...)
 		payload = append(payload, data[:n]...)
 		body, err := r.fs.call(1, payload)
-		if err != nil {
-			return err
+		got := uint64(0)
+		if len(body) >= 4 {
+			got = uint64(binary.LittleEndian.Uint32(body[:4]))
 		}
-		if len(body) != 4 || binary.LittleEndian.Uint32(body) != uint32(n) {
-			return ErrQuota
+		wrote += got
+		if err != nil {
+			return wrote, err
+		}
+		if got != uint64(n) {
+			return wrote, ErrQuota
 		}
 		data = data[n:]
 		off += uint64(n)
 	}
-	return nil
+	return wrote, nil
 }
 
 func (r *Root) readFile(rel string) ([]byte, error) {
@@ -656,7 +908,10 @@ func (r *Root) lstat(rel string) ([5]uint64, error) {
 
 func (r *Root) removeGen(id string) error {
 	if _, err := r.lstat(id); err != nil {
-		return nil
+		if errors.Is(err, ErrAbsent) {
+			return nil
+		}
+		return err
 	}
 	if err := r.auditGen(id); err != nil {
 		return err
@@ -676,6 +931,9 @@ func (r *Root) removeGen(id string) error {
 		if err := r.unlinkExisting(d); err != nil {
 			return err
 		}
+	}
+	if _, err := r.fs.call(8, nil); err != nil {
+		return err
 	}
 	return nil
 }
@@ -702,8 +960,11 @@ func (r *Root) auditGen(id string) error {
 	}
 	for _, c := range checks {
 		kids, err := r.names(c.dir)
-		if err != nil {
+		if errors.Is(err, ErrAbsent) {
 			continue
+		}
+		if err != nil {
+			return err
 		}
 		for _, n := range kids {
 			if !c.allow[n] {
@@ -727,7 +988,10 @@ func knownGenName(name string) bool {
 
 func (r *Root) unlinkExisting(rel string) error {
 	if _, err := r.lstat(rel); err != nil {
-		return nil
+		if errors.Is(err, ErrAbsent) {
+			return nil
+		}
+		return err
 	}
 	_, err := r.fs.call(5, []byte(rel))
 	return err

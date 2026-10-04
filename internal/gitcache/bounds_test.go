@@ -8,6 +8,16 @@ import (
 	"testing"
 )
 
+func TestPackV2Fixture(t *testing.T) {
+	pack, err := PackV2EmptyBlob()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pack) < 32 || string(pack[:4]) != "PACK" || pack[7] != 2 {
+		t.Fatalf("pack header %x", pack[:8])
+	}
+}
+
 func TestBounds(t *testing.T) {
 	if Reserve != PackMax+IndexMax+MetaMax {
 		t.Fatalf("reserve %d", Reserve)
@@ -135,12 +145,16 @@ func TestArgvClosed(t *testing.T) {
 }
 
 func TestAuditIdentity(t *testing.T) {
-	if !strings.Contains(AuditNote, "repack_local_links") || !strings.Contains(AuditNote, "setsid") || !strings.Contains(AuditNote, "BATCH_MODE_INFO") || !strings.Contains(AuditNote, "PROT_NONE") {
+	if !strings.Contains(AuditNote, "repack_local_links") || !strings.Contains(AuditNote, "setsid") || !strings.Contains(AuditNote, "BATCH_MODE_INFO") || !strings.Contains(AuditNote, "PROT_NONE") || !strings.Contains(AuditNote, "precompose") {
 		t.Fatal("audit note missing closure")
+	}
+	darwinFlags, err := FlagsForOS("darwin")
+	if err != nil || len(darwinFlags) != 6 {
+		t.Fatal(err)
 	}
 	id := BuildIdentity{
 		SourceSHA256: GitSourceSHA256,
-		Flags:        append([]string(nil), GitBuildFlags...),
+		Flags:        darwinFlags,
 		OS:           "darwin",
 		Arch:         "arm64",
 		Compiler:     "clang",
@@ -153,10 +167,20 @@ func TestAuditIdentity(t *testing.T) {
 	if err := IdentityOK(id, "", 24); err != nil {
 		t.Fatal(err)
 	}
+	id.Flags = append([]string{}, GitBuildFlags...)
+	if err := IdentityOK(id, "", 24); err != ErrAudit {
+		t.Fatal("linux flags on darwin")
+	}
 	id.OS = "linux"
+	id.Flags = append([]string{}, GitBuildFlags...)
 	if err := IdentityOK(id, "5.15.0", 0); err != nil {
 		t.Fatal(err)
 	}
+	id.Flags = darwinFlags
+	if err := IdentityOK(id, "5.15.0", 0); err != ErrAudit {
+		t.Fatal("darwin flags on linux")
+	}
+	id.Flags = append([]string{}, GitBuildFlags...)
 	if err := IdentityOK(id, "5.4.0", 0); err != ErrUnsupported {
 		t.Fatal(err)
 	}

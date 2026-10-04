@@ -25,6 +25,9 @@ func dispatchHelper(role string) int {
 		return runFSHelper()
 	case "__gitcache_git":
 		return runGitLauncher()
+	case "__gitcache_git_failas":
+		enforceVirtualAS = func(uint64) error { return errASIneffective }
+		return runGitLauncher()
 	case "__gitcache_fsize":
 		if err := EnforceFSIZE(4096); err != nil {
 			fmt.Fprintln(os.Stderr, err.Error())
@@ -41,21 +44,26 @@ func dispatchHelper(role string) int {
 		fmt.Fprintf(os.Stdout, "nofile-enforced %d\n", n)
 		return 0
 	case "__gitcache_cpu":
-		lim := syscall.Rlimit{Cur: 1, Max: 1}
+		// Test-only: soft 1s asks the kernel for SIGXCPU, and hard 8s stays
+		// above it so Linux does not SIGKILL in the same second. Production
+		// ApplyLimits still sets soft=hard to LimitCPU (30s).
+		lim := syscall.Rlimit{Cur: 1, Max: 8}
 		if err := syscall.Setrlimit(syscall.RLIMIT_CPU, &lim); err != nil {
 			fmt.Fprintln(os.Stderr, err.Error())
 			return 2
 		}
-		// The kernel delivers SIGXCPU. A Go process must observe that signal;
-		// ignoring it is not evidence. Exit when it arrives.
 		ch := make(chan os.Signal, 1)
 		signal.Notify(ch, syscall.SIGXCPU)
 		var x uint64
 		for {
 			x += uint64(os.Getpid())
 			select {
-			case <-ch:
-				fmt.Fprintln(os.Stdout, "cpu-enforced")
+			case sig := <-ch:
+				if sig != syscall.SIGXCPU {
+					fmt.Fprintf(os.Stderr, "cpu-unexpected %s\n", sig)
+					return 2
+				}
+				fmt.Fprintln(os.Stdout, "cpu-enforced SIGXCPU")
 				return 1
 			default:
 			}
@@ -63,9 +71,11 @@ func dispatchHelper(role string) int {
 	case "__gitcache_core":
 		lim := syscall.Rlimit{Cur: 0, Max: 0}
 		if err := syscall.Setrlimit(syscall.RLIMIT_CORE, &lim); err != nil {
-			fmt.Fprintln(os.Stderr, err.Error())
+			fmt.Fprintln(os.Stderr, "core-setup-failed")
 			return 2
 		}
+		fmt.Fprintln(os.Stdout, "core-armed")
+		_ = os.Stdout.Sync()
 		_ = syscall.Kill(os.Getpid(), syscall.SIGABRT)
 		return 1
 	case "__gitcache_as":
@@ -111,6 +121,12 @@ func dispatchHelper(role string) int {
 		}
 		fmt.Fprintln(os.Stdout, "token-read")
 		return 1
+	case "__gitcache_ack_bad":
+		_, _ = os.Stdout.Write([]byte("XXXXXXXX"))
+		return 0
+	case "__gitcache_ack_short":
+		_, _ = os.Stdout.Write([]byte{0, 0})
+		return 0
 	case "__gitcache_sleep":
 		select {}
 	case "__gitcache_tree":

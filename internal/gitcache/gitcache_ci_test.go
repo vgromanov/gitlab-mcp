@@ -3,11 +3,16 @@
 package gitcache
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"io"
 	"os"
 	"os/exec"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestNativeFixture fails closed when the pinned Git build, its identity, or
@@ -40,8 +45,21 @@ func TestNativeFixture(t *testing.T) {
 		BinarySHA256: vals["binary_sha256"],
 		VersionLine:  vals["version_line"],
 	}
-	if _, err := os.Stat(git); err != nil {
+	gf, err := os.Open(git)
+	if err != nil {
 		t.Fatal(err)
+	}
+	sum := sha256.New()
+	if _, err := io.Copy(sum, gf); err != nil {
+		gf.Close()
+		t.Fatal(err)
+	}
+	gf.Close()
+	if hex.EncodeToString(sum.Sum(nil)) != id.BinarySHA256 {
+		t.Errorf("git hash does not match the recorded identity")
+	}
+	if _, err := os.Stat(helper); err != nil || helper == "" {
+		t.Fatal("selected helper missing")
 	}
 	if err := IdentityOK(id, vals["kernel"], major); err != nil {
 		t.Errorf("fixture identity rejected: %v compiler=%q os=%q kernel=%q darwin_major=%d version=%q binary=%q",
@@ -65,4 +83,87 @@ func TestNativeFixture(t *testing.T) {
 	if err != nil || !strings.Contains(string(out), "nofile-enforced") {
 		t.Fatalf("NOFILE not enforced: %v %s", err, out)
 	}
+	wrongRoot := privateRoot(t)
+	rf, err := walkRoot(wrongRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rf.Close()
+	if _, err := LaunchGit(RoleVersion, "/usr/bin/true", git, "gen", "", rf, rf); err == nil {
+		t.Fatal("wrong helper accepted")
+	}
+	nativeVersionAndIndex(t, helper, git, id, vals["kernel"], major)
+}
+
+func nativeVersionAndIndex(t *testing.T, helper, git string, idn BuildIdentity, kernel string, major int) {
+	t.Helper()
+	root := privateRoot(t)
+	r, err := Open(root, helper, RootBytes+Reserve*2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	id, err := r.Reserve("dom", "tip")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Activate(id); err != nil {
+		t.Fatal(err)
+	}
+	buf := &bytes.Buffer{}
+	old := launchStdout
+	launchStdout = buf
+	t.Cleanup(func() { launchStdout = old })
+	if err := r.Launch(RoleVersion, git, id, "", idn, kernel, major); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Quiesce(id); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for !strings.Contains(buf.String(), idn.VersionLine) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if strings.TrimSpace(buf.String()) != idn.VersionLine {
+		t.Fatalf("version %q want %q", buf.String(), idn.VersionLine)
+	}
+
+	id2, err := r.Reserve("dom2", "tip")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Activate(id2); err != nil {
+		t.Fatal(err)
+	}
+	pack, err := PackV2EmptyBlob()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.WritePack(id2, pack); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Launch(RoleIndex, git, id2, "", idn, kernel, major); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Quiesce(id2); err != nil {
+		t.Fatal(err)
+	}
+	_, _, _, err = r.State(id2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := os.Stat(privateJoin(root, id2, "objects", "pack", "input.idx"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode().Perm() != 0444 && st.Mode().Perm() != 0600 {
+		t.Fatalf("idx mode %o", st.Mode().Perm())
+	}
+	if st.Size() == 0 {
+		t.Fatal("empty idx")
+	}
+}
+
+func privateJoin(elem ...string) string {
+	return strings.Join(elem, "/")
 }

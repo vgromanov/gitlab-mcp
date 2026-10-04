@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 )
 
 func walkRoot(path string) (*os.File, error) {
@@ -50,7 +51,7 @@ func walkRoot(path string) (*os.File, error) {
 		syscall.Close(fd)
 		return nil, ErrPath
 	}
-	if st.Mode&0o022 != 0 {
+	if st.Mode&0777 != 0700 {
 		syscall.Close(fd)
 		return nil, ErrPath
 	}
@@ -78,23 +79,24 @@ func componentOK(name string) bool {
 }
 
 type fsClient struct {
-	cmd  *exec.Cmd
-	in   io.WriteCloser
-	out  io.Reader
-	mu   sync.Mutex
-	pgid int
-	dead bool
+	cmd      *exec.Cmd
+	in       io.WriteCloser
+	out      io.Reader
+	mu       sync.Mutex
+	pgid     int
+	dead     bool
+	callHook func(op byte) error
 }
 
+// fsHelperArg is the helper argv. Production uses __gitcache_fs.
+// A test may select an ACK stand-in that never completes a valid ready frame.
+var fsHelperArg = "__gitcache_fs"
+
 func startFS(helper string, root *os.File) (*fsClient, error) {
-	if helper == "" {
-		var err error
-		helper, err = os.Executable()
-		if err != nil {
-			return nil, ErrUnsupported
-		}
+	if helper == "" || helper[0] != '/' {
+		return nil, ErrPath
 	}
-	cmd := exec.Command(helper, "__gitcache_fs")
+	cmd := exec.Command(helper, fsHelperArg)
 	cmd.Env = AllowEnv()
 	cmd.Stdin = nil
 	stdin, err := cmd.StdinPipe()
@@ -120,12 +122,24 @@ func startFS(helper string, root *os.File) (*fsClient, error) {
 	stderrW.Close()
 	go drainLimit(stderrR, cmd.Process.Pid, 64<<10)
 	var ready [8]byte
-	if _, err := io.ReadFull(stdout, ready[:]); err != nil {
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
+	if err := readFullDeadline(stdout, ready[:], ackWait); err != nil || ready != [8]byte{} {
+		qerr := QuiesceGroup(cmd.Process.Pid, cmd.Wait)
+		stdin.Close()
+		if qerr != nil {
+			return nil, ErrNotQuiescent
+		}
 		return nil, ErrBusy
 	}
 	return &fsClient{cmd: cmd, in: stdin, out: stdout, pgid: cmd.Process.Pid}, nil
+}
+
+func readFullDeadline(r io.Reader, buf []byte, d time.Duration) error {
+	if f, ok := r.(interface{ SetReadDeadline(time.Time) error }); ok {
+		_ = f.SetReadDeadline(time.Now().Add(d))
+		defer f.SetReadDeadline(time.Time{})
+	}
+	_, err := io.ReadFull(r, buf)
+	return err
 }
 
 func drainLimit(r io.ReadCloser, pid, n int) {
@@ -148,6 +162,11 @@ func (c *fsClient) call(op byte, payload []byte) ([]byte, error) {
 	if c.dead {
 		return nil, ErrClosed
 	}
+	if c.callHook != nil {
+		if err := c.callHook(op); err != nil {
+			return nil, err
+		}
+	}
 	if len(payload) > 1<<20 {
 		return nil, ErrQuota
 	}
@@ -161,8 +180,9 @@ func (c *fsClient) call(op byte, payload []byte) ([]byte, error) {
 		return nil, err
 	}
 	var rh [8]byte
-	if _, err := io.ReadFull(c.out, rh[:]); err != nil {
-		return nil, err
+	if err := readFullDeadline(c.out, rh[:], ackWait); err != nil {
+		c.killLocked()
+		return nil, ErrNotQuiescent
 	}
 	status := binary.LittleEndian.Uint32(rh[:4])
 	n := binary.LittleEndian.Uint32(rh[4:])
@@ -170,8 +190,9 @@ func (c *fsClient) call(op byte, payload []byte) ([]byte, error) {
 		return nil, ErrCorrupt
 	}
 	buf := make([]byte, n)
-	if _, err := io.ReadFull(c.out, buf); err != nil {
-		return nil, err
+	if err := readFullDeadline(c.out, buf, ackWait); err != nil {
+		c.killLocked()
+		return nil, ErrNotQuiescent
 	}
 	if status != 0 {
 		return buf, fsStatus(status)
@@ -189,8 +210,24 @@ func fsStatus(code uint32) error {
 		return ErrPath
 	case 4:
 		return ErrQuota
+	case 6:
+		return ErrAbsent
 	default:
 		return ErrUnsupported
+	}
+}
+
+func (c *fsClient) killLocked() {
+	if c.dead {
+		return
+	}
+	c.dead = true
+	if c.pgid <= 1 {
+		return
+	}
+	_ = syscall.Kill(-c.pgid, syscall.SIGKILL)
+	if c.cmd != nil {
+		_ = c.cmd.Wait()
 	}
 }
 
@@ -198,8 +235,13 @@ func (c *fsClient) crash() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.dead = true
+	if c.pgid <= 1 {
+		return
+	}
 	_ = syscall.Kill(-c.pgid, syscall.SIGKILL)
-	_ = c.cmd.Wait()
+	if c.cmd != nil {
+		_ = c.cmd.Wait()
+	}
 	_ = syscall.Kill(-c.pgid, 0)
 }
 
@@ -404,11 +446,11 @@ func (h *fsHelper) write(payload []byte) (uint32, []byte) {
 		}
 		return fsyncCwd()
 	})
-	if err != nil {
-		return mapErr(err), nil
-	}
 	var out [4]byte
 	binary.LittleEndian.PutUint32(out[:], uint32(n))
+	if err != nil {
+		return mapErr(err), out[:]
+	}
 	return 0, out[:]
 }
 
@@ -557,11 +599,33 @@ func (h *fsHelper) list(payload []byte) (uint32, []byte) {
 	if err != nil {
 		return 5, nil
 	}
+	var st syscall.Stat_t
+	if err := syscall.Fstat(fd, &st); err != nil || st.Mode&syscall.S_IFMT != syscall.S_IFDIR || uint64(st.Dev) != h.dev {
+		syscall.Close(fd)
+		return 3, nil
+	}
 	f := os.NewFile(uintptr(fd), "cwd")
-	names, err := f.Readdirnames(-1)
-	f.Close()
-	if err != nil {
-		return 5, nil
+	defer f.Close()
+	var names []string
+	var nbytes int
+	for {
+		chunk, err := f.Readdirnames(32)
+		if err != nil && len(chunk) == 0 {
+			if err == io.EOF {
+				break
+			}
+			return 5, nil
+		}
+		for _, name := range chunk {
+			if len(name) > 255 || nbytes+len(name)+1 > 8192 || len(names) >= 128 {
+				return 2, nil
+			}
+			names = append(names, name)
+			nbytes += len(name) + 1
+		}
+		if err == io.EOF {
+			break
+		}
 	}
 	return 0, []byte(strings.Join(names, "\n"))
 }
@@ -602,6 +666,8 @@ func mapErr(err error) uint32 {
 		return 3
 	case errors.Is(err, ErrQuota), errors.Is(err, syscall.EFBIG):
 		return 4
+	case errors.Is(err, syscall.ENOENT):
+		return 6
 	default:
 		return 5
 	}

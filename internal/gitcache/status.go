@@ -29,6 +29,7 @@ var (
 	ErrPath         = errors.New("gitcache: path")
 	ErrState        = errors.New("gitcache: state")
 	ErrAudit        = errors.New("gitcache: audit")
+	ErrAbsent       = errors.New("gitcache: absent")
 )
 
 // AllowEnv is the only environment a helper process receives.

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -231,11 +232,34 @@ func TestMoreBranches(t *testing.T) {
 	if err := r.Commit(id, strings.Repeat("ab", 16)); err != ErrState {
 		t.Fatal(err)
 	}
-	if _, err := LaunchGit(RoleIndex, "git", id, "", r.rootFile, r.lockFile); err != ErrPath {
+	if _, err := LaunchGit(RoleIndex, h, "git", id, "", r.rootFile, r.lockFile); err != ErrPath {
 		t.Fatal(err)
 	}
-	if _, err := LaunchGit(RoleIndex, h, id, "", r.rootFile, r.lockFile); err != ErrLimit {
+	// A non-executable absolute path still exercises the launcher. ErrLimit means
+	// a production limit refused Exec and the launcher already reaped that child.
+	// A returned command means limits were installed and Exec was attempted; that
+	// nil error is not RLIMIT_AS evidence. The child must be waited until ESRCH.
+	absent := filepath.Join(t.TempDir(), "not-git")
+	if err := os.WriteFile(absent, []byte("not a git binary"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cmd, err := LaunchGit(RoleIndex, h, absent, id, "", r.rootFile, r.lockFile)
+	if errors.Is(err, ErrLimit) {
+		if cmd != nil {
+			t.Fatal("limit refusal must not return a live command")
+		}
+	} else if err != nil || cmd == nil || cmd.Process == nil {
 		t.Fatalf("launch %v", err)
+	} else {
+		waitErr := cmd.Wait()
+		var exitErr *exec.ExitError
+		if !errors.As(waitErr, &exitErr) || exitErr.ExitCode() != 127 {
+			t.Fatalf("absent tool must fail exec after limits, wait %v", waitErr)
+		}
+		if kerr := syscall.Kill(-cmd.Process.Pid, 0); !errors.Is(kerr, syscall.ESRCH) {
+			_ = QuiesceGroup(cmd.Process.Pid, func() error { return nil })
+			t.Fatalf("launcher child still alive: %v", kerr)
+		}
 	}
 	if err := r.Close(); err != nil {
 		t.Fatal(err)
@@ -353,6 +377,7 @@ func (m *memWriteCloser) Close() error { return nil }
 
 func TestDenseBranches(t *testing.T) {
 	saveWD(t)
+	hb := helperBin(t)
 	if _, err := walkRoot("//nope"); err != ErrPath {
 		t.Fatal(err)
 	}
@@ -380,7 +405,10 @@ func TestDenseBranches(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fs, err := startFS("", rf)
+	if _, err := startFS("", rf); err != ErrPath {
+		t.Fatal("empty helper")
+	}
+	fs, err := startFS(hb, rf)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -433,7 +461,18 @@ func TestDenseBranches(t *testing.T) {
 	if err := writeStatus(failWriter{}, 1, []byte("body")); err == nil {
 		t.Fatal("status write")
 	}
-	drainLimit(io.NopCloser(bytes.NewReader(make([]byte, 8000))), 1<<20, 100)
+	over := exec.Command("/bin/sleep", "30")
+	over.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := over.Start(); err != nil {
+		t.Fatal(err)
+	}
+	drainLimit(io.NopCloser(bytes.NewReader(make([]byte, 8000))), over.Process.Pid, 100)
+	if err := over.Wait(); err == nil {
+		t.Fatal("over-limit drain left the child running")
+	}
+	if kerr := syscall.Kill(-over.Process.Pid, 0); !errors.Is(kerr, syscall.ESRCH) {
+		t.Fatal(kerr)
+	}
 
 	root := privateRoot(t)
 	fd, err := syscall.Open(root, syscall.O_RDONLY|syscall.O_DIRECTORY, 0)
@@ -519,16 +558,16 @@ func TestDenseBranches(t *testing.T) {
 	if _, err := roleFSIZE(RoleVersion); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := LaunchGit(Role("no"), "/usr/bin/git", "gen", "", nil, nil); err != ErrUnsupported {
+	if _, err := LaunchGit(Role("no"), hb, "/usr/bin/git", "gen", "", nil, nil); err != ErrUnsupported {
 		t.Fatal(err)
 	}
-	if _, err := LaunchGit(RoleIndex, "/usr/bin/git", "", "", nil, nil); err != ErrPath {
+	if _, err := LaunchGit(RoleIndex, hb, "/usr/bin/git", "", "", nil, nil); err != ErrPath {
 		t.Fatal(err)
 	}
-	if _, err := LaunchGit(RoleIndex, "/usr/bin/git", "/abs", "", nil, nil); err != ErrPath {
+	if _, err := LaunchGit(RoleIndex, "relative", "/usr/bin/git", "gen", "", nil, nil); err != ErrPath {
 		t.Fatal(err)
 	}
-	if err := QuiesceGroup(1<<20, func() error { return nil }); err != nil {
+	if _, err := LaunchGit(RoleIndex, hb, "/usr/bin/git", "/abs", "", nil, nil); err != ErrPath {
 		t.Fatal(err)
 	}
 	if _, err := ReadToken(bytes.NewReader(nil)); err != ErrCorrupt {

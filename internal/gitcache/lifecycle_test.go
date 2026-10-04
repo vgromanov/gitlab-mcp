@@ -3,6 +3,7 @@
 package gitcache
 
 import (
+	"bytes"
 	"errors"
 	"os"
 	"os/exec"
@@ -190,18 +191,20 @@ func TestLifecyclePinLRUAndClose(t *testing.T) {
 	if _, _, n, err := r.State(id); err != nil || n != 1 {
 		t.Fatalf("pin %d %v", n, err)
 	}
+	if _, err := r.EvictLRU(); err != ErrBusy {
+		t.Fatalf("pinned evict %v", err)
+	}
 	if err := r.Close(); err != ErrPinned {
 		t.Fatalf("close pinned %v", err)
 	}
-	if _, err := r.EvictLRU(); err != ErrBusy {
-		t.Fatalf("pinned evict %v", err)
+	if _, err := r.EvictLRU(); err != ErrClosed {
+		t.Fatalf("evict while draining %v", err)
 	}
 	if err := r.Unpin(id); err != nil {
 		t.Fatal(err)
 	}
-	evicted, err := r.EvictLRU()
-	if err != nil || evicted != id {
-		t.Fatalf("evict %s %v", evicted, err)
+	if _, err := r.EvictLRU(); err != ErrClosed {
+		t.Fatalf("evict remains closed while draining %v", err)
 	}
 	if err := r.Close(); err != nil {
 		t.Fatal(err)
@@ -285,7 +288,21 @@ func TestLimitsAndQuiescence(t *testing.T) {
 	cmd = exec.Command(exe, "__gitcache_core")
 	cmd.Env = AllowEnv()
 	cmd.Dir = dir
-	_ = cmd.Run()
+	coreOut, coreErr := cmd.CombinedOutput()
+	if !strings.Contains(string(coreOut), "core-armed") {
+		t.Fatalf("core setup %v %s", coreErr, coreOut)
+	}
+	var coreExit *exec.ExitError
+	if !errors.As(coreErr, &coreExit) {
+		t.Fatalf("core exit %v", coreErr)
+	}
+	aborted := coreExit.ExitCode() == 2
+	if ws, ok := coreExit.Sys().(syscall.WaitStatus); ok && ws.Signaled() && ws.Signal() == syscall.SIGABRT {
+		aborted = true
+	}
+	if !aborted {
+		t.Fatalf("core signal %v", coreErr)
+	}
 	ents, err := os.ReadDir(dir)
 	if err != nil {
 		t.Fatal(err)
@@ -301,9 +318,41 @@ func TestLimitsAndQuiescence(t *testing.T) {
 	cmd = exec.Command(exe, "__gitcache_cpu")
 	cmd.Env = AllowEnv()
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	out, err = cmd.CombinedOutput()
-	if err == nil || !strings.Contains(string(out), "cpu-enforced") {
-		t.Fatalf("cpu %v %s", err, out)
+	var cpuOut bytes.Buffer
+	cmd.Stdout = &cpuOut
+	cmd.Stderr = &cpuOut
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	var waitErr error
+	select {
+	case waitErr = <-done:
+	case <-time.After(20 * time.Second):
+		// Kill the group, then read the Wait the goroutine already started.
+		// A nil wait function would not reap cmd.
+		qerr := QuiesceGroup(cmd.Process.Pid, func() error {
+			waitErr = <-done
+			return waitErr
+		})
+		t.Fatalf("cpu helper exceeded 20s wall bound: wait %v quiesce %v %s", waitErr, qerr, cpuOut.String())
+	}
+	cpuOK := false
+	var exitErr *exec.ExitError
+	if errors.As(waitErr, &exitErr) && exitErr.ExitCode() == 1 && strings.Contains(cpuOut.String(), "cpu-enforced SIGXCPU") {
+		cpuOK = true
+	}
+	if !cpuOK && exitErr != nil {
+		if ws, ok := exitErr.Sys().(syscall.WaitStatus); ok && ws.Signaled() && ws.Signal() == syscall.SIGKILL {
+			cpuOK = true
+		}
+	}
+	if !cpuOK {
+		t.Fatalf("cpu %v %s", waitErr, cpuOut.String())
+	}
+	if kerr := syscall.Kill(-cmd.Process.Pid, 0); !errors.Is(kerr, syscall.ESRCH) {
+		t.Fatalf("cpu child not reaped: %v", kerr)
 	}
 }
 

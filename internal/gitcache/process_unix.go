@@ -45,8 +45,17 @@ func ApplyLimits(fsize uint64) error {
 			return ErrLimit
 		}
 	}
+	// getrlimit agreement is not the AS gate. The child must prove the
+	// mapping before it is allowed to ACK or Exec.
+	if err := enforceVirtualAS(LimitAS); err != nil {
+		return ErrLimit
+	}
 	return nil
 }
+
+// enforceVirtualAS is the AS gate used by ApplyLimits. Tests may replace it
+// only inside a helper process that has not reached Exec.
+var enforceVirtualAS = EnforceVirtualAS
 
 // ReadToken consumes a bounded frame only after RLIMIT_CORE is confirmed 0.
 // A failed check returns before any read.
@@ -147,7 +156,15 @@ func roleArgv(role Role, git, tip string) ([]string, error) {
 // Limits are applied in the child before Exec. A failed limit writes "limit"
 // on the ack pipe and does not Exec. The caller must Quiesce the returned
 // process; discarding it without Wait leaves the reservation charged.
-func LaunchGit(role Role, git, genPath, tip string, root *os.File, lock *os.File) (*exec.Cmd, error) {
+// gitLaunchArg is the helper argv. Production uses __gitcache_git.
+// A test may select __gitcache_git_failas to force the AS gate closed.
+var gitLaunchArg = "__gitcache_git"
+
+// launchStdout is a test seam. Production leaves it nil. A native test may
+// set it to record the child stdout that drainLimit would otherwise discard.
+var launchStdout *bytes.Buffer
+
+func LaunchGit(role Role, helper, git, genPath, tip string, root *os.File, lock *os.File) (*exec.Cmd, error) {
 	fsize, err := roleFSIZE(role)
 	if err != nil {
 		return nil, err
@@ -156,7 +173,7 @@ func LaunchGit(role Role, git, genPath, tip string, root *os.File, lock *os.File
 	if err != nil {
 		return nil, err
 	}
-	if genPath == "" || genPath[0] == '/' {
+	if genPath == "" || genPath[0] == '/' || helper == "" || helper[0] != '/' {
 		return nil, ErrPath
 	}
 	reqR, reqW, err := os.Pipe()
@@ -169,15 +186,7 @@ func LaunchGit(role Role, git, genPath, tip string, root *os.File, lock *os.File
 		reqW.Close()
 		return nil, err
 	}
-	helper, err := os.Executable()
-	if err != nil {
-		reqR.Close()
-		reqW.Close()
-		ackR.Close()
-		ackW.Close()
-		return nil, err
-	}
-	cmd := exec.Command(helper, "__gitcache_git")
+	cmd := exec.Command(helper, gitLaunchArg)
 	cmd.Env = GitEnv()
 	cmd.Stdin = nil
 	cmd.ExtraFiles = []*os.File{root, lock, reqR, ackW}
@@ -203,7 +212,12 @@ func LaunchGit(role Role, git, genPath, tip string, root *os.File, lock *os.File
 	if role == RoleCatFile {
 		outLimit = CatFileStdoutMax
 	}
-	go drainLimit(stdout, cmd.Process.Pid, outLimit)
+	var out io.ReadCloser = stdout
+	if launchStdout != nil {
+		launchStdout.Reset()
+		out = closeReader{Reader: io.TeeReader(stdout, launchStdout), Closer: stdout}
+	}
+	go drainLimit(out, cmd.Process.Pid, outLimit)
 	_ = fsize
 	_ = argv // rebuilt in the child from the role, the absolute git path, and the tip
 	payload := []byte(string(role) + "\x00" + git + "\x00" + genPath + "\x00" + tip)
@@ -226,6 +240,11 @@ func LaunchGit(role Role, git, genPath, tip string, root *os.File, lock *os.File
 		return nil, ErrLimit
 	}
 	return cmd, nil
+}
+
+type closeReader struct {
+	io.Reader
+	io.Closer
 }
 
 func closePipes(fs ...*os.File) {

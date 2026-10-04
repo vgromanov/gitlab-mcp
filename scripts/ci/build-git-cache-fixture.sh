@@ -27,15 +27,24 @@ mkdir -p "$RUNNER_TEMP/git-src"
 tar -xJf "$arc" -C "$RUNNER_TEMP/git-src"
 cd "$RUNNER_TEMP/git-src/git-2.50.1"
 
-make -j2 \
+os=$(uname -s | tr '[:upper:]' '[:lower:]')
+flag_csv="NO_CURL=YesPlease,NO_EXPAT=YesPlease,NO_GETTEXT=YesPlease,NO_TCLTK=YesPlease,NO_OPENSSL=YesPlease,NO_APPLE_COMMON_CRYPTO=YesPlease"
+set -- \
 	NO_CURL=YesPlease \
 	NO_EXPAT=YesPlease \
 	NO_GETTEXT=YesPlease \
 	NO_TCLTK=YesPlease \
 	NO_OPENSSL=YesPlease \
-	NO_APPLE_COMMON_CRYPTO=YesPlease \
-	NO_ICONV=YesPlease \
-	git
+	NO_APPLE_COMMON_CRYPTO=YesPlease
+case "$os" in
+linux)
+	set -- "$@" NO_ICONV=YesPlease
+	flag_csv="${flag_csv},NO_ICONV=YesPlease"
+	;;
+darwin) ;;
+*) echo "unsupported fixture os" >&2; exit 1 ;;
+esac
+make -j2 "$@" git
 
 test -x git
 if command -v sha256sum >/dev/null 2>&1; then
@@ -44,7 +53,6 @@ else
 	bin=$(shasum -a 256 git | awk '{print $1}')
 fi
 
-os=$(uname -s | tr '[:upper:]' '[:lower:]')
 machine=$(uname -m)
 case "$machine" in
 aarch64|arm64) arch=arm64 ;;
@@ -63,7 +71,7 @@ version=$(./git version)
 ident="$RUNNER_TEMP/gitcache-identity"
 {
 	printf 'source_sha256=%s\n' "$sum"
-	printf 'flags=%s\n' "NO_CURL=YesPlease,NO_EXPAT=YesPlease,NO_GETTEXT=YesPlease,NO_TCLTK=YesPlease,NO_OPENSSL=YesPlease,NO_APPLE_COMMON_CRYPTO=YesPlease,NO_ICONV=YesPlease"
+	printf 'flags=%s\n' "$flag_csv"
 	printf 'os=%s\n' "$os"
 	printf 'arch=%s\n' "$arch"
 	printf 'compiler=%s\n' "$compiler"

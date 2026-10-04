@@ -8,15 +8,31 @@ const (
 	GitArchiveURL    = "https://www.kernel.org/pub/software/scm/git/git-2.50.1.tar.xz"
 )
 
-// GitBuildFlags is the fixture make invocation, in order.
-var GitBuildFlags = []string{
+// CommonBuildFlags are the flags shared by Linux and Darwin, in order.
+var CommonBuildFlags = []string{
 	"NO_CURL=YesPlease",
 	"NO_EXPAT=YesPlease",
 	"NO_GETTEXT=YesPlease",
 	"NO_TCLTK=YesPlease",
 	"NO_OPENSSL=YesPlease",
 	"NO_APPLE_COMMON_CRYPTO=YesPlease",
-	"NO_ICONV=YesPlease",
+}
+
+// GitBuildFlags is the Linux fixture list, including NO_ICONV.
+var GitBuildFlags = append(append([]string{}, CommonBuildFlags...), "NO_ICONV=YesPlease")
+
+// FlagsForOS returns the only flag list accepted for that OS.
+// Darwin omits NO_ICONV so compat/posix.h includes iconv.h before sane-ctype.h.
+// Linux keeps NO_ICONV. Any other OS, or a swapped list, is rejected.
+func FlagsForOS(osName string) ([]string, error) {
+	switch osName {
+	case "linux":
+		return append([]string{}, GitBuildFlags...), nil
+	case "darwin":
+		return append([]string{}, CommonBuildFlags...), nil
+	default:
+		return nil, ErrUnsupported
+	}
 }
 
 // AuditNote records the selected-build writer and descendant closure.
@@ -27,7 +43,8 @@ profile: Linux>=5.15 amd64/arm64 and macOS 15 / Darwin 24 amd64/arm64. Other OS 
 startup: common-init.c trace2_initialize runs only after the process environment exists. tr2_sysenv_load uses read_very_early_config, which sets ignore_repo. git_config_system honors GIT_CONFIG_NOSYSTEM. GIT_CONFIG_GLOBAL and GIT_CONFIG_SYSTEM select those files. Repo config is read later by the builtin. The only accepted config bytes are the core allowlist (repositoryformatversion, bare, logallrefupdates, fsyncMethod).
 index-pack writers, fixed argv (positional pack, -o final idx, --no-rev-index, --threads=1, no --stdin, --fix-thin, --promisor, or --keep): open_pack_file (index-pack.c:359) takes the else branch, xopen O_RDONLY, output_fd=-1, so the tmp_pack odb_mkstemp at :365 is not reached. write_idx_file (pack-write.c:89) sees a non-nil index_name, unlinks that name, and xopen O_CREAT|O_EXCL|O_WRONLY; tmp_idx at :87 is not reached. --no-rev-index sets rev_index=0 (:2005) and write_rev_file is skipped (:2101). opts.flags clears WRITE_REV first (:2039). conclude_pack rewrites the pack only when fix_thin_pack is set; that flag is only set by --fix-thin. final() (:1608) calls rename_tmp_packfile, which renames only when the final name differs from the current name (:1597); the explicit index path is the same name and is chmod 0444. No setsid in index-pack.c, pack-write.c, cat-file.c, or rev-list.c.
 descendants: the only start_command in index-pack.c is repack_local_links (:1849), and that function returns immediately when outgoing_links is empty (:1826). record_outgoing_links is assigned only from --promisor (:1958). do_record_outgoing_links runs only inside that flag (:961), even though --strict also enters the fsck block at :929. cat-file --batch-check sets BATCH_MODE_INFO (:1001). batch_object_write emits the format and calls print_object_or_die only for BATCH_MODE_CONTENTS (:556). %(objectname) and %(objecttype) (expand_atom :319 and :322) copy the hex id and the type name. textconv_object and filter_object are inside print_object_or_die and require transform_mode from --textconv or --filters, which this argv does not pass. rev-list.c has no start_command or run_command. --threads=1 does not add a pack-objects child. Builtin dispatch of these names does not take the alias or dashed external path.
-not closed: a setsid descendant would leave the process group; group ESRCH does not see it. Trace2 still opens a target if the stripped environment or the allowlist config fails to suppress it. A binary whose build flags or source hash differ is not this audit. RLIMIT_AS of 8GiB is part of the role contract. Installing the rlimit is not enforcement: the helper must fail a PROT_NONE map of 8GiB+4096 with ENOMEM after a 1GiB map succeeds. If the kernel rejects the rlimit, or the oversized map succeeds, Exec is skipped and the required CI probe fails.
+darwin recipe: Linux keeps NO_ICONV. Darwin omits only that flag. compat/posix.h includes iconv.h at the NO_ICONV guard (posix.h:227) before sane-ctype.h (posix.h:449). Defining NO_ICONV skips that include. Darwin config.mak.uname always adds -DPRECOMPOSE_UNICODE and compat/precompose_utf8.o. precompose_utf8.h then includes iconv.h after the ctype macros, which collides with the Xcode 16.4 SDK _ctype.h inline functions. Omitting NO_ICONV on Darwin restores the upstream include order. It does not change archive hash, version, or the other six flags. precompose_utf8.c calls iconv for pathname composition. setup.c calls probe_utf8_pathname_composition, which can create and unlink a probe file and git_config_set core.precomposeunicode. That is an in-process writer on Darwin, not a start_command. This audit does not claim that probe is absent from the Darwin build.
+not closed: a setsid descendant would leave the process group; group ESRCH does not see it. Trace2 still opens a target if the stripped environment or the allowlist config fails to suppress it. The Darwin precompose probe can write inside the generation. A binary whose build flags or source hash differ is not this audit. RLIMIT_AS of 8GiB is part of the role contract. Installing the rlimit is not enforcement: before ACK and Exec the helper must succeed a PROT_NONE map under the cap and fail a map of 8GiB+4096 with ENOMEM. If the kernel rejects the rlimit, the under-map fails, or the oversized map succeeds, Exec is skipped. A successful compile is not that proof.
 `
 
 // BuildIdentity is measured from the fixture, not from git version alone.
@@ -48,11 +65,15 @@ func IdentityOK(id BuildIdentity, kernelRelease string, darwinMajor int) error {
 	if id.SourceSHA256 != GitSourceSHA256 {
 		return ErrAudit
 	}
-	if len(id.Flags) != len(GitBuildFlags) {
+	want, err := FlagsForOS(id.OS)
+	if err != nil {
+		return ErrUnsupported
+	}
+	if len(id.Flags) != len(want) {
 		return ErrAudit
 	}
-	for i := range GitBuildFlags {
-		if id.Flags[i] != GitBuildFlags[i] {
+	for i := range want {
+		if id.Flags[i] != want[i] {
 			return ErrAudit
 		}
 	}
