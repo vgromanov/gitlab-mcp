@@ -761,8 +761,12 @@ func (rt *reviewRuntime) one(item reviewContextItemIn) reviewContextItemOut {
 	if err := budgetAllowsNext(rt.ctx); err != nil {
 		return rt.failClosedManifest(&out, causeOf(err))
 	}
-	if err := reviewPreMintBudget(rt.ctx); err != nil {
-		return rt.failClosedManifest(&out, causeOf(err))
+	// Item and elapsed caps are extra only after a diff-manifest proof is installed.
+	// Discussions, metadata, and approvals keep the original mint budget checks.
+	if out.diffManifestDigest != "" {
+		if err := reviewPreMintBudget(rt.ctx); err != nil {
+			return rt.failClosedManifest(&out, causeOf(err))
+		}
 	}
 	rt.finalizeDiscBound(&out)
 	complete, excluded = dropUnprovedDiscussions(item, &out, complete, excluded)

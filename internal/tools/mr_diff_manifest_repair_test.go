@@ -691,6 +691,131 @@ func TestRepairF7_groupPolicyTypedErrors(t *testing.T) {
 			t.Fatalf("got %v parent=%v", err, parent.Err())
 		}
 	})
+	t.Run("allowlist bytes", func(t *testing.T) {
+		var ancestry int
+		d := deps(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case strings.HasSuffix(r.URL.Path, "/user"):
+				_, _ = io.WriteString(w, `{"id":7}`)
+			case strings.Contains(r.URL.Path, "/groups/10"):
+				_, _ = io.WriteString(w, `{"id":10,"full_path":"`+strings.Repeat("g", 4000)+`"}`)
+			case strings.Contains(r.URL.Path, "/groups/99"):
+				ancestry++
+				_, _ = io.WriteString(w, `{"id":99,"full_path":"other","parent_id":10}`)
+			case strings.Contains(r.URL.Path, "/projects/42"):
+				_, _ = io.WriteString(w, project(42, 99))
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		b := igl.DefaultBudget()
+		b.MaxBytes = 900
+		b.MaxRequests = 16
+		_, err := AuthorizeCanonicalProject(igl.WithBudget(context.Background(), b), d, "42")
+		expectTyped(t, err, igl.ErrBudgetBytes)
+		if ancestry != 0 {
+			t.Fatalf("allowlist byte stop reached ancestry %d", ancestry)
+		}
+	})
+	t.Run("allowlist items", func(t *testing.T) {
+		var ancestry int
+		d := deps(t, handler(func(w http.ResponseWriter, r *http.Request) {
+			ancestry++
+			_, _ = io.WriteString(w, `{"id":99,"full_path":"other","parent_id":10}`)
+		}))
+		b := igl.DefaultBudget()
+		b.MaxItems = 1
+		if err := b.AddItem(); err != nil {
+			t.Fatal(err)
+		}
+		_, err := AuthorizeCanonicalProject(igl.WithBudget(context.Background(), b), d, "42")
+		expectTyped(t, err, igl.ErrBudgetItems)
+		if ancestry != 0 {
+			t.Fatalf("allowlist item stop reached ancestry %d", ancestry)
+		}
+	})
+	t.Run("ancestry items", func(t *testing.T) {
+		d := deps(t, handler(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = io.WriteString(w, `{"id":99,"full_path":"other","parent_id":10}`)
+		}))
+		b := igl.DefaultBudget()
+		b.MaxItems = 1
+		if err := b.AddItem(); err != nil {
+			t.Fatal(err)
+		}
+		_, err := groupAncestryContains(igl.WithBudget(context.Background(), b), d, 99, map[int64]struct{}{10: {}})
+		expectTyped(t, err, igl.ErrBudgetItems)
+	})
+	t.Run("allowlist parent deadline", func(t *testing.T) {
+		d := deps(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case strings.HasSuffix(r.URL.Path, "/user"):
+				_, _ = io.WriteString(w, `{"id":7}`)
+			case strings.Contains(r.URL.Path, "/groups/10"):
+				timer := time.NewTimer(2 * time.Second)
+				defer timer.Stop()
+				select {
+				case <-r.Context().Done():
+				case <-timer.C:
+				}
+			case strings.Contains(r.URL.Path, "/projects/42"):
+				_, _ = io.WriteString(w, project(42, 99))
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		parent, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+		defer cancel()
+		_, err := AuthorizeCanonicalProject(parent, d, "42")
+		if !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, igl.ErrBudgetElapsed) {
+			t.Fatalf("got %v", err)
+		}
+	})
+	t.Run("allowlist max elapsed", func(t *testing.T) {
+		parent := context.Background()
+		d := deps(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case strings.HasSuffix(r.URL.Path, "/user"):
+				_, _ = io.WriteString(w, `{"id":7}`)
+			case strings.Contains(r.URL.Path, "/groups/10"):
+				timer := time.NewTimer(2 * time.Second)
+				defer timer.Stop()
+				select {
+				case <-r.Context().Done():
+				case <-timer.C:
+				}
+			case strings.Contains(r.URL.Path, "/projects/42"):
+				_, _ = io.WriteString(w, project(42, 99))
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		b := igl.DefaultBudget()
+		b.MaxElapsed = 80 * time.Millisecond
+		b.MaxRequests = 16
+		_, err := AuthorizeCanonicalProject(igl.WithBudget(parent, b), d, "42")
+		if !errors.Is(err, igl.ErrBudgetElapsed) || parent.Err() != nil {
+			t.Fatalf("got %v parent=%v", err, parent.Err())
+		}
+	})
+	t.Run("allowlist cancel", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		d := deps(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case strings.HasSuffix(r.URL.Path, "/user"):
+				_, _ = io.WriteString(w, `{"id":7}`)
+			case strings.Contains(r.URL.Path, "/groups/10"):
+				cancel()
+				<-r.Context().Done()
+			case strings.Contains(r.URL.Path, "/projects/42"):
+				_, _ = io.WriteString(w, project(42, 99))
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		_, err := AuthorizeCanonicalProject(ctx, d, "42")
+		expectTyped(t, err, context.Canceled)
+	})
 	t.Run("fork elapsed", func(t *testing.T) {
 		d := deps(t, handler(func(w http.ResponseWriter, r *http.Request) {
 			if !strings.Contains(r.URL.Path, "/groups/99") && !strings.Contains(r.URL.Path, "/projects/77") {
@@ -710,6 +835,25 @@ func TestRepairF7_groupPolicyTypedErrors(t *testing.T) {
 		err := requireProvenMRForkProjects(ctx, d, CanonicalProject{ID: 42}, mr)
 		if !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, igl.ErrBudgetElapsed) {
 			t.Fatalf("got %v", err)
+		}
+	})
+	t.Run("fork max elapsed", func(t *testing.T) {
+		parent := context.Background()
+		d := deps(t, handler(func(w http.ResponseWriter, r *http.Request) {
+			timer := time.NewTimer(2 * time.Second)
+			defer timer.Stop()
+			select {
+			case <-r.Context().Done():
+			case <-timer.C:
+			}
+		}))
+		b := igl.DefaultBudget()
+		b.MaxElapsed = 80 * time.Millisecond
+		b.MaxRequests = 16
+		mr := &gitlab.MergeRequest{BasicMergeRequest: gitlab.BasicMergeRequest{ID: 5001, IID: 1, ProjectID: 42, SourceProjectID: 77}}
+		err := requireProvenMRForkProjects(igl.WithBudget(parent, b), d, CanonicalProject{ID: 42}, mr)
+		if !errors.Is(err, igl.ErrBudgetElapsed) || parent.Err() != nil {
+			t.Fatalf("got %v parent=%v", err, parent.Err())
 		}
 	})
 	t.Run("owner cancel", func(t *testing.T) {
