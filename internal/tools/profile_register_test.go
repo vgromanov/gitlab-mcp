@@ -207,8 +207,10 @@ func TestRegisterAll_annotationProbes(t *testing.T) {
 	}
 }
 
-// reviewAuthzPath documents the 018 authorization entry for each review tool.
-// Map keys are the independent literal 27-tool oracle.
+// reviewAuthzPath documents the authorization entry for each of the 29 review tools.
+// get_merge_request_diff_window uses loadDiffIdentity. The other merge-request
+// content tools still use authorizeMROwnerAndForks. Map keys stay the independent
+// literal 29-tool oracle; this comment is not that oracle.
 var reviewAuthzPath = map[string]string{
 	"get_project":                      "resolveProjectAuthz",
 	"get_merge_request":                "pidMR.resolve",
@@ -220,7 +222,7 @@ var reviewAuthzPath = map[string]string{
 	"list_merge_request_changed_files": "authorizeMROwnerAndForks",
 	"list_merge_request_versions":      "authorizeMROwnerAndForks",
 	"get_merge_request_version":        "authorizeMROwnerAndForks",
-	"get_merge_request_diff_window":    "authorizeMROwnerAndForks",
+	"get_merge_request_diff_window":    "loadDiffIdentity",
 	"list_merge_request_diffs":         "AuthorizeCanonicalProject+020envelope",
 	"mr_discussions":                   "pidMR.resolve",
 	"get_merge_request_notes":          "pidMR.resolve",

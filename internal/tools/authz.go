@@ -88,6 +88,9 @@ func getProjectSafe(ctx context.Context, d Deps, pid string) (*gitlab.Project, e
 	wantNumeric, isNumeric := parseStrictPositiveID(tok)
 	p, _, err := d.Client.Projects.GetProject(tok, nil, gitlab.WithContext(ctx))
 	if err != nil {
+		if cause := groupContextCause(ctx, err); errors.Is(cause, context.Canceled) || errors.Is(cause, context.DeadlineExceeded) || errors.Is(cause, igl.ErrBudgetElapsed) {
+			return nil, cause
+		}
 		if passthroughTypedProviderErr(err) {
 			return nil, err
 		}

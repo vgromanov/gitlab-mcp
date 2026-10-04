@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/cursor"
 	igl "gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/gitlab"
 	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/tools/readmeta"
 
@@ -1112,4 +1113,275 @@ func TestRepairR2_earlierParentDeadlineAfterBudget(t *testing.T) {
 			t.Fatalf("got %v parent=%v", err, parent.Err())
 		}
 	})
+}
+
+func jsonProvider(req *http.Request, code int, body string) (*http.Response, error) {
+	h := make(http.Header)
+	h.Set("Content-Type", "application/json")
+	return &http.Response{
+		StatusCode:    code,
+		Status:        fmt.Sprintf("%d", code),
+		Header:        h,
+		Body:          io.NopCloser(strings.NewReader(body)),
+		ContentLength: int64(len(body)),
+		Request:       req,
+	}, nil
+}
+
+// holdAfterBoth sleeps past an earlier 20ms parent deadline and an 80ms budget,
+// then returns a plain error. BudgetInterceptor normalizes that late parent
+// deadline to ErrBudgetElapsed. The sleep ignores cancel, so this is not an
+// in-flight return at the 20ms deadline.
+func holdAfterBoth(match func(string) bool, fast func(*http.Request) (*http.Response, error)) http.RoundTripper {
+	return roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if match(req.URL.Path) {
+			time.Sleep(120 * time.Millisecond)
+			return nil, errors.New("delayed provider")
+		}
+		return fast(req)
+	})
+}
+
+func authClient(t *testing.T, next http.RoundTripper) Deps {
+	t.Helper()
+	d := newReviewDeps(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("real server reached")
+	}))
+	cli, err := gitlab.NewClient("fixture-only",
+		gitlab.WithBaseURL(d.Config.APIURL),
+		gitlab.WithoutRetries(),
+		gitlab.WithHTTPClient(&http.Client{Transport: next, Timeout: 2 * time.Second}),
+		gitlab.WithInterceptor(igl.BudgetInterceptor()),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.Client = cli
+	d.Config.AllowedProjectIDs = []string{"42"}
+	return d
+}
+
+func earlierParentBudget(t *testing.T) (context.Context, context.Context) {
+	t.Helper()
+	parent, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	t.Cleanup(cancel)
+	b := igl.DefaultBudget()
+	b.MaxElapsed = 80 * time.Millisecond
+	b.MaxRequests = 16
+	return parent, igl.WithBudget(parent, b)
+}
+
+func project42(req *http.Request) (*http.Response, error) {
+	if strings.Contains(req.URL.Path, "/projects/42") {
+		return jsonProvider(req, http.StatusOK, `{"id":42,"path_with_namespace":"g/p","namespace":{"id":1,"kind":"group"}}`)
+	}
+	return jsonProvider(req, http.StatusNotFound, `{}`)
+}
+
+func TestRepairAuth_ownerMRForkEarlierDeadline(t *testing.T) {
+	mrSame := `{"id":5001,"iid":1,"project_id":42,"source_project_id":42,"target_project_id":42}`
+	mrFork := `{"id":5001,"iid":1,"project_id":42,"source_project_id":99,"target_project_id":42}`
+	wantDeadline := func(t *testing.T, err error, parent context.Context) {
+		t.Helper()
+		if !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, igl.ErrBudgetElapsed) || parent.Err() == nil {
+			t.Fatalf("got %v parent=%v", err, parent.Err())
+		}
+	}
+	t.Run("owner project after both", func(t *testing.T) {
+		parent, ctx := earlierParentBudget(t)
+		d := authClient(t, holdAfterBoth(func(path string) bool {
+			return strings.Contains(path, "/projects/42") && !strings.Contains(path, "/merge_requests/")
+		}, project42))
+		_, err := getProjectSafe(ctx, d, "42")
+		wantDeadline(t, err, parent)
+	})
+	t.Run("legacy MR after both", func(t *testing.T) {
+		parent, ctx := earlierParentBudget(t)
+		d := authClient(t, holdAfterBoth(func(path string) bool {
+			return strings.Contains(path, "/merge_requests/")
+		}, project42))
+		_, _, err := loadAuthorizedMR(ctx, d, "42", 1)
+		wantDeadline(t, err, parent)
+	})
+	t.Run("diff identity MR after both", func(t *testing.T) {
+		parent, ctx := earlierParentBudget(t)
+		d := authClient(t, holdAfterBoth(func(path string) bool {
+			return strings.Contains(path, "/merge_requests/")
+		}, func(req *http.Request) (*http.Response, error) {
+			if strings.Contains(req.URL.Path, "/merge_requests/") {
+				return jsonProvider(req, http.StatusOK, mrSame)
+			}
+			return project42(req)
+		}))
+		_, _, err := loadDiffIdentity(ctx, d, "42", 1)
+		wantDeadline(t, err, parent)
+	})
+	t.Run("fork source project after both", func(t *testing.T) {
+		parent, ctx := earlierParentBudget(t)
+		d := authClient(t, holdAfterBoth(func(path string) bool {
+			return strings.Contains(path, "/projects/99")
+		}, func(req *http.Request) (*http.Response, error) {
+			if strings.Contains(req.URL.Path, "/merge_requests/") {
+				return jsonProvider(req, http.StatusOK, mrFork)
+			}
+			return project42(req)
+		}))
+		_, _, err := loadDiffIdentity(ctx, d, "42", 1)
+		wantDeadline(t, err, parent)
+	})
+	t.Run("genuine max elapsed keeps live parent", func(t *testing.T) {
+		parent := context.Background()
+		b := igl.DefaultBudget()
+		b.MaxElapsed = 80 * time.Millisecond
+		b.MaxRequests = 16
+		ctx := igl.WithBudget(parent, b)
+		d := authClient(t, holdAfterBoth(func(path string) bool {
+			return strings.Contains(path, "/projects/42") && !strings.Contains(path, "/merge_requests/")
+		}, project42))
+		_, err := getProjectSafe(ctx, d, "42")
+		if !errors.Is(err, igl.ErrBudgetElapsed) || parent.Err() != nil {
+			t.Fatalf("got %v parent=%v", err, parent.Err())
+		}
+	})
+	t.Run("requests bytes items cancel and ordinary stay", func(t *testing.T) {
+		b := igl.DefaultBudget()
+		b.MaxRequests = 1
+		b.MaxElapsed = 30 * time.Second
+		ctx := igl.WithBudget(context.Background(), b)
+		d := authClient(t, roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return project42(req)
+		}))
+		if _, err := getProjectSafe(ctx, d, "42"); err != nil {
+			t.Fatal(err)
+		}
+		_, err := getProjectSafe(ctx, d, "42")
+		if !errors.Is(err, igl.ErrBudgetRequests) || errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("requests: %v", err)
+		}
+		for _, sentinel := range []error{igl.ErrBudgetBytes, igl.ErrBudgetItems} {
+			d := authClient(t, roundTripFunc(func(*http.Request) (*http.Response, error) {
+				return nil, sentinel
+			}))
+			_, err := getProjectSafe(igl.WithBudget(context.Background(), igl.DefaultBudget()), d, "42")
+			if !errors.Is(err, sentinel) || errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("%v: %v", sentinel, err)
+			}
+		}
+		parent, cancel := context.WithCancel(context.Background())
+		cancel()
+		d = authClient(t, roundTripFunc(func(*http.Request) (*http.Response, error) {
+			t.Fatal("cancel reached provider")
+			return nil, errors.New("unreachable")
+		}))
+		_, err = getProjectSafe(igl.WithBudget(parent, igl.DefaultBudget()), d, "42")
+		if !errors.Is(err, context.Canceled) || errors.Is(err, igl.ErrBudgetElapsed) {
+			t.Fatalf("cancel: %v", err)
+		}
+		d = authClient(t, roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return jsonProvider(req, http.StatusNotFound, `{}`)
+		}))
+		_, err = getProjectSafe(context.Background(), d, "42")
+		if err == nil || !strings.Contains(err.Error(), readmeta.CodeIdentityUnresolved) || errors.Is(err, igl.ErrBudgetElapsed) {
+			t.Fatalf("ordinary: %v", err)
+		}
+	})
+}
+
+func sufficientManifestBudget() *igl.Budget {
+	b := igl.DefaultBudget()
+	// Default MaxItems is 100. A proved 101-path body charges each path, and
+	// review context also charges the review item. This borrowed cap is only
+	// large enough for that charge; it does not change the product default.
+	b.MaxItems = 128
+	return b
+}
+
+func TestRepairContext101_sharedDigest(t *testing.T) {
+	head, base, start := shaN(1), shaN(101), shaN(201)
+	var diffs []string
+	for i := 0; i < 101; i++ {
+		diffs = append(diffs, fmt.Sprintf(`{"old_path":"p%03d","new_path":"p%03d","diff":"x"}`, i, i))
+	}
+	body := versionObject(9, 5001, head, base, start, "collected", "101", "["+strings.Join(diffs, ",")+"]")
+	d := newReviewDeps(t, repairReviewHandler(body, nil))
+	d.Config.AllowedProjectIDs = []string{"42"}
+	out, err := callReviewDirect(t, d, igl.WithBudget(context.Background(), sufficientManifestBudget()), []reviewContextItemIn{metaItem("42", 1, "diff_manifest")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item := out.Items[0]
+	sec := item.Sections["diff_manifest"]
+	if item.Cause != "" || !item.ReviewClean || item.ContextRef == nil || item.DiffManifest == nil || item.diffManifestDigest == "" {
+		t.Fatalf("cause=%s clean=%v ref=%v manifest=%v digest=%q", item.Cause, item.ReviewClean, item.ContextRef != nil, item.DiffManifest != nil, item.diffManifestDigest)
+	}
+	if len(item.DiffManifest.Entries) != 101 || sec.NextCursor != nil || sec.ContentComplete != readmeta.ContentCompleteTrue || item.DiffManifest.Digest == nil || *item.DiffManifest.Digest != item.diffManifestDigest {
+		t.Fatalf("entries=%d cursor=%v complete=%s digest=%v private=%s", len(item.DiffManifest.Entries), sec.NextCursor, sec.ContentComplete, item.DiffManifest.Digest, item.diffManifestDigest)
+	}
+	payload, err := cursor.Decode(d.Config.CursorKey, *item.ContextRef, d.now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if payload.ContextRef == nil || payload.ContextRef.Evidence["diff_manifest"] != cursor.DiffManifestEvidenceV1 || payload.ContextRef.Digests["diff_manifest"] != item.diffManifestDigest {
+		t.Fatalf("evidence=%v digests=%v", payload.ContextRef.Evidence, payload.ContextRef.Digests)
+	}
+	id := int64(9)
+	per := 50
+	_, raw, err := getMergeRequestDiffWindow(igl.WithBudget(context.Background(), sufficientManifestBudget()), nil, diffWindowIn{
+		ProjectID: "42", MergeRequestIID: 1, DiffVersionID: &id, PerPage: &per,
+	}, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	window, ok := raw.(diffWindowOut)
+	if !ok || window.Digest == nil || *window.Digest != item.diffManifestDigest || len(window.Entries) != 50 {
+		t.Fatalf("direct ok=%v digest=%v entries=%d", ok, window.Digest, len(window.Entries))
+	}
+}
+
+func TestRepairManifest_renameDeletePatchDigest(t *testing.T) {
+	head, base, start := shaN(1), shaN(2), shaN(3)
+	flags := `{"old_path":"a.txt","new_path":"b.txt","a_mode":"100644","b_mode":"100755","renamed_file":true,"new_file":false,"deleted_file":false},{"old_path":"c.txt","new_path":"c.txt","deleted_file":true,"renamed_file":false}`
+	first := versionObject(1, 5001, head, base, start, "collected", "2", "["+strings.ReplaceAll(flags, "}", `,"diff":"patch-a","patch":"patch-a"}`)+"]")
+	second := versionObject(1, 5001, head, base, start, "collected", "2", "["+strings.ReplaceAll(flags, "}", `,"diff":"other-patch","patch":"other-patch"}`)+"]")
+	mr := `{"id":5001,"iid":1,"project_id":42,"source_project_id":42,"target_project_id":42}`
+	serve := func(body string) http.Handler {
+		return serveDiffBase(&pathLog{}, func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case strings.Contains(r.URL.Path, "/versions/1"):
+				_, _ = io.WriteString(w, body)
+			case strings.Contains(r.URL.Path, "/merge_requests/"):
+				_, _ = io.WriteString(w, mr)
+			default:
+				http.NotFound(w, r)
+			}
+		})
+	}
+	read := func(body string) map[string]any {
+		t.Helper()
+		out, err := callDiffWindow(t, diffDeps(t, serve(body)), nil, map[string]any{"project_id": "42", "merge_request_iid": 1, "diff_version_id": 1, "per_page": 2})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	left := read(first)
+	right := read(second)
+	if left["digest"] == nil || left["digest"] != right["digest"] {
+		t.Fatalf("patch changed digest %v %v", left["digest"], right["digest"])
+	}
+	entries := asSlice(t, left["entries"])
+	if len(entries) != 2 {
+		t.Fatalf("entries %#v", entries)
+	}
+	renamed, _ := entries[0].(map[string]any)
+	deleted, _ := entries[1].(map[string]any)
+	if renamed["old_path"] != "a.txt" || renamed["new_path"] != "b.txt" || renamed["a_mode"] != "100644" || renamed["b_mode"] != "100755" || renamed["renamed_file"] != true || renamed["diff"] != nil || renamed["patch"] != nil {
+		t.Fatalf("rename %#v", renamed)
+	}
+	if deleted["old_path"] != "c.txt" || deleted["new_path"] != "c.txt" || deleted["deleted_file"] != true || deleted["a_mode"] != nil || deleted["b_mode"] != nil || deleted["diff"] != nil {
+		t.Fatalf("delete %#v", deleted)
+	}
+	if sectionMap(left)["content_complete"] != readmeta.ContentCompleteTrue {
+		t.Fatalf("section %#v", sectionMap(left))
+	}
 }
