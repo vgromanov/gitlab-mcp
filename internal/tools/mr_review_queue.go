@@ -81,6 +81,12 @@ func getMergeRequestReviewQueue(ctx context.Context, _ *mcp.CallToolRequest, in 
 		return nil, nil, fmt.Errorf("%s", errCursorKeyMissingQueue)
 	}
 
+	instance, err := cursorInstance(d.Config)
+	if err != nil {
+		return nil, nil, fmt.Errorf("%s: instance", cursor.ResyncRequired)
+	}
+	policyFP := d.Config.PolicyFingerprint()
+
 	var resume *cursor.Payload
 	if tok := strings.TrimSpace(ptrStr(in.Cursor)); tok != "" {
 		p, err := cursor.Decode(d.Config.CursorKey, tok, now)
@@ -88,12 +94,27 @@ func getMergeRequestReviewQueue(ctx context.Context, _ *mcp.CallToolRequest, in 
 			return nil, nil, fmt.Errorf("%s: cursor validation failed", cursor.ResyncRequired)
 		}
 		resume = &p
+		// Local signature/expiry/structure already enforced by Decode. Compare
+		// normalized input + config bindings BEFORE any SDK/identity transport.
+		preflightActor := resume.ActorID
+		if in.ActorID != nil {
+			preflightActor = *in.ActorID
+		}
+		preflightFilters := buildQueueFilters(norm, preflightActor)
+		if err := preflightQueueResumeLocal(*resume, instance, policyFP, preflightFilters, norm); err != nil {
+			return nil, nil, err
+		}
 	}
 
 	authActor, err := resolveCursorActor(ctx, d)
 	if err != nil {
 		return nil, nil, err
 	}
+	if resume != nil && authActor != resume.ActorID {
+		// Authenticated principal mismatch: resync before group/discovery work.
+		return nil, nil, fmt.Errorf("%s: binding mismatch", cursor.ResyncRequired)
+	}
+
 	discoveryActor := authActor
 	if in.ActorID != nil {
 		discoveryActor, err = resolveDiscoveryActor(ctx, d, *in.ActorID)
@@ -102,20 +123,15 @@ func getMergeRequestReviewQueue(ctx context.Context, _ *mcp.CallToolRequest, in 
 		}
 	}
 
+	// Always build filters from CURRENT normalized input first. Do not copy
+	// cursor Since/CallerUntil/Until over request filters before MatchBinding.
+	filters := buildQueueFilters(norm, discoveryActor)
+
 	group, err := AuthorizeCanonicalGroup(ctx, d, norm.groupID)
 	if err != nil {
 		return nil, nil, sanitizeQueueErr(err)
 	}
 	groupID := strconv.FormatInt(group.ID, 10)
-
-	instance, err := cursorInstance(d.Config)
-	if err != nil {
-		return nil, nil, fmt.Errorf("%s: instance", cursor.ResyncRequired)
-	}
-	policyFP := d.Config.PolicyFingerprint()
-	// Always build filters from CURRENT normalized input first. Do not copy
-	// cursor Since/CallerUntil/Until over request filters before MatchBinding.
-	filters := buildQueueFilters(norm, discoveryActor)
 	scope := cursor.Scope{Kind: cursor.ScopeGroupQueue, GroupID: groupID}
 	upper := ""
 	expires := now.Add(cursor.DefaultTTL).UTC().Format(time.RFC3339)
@@ -132,9 +148,6 @@ func getMergeRequestReviewQueue(ctx context.Context, _ *mcp.CallToolRequest, in 
 		qc = resume.QueueCont
 		if qc == nil {
 			return nil, nil, fmt.Errorf("%s: missing queue_cont", cursor.ResyncRequired)
-		}
-		if err := validateQueueContProgress(qc, norm); err != nil {
-			return nil, nil, fmt.Errorf("%s: queue progress", cursor.ResyncRequired)
 		}
 	} else {
 		pinUntil(&filters, now, norm.before)
@@ -393,6 +406,39 @@ func pinUntil(filters *cursor.Filters, now time.Time, before *time.Time) {
 		u = before.UTC()
 	}
 	filters.Until = u.Format(time.RFC3339)
+}
+
+// preflightQueueResumeLocal compares resume bindings that need no SDK transport:
+// instance/policy/tool/section/scope kind, normalized selection/date/order/page,
+// and strict queue progress. Does not overwrite caller bounds from the token.
+// Canonical group alias identity is deferred until after this preflight passes.
+func preflightQueueResumeLocal(resume cursor.Payload, instance, policyFP string, reqFilters cursor.Filters, norm normalizedQueue) error {
+	if resume.Instance != instance || resume.PolicyFP != policyFP {
+		return fmt.Errorf("%s: binding mismatch", cursor.ResyncRequired)
+	}
+	if resume.Tool != cursor.ToolReviewQueue || resume.Section != cursor.SectionReviewQueue {
+		return fmt.Errorf("%s: binding mismatch", cursor.ResyncRequired)
+	}
+	if resume.Scope.Kind != cursor.ScopeGroupQueue {
+		return fmt.Errorf("%s: binding mismatch", cursor.ResyncRequired)
+	}
+	bound := resume.Filters
+	if reqFilters.Since != bound.Since || reqFilters.CallerUntil != bound.CallerUntil {
+		return fmt.Errorf("%s: binding mismatch", cursor.ResyncRequired)
+	}
+	if reqFilters.Selection != bound.Selection || reqFilters.Order != bound.Order || reqFilters.PerPage != bound.PerPage {
+		return fmt.Errorf("%s: binding mismatch", cursor.ResyncRequired)
+	}
+	if bound.Until != resume.UpperBound {
+		return fmt.Errorf("%s: binding mismatch", cursor.ResyncRequired)
+	}
+	if resume.QueueCont == nil {
+		return fmt.Errorf("%s: missing queue_cont", cursor.ResyncRequired)
+	}
+	if err := validateQueueContProgress(resume.QueueCont, norm); err != nil {
+		return fmt.Errorf("%s: queue progress", cursor.ResyncRequired)
+	}
+	return nil
 }
 
 // matchQueueResumeBinding checks current normalized selection against the signed

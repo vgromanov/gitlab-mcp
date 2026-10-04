@@ -491,3 +491,118 @@ func TestQueueCont_rejectsContradictoryReplay(t *testing.T) {
 		t.Fatal("empty lim code must reject")
 	}
 }
+
+func queuePayloadOK() Payload {
+	p := basePayload()
+	p.Tool = ToolReviewQueue
+	p.Section = SectionReviewQueue
+	p.Scope = Scope{Kind: ScopeGroupQueue, GroupID: "9"}
+	p.ImmutableRefs = nil
+	p.PageState = PageState{}
+	head := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	p.QueueCont = &QueueCont{
+		V:     QueueContSchemaRQ2,
+		Phase: "emit",
+		Kinds: []string{"authored", "reviewer"},
+		KI:    2,
+		KP: []QueueKindProg{
+			{Kind: "authored", State: "opened", P: 1, N: 0, E: true, CN: 0, PD: "", PSz: 20},
+			{Kind: "reviewer", State: "opened", P: 2, N: 3, E: false, CN: 1, PD: SequenceDigest([]string{"42:1|u|h"}), PSz: 20},
+		},
+		CM: []QueueCandidate{{
+			K: "42:1", B: 5, U: "2026-10-03T11:00:00.123456789Z", H: &head,
+		}},
+		EI:   0,
+		Lim:  []string{"dedupe_capacity"},
+		Term: true,
+	}
+	return p
+}
+
+func TestQueueCont_roundTripCandidatesAndRejectTamper(t *testing.T) {
+	key := testKey(t)
+	now := time.Date(2026, 10, 3, 13, 0, 0, 0, time.UTC)
+	p := queuePayloadOK()
+	tok, err := Encode(key, p)
+	if err != nil {
+		t.Fatalf("encode ok payload: %v", err)
+	}
+	got, err := Decode(key, tok, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.QueueCont == nil || len(got.QueueCont.CM) != 1 || got.QueueCont.CM[0].K != "42:1" {
+		t.Fatalf("round-trip cm: %+v", got.QueueCont)
+	}
+
+	// Rotation: different key rejects without transport.
+	other := testKey(t)
+	if _, err := Decode(other, tok, now); err == nil {
+		t.Fatal("key rotation must reject")
+	}
+
+	// Tamper payload bytes after MAC → resync.
+	parts := strings.Split(tok, ".")
+	if len(parts) != 3 || parts[0] != "v1" {
+		t.Fatalf("token shape %q", tok)
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw[len(raw)/2] ^= 0x5a
+	tampered := parts[0] + "." + base64.RawURLEncoding.EncodeToString(raw) + "." + parts[2]
+	if _, err := Decode(key, tampered, now); err == nil {
+		t.Fatal("tampered token must reject")
+	}
+
+	// Expiry: advance past TTL.
+	if _, err := Decode(key, tok, now.Add(3*time.Hour)); err == nil {
+		t.Fatal("expired token must reject")
+	}
+}
+
+func TestQueueCont_rejectsBadCandidatesKeysBitsAndProgress(t *testing.T) {
+	key := testKey(t)
+	cases := []struct {
+		name string
+		mut  func(*Payload)
+	}{
+		{"bad_key", func(p *Payload) { p.QueueCont.CM[0].K = "0:1" }},
+		{"bad_bits", func(p *Payload) { p.QueueCont.CM[0].B = 0 }},
+		{"bits_outside_kinds", func(p *Payload) { p.QueueCont.CM[0].B = 2 }}, // ongoing not requested
+		{"bad_time", func(p *Payload) { p.QueueCont.CM[0].U = "not-a-time" }},
+		{"bad_head", func(p *Payload) {
+			h := "zzzz"
+			p.QueueCont.CM[0].H = &h
+		}},
+		{"dup_key", func(p *Payload) {
+			c := p.QueueCont.CM[0]
+			p.QueueCont.CM = append(p.QueueCont.CM, c)
+		}},
+		{"ki_overflow", func(p *Payload) { p.QueueCont.KI = 99 }},
+		{"phase_discover_ei", func(p *Payload) {
+			p.QueueCont.Phase = "discover"
+			p.QueueCont.EI = 1
+		}},
+		{"unsorted_kinds", func(p *Payload) { p.QueueCont.Kinds = []string{"reviewer", "authored"} }},
+		{"dup_stream", func(p *Payload) {
+			p.QueueCont.KP = append(p.QueueCont.KP, p.QueueCont.KP[0])
+		}},
+		{"page_state_pollution", func(p *Payload) {
+			p.PageState = PageState{Page: 1, PerPage: 20, ProviderNextPage: 2}
+		}},
+		{"legacy_refs", func(p *Payload) {
+			p.ImmutableRefs = []string{"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := queuePayloadOK()
+			tc.mut(&p)
+			if _, err := Encode(key, p); err == nil {
+				t.Fatal("expected encode reject")
+			}
+		})
+	}
+}
