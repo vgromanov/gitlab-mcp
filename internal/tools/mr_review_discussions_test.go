@@ -1157,3 +1157,227 @@ func TestDiscussionN1EmptyInspectedCount(t *testing.T) {
 		t.Fatalf("refused items=%v gets=%d", refused.Counts.Items, log2.count("/discussions"))
 	}
 }
+
+func f5Note(system bool, inner string) string {
+	flag := "false"
+	if system {
+		flag = "true"
+	}
+	if inner == "" {
+		return fmt.Sprintf(`{"id":1,"system":%s}`, flag)
+	}
+	return fmt.Sprintf(`{"id":1,"system":%s,%s}`, flag, inner)
+}
+
+func f5Page(note string) string {
+	return "[" + discObj("d", note) + "]"
+}
+
+func TestDiscussionF5SystemMandatoryRed(t *testing.T) {
+	pages := []string{
+		f5Page(f5Note(true, "")),
+		f5Page(f5Note(true, `"author":null,"body":null`)),
+		f5Page(f5Note(true, `"body":"x"`)),
+		f5Page(f5Note(true, `"author":null,"body":"x"`)),
+		f5Page(f5Note(true, `"author":{"id":9}`)),
+		f5Page(f5Note(true, `"author":{"id":9},"body":null`)),
+	}
+	for _, page := range pages {
+		if _, _, _, ok := discussionDigestDocuments([]byte(page)); ok {
+			t.Errorf("helper minted digests without proved author/body: %s", page)
+		}
+	}
+	if t.Failed() {
+		page := pages[0]
+		log := &pathLog{}
+		script := &reviewScript{log: log, discussions: discPages(map[int]string{1: page}, map[int]string{1: ""})}
+		d := newReviewDeps(t, http.HandlerFunc(script.serve))
+		mcpOut, err := callReviewContext(t, d, nil, map[string]any{"items": []any{itemArg("42", 1, []any{"metadata", "discussions"}, map[string]any{"discussion_selection": "all"})}}, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw := asMap(t, itemsOf(t, mcpOut)[0])
+		disc := asMap(t, raw["discussions"])
+		sec := asMap(t, asMap(t, raw["sections"])["discussions"])
+		if disc["semantic_feedback_digest"] != nil || disc["position_digest"] != nil || disc["full_revision_digest"] != nil || sec["content_complete"] == readmeta.ContentCompleteTrue {
+			t.Errorf("streamable minted unproved system note digests %#v %#v", disc, sec)
+		}
+	}
+}
+
+func TestDiscussionF5MandatoryFieldMatrix(t *testing.T) {
+	type row struct {
+		name   string
+		inner  string
+		raw    string
+		claim  bool
+		stream bool
+	}
+	rows := []row{
+		{name: "both-omitted", claim: false, stream: true},
+		{name: "both-null", inner: `"author":null,"body":null`, claim: false, stream: true},
+		{name: "author-omitted", inner: `"body":"x"`, claim: false, stream: true},
+		{name: "author-null", inner: `"author":null,"body":"x"`, claim: false, stream: true},
+		{name: "body-omitted", inner: `"author":{"id":9}`, claim: false, stream: true},
+		{name: "body-null", inner: `"author":{"id":9},"body":null`, claim: false, stream: true},
+		{name: "author-wrong-type", inner: `"author":"nope","body":"x"`, claim: false, stream: true},
+		{name: "author-id-missing", inner: `"author":{},"body":"x"`, claim: false},
+		{name: "author-id-null", inner: `"author":{"id":null},"body":"x"`, claim: false},
+		{name: "author-id-zero", inner: `"author":{"id":0},"body":"x"`, claim: false, stream: true},
+		{name: "author-id-negative", inner: `"author":{"id":-1},"body":"x"`, claim: false},
+		{name: "author-id-string", inner: `"author":{"id":"9"},"body":"x"`, claim: false},
+		{name: "body-wrong-type", inner: `"author":{"id":9},"body":1`, claim: false, stream: true},
+		{name: "note-id-omitted", raw: `{"system":%s,"author":{"id":9},"body":"x"}`, claim: false},
+		{name: "note-id-null", raw: `{"id":null,"system":%s,"author":{"id":9},"body":"x"}`, claim: false, stream: true},
+		{name: "note-id-zero", raw: `{"id":0,"system":%s,"author":{"id":9},"body":"x"}`, claim: false},
+		{name: "note-id-string", raw: `{"id":"1","system":%s,"author":{"id":9},"body":"x"}`, claim: false},
+		{name: "valid", inner: `"author":{"id":9},"body":"x"`, claim: true},
+		{name: "empty-body", inner: `"author":{"id":9},"body":""`, claim: true},
+	}
+	emptySem := discSHA(`{"v":"discussions.semantic_feedback.v1","records":[]}`)
+	emptyFull := discSHA(`{"v":"discussions.full_revision.v1","records":[]}`)
+	for _, system := range []bool{true, false} {
+		flag := "false"
+		if system {
+			flag = "true"
+		}
+		for _, row := range rows {
+			row := row
+			system := system
+			t.Run(fmt.Sprintf("system-%s/%s", flag, row.name), func(t *testing.T) {
+				note := f5Note(system, row.inner)
+				if row.raw != "" {
+					note = fmt.Sprintf(row.raw, flag)
+				}
+				page := f5Page(note)
+				sem, _, full, ok := discussionDigestDocuments([]byte(page))
+				if row.claim {
+					if !ok || sem == "" || full == "" || full == emptyFull {
+						t.Fatalf("valid note lost sem=%s full=%s ok=%v", sem, full, ok)
+					}
+					if system && sem != emptySem {
+						t.Fatalf("system note entered semantic digest %s", sem)
+					}
+					if !system && sem == emptySem {
+						t.Fatalf("user note missing from semantic digest")
+					}
+					all := decodeDiscussionPage(strings.NewReader(page), nil, "", "", "all", &discScanState{seenDisc: map[string]struct{}{}, seenNote: map[string]struct{}{}}, func() error { return nil })
+					semSel := decodeDiscussionPage(strings.NewReader(page), nil, "", "", "semantic", &discScanState{seenDisc: map[string]struct{}{}, seenNote: map[string]struct{}{}}, func() error { return nil })
+					if system && (len(all.notes) != 1 || len(semSel.notes) != 0) {
+						t.Fatalf("selection all=%d semantic=%d", len(all.notes), len(semSel.notes))
+					}
+					if !system && (len(all.notes) != 1 || len(semSel.notes) != 1) {
+						t.Fatalf("user selection all=%d semantic=%d", len(all.notes), len(semSel.notes))
+					}
+					return
+				}
+				if ok {
+					t.Fatalf("helper minted digests for %s", page)
+				}
+				if !row.stream {
+					return
+				}
+				log := &pathLog{}
+				script := &reviewScript{log: log, discussions: discPages(map[int]string{1: page}, map[int]string{1: ""})}
+				d := newReviewDeps(t, http.HandlerFunc(script.serve))
+				mcpOut, err := callReviewContext(t, d, nil, map[string]any{"items": []any{itemArg("42", 1, []any{"metadata", "discussions"}, map[string]any{"discussion_selection": "all"})}}, true)
+				if err != nil {
+					t.Fatal(err)
+				}
+				raw := asMap(t, itemsOf(t, mcpOut)[0])
+				ref, _ := raw["context_ref"].(string)
+				if ref == "" {
+					t.Fatal("metadata ref missing")
+				}
+				assertMetadataRefExcludesDiscussions(t, d, ref)
+				disc := asMap(t, raw["discussions"])
+				sec := asMap(t, asMap(t, raw["sections"])["discussions"])
+				if disc["semantic_feedback_digest"] != nil || disc["position_digest"] != nil || disc["full_revision_digest"] != nil || sec["content_complete"] == readmeta.ContentCompleteTrue {
+					t.Fatalf("streamable claimed invalid note %#v %#v", disc, sec)
+				}
+			})
+		}
+	}
+}
+
+func TestDiscussionF6FractionalBound(t *testing.T) {
+	clock := time.Date(2026, 10, 4, 12, 0, 0, int(500*time.Millisecond), time.UTC)
+	page := "[" + discObj("d", noteObj(1, "a", "")+","+noteObj(2, "b", "")+","+noteObj(3, "c", "")) + "]"
+	log := &pathLog{}
+	script := &reviewScript{log: log, discussions: discPages(map[int]string{1: page}, map[int]string{1: ""})}
+	d := newReviewDeps(t, http.HandlerFunc(script.serve))
+	d.Clock = &cursor.FakeClock{T: clock}
+	b := reviewBudget(128)
+	b.MaxItems = 10
+	item := metaItem("42", 1, "discussions")
+	item.DiscussionSelection = "all"
+	_, raw, err := getMergeRequestReviewContext(igl.WithBudget(context.Background(), b), nil, getMergeRequestReviewContextIn{Items: []reviewContextItemIn{item}, MaxElapsedMS: ptr64(200)}, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seed := raw.(reviewContextOut).Items[0]
+	sec := seed.Sections["discussions"]
+	if sec.NextCursor == nil {
+		t.Fatalf("seed fixture cursor missing lim=%#v complete=%v", sec.Limitations, sec.ContentComplete)
+	}
+	payload, err := cursor.Decode(d.Config.CursorKey, *sec.NextCursor, clock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantBound := clock.Add(200 * time.Millisecond)
+	wantExp := clock.Add(cursor.DefaultTTL)
+	gotBound, berr := time.Parse(time.RFC3339Nano, payload.UpperBound)
+	gotUntil, uerr := time.Parse(time.RFC3339Nano, payload.Filters.Until)
+	gotExp, eerr := time.Parse(time.RFC3339Nano, payload.ExpiresAt)
+	if berr != nil || uerr != nil || eerr != nil || !gotBound.Equal(wantBound) || !gotUntil.Equal(wantBound) || payload.UpperBound != payload.Filters.Until || !gotExp.Equal(wantExp) {
+		t.Errorf("signed time upper=%s until=%s exp=%s wantBound=%s wantExp=%s", payload.UpperBound, payload.Filters.Until, payload.ExpiresAt, wantBound.Format(time.RFC3339Nano), wantExp.Format(time.RFC3339Nano))
+	}
+	before := log.count("/discussions")
+	item.Cursors = []reviewContextCursorIn{{Section: "discussions", Cursor: *sec.NextCursor}}
+	b2 := reviewBudget(128)
+	b2.MaxItems = 11
+	beforeReqs, _, beforeItems := b2.Stats()
+	_, raw, err = getMergeRequestReviewContext(igl.WithBudget(context.Background(), b2), nil, getMergeRequestReviewContextIn{Items: []reviewContextItemIn{item}, MaxElapsedMS: ptr64(30000)}, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resumed := raw.(reviewContextOut).Items[0]
+	rsec := resumed.Sections["discussions"]
+	after := log.count("/discussions")
+	if after == before || rsec.NextCursor == nil || (len(rsec.Limitations) > 0 && rsec.Limitations[0].Code == readmeta.CodeBudgetElapsed) {
+		t.Errorf("resume with 200ms left gets %d->%d cursor=%v lim=%#v", before, after, rsec.NextCursor != nil, rsec.Limitations)
+	}
+	if t.Failed() {
+		return
+	}
+	next, err := cursor.Decode(d.Config.CursorKey, *rsec.NextCursor, clock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next.UpperBound != payload.UpperBound || next.Filters.Until != payload.Filters.Until || next.ExpiresAt != payload.ExpiresAt {
+		t.Fatalf("renewed upper %s->%s until %s->%s exp %s->%s", payload.UpperBound, next.UpperBound, payload.Filters.Until, next.Filters.Until, payload.ExpiresAt, next.ExpiresAt)
+	}
+	if next.DiscussionsCont == nil || payload.DiscussionsCont == nil || next.DiscussionsCont.NI != payload.DiscussionsCont.NI+1 {
+		t.Fatalf("coordinate did not advance %#v -> %#v", payload.DiscussionsCont, next.DiscussionsCont)
+	}
+	afterReqs, _, afterItems := b2.Stats()
+	if afterReqs <= beforeReqs || afterItems < beforeItems {
+		t.Fatalf("counters reset reqs %d->%d items %d->%d", beforeReqs, afterReqs, beforeItems, afterItems)
+	}
+	d.Clock.(*cursor.FakeClock).Advance(200 * time.Millisecond)
+	atBound := log.count("/discussions")
+	item.Cursors = []reviewContextCursorIn{{Section: "discussions", Cursor: *rsec.NextCursor}}
+	b3 := reviewBudget(128)
+	b3.MaxItems = 12
+	_, raw, err = getMergeRequestReviewContext(igl.WithBudget(context.Background(), b3), nil, getMergeRequestReviewContextIn{Items: []reviewContextItemIn{item}, MaxElapsedMS: ptr64(30000)}, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stopped := raw.(reviewContextOut).Items[0].Sections["discussions"]
+	if log.count("/discussions") != atBound || stopped.NextCursor != nil || stopped.ContentComplete == readmeta.ContentCompleteTrue {
+		t.Fatalf("exact bound gets %d->%d cursor=%v complete=%v lim=%#v", atBound, log.count("/discussions"), stopped.NextCursor != nil, stopped.ContentComplete, stopped.Limitations)
+	}
+	if len(stopped.Limitations) == 0 || stopped.Limitations[0].Code != readmeta.CodeBudgetElapsed {
+		t.Fatalf("exact bound lim %#v", stopped.Limitations)
+	}
+}

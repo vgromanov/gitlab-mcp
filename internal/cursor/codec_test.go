@@ -60,6 +60,41 @@ func errorsIsResync(err error) bool {
 	return err != nil && (err == ErrResyncRequired || err.Error() == ResyncRequired)
 }
 
+func TestEncodeDecode_fractionalExpires(t *testing.T) {
+	key := testKey(t)
+	t.Run("fractional", func(t *testing.T) {
+		p := basePayload()
+		p.UpperBound = "2026-10-03T12:00:00.7Z"
+		p.Filters.Until = p.UpperBound
+		p.ExpiresAt = "2026-10-03T14:00:00.5Z"
+		tok, err := Encode(key, p)
+		if err != nil {
+			t.Fatalf("encode fractional: %v", err)
+		}
+		got, err := Decode(key, tok, time.Date(2026, 10, 3, 13, 0, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatalf("decode fractional: %v", err)
+		}
+		if got.ExpiresAt != p.ExpiresAt || got.UpperBound != p.UpperBound || got.Filters.Until != p.Filters.Until {
+			t.Fatalf("roundtrip upper=%s until=%s exp=%s", got.UpperBound, got.Filters.Until, got.ExpiresAt)
+		}
+	})
+	t.Run("integer-second", func(t *testing.T) {
+		p := basePayload()
+		tok, err := Encode(key, p)
+		if err != nil {
+			t.Fatalf("encode integer: %v", err)
+		}
+		got, err := Decode(key, tok, time.Date(2026, 10, 3, 13, 0, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatalf("decode integer: %v", err)
+		}
+		if got.ExpiresAt != p.ExpiresAt || got.UpperBound != p.UpperBound {
+			t.Fatalf("integer changed upper=%s exp=%s", got.UpperBound, got.ExpiresAt)
+		}
+	})
+}
+
 func TestEncodeDecode_roundTrip(t *testing.T) {
 	key := testKey(t)
 	p := basePayload()

@@ -323,7 +323,7 @@ func Decode(key []byte, token string, now time.Time) (Payload, error) {
 	if err := validatePayload(&p); err != nil {
 		return zero, ErrResyncRequired
 	}
-	exp, err := time.Parse(time.RFC3339, p.ExpiresAt)
+	exp, err := time.Parse(time.RFC3339Nano, p.ExpiresAt)
 	if err != nil {
 		return zero, ErrResyncRequired
 	}
@@ -359,11 +359,11 @@ func validatePayload(p *Payload) error {
 	if strings.TrimSpace(p.UpperBound) == "" || strings.TrimSpace(p.ExpiresAt) == "" {
 		return ErrResyncRequired
 	}
-	// Pinned until may carry fractional seconds. RFC3339Nano accepts both forms.
+	// Pinned until and expires_at may carry fractional seconds. RFC3339Nano accepts both forms.
 	if _, err := time.Parse(time.RFC3339Nano, p.UpperBound); err != nil {
 		return ErrResyncRequired
 	}
-	if _, err := time.Parse(time.RFC3339, p.ExpiresAt); err != nil {
+	if _, err := time.Parse(time.RFC3339Nano, p.ExpiresAt); err != nil {
 		return ErrResyncRequired
 	}
 	if p.Filters.PerPage < 1 || p.Filters.PerPage > 50 {

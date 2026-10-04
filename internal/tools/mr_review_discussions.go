@@ -490,7 +490,7 @@ func (rt *reviewRuntime) readDiscussions(item reviewContextItemIn, owner Canonic
 		if err != nil {
 			return errDiscResync
 		}
-		exp, err := time.Parse(time.RFC3339, p.ExpiresAt)
+		exp, err := time.Parse(time.RFC3339Nano, p.ExpiresAt)
 		if err != nil {
 			return errDiscResync
 		}
@@ -738,7 +738,7 @@ func finishDiscussionClaim(out *reviewContextItemOut, head string) {
 
 func (rt *reviewRuntime) mintDiscCursor(b reviewBracket, coord discCoord, deadline, expiry time.Time, selection string) (string, error) {
 	iid := b.IID
-	until := deadline.UTC().Format(time.RFC3339)
+	until := deadline.UTC().Format(time.RFC3339Nano)
 	payload := cursor.Payload{
 		SchemaVersion: cursor.SchemaV1,
 		Instance:      rt.instance,
@@ -759,7 +759,7 @@ func (rt *reviewRuntime) mintDiscCursor(b reviewBracket, coord discCoord, deadli
 		},
 		ImmutableRefs: discRefsOf(b),
 		UpperBound:    until,
-		ExpiresAt:     expiry.UTC().Format(time.RFC3339),
+		ExpiresAt:     expiry.UTC().Format(time.RFC3339Nano),
 		DiscussionsCont: &cursor.DiscussionsCont{
 			V:   cursor.DiscussionsContSchemaDC1,
 			P:   coord.P,
@@ -1556,10 +1556,7 @@ func classifyNote(discID string, indiv presenceValue, raw json.RawMessage) (kept
 	if !cOK || !uOK || !eOK || !rOK || !commitOK || !intOK || !id1OK || !id2OK || !ntOK {
 		kn.ok = false
 	}
-	if !kn.system && (author.State != "value" || body.State != "value" || !idOK) {
-		kn.ok = false
-	}
-	if kn.system && !idOK {
+	if author.State != "value" || body.State != "value" || !idOK {
 		kn.ok = false
 	}
 	kn.sem.DiscussionID = discID
