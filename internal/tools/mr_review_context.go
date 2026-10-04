@@ -117,18 +117,19 @@ type reviewBracket struct {
 }
 
 type reviewRuntime struct {
-	d         Deps
-	ctx       context.Context
-	budget    *igl.Budget
-	actorID   int64
-	instance  string
-	policyFP  string
-	now       time.Time
-	elapsed   time.Duration
-	fail      error
-	projects  map[int64]CanonicalProject
-	allowProj map[int64]struct{}
-	allowGrp  map[int64]struct{}
+	d            Deps
+	ctx          context.Context
+	budget       *igl.Budget
+	actorID      int64
+	instance     string
+	policyFP     string
+	now          time.Time
+	elapsed      time.Duration
+	fail         error
+	discDeadline time.Time
+	projects     map[int64]CanonicalProject
+	allowProj    map[int64]struct{}
+	allowGrp     map[int64]struct{}
 }
 
 func registerMergeRequestReviewContext(s *mcp.Server, d Deps) {
@@ -557,6 +558,7 @@ func (rt *reviewRuntime) one(item reviewContextItemIn) reviewContextItemOut {
 		ObservationalConsistency: readmeta.ConsistencyUnknown,
 		Sections:                 map[string]readmeta.Section{},
 	}
+	rt.discDeadline = time.Time{}
 	rt.fillUnsupported(item, &out)
 	defer rt.sealRequested(item, &out)
 	if err := rt.phaseErr("proof"); err != nil {
@@ -625,13 +627,24 @@ func (rt *reviewRuntime) one(item reviewContextItemIn) reviewContextItemOut {
 				rt.fail = fmt.Errorf("%s: discussion cursor", cursor.ResyncRequired)
 				out.Cause = cursor.ResyncRequired
 			}
+			rt.finalizeDiscBound(&out)
 			return out
+		}
+		if !rt.discDeadline.IsZero() {
+			parent := rt.ctx
+			child, cancel := discBoundContext(parent, rt.d.now(), rt.discDeadline)
+			rt.ctx = child
+			defer func() {
+				cancel()
+				rt.ctx = parent
+			}()
 		}
 	}
 	if err := rt.phaseErr("bracket"); err != nil {
 		out.Cause = reviewClassify(err)
 		out.ContextRef = nil
 		out.ReviewClean = false
+		rt.finalizeDiscBound(&out)
 		return out
 	}
 	secondDetail, cause2, consistency2, serr := rt.readDetail(owner, item.MergeRequestIID)
@@ -639,6 +652,7 @@ func (rt *reviewRuntime) one(item reviewContextItemIn) reviewContextItemOut {
 		out.Cause = causeOf(serr)
 		out.ContextRef = nil
 		out.Metadata = nil
+		rt.finalizeDiscBound(&out)
 		return out
 	}
 	if cause2 != "" || !sameBracketIdentity(first.bracket, secondDetail) {
@@ -653,6 +667,7 @@ func (rt *reviewRuntime) one(item reviewContextItemIn) reviewContextItemOut {
 		out.Metadata = nil
 		out.ContextRef = nil
 		rt.markSection(&out, "metadata", readmeta.ContentCompleteUnknown, out.ObservationalConsistency)
+		rt.finalizeDiscBound(&out)
 		return out
 	}
 	second, serr2 := rt.finishBracket(secondDetail, item.MergeRequestIID)
@@ -660,6 +675,7 @@ func (rt *reviewRuntime) one(item reviewContextItemIn) reviewContextItemOut {
 		out.Cause = causeOf(serr2)
 		out.ContextRef = nil
 		out.Metadata = nil
+		rt.finalizeDiscBound(&out)
 		return out
 	}
 	if !second.proved || !bracketsEqual(first.bracket, second.bracket) {
@@ -677,9 +693,11 @@ func (rt *reviewRuntime) one(item reviewContextItemIn) reviewContextItemOut {
 		out.Metadata = nil
 		out.ContextRef = nil
 		rt.markSection(&out, "metadata", readmeta.ContentCompleteUnknown, out.ObservationalConsistency)
+		rt.finalizeDiscBound(&out)
 		return out
 	}
 	agreed := second.bracket
+	rt.finalizeDiscBound(&out)
 	if itemWants(item, "discussions") {
 		finishDiscussionClaim(&out, agreed.Head)
 	}
@@ -728,6 +746,8 @@ func (rt *reviewRuntime) one(item reviewContextItemIn) reviewContextItemOut {
 	} else if out.ObservationalConsistency == "" {
 		out.ObservationalConsistency = readmeta.ConsistencyUnknown
 	}
+	rt.finalizeDiscBound(&out)
+	complete, excluded = dropUnprovedDiscussions(item, &out, complete, excluded)
 	if len(complete) == 0 {
 		out.ContextRef = nil
 		return out
@@ -737,12 +757,20 @@ func (rt *reviewRuntime) one(item reviewContextItemIn) reviewContextItemOut {
 		out.Cause = reviewClassify(err)
 		out.ContextRef = nil
 		out.ReviewClean = false
+		rt.finalizeDiscBound(&out)
 		return out
 	}
 	if err := budgetAllowsNext(rt.ctx); err != nil {
 		out.Cause = causeOf(err)
 		out.ContextRef = nil
 		out.ReviewClean = false
+		rt.finalizeDiscBound(&out)
+		return out
+	}
+	rt.finalizeDiscBound(&out)
+	complete, excluded = dropUnprovedDiscussions(item, &out, complete, excluded)
+	if len(complete) == 0 {
+		out.ContextRef = nil
 		return out
 	}
 	ref, err := rt.mint(owner, item, agreed, complete, excluded, metaDigestOf(out))
@@ -750,10 +778,43 @@ func (rt *reviewRuntime) one(item reviewContextItemIn) reviewContextItemOut {
 		out.Cause = causeOf(err)
 		out.ContextRef = nil
 		out.ReviewClean = false
+		rt.finalizeDiscBound(&out)
 		return out
 	}
 	out.ContextRef = &ref
 	return out
+}
+
+func dropUnprovedDiscussions(item reviewContextItemIn, out *reviewContextItemOut, complete, excluded []string) ([]string, []string) {
+	if out == nil || !itemWants(item, "discussions") {
+		return complete, excluded
+	}
+	if out.Sections["discussions"].ContentComplete == readmeta.ContentCompleteTrue {
+		return complete, excluded
+	}
+	nextC := complete[:0]
+	seen := false
+	for _, name := range complete {
+		if name == "discussions" {
+			seen = true
+			continue
+		}
+		nextC = append(nextC, name)
+	}
+	complete = nextC
+	for _, name := range excluded {
+		if name == "discussions" {
+			sort.Strings(complete)
+			sort.Strings(excluded)
+			return complete, excluded
+		}
+	}
+	if seen || itemWants(item, "discussions") {
+		excluded = append(excluded, "discussions")
+	}
+	sort.Strings(complete)
+	sort.Strings(excluded)
+	return complete, excluded
 }
 
 type reviewMintHookKey struct{}
@@ -938,6 +999,9 @@ func (rt *reviewRuntime) rawGET(path string, opt any) ([]byte, http.Header, erro
 	}
 	var buf bytes.Buffer
 	resp, err := rt.d.Client.Do(req, &buf)
+	if errors.Is(rt.ctx.Err(), context.DeadlineExceeded) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, igl.ErrBudgetElapsed) {
+		return nil, nil, fmt.Errorf("%s", readmeta.CodeBudgetElapsed)
+	}
 	if readErr := bodyCap.capturedReadErr(); readErr != nil {
 		return nil, nil, reviewTransportErr(readErr)
 	}

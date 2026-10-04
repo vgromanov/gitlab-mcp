@@ -1381,3 +1381,252 @@ func TestDiscussionF6FractionalBound(t *testing.T) {
 		t.Fatalf("exact bound lim %#v", stopped.Limitations)
 	}
 }
+
+func f7Notes() string {
+	return "[" + discObj("d", noteObj(1, "a", "")+","+noteObj(2, "b", "")+","+noteObj(3, "c", "")) + "]"
+}
+
+func TestDiscussionF7ClosingBound(t *testing.T) {
+	t.Run("clock_crosses_on_resume_closing_versions", func(t *testing.T) {
+		clock := time.Date(2026, 10, 4, 12, 0, 0, int(500*time.Millisecond), time.UTC)
+		page := f7Notes()
+		var versions int
+		var script *reviewScript
+		var d Deps
+		d = newReviewDeps(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.Contains(r.URL.Path, "/versions") {
+				versions++
+				if versions == 4 {
+					d.Clock.(*cursor.FakeClock).Advance(200 * time.Millisecond)
+				}
+			}
+			script.serve(w, r)
+		}))
+		d.Clock = &cursor.FakeClock{T: clock}
+		script = &reviewScript{discussions: discPages(map[int]string{1: page}, map[int]string{1: ""})}
+		b := reviewBudget(128)
+		b.MaxItems = 10
+		item := metaItem("42", 1, "metadata", "discussions")
+		item.DiscussionSelection = "all"
+		_, raw, err := getMergeRequestReviewContext(igl.WithBudget(context.Background(), b), nil, getMergeRequestReviewContextIn{Items: []reviewContextItemIn{item}, MaxElapsedMS: ptr64(200)}, d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		seed := raw.(reviewContextOut).Items[0]
+		if seed.Sections["discussions"].NextCursor == nil {
+			t.Fatalf("seed fixture cursor missing lim=%#v", seed.Sections["discussions"].Limitations)
+		}
+		seedTok, err := cursor.Decode(d.Config.CursorKey, *seed.Sections["discussions"].NextCursor, clock)
+		if err != nil || seedTok.DiscussionsCont == nil || seedTok.DiscussionsCont.NI != 1 {
+			t.Fatalf("seed index fixture %#v err=%v", seedTok.DiscussionsCont, err)
+		}
+		item.Cursors = []reviewContextCursorIn{{Section: "discussions", Cursor: *seed.Sections["discussions"].NextCursor}}
+		b2 := reviewBudget(128)
+		b2.MaxItems = 11
+		ctx := igl.WithBudget(context.Background(), b2)
+		beforeReqs, _, beforeItems := b2.Stats()
+		maxItems, _, _, _ := b2.LimitsSnapshot()
+		_, raw, err = getMergeRequestReviewContext(ctx, nil, getMergeRequestReviewContextIn{Items: []reviewContextItemIn{item}, MaxElapsedMS: ptr64(30000)}, d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := raw.(reviewContextOut).Items[0]
+		sec := got.Sections["discussions"]
+		if sec.NextCursor != nil {
+			tok, decErr := cursor.Decode(d.Config.CursorKey, *sec.NextCursor, clock)
+			ni := -1
+			if decErr == nil && tok.DiscussionsCont != nil {
+				ni = tok.DiscussionsCont.NI
+			}
+			t.Errorf("staged continuation survived closing versions past the bound ni=%d lim=%#v", ni, sec.Limitations)
+		}
+		if sec.ContentComplete == readmeta.ContentCompleteTrue || (got.Discussions != nil && (got.Discussions.SemanticFeedbackDigest != nil || got.Discussions.PositionDigest != nil || got.Discussions.FullRevisionDigest != nil)) {
+			t.Errorf("closing cross promoted discussions evidence %+v", got.Discussions)
+		}
+		if len(sec.Limitations) == 0 || sec.Limitations[0].Code != readmeta.CodeBudgetElapsed {
+			t.Errorf("discussions lim %#v", sec.Limitations)
+		}
+		if got.Cause != "" || got.ContextRef == nil {
+			t.Errorf("sibling proof cause=%q ref=%v", got.Cause, got.ContextRef != nil)
+		} else {
+			assertMetadataRefExcludesDiscussions(t, d, *got.ContextRef)
+		}
+		afterReqs, _, afterItems := b2.Stats()
+		maxAfter, _, _, _ := b2.LimitsSnapshot()
+		if afterReqs <= beforeReqs || afterItems < beforeItems || maxAfter != maxItems || ctx.Err() != nil {
+			t.Errorf("budget ownership reqs %d->%d items %d->%d cap %d->%d ctx=%v", beforeReqs, afterReqs, beforeItems, afterItems, maxItems, maxAfter, ctx.Err())
+		}
+		if versions != 4 {
+			t.Errorf("versions responses %d", versions)
+		}
+	})
+
+	t.Run("wall_delay_on_resume_closing_versions", func(t *testing.T) {
+		clock := time.Date(2026, 10, 4, 12, 0, 0, int(500*time.Millisecond), time.UTC)
+		page := f7Notes()
+		var versions int
+		var script *reviewScript
+		outcome := make(chan string, 1)
+		var d Deps
+		d = newReviewDeps(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.Contains(r.URL.Path, "/versions") {
+				versions++
+				if versions == 4 {
+					select {
+					case <-r.Context().Done():
+						outcome <- "cancelled:" + r.Context().Err().Error()
+						return
+					case <-time.After(450 * time.Millisecond):
+						outcome <- "completed"
+					}
+				}
+			}
+			script.serve(w, r)
+		}))
+		d.Clock = &cursor.FakeClock{T: clock}
+		script = &reviewScript{discussions: discPages(map[int]string{1: page}, map[int]string{1: ""})}
+		b := reviewBudget(128)
+		b.MaxItems = 10
+		item := metaItem("42", 1, "metadata", "discussions")
+		item.DiscussionSelection = "all"
+		_, raw, err := getMergeRequestReviewContext(igl.WithBudget(context.Background(), b), nil, getMergeRequestReviewContextIn{Items: []reviewContextItemIn{item}, MaxElapsedMS: ptr64(200)}, d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cur := raw.(reviewContextOut).Items[0].Sections["discussions"].NextCursor
+		if cur == nil {
+			t.Fatal("seed fixture")
+		}
+		item.Cursors = []reviewContextCursorIn{{Section: "discussions", Cursor: *cur}}
+		b2 := reviewBudget(128)
+		b2.MaxItems = 11
+		start := time.Now()
+		_, raw, err = getMergeRequestReviewContext(igl.WithBudget(context.Background(), b2), nil, getMergeRequestReviewContextIn{Items: []reviewContextItemIn{item}, MaxElapsedMS: ptr64(30000)}, d)
+		elapsed := time.Since(start)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var saw string
+		select {
+		case saw = <-outcome:
+		case <-time.After(500 * time.Millisecond):
+			saw = "no-outcome"
+		}
+		got := raw.(reviewContextOut).Items[0]
+		sec := got.Sections["discussions"]
+		if saw != "cancelled:context deadline exceeded" && !strings.HasPrefix(saw, "cancelled:") {
+			t.Errorf("closing versions outcome %q elapsed=%s cursor=%v", saw, elapsed, sec.NextCursor != nil)
+		}
+		if sec.NextCursor != nil || got.Cause != readmeta.CodeBudgetElapsed || got.ContextRef != nil {
+			t.Errorf("unbounded closing publication outcome=%q cause=%q cursor=%v ref=%v lim=%#v elapsed=%s", saw, got.Cause, sec.NextCursor != nil, got.ContextRef != nil, sec.Limitations, elapsed)
+		}
+	})
+
+	t.Run("before_bound_copies_nano", func(t *testing.T) {
+		clock := time.Date(2026, 10, 4, 12, 0, 0, int(500*time.Millisecond), time.UTC)
+		page := f7Notes()
+		script := &reviewScript{discussions: discPages(map[int]string{1: page}, map[int]string{1: ""})}
+		d := newReviewDeps(t, http.HandlerFunc(script.serve))
+		d.Clock = &cursor.FakeClock{T: clock}
+		b := reviewBudget(128)
+		b.MaxItems = 10
+		item := metaItem("42", 1, "metadata", "discussions")
+		item.DiscussionSelection = "all"
+		_, raw, err := getMergeRequestReviewContext(igl.WithBudget(context.Background(), b), nil, getMergeRequestReviewContextIn{Items: []reviewContextItemIn{item}, MaxElapsedMS: ptr64(200)}, d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cur := raw.(reviewContextOut).Items[0].Sections["discussions"].NextCursor
+		if cur == nil {
+			t.Fatal("seed fixture")
+		}
+		item.Cursors = []reviewContextCursorIn{{Section: "discussions", Cursor: *cur}}
+		b2 := reviewBudget(128)
+		b2.MaxItems = 11
+		_, raw, err = getMergeRequestReviewContext(igl.WithBudget(context.Background(), b2), nil, getMergeRequestReviewContextIn{Items: []reviewContextItemIn{item}, MaxElapsedMS: ptr64(30000)}, d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := raw.(reviewContextOut).Items[0]
+		if got.Sections["discussions"].NextCursor == nil || got.Cause != "" {
+			t.Fatalf("before-bound resume %+v cause=%q", got.Sections["discussions"], got.Cause)
+		}
+		next, err := cursor.Decode(d.Config.CursorKey, *got.Sections["discussions"].NextCursor, clock)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantBound := clock.Add(200 * time.Millisecond).Format(time.RFC3339Nano)
+		wantExp := clock.Add(cursor.DefaultTTL).Format(time.RFC3339Nano)
+		if next.UpperBound != wantBound || next.Filters.Until != wantBound || next.ExpiresAt != wantExp || next.DiscussionsCont == nil || next.DiscussionsCont.NI != 2 {
+			t.Fatalf("copied bound upper=%s until=%s exp=%s ni=%v", next.UpperBound, next.Filters.Until, next.ExpiresAt, next.DiscussionsCont)
+		}
+	})
+
+	t.Run("parent_deadline_cancels_closing", func(t *testing.T) {
+		page := f7Notes()
+		var versions int
+		var script *reviewScript
+		cancelled := make(chan struct{})
+		var d Deps
+		d = newReviewDeps(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.Contains(r.URL.Path, "/versions") {
+				versions++
+				if versions == 4 {
+					select {
+					case <-r.Context().Done():
+						close(cancelled)
+						return
+					case <-time.After(2 * time.Second):
+					}
+				}
+			}
+			script.serve(w, r)
+		}))
+		script = &reviewScript{discussions: discPages(map[int]string{1: page}, map[int]string{1: ""})}
+		b := reviewBudget(128)
+		b.MaxItems = 10
+		item := metaItem("42", 1, "discussions")
+		item.DiscussionSelection = "all"
+		_, raw, err := getMergeRequestReviewContext(igl.WithBudget(context.Background(), b), nil, getMergeRequestReviewContextIn{Items: []reviewContextItemIn{item}, MaxElapsedMS: ptr64(30000)}, d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cur := raw.(reviewContextOut).Items[0].Sections["discussions"].NextCursor
+		if cur == nil {
+			t.Fatal("seed fixture")
+		}
+		item.Cursors = []reviewContextCursorIn{{Section: "discussions", Cursor: *cur}}
+		ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
+		defer cancel()
+		b2 := reviewBudget(128)
+		b2.MaxItems = 11
+		_, _, err = getMergeRequestReviewContext(igl.WithBudget(ctx, b2), nil, getMergeRequestReviewContextIn{Items: []reviewContextItemIn{item}, MaxElapsedMS: ptr64(30000)}, d)
+		select {
+		case <-cancelled:
+		case <-time.After(2 * time.Second):
+			t.Fatal("earlier parent deadline did not cancel closing versions")
+		}
+		_ = err
+	})
+}
+
+func TestDiscussionN2Int64Identity(t *testing.T) {
+	maxID := "9223372036854775807"
+	over := "9223372036854775808"
+	maxNote := fmt.Sprintf(`{"id":%s,"system":false,"author":{"id":9},"body":"x"}`, maxID)
+	maxAuthor := fmt.Sprintf(`{"id":1,"system":false,"author":{"id":%s},"body":"x"}`, maxID)
+	overNote := fmt.Sprintf(`{"id":%s,"system":false,"author":{"id":9},"body":"x"}`, over)
+	overAuthor := fmt.Sprintf(`{"id":1,"system":false,"author":{"id":%s},"body":"x"}`, over)
+	if _, _, _, ok := discussionDigestDocuments([]byte(f5Page(maxNote))); !ok {
+		t.Fatal("max int64 note id rejected")
+	}
+	if _, _, _, ok := discussionDigestDocuments([]byte(f5Page(maxAuthor))); !ok {
+		t.Fatal("max int64 author id rejected")
+	}
+	if _, _, _, ok := discussionDigestDocuments([]byte(f5Page(overNote))); ok {
+		t.Error("note id max+1 minted digests")
+	}
+	if _, _, _, ok := discussionDigestDocuments([]byte(f5Page(overAuthor))); ok {
+		t.Error("author id max+1 minted digests")
+	}
+}

@@ -499,10 +499,12 @@ func (rt *reviewRuntime) readDiscussions(item reviewContextItemIn, owner Canonic
 		start = discCoord{P: c.P, DI: c.DI, NI: c.NI, DID: c.DID}
 		wantDP, wantND = c.DP, c.ND
 		if !rt.d.now().Before(deadline) {
+			rt.discDeadline = deadline
 			rt.publishDisc(out, &view, selection, nil, nil, 0, false, false, false, false, readmeta.CodeBudgetElapsed, false, discCoord{}, start, deadline, expiry, b)
 			return nil
 		}
 	}
+	rt.discDeadline = deadline
 	st := &discScanState{seenDisc: map[string]struct{}{}, seenNote: map[string]struct{}{}}
 	var returned []discussionNoteOut
 	var kept []keptNote
@@ -702,6 +704,43 @@ func (rt *reviewRuntime) publishDisc(out *reviewContextItemOut, view *discussion
 	}
 	view.Section = sec
 	out.Discussions = view
+	out.Sections["discussions"] = sec
+}
+
+func (rt *reviewRuntime) finalizeDiscBound(out *reviewContextItemOut) {
+	if out == nil || rt.discDeadline.IsZero() {
+		return
+	}
+	pastClock := !rt.d.now().Before(rt.discDeadline)
+	ctxErr := rt.ctx.Err()
+	if !pastClock && ctxErr == nil {
+		return
+	}
+	sec, ok := out.Sections["discussions"]
+	if !ok {
+		return
+	}
+	sec.NextCursor = nil
+	if sec.ContentComplete == readmeta.ContentCompleteTrue {
+		sec.ContentComplete = readmeta.ContentCompleteFalse
+	}
+	code := readmeta.CodeBudgetElapsed
+	if !pastClock && errors.Is(ctxErr, context.Canceled) {
+		code = readmeta.CodeCancelled
+	}
+	sec.Limitations = []readmeta.Limitation{{Code: code, Message: "discussions"}}
+	if out.Discussions != nil {
+		d := *out.Discussions
+		d.SemanticFeedbackDigest = nil
+		d.PositionDigest = nil
+		d.FullRevisionDigest = nil
+		d.claimAll = false
+		d.claimSemantic = false
+		d.evidence = ""
+		d.semHex, d.posHex, d.fullHex = nil, nil, nil
+		d.Section = sec
+		out.Discussions = &d
+	}
 	out.Sections["discussions"] = sec
 }
 
@@ -1481,7 +1520,12 @@ func classifyNote(discID string, indiv presenceValue, raw json.RawMessage) (kept
 		kn.sem.NoteID = absentP()
 	} else {
 		kn.noteText = idText
-		kn.noteNum, _ = strconv.ParseInt(idText, 10, 64)
+		n, nerr := strconv.ParseInt(idText, 10, 64)
+		if nerr != nil {
+			kn.ok = false
+		} else {
+			kn.noteNum = n
+		}
 		kn.sem.NoteID = valueP(idText)
 		kn.out.NoteID = &idText
 	}
@@ -1657,7 +1701,10 @@ func presencePosInt(obj map[string]json.RawMessage, key string) (presenceValue, 
 	if !canonicalPosInt(text) {
 		return absentP(), 0, false
 	}
-	n, _ := strconv.ParseInt(text, 10, 64)
+	n, err := strconv.ParseInt(text, 10, 64)
+	if err != nil {
+		return absentP(), 0, false
+	}
 	return valueP(text), n, true
 }
 
