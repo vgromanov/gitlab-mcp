@@ -387,6 +387,10 @@ func quotedHeadContinuation(src []byte, from, to int) (int, int, bool) {
 			continue
 		}
 		if src[end] == quote {
+			if end > 0 && src[end-1] == '\\' {
+				end++
+				continue
+			}
 			end++
 			break
 		}

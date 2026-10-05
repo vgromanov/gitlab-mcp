@@ -385,6 +385,21 @@ func TestStreamJobTrace_cancelDuringBudgetedRead(t *testing.T) {
 	}
 }
 
+func TestStreamJobTrace_206ExactSpanExtraPeekByteRejected(t *testing.T) {
+	body := bytes.Repeat([]byte("a"), 101)
+	rt := &scriptedRT{
+		status:  http.StatusPartialContent,
+		headers: http.Header{"Content-Range": []string{"bytes 0-99/500"}},
+		body:    io.NopCloser(bytes.NewReader(body)),
+	}
+	res := StreamJobTrace(context.Background(), clientWithRT(t, rt), JobTraceRequest{
+		ProjectID: "42", JobID: 1, MaxScanBytes: 100,
+	})
+	if res.Err == nil || len(res.Data) != 0 || res.RangeHonored || res.ObservedStart != nil {
+		t.Fatalf("extra peek accepted: %+v scanned=%d", res, res.Scanned)
+	}
+}
+
 func TestStreamJobTrace_capped206RejectsSpanOverflow(t *testing.T) {
 	start := int64(100)
 	rt := &scriptedRT{

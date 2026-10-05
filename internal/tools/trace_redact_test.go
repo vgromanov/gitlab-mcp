@@ -366,6 +366,15 @@ func TestRedactRangeEdges_quotedContinuationWithSpaces(t *testing.T) {
 	}
 }
 
+func TestRedactRangeEdges_escapedQuoteAtWindowStart(t *testing.T) {
+	src := []byte(`Authorization: Bearer "` + strings.Repeat("A ", 120) + `SECRET\"` + `LEAK` + strings.Repeat(" C ", 40) + `" next`)
+	from := bytes.Index(src, []byte(`SECRET\"`)) + len(`SECRET\`)
+	out, _ := redactRangeEdges(src, from, len(src)-1, "", true, false, false)
+	if strings.Contains(out, "LEAK") || strings.Contains(out, "SECRET") {
+		t.Fatalf("escaped quote at cut leaked %q", out)
+	}
+}
+
 func TestRedactRangeEdges_mixedQuoteInsideUnknownDelimiter(t *testing.T) {
 	for _, pair := range [][2]string{{`"`, `'`}, {`'`, `"`}} {
 		src := []byte(strings.Repeat("AA BB ", 200) + "SECRET" + pair[1] + "LEAK rest" +

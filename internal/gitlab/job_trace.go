@@ -343,7 +343,7 @@ func finalizeJobTrace(out *JobTraceResult, req JobTraceRequest, hdr http.Header,
 				return
 			}
 			providerSpan := endExcl - crStart
-			if retained > providerSpan {
+			if retained > providerSpan || out.Scanned > providerSpan {
 				out.Data = []byte{}
 				out.Err = fmt.Errorf("Content-Range length mismatch")
 				out.RangeHonored = false
