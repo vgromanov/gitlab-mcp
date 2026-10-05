@@ -149,7 +149,11 @@ func getMergeRequestPipelineGraph(ctx context.Context, _ *mcp.CallToolRequest, i
 		budget.CapLimits(in.MaxItems, 0, 0)
 	}
 	if in.MaxRequests > 0 {
-		budget.CapLimits(0, 0, in.MaxRequests)
+		if ownsBudget {
+			budget.SetMaxRequests(in.MaxRequests)
+		} else {
+			budget.CapLimits(0, 0, in.MaxRequests)
+		}
 	}
 	if ownsBudget {
 		defer budget.Cancel()
@@ -422,7 +426,9 @@ func resumeGraphBridges(ctx context.Context, section *readmeta.Section, pid, pip
 	if err != nil {
 		return nil, nil, err
 	}
-	walk.ingestBridges(graphNodeKey{Project: pipePID, Pipeline: pipe.ID}, deref(pipe.SHA), page, prior)
+	if err := walk.ingestBridges(ctx, d, graphNodeKey{Project: pipePID, Pipeline: pipe.ID}, deref(pipe.SHA), page, prior); err != nil {
+		return nil, nil, err
+	}
 	if page.Partial {
 		section.AddLimitation(readmeta.CodePartial, page.Reason)
 		walk.unseen = true
@@ -886,7 +892,9 @@ func walkBridgesAndChildren(ctx context.Context, section *readmeta.Section, root
 		next, _ := pagingContinues(bpage.Paging, 1)
 		return mintBridgeCursor(section, d, actorID, pipePID, pipe.ID, sha, sel, upper, expires, 1, bpage, rootPID, walk, next, lineageCarry{})
 	}
-	walk.ingestBridges(graphNodeKey{Project: pipePID, Pipeline: pipe.ID}, deref(pipe.SHA), bpage, lineageCarry{})
+	if err := walk.ingestBridges(ctx, d, graphNodeKey{Project: pipePID, Pipeline: pipe.ID}, deref(pipe.SHA), bpage, lineageCarry{}); err != nil {
+		return err
+	}
 	if bpage.Unsupported || bpage.Inaccessible {
 		return nil
 	}

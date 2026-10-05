@@ -219,6 +219,18 @@ func (b *Budget) CapLimits(maxItems int, maxBytes int64, maxRequests int) {
 	}
 }
 
+// SetMaxRequests sets the request cap for an owned tool budget. Unlike
+// CapLimits, a positive value replaces the current cap even when that
+// relaxes the limit (e.g. raising the default for a single tool call).
+func (b *Budget) SetMaxRequests(maxRequests int) {
+	if b == nil || maxRequests <= 0 {
+		return
+	}
+	b.mu.Lock()
+	b.MaxRequests = maxRequests
+	b.mu.Unlock()
+}
+
 // ElapsedExceeded reports that the budget clock, not a parent deadline, has passed.
 func (b *Budget) ElapsedExceeded() bool {
 	if b == nil {

@@ -301,6 +301,14 @@ func TestPipelineGraph_deniedChildNoContent(t *testing.T) {
 		if e["kind"] == edgeKindDenied && e["from_project"] == "42" && fmt.Sprint(e["from_pipeline"]) == "100" {
 			found = true
 		}
+		if e["kind"] == edgeKindDenied {
+			if v, ok := e["to_project"]; ok && v != nil && fmt.Sprint(v) != "" && fmt.Sprint(v) != "0" {
+				t.Fatalf("denied edge leaked destination %#v", e)
+			}
+			if v, ok := e["to_pipeline"]; ok && v != nil && fmt.Sprint(v) != "" && fmt.Sprint(v) != "0" {
+				t.Fatalf("denied edge leaked destination %#v", e)
+			}
+		}
 	}
 	if !found {
 		t.Fatalf("denied edge missing source %#v", out["edges"])
@@ -383,6 +391,39 @@ func TestPipelineGraph_depthAndNodeStop(t *testing.T) {
 	kinds := edgeKinds(t, out)
 	if !hasKind(kinds, edgeKindDepthStop) && !hasKind(kinds, edgeKindNodeStop) {
 		t.Fatalf("expected depth or node stop, got %#v", kinds)
+	}
+}
+
+func TestPipelineGraph_siblingBranchCycleNotReady(t *testing.T) {
+	h := &walkServer{
+		pipes: map[string]string{
+			"42/100": walkPipe(100, 42, graphPipeSHA, "feature"),
+			"99/200": walkPipe(200, 99, graphChildSHA, "a"),
+			"99/201": walkPipe(201, 99, graphChildSHA, "b"),
+		},
+		jobs: map[string]string{
+			"42/100/1": "[" + jobJSON(1, "test", "success", "false") + "]",
+			"99/200/1": "[" + jobJSON(10, "a", "success", "false") + "]",
+			"99/201/1": "[" + jobJSON(11, "b", "success", "false") + "]",
+		},
+		bridges: map[string]string{
+			"42/100/1": "[" + bridgeJSON(50, "to-a", 99, 200, graphChildSHA) + "," + bridgeJSON(51, "to-b", 99, 201, graphChildSHA) + "]",
+			"99/200/1": "[" + bridgeJSON(60, "a-to-b", 99, 201, graphChildSHA) + "]",
+			"99/201/1": "[" + bridgeJSON(61, "b-to-a", 99, 200, graphChildSHA) + "]",
+		},
+		mr:      graphMR("feature"),
+		mrPipes: graphPipes("feature"),
+	}
+	out, _, err := callWalk(t, h, pipelineGraphIn{ProjectID: "42", MergeRequestIID: 7, MaxRequests: 64}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kinds := edgeKinds(t, out)
+	if !hasKind(kinds, edgeKindCycle) {
+		t.Fatalf("sibling branch cycle missing cycle edge %#v", out["edges"])
+	}
+	if out["assessment"] == assessReady || out["downstream_coverage"] == downstreamCoverageComplete {
+		t.Fatalf("sibling cycle certified ready: %#v", out)
 	}
 }
 

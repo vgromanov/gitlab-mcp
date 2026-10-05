@@ -516,7 +516,7 @@ func parseGraphBridge(raw json.RawMessage) (graphBridge, error) {
 	return br, nil
 }
 
-func (w *graphWalk) ingestBridges(parent graphNodeKey, parentSHA string, page bridgePage, prior lineageCarry) {
+func (w *graphWalk) ingestBridges(ctx context.Context, d Deps, parent graphNodeKey, parentSHA string, page bridgePage, prior lineageCarry) error {
 	w.bridgesOn = true
 	w.bridgesEv = chainEvidence(w.bridgesEv, bridgePageTokens(page)...)
 	if page.Unsupported {
@@ -531,7 +531,7 @@ func (w *graphWalk) ingestBridges(parent graphNodeKey, parentSHA string, page br
 			Capability:   bridgeCapabilityUnknown,
 			Provenance:   []string{"bridges_404"},
 		})
-		return
+		return nil
 	}
 	if page.Inaccessible {
 		w.cap = bridgeCapabilityBridges
@@ -545,7 +545,7 @@ func (w *graphWalk) ingestBridges(parent graphNodeKey, parentSHA string, page br
 			Capability:   bridgeCapabilityBridges,
 			Provenance:   []string{"bridges_403"},
 		})
-		return
+		return nil
 	}
 	w.cap = bridgeCapabilityBridges
 	if !w.hasIncompleteEdges() && !w.stickyIncomplete {
@@ -554,8 +554,11 @@ func (w *graphWalk) ingestBridges(parent graphNodeKey, parentSHA string, page br
 	groups := buildLineage(bridgeJobs(page.Bridges), prior)
 	w.recordOutcomes(groups)
 	for _, br := range page.Bridges {
-		w.addBridgeEdge(parent, parentSHA, br)
+		if err := w.addBridgeEdge(ctx, d, parent, parentSHA, br); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
 func (w *graphWalk) hasIncompleteEdges() bool {
@@ -579,7 +582,7 @@ func bridgeJobs(in []graphBridge) []graphJob {
 	return out
 }
 
-func (w *graphWalk) addBridgeEdge(parent graphNodeKey, parentSHA string, br graphBridge) {
+func (w *graphWalk) addBridgeEdge(ctx context.Context, d Deps, parent graphNodeKey, parentSHA string, br graphBridge) error {
 	id := br.Job.ID
 	base := graphEdgeView{
 		FromProject:  parent.Project,
@@ -593,24 +596,52 @@ func (w *graphWalk) addBridgeEdge(parent graphNodeKey, parentSHA string, br grap
 		w.unseen = true
 		w.stickyIncomplete = true
 		w.edges = append(w.edges, base)
-		return
+		return nil
 	}
 	if br.ChildProject < 1 {
 		base.Kind = edgeKindIdentity
 		w.unseen = true
 		w.stickyIncomplete = true
 		w.edges = append(w.edges, base)
-		return
+		return nil
 	}
-	if br.ChildPipeline < 1 {
-		base.Kind = edgeKindMissing
-		base.ToProject = strconv.FormatInt(br.ChildProject, 10)
+	childProject := strconv.FormatInt(br.ChildProject, 10)
+	authKind, err := w.authorize(ctx, d, childProject)
+	if err != nil {
+		return err
+	}
+	if authKind == edgeKindDenied {
+		base.Kind = edgeKindDenied
+		w.unseen = true
+		w.stickyIncomplete = true
+		w.coverage = downstreamCoveragePartial
+		w.edges = append(w.edges, base)
+		return nil
+	}
+	if authKind == edgeKindInaccessible {
+		base.Kind = edgeKindInaccessible
+		w.unseen = true
+		w.stickyIncomplete = true
+		w.coverage = downstreamCoveragePartial
+		w.edges = append(w.edges, base)
+		return nil
+	}
+	if authKind == edgeKindIdentity {
+		base.Kind = edgeKindIdentity
 		w.unseen = true
 		w.stickyIncomplete = true
 		w.edges = append(w.edges, base)
-		return
+		return nil
 	}
-	child := graphNodeKey{Project: strconv.FormatInt(br.ChildProject, 10), Pipeline: br.ChildPipeline}
+	if br.ChildPipeline < 1 {
+		base.Kind = edgeKindMissing
+		base.ToProject = childProject
+		w.unseen = true
+		w.stickyIncomplete = true
+		w.edges = append(w.edges, base)
+		return nil
+	}
+	child := graphNodeKey{Project: childProject, Pipeline: br.ChildPipeline}
 	base.ToProject = child.Project
 	base.ToPipeline = child.Pipeline
 	base.SHAComparison = compareSHA(br.ChildSHA, parentSHA)
@@ -620,10 +651,10 @@ func (w *graphWalk) addBridgeEdge(parent graphNodeKey, parentSHA string, br grap
 		w.stickyIncomplete = true
 		w.coverage = downstreamCoveragePartial
 		w.edges = append(w.edges, base)
-		return
+		return nil
 	}
 	if _, seen := w.visited[child.String()]; seen || w.queued(child) || w.isAncestor(child) {
-		if w.isAncestor(child) || child == w.current {
+		if w.isAncestor(child) || child == w.current || w.reachableViaBridges(child, w.current) {
 			base.Kind = edgeKindCycle
 			w.unseen = true
 			w.stickyIncomplete = true
@@ -633,7 +664,7 @@ func (w *graphWalk) addBridgeEdge(parent graphNodeKey, parentSHA string, br grap
 		}
 		base.Provenance = append(base.Provenance, base.Kind)
 		w.edges = append(w.edges, base)
-		return
+		return nil
 	}
 	if w.nodeCount >= w.maxNodes {
 		base.Kind = edgeKindNodeStop
@@ -641,7 +672,7 @@ func (w *graphWalk) addBridgeEdge(parent graphNodeKey, parentSHA string, br grap
 		w.stickyIncomplete = true
 		w.coverage = downstreamCoveragePartial
 		w.edges = append(w.edges, base)
-		return
+		return nil
 	}
 	base.Kind = edgeKindBridge
 	w.edges = append(w.edges, base)
@@ -653,6 +684,40 @@ func (w *graphWalk) addBridgeEdge(parent graphNodeKey, parentSHA string, br grap
 		Ancestors: append([]graphNodeKey{}, w.currentAncestors()...),
 		BridgeID:  id,
 	})
+	return nil
+}
+
+func (w *graphWalk) reachableViaBridges(from, to graphNodeKey) bool {
+	if from == to {
+		return true
+	}
+	seen := map[string]struct{}{from.String(): {}}
+	queue := []graphNodeKey{from}
+	for len(queue) > 0 {
+		n := queue[0]
+		queue = queue[1:]
+		for _, e := range w.edges {
+			if e.Kind != edgeKindBridge && e.Kind != edgeKindShared {
+				continue
+			}
+			if e.FromProject != n.Project || e.FromPipeline != n.Pipeline {
+				continue
+			}
+			if e.ToPipeline < 1 {
+				continue
+			}
+			next := graphNodeKey{Project: e.ToProject, Pipeline: e.ToPipeline}
+			if next == to {
+				return true
+			}
+			if _, ok := seen[next.String()]; ok {
+				continue
+			}
+			seen[next.String()] = struct{}{}
+			queue = append(queue, next)
+		}
+	}
+	return false
 }
 
 func (w *graphWalk) queued(k graphNodeKey) bool {
