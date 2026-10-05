@@ -14,7 +14,6 @@ import (
 )
 
 const (
-	maxEvidencePages = 64
 	// Revalidation re-reads already-certified work, so it must not draw down the
 	// caller's per-call item and request budget that paged the graph in the first place.
 	evidenceMaxItems    = 2000
@@ -145,10 +144,7 @@ func newEvidenceBudget() *igl.Budget {
 // when until is 0. A bounded read requires every page to continue to the next.
 func readJobEvidence(ctx context.Context, d Deps, budget *igl.Budget, project string, pipelineID int64, perPage int, state string, from, until int) (string, error) {
 	drift := fmt.Errorf("%s: completed node evidence drift", cursor.ResyncRequired)
-	for page, n := from, 0; until == 0 || page < until; n++ {
-		if n >= maxEvidencePages {
-			return "", drift
-		}
+	for page := from; until == 0 || page < until; {
 		gp, err := collectJobPage(ctx, d, budget, project, pipelineID, page, perPage, nil)
 		if err != nil {
 			return "", err
@@ -172,10 +168,7 @@ func readJobEvidence(ctx context.Context, d Deps, budget *igl.Budget, project st
 // readBridgeEvidence is the bridge-list counterpart of readJobEvidence.
 func readBridgeEvidence(ctx context.Context, d Deps, budget *igl.Budget, project string, pipelineID int64, perPage int, state string, from, until int) (string, error) {
 	drift := fmt.Errorf("%s: completed node evidence drift", cursor.ResyncRequired)
-	for page, n := from, 0; until == 0 || page < until; n++ {
-		if n >= maxEvidencePages {
-			return "", drift
-		}
+	for page := from; until == 0 || page < until; {
 		bp, err := collectBridgePage(ctx, d, budget, project, pipelineID, page, perPage, nil)
 		if err != nil {
 			return "", err

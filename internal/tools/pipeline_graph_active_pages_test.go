@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -150,5 +151,50 @@ func TestPipelineGraph_bridgeRetryLineageAcrossPages(t *testing.T) {
 		if r == "failed_required" {
 			t.Fatalf("older bridge retry on a later page blocked the graph: %#v", last["reasons"])
 		}
+	}
+}
+
+func TestPipelineGraph_manyParentJobPagesResumeIntoChild(t *testing.T) {
+	const parentPages = 70
+	h := &walkServer{
+		pipes: map[string]string{
+			"42/100": walkPipe(100, 42, graphPipeSHA, "feature"),
+			"99/200": walkPipe(200, 99, graphChildSHA, "child"),
+		},
+		jobs: map[string]string{
+			"99/200/1": "[" + jobJSON(5000, "child-a", "success", "false") + "]",
+			"99/200/2": "[" + jobJSON(4999, "child-b", "success", "false") + "]",
+		},
+		bridges: map[string]string{
+			"42/100/1": "[" + bridgeJSON(50, "to-child", 99, 200, graphChildSHA) + "]",
+		},
+		mr:      graphMR("feature"),
+		mrPipes: graphPipes("feature"),
+	}
+	for i := 1; i <= parentPages; i++ {
+		id := parentPages - i + 1
+		h.jobs["42/100/"+strconv.Itoa(i)] = "[" + jobJSON(id, "p"+strconv.Itoa(id), "success", "false") + "]"
+	}
+	d, in := pagedActiveDeps(t, h)
+	tok := ""
+	var last map[string]any
+	sawChild := false
+	for i := 0; i < parentPages+20; i++ {
+		in.Cursor = tok
+		_, raw, callErr := getMergeRequestPipelineGraph(context.Background(), nil, in, d)
+		if callErr != nil {
+			t.Fatalf("call %d: %v", i, callErr)
+		}
+		last = raw.(map[string]any)
+		tok, _ = graphSection(t, last)["next_cursor"].(string)
+		if tok == "" {
+			break
+		}
+		if payload, derr := cursor.Decode(d.Config.CursorKey, tok, time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)); derr == nil && payload.GraphCont != nil && payload.GraphCont.NI == 200 {
+			sawChild = true
+		}
+	}
+	if tok != "" || !sawChild || last["downstream_coverage"] != downstreamCoverageComplete {
+		t.Fatalf("graph with %d parent job pages did not finish: cursor=%q child=%v coverage=%v", parentPages, tok, sawChild, last["downstream_coverage"])
 	}
 }
