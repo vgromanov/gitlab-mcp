@@ -18,6 +18,8 @@ import (
 	fdiff "github.com/go-git/go-git/v5/plumbing/format/diff"
 	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/go-git/go-git/v5/plumbing/storer"
+	godiff "github.com/go-git/go-git/v5/utils/diff"
+	"github.com/sergi/go-diff/diffmatchpatch"
 
 	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/gitcache/pack"
 )
@@ -245,7 +247,7 @@ func (c *Comparison) Patches(ctx context.Context, paths []string, lim Limits) (P
 				out.Partial, out.Reason = true, "output limit"
 				return out, ErrPartial
 			}
-			if ctx.Err() != nil || errors.Is(err, object.ErrCanceled) {
+			if ctx.Err() != nil || errors.Is(err, object.ErrCanceled) || errors.Is(err, context.DeadlineExceeded) {
 				return c.patchBound(out, ctx)
 			}
 			return out, err
@@ -270,7 +272,7 @@ func renderPatch(ctx context.Context, ch *object.Change, f File, room int) (stri
 	if room <= 0 {
 		return "", errCapped
 	}
-	p, err := ch.PatchContext(ctx)
+	p, err := changePatch(ctx, ch)
 	if err != nil {
 		return "", err
 	}
@@ -289,6 +291,108 @@ func renderPatch(ctx context.Context, ch *object.Change, f File, room int) (stri
 	}
 	return w.buf.String(), nil
 }
+
+// changePatch is object.Change.PatchContext with a deadline-bounded line diff.
+// go-git's version diffs with a fixed one-hour timeout and never consults the
+// context while doing so. Here the diff library gets the time left on ctx, and a
+// diff that used it all is discarded instead of returned as a degraded
+// delete-plus-insert.
+func changePatch(ctx context.Context, ch *object.Change) (fdiff.Patch, error) {
+	from, to, err := ch.Files()
+	if err != nil {
+		return nil, err
+	}
+	fromContent, fromBin, err := fileText(from)
+	if err != nil {
+		return nil, err
+	}
+	toContent, toBin, err := fileText(to)
+	if err != nil {
+		return nil, err
+	}
+	fp := &filePatch{from: ch.From, to: ch.To}
+	if fromBin || toBin {
+		return &patch{[]fdiff.FilePatch{fp}}, nil
+	}
+
+	budget := time.Hour
+	if dl, ok := ctx.Deadline(); ok {
+		budget = time.Until(dl)
+	}
+	if err := ctx.Err(); err != nil || budget <= 0 {
+		return nil, context.DeadlineExceeded
+	}
+	start := time.Now()
+	diffs := godiff.DoWithTimeout(fromContent, toContent, budget)
+	if err := ctx.Err(); err != nil || time.Since(start) >= budget {
+		return nil, context.DeadlineExceeded
+	}
+	for _, d := range diffs {
+		var op fdiff.Operation
+		switch d.Type {
+		case diffmatchpatch.DiffEqual:
+			op = fdiff.Equal
+		case diffmatchpatch.DiffDelete:
+			op = fdiff.Delete
+		case diffmatchpatch.DiffInsert:
+			op = fdiff.Add
+		}
+		fp.chunks = append(fp.chunks, chunk{d.Text, op})
+	}
+	return &patch{[]fdiff.FilePatch{fp}}, nil
+}
+
+func fileText(f *object.File) (string, bool, error) {
+	if f == nil {
+		return "", false, nil
+	}
+	bin, err := f.IsBinary()
+	if err != nil || bin {
+		return "", bin, err
+	}
+	text, err := f.Contents()
+	return text, false, err
+}
+
+type patch struct{ files []fdiff.FilePatch }
+
+func (p *patch) FilePatches() []fdiff.FilePatch { return p.files }
+func (p *patch) Message() string                { return "" }
+
+// filePatch mirrors go-git's text file patch: a patch without chunks is
+// reported as binary.
+type filePatch struct {
+	chunks   []fdiff.Chunk
+	from, to object.ChangeEntry
+}
+
+func (p *filePatch) IsBinary() bool        { return len(p.chunks) == 0 }
+func (p *filePatch) Chunks() []fdiff.Chunk { return p.chunks }
+
+func (p *filePatch) Files() (fdiff.File, fdiff.File) {
+	var from, to fdiff.File
+	if p.from.TreeEntry.Mode.IsFile() {
+		from = entryFile{p.from}
+	}
+	if p.to.TreeEntry.Mode.IsFile() {
+		to = entryFile{p.to}
+	}
+	return from, to
+}
+
+type entryFile struct{ e object.ChangeEntry }
+
+func (f entryFile) Hash() plumbing.Hash     { return f.e.TreeEntry.Hash }
+func (f entryFile) Mode() filemode.FileMode { return f.e.TreeEntry.Mode }
+func (f entryFile) Path() string            { return f.e.Name }
+
+type chunk struct {
+	text string
+	op   fdiff.Operation
+}
+
+func (c chunk) Content() string       { return c.text }
+func (c chunk) Type() fdiff.Operation { return c.op }
 
 func hasChunks(p fdiff.Patch) bool {
 	for _, fp := range p.FilePatches() {

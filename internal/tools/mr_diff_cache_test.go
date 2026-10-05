@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-git/go-git/v5/plumbing"
 
@@ -842,5 +843,44 @@ func TestDiffWindow_cacheContentCropsPatchLargerThanContentCap(t *testing.T) {
 func TestPatchByteCapIgnoresEmittedContentCap(t *testing.T) {
 	if got := patchByteCap(context.Background()); got != 1<<20 {
 		t.Fatalf("cap=%d", got)
+	}
+}
+
+// expiringCacheHold blocks until the invocation deadline (max_elapsed_ms) has
+// passed and then hands back a valid hold, so gitdiff.Compare starts with an
+// expired context.
+type expiringCacheHold struct {
+	fakeCacheHold
+}
+
+func (f *expiringCacheHold) Hold(ctx context.Context, in gitcache.AcquireIntent, a gitcache.Authorizer) (*gitcache.ObjectHold, error) {
+	select {
+	case <-ctx.Done():
+	case <-time.After(5 * time.Second):
+	}
+	return f.fakeCacheHold.Hold(ctx, in, a)
+}
+
+func TestDiffWindow_cacheRecoveryPropagatesDeadline(t *testing.T) {
+	objs, base, head := twoCommitObjects(t, "p.txt", "old\n", "new\n")
+	for name, args := range map[string]map[string]any{
+		"version manifest": {"project_id": "42", "merge_request_iid": 1, "diff_version_id": 1},
+		"version content":  {"project_id": "42", "merge_request_iid": 1, "diff_version_id": 1, "mode": "content", "paths": []string{"p.txt"}},
+		"tuple manifest":   {"project_id": "42", "merge_request_iid": 1, "base_sha": base, "start_sha": base, "head_sha": head},
+		"tuple content":    {"project_id": "42", "merge_request_iid": 1, "base_sha": base, "start_sha": base, "head_sha": head, "mode": "content", "paths": []string{"p.txt"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			handler := overflowHandler(head, base)
+			if _, tuple := args["base_sha"]; tuple {
+				handler = tupleOverflowHandler(head, base)
+			}
+			d := diffDeps(t, handler)
+			d.cacheHold = &expiringCacheHold{fakeCacheHold: *cacheHoldFor(objs, base, head)}
+			args["max_elapsed_ms"] = 200
+			out, err := callDiffWindow(t, d, nil, args)
+			if err == nil {
+				t.Fatalf("expired invocation looked like a successful response: %v", out["section"])
+			}
+		})
 	}
 }

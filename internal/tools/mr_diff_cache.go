@@ -161,6 +161,9 @@ func recoverCacheContent(ctx context.Context, d Deps, q diffQuery, sec readmeta.
 	}
 	patchLim := gitdiff.Limits{MaxBytes: patchByteCap(ctx), Timeout: remainingOrDefault(ctx)}
 	pres, err := cmp.Patches(ctx, patchPathspec(opts.Paths, files), patchLim)
+	if ctx.Err() != nil {
+		return diffContentOut{}, false
+	}
 	partial := pres.Partial
 	if err != nil && !partial {
 		return diffContentOut{}, false

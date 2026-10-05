@@ -527,6 +527,9 @@ func readVersionManifest(ctx context.Context, d Deps, q diffQuery, sec readmeta.
 		if out, ok := recoverCacheManifest(ctx, d, q, sec, proved); ok {
 			return out, nil
 		}
+		if err := ctx.Err(); err != nil {
+			return diffWindowOut{}, err
+		}
 		return incompleteManifestWindow(q, sec, proved.Head, status, entries), nil
 	}
 	return finishManifestWindow(q, sec, proved, entries)
@@ -1097,6 +1100,9 @@ func readIncrementalManifest(ctx context.Context, d Deps, q diffQuery, sec readm
 	}
 	if out, ok := recoverCacheManifest(ctx, d, q, sec, provedManifest{Charged: charged.n}); ok {
 		return out, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return diffWindowOut{}, err
 	}
 	return diffWindowOut{Section: sec, Entries: windowEntries(entries, q.Offset, end)}, nil
 }

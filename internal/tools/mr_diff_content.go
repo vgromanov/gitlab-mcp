@@ -1024,6 +1024,9 @@ func readVersionContent(ctx context.Context, d Deps, q diffQuery, sec readmeta.S
 		if out, ok := recoverCacheContent(ctx, d, q, sec, proved, opts, versionID); ok {
 			return out, nil
 		}
+		if err := ctx.Err(); err != nil {
+			return diffContentOut{}, err
+		}
 		if status == "" {
 			status = readmeta.CodePartial
 		}
@@ -1279,6 +1282,9 @@ func readIncrementalContent(ctx context.Context, d Deps, q diffQuery, sec readme
 	sec.Counts.Items = &items
 	if out, ok := recoverCacheContent(ctx, d, q, sec, provedManifest{Charged: charged.n}, opts, 0); ok {
 		return out, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return diffContentOut{}, err
 	}
 	return diffContentOut{
 		Section: sec, Selection: selectionOutFrom(q, provedManifest{}, 0),

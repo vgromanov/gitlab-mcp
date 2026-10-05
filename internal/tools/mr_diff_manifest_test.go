@@ -28,10 +28,20 @@ func diffDeps(t *testing.T, h http.Handler) Deps {
 
 func callDiffWindow(t *testing.T, d Deps, srvCtx context.Context, args map[string]any) (map[string]any, error) {
 	t.Helper()
+	return callDiffWindowSplit(t, d, srvCtx, srvCtx, args)
+}
+
+// callDiffWindowSplit connects the server with srvCtx but issues the call with
+// callCtx, so a test can cancel the server side without the client giving up.
+func callDiffWindowSplit(t *testing.T, d Deps, srvCtx, callCtx context.Context, args map[string]any) (map[string]any, error) {
+	t.Helper()
 	srv := mcp.NewServer(&mcp.Implementation{Name: "diff-window", Version: "t"}, nil)
 	RegisterMergeRequests(srv, d)
 	if srvCtx == nil {
 		srvCtx = context.Background()
+	}
+	if callCtx == nil {
+		callCtx = srvCtx
 	}
 	ct, st := mcp.NewInMemoryTransports()
 	if _, err := srv.Connect(srvCtx, st, nil); err != nil {
@@ -45,7 +55,7 @@ func callDiffWindow(t *testing.T, d Deps, srvCtx context.Context, args map[strin
 	t.Cleanup(func() { _ = cs.Close() })
 	// Use the same ctx as Connect so borrowed budgets/cancel/deadlines reach the tool
 	// and in-flight provider RoundTrips (matches callReviewContext).
-	res, err := cs.CallTool(srvCtx, &mcp.CallToolParams{Name: "get_merge_request_diff_window", Arguments: args})
+	res, err := cs.CallTool(callCtx, &mcp.CallToolParams{Name: "get_merge_request_diff_window", Arguments: args})
 	if err != nil {
 		return nil, err
 	}

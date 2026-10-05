@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/go-git/go-git/v5/plumbing"
+	fdiff "github.com/go-git/go-git/v5/plumbing/format/diff"
 	"github.com/go-git/go-git/v5/plumbing/object"
 
 	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/gitcache/pack"
@@ -639,5 +640,87 @@ func TestCompareClearsLiveCheckSoPatchesOutliveDeadline(t *testing.T) {
 	res, err := cmp.Patches(bg(), nil, Limits{})
 	if err != nil || len(res.Patches) != 1 {
 		t.Fatalf("patches %#v %v", res, err)
+	}
+}
+
+// A large text diff must stop at the request deadline: go-git's own
+// PatchContext diffs with a one-hour timeout and ignores ctx while doing so.
+func TestPatchRenderHonorsDeadline(t *testing.T) {
+	var oldB, newB strings.Builder
+	for i := 0; i < 80000; i++ {
+		fmt.Fprintf(&oldB, "old unique line %d\n", i)
+		fmt.Fprintf(&newB, "new unique line %d\n", i)
+	}
+	s := store{}
+	base := s.snapshot(t, "", map[string]fileSpec{"big.txt": reg(oldB.String())})
+	head := s.snapshot(t, base, map[string]fileSpec{"big.txt": reg(newB.String())})
+	cmp, err := Compare(bg(), base, head, SemanticsStraight, s, Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	res, err := cmp.Patches(bg(), []string{"big.txt"}, Limits{Timeout: 100 * time.Millisecond})
+	elapsed := time.Since(start)
+	if !errors.Is(err, ErrPartial) || !res.Partial || res.Reason != "time limit" || len(res.Patches) != 0 {
+		t.Fatalf("want time-limit partial without a patch: %#v %v", res, err)
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("render ignored the deadline: %v", elapsed)
+	}
+}
+
+func TestPatchRenderCanceledContext(t *testing.T) {
+	s := store{}
+	base := s.snapshot(t, "", map[string]fileSpec{"a.txt": reg("1\n")})
+	head := s.snapshot(t, base, map[string]fileSpec{"a.txt": reg("2\n")})
+	cmp, err := Compare(bg(), base, head, SemanticsStraight, s, Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(bg())
+	cancel()
+	if _, err := cmp.Patches(ctx, nil, Limits{}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+// The deadline-aware patch must encode exactly what go-git's own patch does.
+func TestChangePatchMatchesGoGitPatch(t *testing.T) {
+	s := store{}
+	lines := strings.Repeat("shared line\n", 20)
+	base := s.snapshot(t, "", map[string]fileSpec{
+		"mod.txt": reg(lines + "tail\n"), "del.txt": reg("bye\n"), "mode.sh": reg("#!/bin/sh\n"),
+		"bin.dat": reg("a\x00b"), "empty.txt": reg(""),
+	})
+	head := s.snapshot(t, base, map[string]fileSpec{
+		"mod.txt": reg(lines + "TAIL\nmore\n"), "add.txt": reg("hello\nworld\n"), "mode.sh": exec("#!/bin/sh\n"),
+		"bin.dat": reg("a\x00c"), "empty.txt": reg("now text\n"),
+	})
+	cmp, err := Compare(bg(), base, head, SemanticsStraight, s, Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cmp.changes) < 5 {
+		t.Fatalf("changes=%d", len(cmp.changes))
+	}
+	for _, ch := range cmp.changes {
+		mine, err := changePatch(bg(), ch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		theirs, err := ch.PatchContext(bg())
+		if err != nil {
+			t.Fatal(err)
+		}
+		var a, b strings.Builder
+		if err := fdiff.NewUnifiedEncoder(&a, contextLines).Encode(mine); err != nil {
+			t.Fatal(err)
+		}
+		if err := fdiff.NewUnifiedEncoder(&b, contextLines).Encode(theirs); err != nil {
+			t.Fatal(err)
+		}
+		if a.String() != b.String() {
+			t.Fatalf("%s -> %s differs:\n%q\nvs\n%q", ch.From.Name, ch.To.Name, a.String(), b.String())
+		}
 	}
 }
