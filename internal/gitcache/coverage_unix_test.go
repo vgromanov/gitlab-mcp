@@ -5,9 +5,6 @@ package gitcache
 import (
 	"context"
 	"errors"
-	"os"
-	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/go-git/go-git/v5/plumbing"
@@ -175,115 +172,6 @@ func TestWarmAcquireProveGrant(t *testing.T) {
 	}
 	if err := hold.Release(); err != nil {
 		t.Fatal(err)
-	}
-}
-
-func TestOpenCompareDirUnderRoot(t *testing.T) {
-	root := regressionRoot(t)
-	mgr, err := OpenManager(root, bounds.BrootBytes+bounds.GenerationCharge())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer mgr.Close(context.Background())
-	dir, cleanup, err := mgr.OpenCompareDir(context.Background(), 16)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.HasPrefix(dir, filepath.Join(root, compareDirName)+string(filepath.Separator)) {
-		t.Fatalf("dir %s not under %s", dir, root)
-	}
-	if err := cleanup(); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := mgr.OpenCompareDir(context.Background(), bounds.MaxRetainedOutput+1); !errors.Is(err, ErrLimit) {
-		t.Fatalf("oversize: %v", err)
-	}
-	if err := mgr.Close(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	reopened, err := OpenManager(root, bounds.BrootBytes+bounds.GenerationCharge())
-	if err != nil {
-		t.Fatalf("compare leftover must not corrupt root: %v", err)
-	}
-	if err := reopened.Close(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestOpenCompareDirAllowsRetainedObjectBound(t *testing.T) {
-	root := regressionRoot(t)
-	mgr, err := OpenManager(root, bounds.DefaultQuotaBytes)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer mgr.Close(context.Background())
-	dir, cleanup, err := mgr.OpenCompareDir(context.Background(), bounds.MaxScratchBytes+1)
-	if err != nil {
-		t.Fatalf("retained-object sized scratch: %v", err)
-	}
-	if err := cleanup(); err != nil {
-		t.Fatal(err)
-	}
-	if dir == "" {
-		t.Fatal("empty dir")
-	}
-}
-
-func TestOpenCompareDirReservesQuota(t *testing.T) {
-	root := regressionRoot(t)
-	quota := bounds.BrootBytes + 200
-	mgr, err := OpenManager(root, quota)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer mgr.Close(context.Background())
-	dir, cleanup, err := mgr.OpenCompareDir(context.Background(), 150)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := mgr.OpenCompareDir(context.Background(), 150); !errors.Is(err, ErrQuota) {
-		t.Fatalf("second reservation: %v", err)
-	}
-	if err := cleanup(); err != nil {
-		t.Fatal(err)
-	}
-	dir2, cleanup2, err := mgr.OpenCompareDir(context.Background(), 150)
-	if err != nil {
-		t.Fatalf("after release: %v", err)
-	}
-	if err := cleanup2(); err != nil {
-		t.Fatal(err)
-	}
-	if dir == "" || dir2 == "" {
-		t.Fatal("empty dir")
-	}
-}
-
-func TestOpenCompareDirReclaimsLeftoversOnReopen(t *testing.T) {
-	root := regressionRoot(t)
-	mgr, err := OpenManager(root, bounds.BrootBytes+bounds.GenerationCharge())
-	if err != nil {
-		t.Fatal(err)
-	}
-	dir, _, err := mgr.OpenCompareDir(context.Background(), 16)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "stale"), []byte("x"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := mgr.Close(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	reopened, err := OpenManager(root, bounds.BrootBytes+bounds.GenerationCharge())
-	if err != nil {
-		t.Fatalf("leftover compare child must not corrupt root: %v", err)
-	}
-	if err := reopened.Close(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("leftover %s not reclaimed: %v", dir, err)
 	}
 }
 

@@ -15,6 +15,6 @@
 // require this package. When a service is enabled, get_merge_request acquires
 // that merge request through GitCacheAuthorizer and Service.Acquire.
 // get_merge_request_diff_window (RVG-145) may compare those authorized
-// objects with a locked-down no-checkout git subprocess; this package still
-// does not invoke installed Git for acquisition.
+// objects in-process with go-git (package gitdiff); no part of the cache
+// invokes installed Git.
 package gitcache

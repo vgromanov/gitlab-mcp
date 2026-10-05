@@ -13,7 +13,6 @@ import (
 	"golang.org/x/sys/unix"
 	"io"
 	"os"
-	"path/filepath"
 	"sync"
 	"syscall"
 
@@ -24,34 +23,32 @@ import (
 )
 
 const (
-	lockName       = "root.lock"
-	ledgerName     = "ledger.bin"
-	ledgerTmp      = "ledger.tmp"
-	gensDir        = "generations"
-	stageDir       = "staging"
-	compareDirName = "compare"
+	lockName   = "root.lock"
+	ledgerName = "ledger.bin"
+	ledgerTmp  = "ledger.tmp"
+	gensDir    = "generations"
+	stageDir   = "staging"
 )
 
 // Manager owns one private cache root for the process lifetime.
 type Manager struct {
-	root           *os.File
-	lock           *os.File
-	rootDev        uint64
-	quota          uint64
-	slots          []Slot
-	mu             sync.Mutex
-	closed         bool
-	closing        bool
-	closeMu        sync.Mutex
-	acqBusy        bool
-	readers        int
-	cancel         context.CancelFunc
-	workCtx        context.Context
-	wg             sync.WaitGroup
-	fault          *FaultPoints // test seams
-	ledgerDigest   [32]byte
-	closeDone      chan struct{}
-	compareScratch uint64
+	root         *os.File
+	lock         *os.File
+	rootDev      uint64
+	quota        uint64
+	slots        []Slot
+	mu           sync.Mutex
+	closed       bool
+	closing      bool
+	closeMu      sync.Mutex
+	acqBusy      bool
+	readers      int
+	cancel       context.CancelFunc
+	workCtx      context.Context
+	wg           sync.WaitGroup
+	fault        *FaultPoints // test seams
+	ledgerDigest [32]byte
+	closeDone    chan struct{}
 }
 
 // FaultPoints are hermetic crash injection points. Nil in production.
@@ -268,7 +265,7 @@ func (m *Manager) inventoryExistingRoot() error {
 	allowed := map[string]bool{
 		".": true, "..": true,
 		lockName: true, ledgerName: true, ledgerTmp: true,
-		gensDir: true, stageDir: true, compareDirName: true,
+		gensDir: true, stageDir: true,
 	}
 	for _, name := range names {
 		if !allowed[name] {
@@ -294,7 +291,7 @@ func (m *Manager) inventoryExistingRoot() error {
 			if name == ledgerTmp && st.Size > bounds.LedgerBytes {
 				return ErrCorrupt
 			}
-		case gensDir, stageDir, compareDirName:
+		case gensDir, stageDir:
 			fd, err := m.openPrivateDir(int(m.root.Fd()), name)
 			if err != nil {
 				return err
@@ -558,9 +555,6 @@ func (m *Manager) recoverLocked() error {
 	if err := m.reclaimStagingLocked(); err != nil {
 		return err
 	}
-	if err := m.reclaimCompareLocked(); err != nil {
-		return err
-	}
 	if err := m.inventoryGenerationsLocked(); err != nil {
 		return err
 	}
@@ -602,58 +596,6 @@ func (m *Manager) reclaimStagingLocked() error {
 		return ErrCorrupt
 	}
 	return nil
-}
-
-func (m *Manager) reclaimCompareLocked() error {
-	fd, err := m.openPrivateDir(int(m.root.Fd()), compareDirName)
-	if err != nil {
-		if errors.Is(err, ErrPath) {
-			return nil
-		}
-		return err
-	}
-	syscall.Close(fd)
-	root := filepath.Join(m.root.Name(), compareDirName)
-	entries, err := os.ReadDir(root)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-		return err
-	}
-	for _, e := range entries {
-		if err := os.RemoveAll(filepath.Join(root, e.Name())); err != nil {
-			return err
-		}
-	}
-	m.compareScratch = 0
-	return nil
-}
-
-func (m *Manager) reserveCompareScratchLocked(size uint64) error {
-	charged, err := chargedTotal(m.slots)
-	if err != nil {
-		return err
-	}
-	need := charged + m.compareScratch + size + uint64(bounds.BrootBytes)
-	if need < charged || need < m.compareScratch || need > m.quota {
-		return ErrQuota
-	}
-	m.compareScratch += size
-	return nil
-}
-
-func (m *Manager) releaseCompareScratch(size uint64) {
-	if m == nil || size == 0 {
-		return
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.compareScratch >= size {
-		m.compareScratch -= size
-		return
-	}
-	m.compareScratch = 0
 }
 
 func (m *Manager) reclaimReservedLocked(slot int) {
@@ -746,10 +688,6 @@ func (m *Manager) reserveLocked(ctx context.Context) (int, [32]byte, error) {
 	need := uint64(bounds.GenerationCharge())
 	broot := uint64(bounds.BrootBytes)
 	charged := broot + total
-	if charged < broot {
-		return -1, [32]byte{}, ErrOverflow
-	}
-	charged += m.compareScratch
 	if charged < broot {
 		return -1, [32]byte{}, ErrOverflow
 	}

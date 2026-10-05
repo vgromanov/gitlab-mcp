@@ -14,7 +14,6 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	igl "gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/gitlab"
 	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/tools/readmeta"
 
 	gitlab "gitlab.com/gitlab-org/api/client-go/v2"
@@ -1087,42 +1086,44 @@ func readVersionContent(ctx context.Context, d Deps, q diffQuery, sec readmeta.S
 }
 
 func proveVersionContent(ctx context.Context, d Deps, q diffQuery, versionID int64, paths []string) (provedManifest, []retainedDiffFile, string, error) {
+	var charged chargeCount
+	zero := func() provedManifest { return provedManifest{Charged: charged.n} }
 	collect := newPatchCollect(paths)
-	first, err := getVersionBodyCollect(ctx, d, q.OwnerID, q.IID, versionID, true, collect)
+	first, err := getVersionBodyCollect(ctx, d, q.OwnerID, q.IID, versionID, &charged, collect)
 	if err != nil {
 		if passthroughTypedProviderErr(err) {
-			return provedManifest{}, nil, "", err
+			return zero(), nil, "", err
 		}
 		if err == errDiffUnproved {
-			return provedManifest{}, nil, readmeta.CodeUnsupported, nil
+			return zero(), nil, readmeta.CodeUnsupported, nil
 		}
-		return provedManifest{}, nil, readmeta.CodeHTTPError, nil
+		return zero(), nil, readmeta.CodeHTTPError, nil
 	}
 	parsed, status := parseVersionProof(first, versionID, q.MRID)
 	if status != "" {
-		return provedManifest{}, nil, status, nil
+		return zero(), nil, status, nil
 	}
 	firstFiles := retainedFromStream(first)
 	firstDigests := selectedSourceDigests(firstFiles, paths)
 
 	collect2 := newPatchCollect(paths)
-	second, err := getVersionBodyCollect(ctx, d, q.OwnerID, q.IID, versionID, false, collect2)
+	second, err := getVersionBodyCollect(ctx, d, q.OwnerID, q.IID, versionID, nil, collect2)
 	if err != nil {
 		if passthroughTypedProviderErr(err) {
-			return provedManifest{}, nil, "", err
+			return zero(), nil, "", err
 		}
-		return provedManifest{}, nil, readmeta.CodeHTTPError, nil
+		return zero(), nil, readmeta.CodeHTTPError, nil
 	}
 	again, status := parseVersionProof(second, versionID, q.MRID)
 	if status != "" || !sameParsedIdentity(parsed, again) || !requestedTupleMatches(q, parsed) {
-		return provedManifest{}, nil, readmeta.CodeInconsistent, nil
+		return zero(), nil, readmeta.CodeInconsistent, nil
 	}
 	secondFiles := retainedFromStream(second)
 	secondDigests := selectedSourceDigests(secondFiles, paths)
 	if !sameStringMap(firstDigests, secondDigests) {
-		return provedManifest{}, nil, readmeta.CodeInconsistent, nil
+		return zero(), nil, readmeta.CodeInconsistent, nil
 	}
-	proved := provedManifest{Head: parsed.head, Base: parsed.base, Start: parsed.start, Total: parsed.total}
+	proved := provedManifest{Head: parsed.head, Base: parsed.base, Start: parsed.start, Total: parsed.total, Charged: charged.n}
 	if !parsed.complete {
 		return proved, firstFiles, parsed.reason, nil
 	}
@@ -1161,13 +1162,13 @@ func sameStringMap(a, b map[string]string) bool {
 	return true
 }
 
-func getVersionBodyCollect(ctx context.Context, d Deps, projectID, iid, versionID int64, charge bool, collect *patchCollect) (objectStream, error) {
+func getVersionBodyCollect(ctx context.Context, d Deps, projectID, iid, versionID int64, charged *chargeCount, collect *patchCollect) (objectStream, error) {
 	path := fmt.Sprintf("projects/%s/merge_requests/%d/versions/%d", gitlab.PathEscape(strconv.FormatInt(projectID, 10)), iid, versionID)
 	st, resp, err := streamDiffObject(ctx, d.Client, path, nil, func(diffManifestEntry) error {
-		if !charge {
+		if charged == nil {
 			return nil
 		}
-		return igl.BudgetFromContext(ctx).AddItem()
+		return charged.charge(ctx)
 	}, collect)
 	if err != nil {
 		if passthroughTypedProviderErr(err) {
@@ -1197,11 +1198,9 @@ func readIncrementalContent(ctx context.Context, d Deps, q diffQuery, sec readme
 	}
 	path := fmt.Sprintf("projects/%s/repository/compare", gitlab.PathEscape(strconv.FormatInt(projectID, 10)))
 	collect := newPatchCollect(opts.Paths)
+	var charged chargeCount
 	st, _, err := streamDiffObject(ctx, d.Client, path, &compareOpt{From: q.Selection.From, To: q.Selection.To, Straight: true}, func(diffManifestEntry) error {
-		if b := igl.BudgetFromContext(ctx); b != nil {
-			return b.AddItem()
-		}
-		return nil
+		return charged.charge(ctx)
 	}, collect)
 	if err != nil {
 		if passthroughTypedProviderErr(err) {
@@ -1278,7 +1277,7 @@ func readIncrementalContent(ctx context.Context, d Deps, q diffQuery, sec readme
 	sec.Consistency = readmeta.ConsistencyConsistent
 	items := len(built)
 	sec.Counts.Items = &items
-	if out, ok := recoverCacheContent(ctx, d, q, sec, provedManifest{}, opts, 0); ok {
+	if out, ok := recoverCacheContent(ctx, d, q, sec, provedManifest{Charged: charged.n}, opts, 0); ok {
 		return out, nil
 	}
 	return diffContentOut{

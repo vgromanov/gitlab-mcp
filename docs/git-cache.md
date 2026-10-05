@@ -5,10 +5,15 @@ by default. When disabled, ordinary API metadata, approval, discussion, and
 raw-file tools keep their existing behavior and perform no cache filesystem or
 network work.
 
-Acquisition still does **not** invoke installed Git. RVG-145 comparison recovery
-(`get_merge_request_diff_window`) may run a locked-down no-checkout `git diff`
-against already authorized objects when the API cannot supply an exact
-comparison. Disable `GITLAB_MCP_GIT_CACHE` to keep honest API-partial results.
+Neither acquisition nor comparison invokes installed Git. RVG-145 comparison
+recovery (`get_merge_request_diff_window`) diffs already authorized objects
+in-process with go-git (tree diff with rename detection plus unified patches)
+when the API cannot supply an exact comparison. No `git` executable, scratch
+directory, or hook/attribute/textconv/external-diff configuration is involved,
+so the tool stays self-contained. The raw comparison listing is charged
+against the invocation `max_bytes` budget before any patch work, and recovery
+is declined when that charge exhausts the budget. Disable
+`GITLAB_MCP_GIT_CACHE` to keep honest API-partial results.
 
 ## What it does
 

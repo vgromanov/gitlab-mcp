@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -35,9 +36,6 @@ func (f *fakeCacheHold) Hold(context.Context, gitcache.AcquireIntent, gitcache.A
 }
 
 func TestDiffWindow_cacheRecoversOverflow(t *testing.T) {
-	if err := gitdiff.LookPath(); err != nil {
-		t.Skip(err.Error())
-	}
 	objs, base, head := twoCommitObjects(t, "p.txt", "old\n", "new\n")
 	hold := &gitcache.ObjectHold{
 		Result: gitcache.AcquireResult{
@@ -88,9 +86,6 @@ func TestDiffWindow_cacheRecoversOverflow(t *testing.T) {
 }
 
 func TestDiffWindow_cacheRecoversContent(t *testing.T) {
-	if err := gitdiff.LookPath(); err != nil {
-		t.Skip(err.Error())
-	}
 	objs, base, head := twoCommitObjects(t, "p.txt", "old\n", "new\n")
 	hold := &gitcache.ObjectHold{
 		Result: gitcache.AcquireResult{
@@ -153,9 +148,6 @@ func TestSortManifestEntriesMatchesAPI(t *testing.T) {
 }
 
 func TestDiffWindow_cacheItemBudgetLeavesSelectorsUnobserved(t *testing.T) {
-	if err := gitdiff.LookPath(); err != nil {
-		t.Skip(err.Error())
-	}
 	objs, base, head := twoFileCommitObjects(t)
 	hold := &gitcache.ObjectHold{
 		Result: gitcache.AcquireResult{
@@ -194,9 +186,6 @@ func TestDiffWindow_cacheItemBudgetLeavesSelectorsUnobserved(t *testing.T) {
 }
 
 func TestDiffWindow_cacheMismatchNeverVerified(t *testing.T) {
-	if err := gitdiff.LookPath(); err != nil {
-		t.Skip(err.Error())
-	}
 	objs, base, head := twoCommitObjects(t, "p.txt", "old\n", "new\n")
 	hold := &gitcache.ObjectHold{
 		Result: gitcache.AcquireResult{
@@ -405,9 +394,6 @@ func TestDiffWindow_completeAPISkipsCache(t *testing.T) {
 }
 
 func TestDiffWindow_apiAndGitAgreeOnFixture(t *testing.T) {
-	if err := gitdiff.LookPath(); err != nil {
-		t.Skip(err.Error())
-	}
 	objs, base, head := twoCommitObjects(t, "p.txt", "old\n", "new\n")
 	h := serveDiffBase(&pathLog{}, func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -428,15 +414,11 @@ func TestDiffWindow_apiAndGitAgreeOnFixture(t *testing.T) {
 		t.Fatalf("api entries=%#v", entries)
 	}
 	api := asMap(t, entries[0])
-	dir := t.TempDir()
-	if err := gitdiff.WriteBare(context.Background(), dir, objs); err != nil {
-		t.Fatal(err)
+	cmp, err := gitdiff.Compare(context.Background(), base, head, gitdiff.SemanticsFullMR, objs, gitdiff.Limits{})
+	if err != nil || len(cmp.Files) != 1 {
+		t.Fatalf("git %#v %v", cmp.Result, err)
 	}
-	res, err := gitdiff.Raw(context.Background(), dir, base, head, gitdiff.SemanticsFullMR, objs, gitdiff.Limits{})
-	if err != nil || len(res.Files) != 1 {
-		t.Fatalf("git %#v %v", res, err)
-	}
-	g := res.Files[0]
+	g := cmp.Files[0]
 	if api["new_path"] != g.NewPath || api["old_path"] != g.OldPath {
 		t.Fatalf("paths api=%#v git=%#v", api, g)
 	}
@@ -450,9 +432,6 @@ func TestDiffWindow_apiAndGitAgreeOnFixture(t *testing.T) {
 }
 
 func TestDiffWindow_cacheRecoversIncremental(t *testing.T) {
-	if err := gitdiff.LookPath(); err != nil {
-		t.Skip(err.Error())
-	}
 	objs, base, head := twoCommitObjects(t, "p.txt", "old\n", "new\n")
 	hold := &gitcache.ObjectHold{
 		Result: gitcache.AcquireResult{
@@ -493,9 +472,6 @@ func TestDiffWindow_cacheRecoversIncremental(t *testing.T) {
 }
 
 func TestDiffWindow_incrementalMaxItemsStillRecovers(t *testing.T) {
-	if err := gitdiff.LookPath(); err != nil {
-		t.Skip(err.Error())
-	}
 	objs, base, head := twoCommitObjects(t, "p.txt", "old\n", "new\n")
 	hold := &gitcache.ObjectHold{
 		Result: gitcache.AcquireResult{
@@ -539,9 +515,6 @@ func TestDiffWindow_incrementalMaxItemsStillRecovers(t *testing.T) {
 }
 
 func TestDiffWindow_cacheRecoversMissingDiffsArray(t *testing.T) {
-	if err := gitdiff.LookPath(); err != nil {
-		t.Skip(err.Error())
-	}
 	objs, base, head := twoCommitObjects(t, "p.txt", "old\n", "new\n")
 	hold := &gitcache.ObjectHold{
 		Result: gitcache.AcquireResult{
@@ -595,9 +568,6 @@ func TestPatchPathspecIncludesBothRenameSides(t *testing.T) {
 }
 
 func TestDiffWindow_cacheRenameOneSidedSelector(t *testing.T) {
-	if err := gitdiff.LookPath(); err != nil {
-		t.Skip(err.Error())
-	}
 	objs, base, head := renameCommitObjects(t)
 	for _, path := range []string{"old.txt", "new.txt"} {
 		t.Run(path, func(t *testing.T) {
@@ -660,5 +630,146 @@ func TestManifestByteCapExhaustedIsZero(t *testing.T) {
 	}
 	if got := manifestByteCap(context.Background()); got != 8<<20 {
 		t.Fatalf("unlimited cap=%d", got)
+	}
+}
+
+func cacheHoldFor(objs map[plumbing.Hash]pack.Object, base, head string) *fakeCacheHold {
+	return &fakeCacheHold{enabled: true, hold: &gitcache.ObjectHold{
+		Result: gitcache.AcquireResult{
+			GenerationID: "gen-x",
+			Grant: gitcache.Grant{
+				ProjectID: "42", SourceFork: "42", TargetProjectID: "42",
+				HeadSHA: plumbing.NewHash(head), BaseSHA: plumbing.NewHash(base), StartSHA: plumbing.NewHash(base),
+			},
+		},
+		Objects: objs,
+	}}
+}
+
+func tupleOverflowHandler(head, base string) http.Handler {
+	row := fmt.Sprintf(`{"id":7,"merge_request_id":5001,"head_commit_sha":%q,"base_commit_sha":%q,"start_commit_sha":%q}`, head, base, base)
+	return serveDiffBase(&pathLog{}, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/versions/7"):
+			_, _ = io.WriteString(w, versionObject(7, 5001, head, base, base, "overflow", "1", "[]"))
+		case strings.Contains(r.URL.Path, "/versions"):
+			w.Header().Set("X-Next-Page", "")
+			_, _ = io.WriteString(w, "["+row+"]")
+		case strings.Contains(r.URL.Path, "/merge_requests/"):
+			_, _ = io.WriteString(w, `{"id":5001,"iid":1,"project_id":42,"source_project_id":42}`)
+		default:
+			http.NotFound(w, r)
+		}
+	})
+}
+
+func TestDiffWindow_tupleVersionListItemsAreNotCreditedToRecovery(t *testing.T) {
+	objs, base, head := twoFileCommitObjects(t)
+	for _, tc := range []struct {
+		maxItems int
+		want     int
+	}{{1, 0}, {2, 1}, {3, 2}} {
+		t.Run(fmt.Sprintf("max_items_%d", tc.maxItems), func(t *testing.T) {
+			d := diffDeps(t, tupleOverflowHandler(head, base))
+			d.cacheHold = cacheHoldFor(objs, base, head)
+			out, err := callDiffWindow(t, d, nil, map[string]any{
+				"project_id": "42", "merge_request_iid": 1, "base_sha": base, "start_sha": base, "head_sha": head,
+				"per_page": 20, "max_items": tc.maxItems,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			entries, _ := out["entries"].([]any)
+			if len(entries) != tc.want {
+				t.Fatalf("max_items=%d returned %d entries, want %d (version list row must stay charged): %#v", tc.maxItems, len(entries), tc.want, entries)
+			}
+			if tc.want < 2 && sectionMap(out)["content_complete"] == readmeta.ContentCompleteTrue {
+				t.Fatalf("budget-truncated recovery claimed complete: %#v", sectionMap(out))
+			}
+		})
+	}
+}
+
+func TestDiffWindow_tupleContentChargesFirstRecoveredDiff(t *testing.T) {
+	objs, base, head := twoFileCommitObjects(t)
+	d := diffDeps(t, tupleOverflowHandler(head, base))
+	d.cacheHold = cacheHoldFor(objs, base, head)
+	out, err := callDiffWindow(t, d, nil, map[string]any{
+		"project_id": "42", "merge_request_iid": 1, "base_sha": base, "start_sha": base, "head_sha": head,
+		"mode": "content", "paths": []string{"a.txt", "b.txt"}, "max_items": 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	byPath := map[string]string{}
+	for _, raw := range asSlice(t, out["selectors"]) {
+		s := asMap(t, raw)
+		byPath[asString(s["path"])] = asString(s["status"])
+	}
+	if byPath["a.txt"] != diffSelectorMatched || byPath["b.txt"] != diffSelectorUnobserved {
+		t.Fatalf("selectors=%#v", byPath)
+	}
+}
+
+func TestChargeRawComparison(t *testing.T) {
+	if !chargeRawComparison(context.Background(), 1<<30) {
+		t.Fatal("no budget must always pass")
+	}
+	b := igl.DefaultBudget()
+	b.MaxBytes = 100
+	ctx := igl.WithBudget(context.Background(), b)
+	if !chargeRawComparison(ctx, 60) {
+		t.Fatal("within budget")
+	}
+	if got := b.RemainingBytes(); got != 40 {
+		t.Fatalf("remaining=%d", got)
+	}
+	if chargeRawComparison(ctx, 40) {
+		t.Fatal("charge that exhausts the budget must decline")
+	}
+	if chargeRawComparison(ctx, 1) {
+		t.Fatal("already exhausted budget must decline")
+	}
+}
+
+func TestDiffWindow_cacheRawComparisonIsChargedAgainstMaxBytes(t *testing.T) {
+	objs, base, head := twoFileCommitObjects(t)
+	cmp, err := gitdiff.Compare(context.Background(), base, head, gitdiff.SemanticsFullMR, objs, gitdiff.Limits{})
+	if err != nil || cmp.RawBytes == 0 {
+		t.Fatalf("compare %#v %v", cmp.Result, err)
+	}
+	run := func(withCache bool, maxBytes int64, args map[string]any) (map[string]any, int64) {
+		t.Helper()
+		d := diffDeps(t, overflowHandler(head, base))
+		if withCache {
+			d.cacheHold = cacheHoldFor(objs, base, head)
+		}
+		b := igl.DefaultBudget()
+		b.MaxBytes = maxBytes
+		b.MaxRequests = 64
+		ctx := igl.WithBudget(context.Background(), b)
+		out, err := callDiffWindow(t, d, ctx, args)
+		if err != nil {
+			t.Fatalf("maxBytes=%d: %v", maxBytes, err)
+		}
+		_, used, _ := b.Stats()
+		return out, used
+	}
+	for _, args := range []map[string]any{
+		{"project_id": "42", "merge_request_iid": 1, "diff_version_id": 1, "per_page": 20},
+		{"project_id": "42", "merge_request_iid": 1, "diff_version_id": 1, "mode": "content", "paths": []string{"a.txt"}},
+	} {
+		_, apiOnly := run(false, 1<<30, args)
+		out, withCache := run(true, 1<<30, args)
+		if sectionMap(out)["source"] != readmeta.SourceGitCache {
+			t.Fatalf("args=%v section=%#v", args, sectionMap(out))
+		}
+		if withCache-apiOnly < int64(cmp.RawBytes) {
+			t.Fatalf("args=%v raw comparison not charged: api=%d cached=%d raw=%d", args, apiOnly, withCache, cmp.RawBytes)
+		}
+		exhausted, _ := run(true, apiOnly+int64(cmp.RawBytes), args)
+		if sectionMap(exhausted)["source"] == readmeta.SourceGitCache {
+			t.Fatalf("args=%v recovery must decline once the raw comparison exhausts max_bytes: %#v", args, sectionMap(exhausted))
+		}
 	}
 }

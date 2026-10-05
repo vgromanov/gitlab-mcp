@@ -2,7 +2,6 @@ package tools
 
 import (
 	"context"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -12,7 +11,6 @@ import (
 
 	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/gitcache"
 	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/gitcache/gitdiff"
-	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/gitcache/pack"
 	igl "gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/gitlab"
 	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/tools/readmeta"
 )
@@ -75,21 +73,17 @@ func recoverCacheManifest(ctx context.Context, d Deps, q diffQuery, sec readmeta
 		return diffWindowOut{}, false
 	}
 	defer hold.Release()
-	dir, cleanup, err := d.openCompareDir(ctx, hold.Objects)
-	if err != nil {
-		return diffWindowOut{}, false
-	}
-	defer cleanup()
-	if err := gitdiff.WriteBare(ctx, dir, hold.Objects); err != nil {
-		return diffWindowOut{}, false
-	}
 	lim := gitdiff.Limits{MaxBytes: manifestByteCap(ctx), Timeout: remainingOrDefault(ctx)}
-	res, err := gitdiff.Raw(ctx, dir, from, to, sem, hold.Objects, lim)
+	cmp, err := gitdiff.Compare(ctx, from, to, sem, hold.Objects, lim)
+	res := cmp.Result
 	if err != nil {
 		if res.Partial {
 			sec.AddLimitation(readmeta.CodePartial, res.Reason)
 			sec.ContentComplete = readmeta.ContentCompleteFalse
 		}
+		return diffWindowOut{}, false
+	}
+	if !chargeRawComparison(ctx, res.RawBytes) {
 		return diffWindowOut{}, false
 	}
 	sec.Limitations = []readmeta.Limitation{}
@@ -98,7 +92,7 @@ func recoverCacheManifest(ctx context.Context, d Deps, q diffQuery, sec readmeta
 		all = append(all, entryFromGitFile(f))
 	}
 	sortManifestEntries(all)
-	already := alreadyChargedItems(ctx)
+	already := proved.Charged
 	entries := make([]diffManifestEntry, 0, len(all))
 	full := true
 	for i, e := range all {
@@ -135,17 +129,13 @@ func recoverCacheContent(ctx context.Context, d Deps, q diffQuery, sec readmeta.
 		return diffContentOut{}, false
 	}
 	defer hold.Release()
-	dir, cleanup, err := d.openCompareDir(ctx, hold.Objects)
-	if err != nil {
-		return diffContentOut{}, false
-	}
-	defer cleanup()
-	if err := gitdiff.WriteBare(ctx, dir, hold.Objects); err != nil {
-		return diffContentOut{}, false
-	}
 	rawLim := gitdiff.Limits{MaxBytes: manifestByteCap(ctx), Timeout: remainingOrDefault(ctx)}
-	res, err := gitdiff.Raw(ctx, dir, from, to, sem, hold.Objects, rawLim)
+	cmp, err := gitdiff.Compare(ctx, from, to, sem, hold.Objects, rawLim)
 	if err != nil {
+		return diffContentOut{}, false
+	}
+	res := cmp.Result
+	if !chargeRawComparison(ctx, res.RawBytes) {
 		return diffContentOut{}, false
 	}
 	sec.Limitations = []readmeta.Limitation{}
@@ -156,7 +146,7 @@ func recoverCacheContent(ctx context.Context, d Deps, q diffQuery, sec readmeta.
 	sort.SliceStable(all, func(i, j int) bool {
 		return manifestOrderLess(all[i].entry, all[j].entry)
 	})
-	already := alreadyChargedItems(ctx)
+	already := proved.Charged
 	files := make([]retainedDiffFile, 0, len(all))
 	truncated := false
 	for i, f := range all {
@@ -170,17 +160,23 @@ func recoverCacheContent(ctx context.Context, d Deps, q diffQuery, sec readmeta.
 		files = append(files, f)
 	}
 	patchLim := gitdiff.Limits{MaxBytes: patchByteCap(ctx, opts), Timeout: remainingOrDefault(ctx)}
-	text, partial, command, err := gitdiff.Patch(ctx, dir, from, to, patchPathspec(opts.Paths, files), patchLim)
+	pres, err := cmp.Patches(ctx, patchPathspec(opts.Paths, files), patchLim)
+	partial := pres.Partial
 	if err != nil && !partial {
 		return diffContentOut{}, false
 	}
 	if b := igl.BudgetFromContext(ctx); b != nil {
-		if err := b.ChargeBytes(int64(len(text))); err != nil {
+		if err := b.ChargeBytes(int64(pres.Bytes)); err != nil {
 			partial = true
 			sec.AddLimitation(readmeta.CodePartial, "byte budget")
 		}
 	}
-	byPath := gitdiff.SplitPatches(text)
+	command := pres.Command
+	byPath := make(map[string]string, 2*len(pres.Patches))
+	for _, p := range pres.Patches {
+		byPath[p.OldPath] = p.Text
+		byPath[p.NewPath] = p.Text
+	}
 	for i := range files {
 		e := files[i].entry
 		p := firstNonEmpty(pathStr(e.NewPath), pathStr(e.OldPath))
@@ -456,12 +452,17 @@ func shaOr(primary, fallback string) string {
 	return ""
 }
 
-func alreadyChargedItems(ctx context.Context) int {
-	if b := igl.BudgetFromContext(ctx); b != nil {
-		_, _, items := b.Stats()
-		return items
+// chargeRawComparison charges the raw comparison listing against max_bytes and
+// reports false when that exhausts the byte budget, so no patch work follows.
+func chargeRawComparison(ctx context.Context, n int) bool {
+	b := igl.BudgetFromContext(ctx)
+	if b == nil {
+		return true
 	}
-	return 0
+	if err := b.ChargeBytes(int64(n)); err != nil {
+		return false
+	}
+	return b.RemainingBytes() != 0
 }
 
 func manifestByteCap(ctx context.Context) int {
@@ -504,32 +505,6 @@ func cacheProjectID(q diffQuery) string {
 		return strconv.FormatInt(q.OwnerID, 10)
 	}
 	return ""
-}
-
-func (d Deps) openCompareDir(ctx context.Context, objs map[plumbing.Hash]pack.Object) (string, func(), error) {
-	size := objectBytes(objs)
-	if d.GitCache != nil {
-		if mgr := d.GitCache.Manager(); mgr != nil {
-			dir, cleanup, err := mgr.OpenCompareDir(ctx, size)
-			if err != nil {
-				return "", nil, err
-			}
-			return dir, func() { _ = cleanup() }, nil
-		}
-	}
-	dir, err := os.MkdirTemp("", "gitlab-mcp-gitdiff-")
-	if err != nil {
-		return "", nil, err
-	}
-	return dir, func() { _ = os.RemoveAll(dir) }, nil
-}
-
-func objectBytes(objs map[plumbing.Hash]pack.Object) int64 {
-	var n int64
-	for _, obj := range objs {
-		n += int64(len(obj.Data))
-	}
-	return n
 }
 
 func remainingOrDefault(ctx context.Context) time.Duration {

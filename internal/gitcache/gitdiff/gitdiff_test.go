@@ -1,12 +1,13 @@
 package gitdiff
 
 import (
-	"bytes"
 	"context"
+	"errors"
 	"fmt"
-	"os"
-	"os/exec"
+	"go/parser"
+	"go/token"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -17,364 +18,515 @@ import (
 	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/gitcache/tree"
 )
 
-func requireGit(t *testing.T) {
-	t.Helper()
-	if err := LookPath(); err != nil {
-		t.Skip(err.Error())
-	}
+// fileSpec describes one blob (or gitlink) in a synthetic snapshot.
+type fileSpec struct {
+	mode string
+	data string
+	sha  string
 }
 
-func TestRawSpecialPathsAndKinds(t *testing.T) {
-	requireGit(t)
-	repo := t.TempDir()
-	gitCmd(t, repo, "init", "-q", "--initial-branch=main")
-	gitCmd(t, repo, "config", "user.email", "t@t")
-	gitCmd(t, repo, "config", "user.name", "t")
-	write(t, filepath.Join(repo, "keep.txt"), "keep\n")
-	write(t, filepath.Join(repo, "gone.txt"), "gone\n")
-	write(t, filepath.Join(repo, "old name.txt"), "rename-me\n")
-	write(t, filepath.Join(repo, "mode.txt"), "mode\n")
-	write(t, filepath.Join(repo, "bin.dat"), "a\x00b")
-	write(t, filepath.Join(repo, "file with spaces.txt"), "spaces\n")
-	nl := filepath.Join(repo, "new\nline.txt")
-	write(t, nl, "nl\n")
-	gitCmd(t, repo, "add", "-A")
-	sub := strings.Repeat("a", 40)
-	gitCmd(t, repo, "update-index", "--add", "--cacheinfo", "160000,"+sub+",vendor/mod")
-	gitCmd(t, repo, "commit", "-qm", "base")
-	base := strings.TrimSpace(string(gitCmd(t, repo, "rev-parse", "HEAD")))
+func reg(data string) fileSpec  { return fileSpec{mode: tree.ModeFile, data: data} }
+func exec(data string) fileSpec { return fileSpec{mode: tree.ModeExec, data: data} }
+func link(sha string) fileSpec  { return fileSpec{mode: tree.ModeCommit, sha: sha} }
 
-	if err := os.Remove(filepath.Join(repo, "gone.txt")); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Rename(filepath.Join(repo, "old name.txt"), filepath.Join(repo, "new name.txt")); err != nil {
-		t.Fatal(err)
-	}
-	write(t, filepath.Join(repo, "mode.txt"), "mode\n")
-	if err := os.Chmod(filepath.Join(repo, "mode.txt"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	write(t, filepath.Join(repo, "added.txt"), "add\n")
-	write(t, filepath.Join(repo, "bin.dat"), "a\x00c")
-	write(t, filepath.Join(repo, "file with spaces.txt"), "spaces-changed\n")
-	write(t, nl, "nl-changed\n")
-	gitCmd(t, repo, "add", "-A")
-	sub2 := strings.Repeat("b", 40)
-	gitCmd(t, repo, "update-index", "--add", "--cacheinfo", "160000,"+sub2+",vendor/mod")
-	gitCmd(t, repo, "commit", "-qm", "head")
-	head := strings.TrimSpace(string(gitCmd(t, repo, "rev-parse", "HEAD")))
+type store map[plumbing.Hash]pack.Object
 
-	gitDir := filepath.Join(repo, ".git")
-	objs := loadObjects(t, gitDir)
-	bare := t.TempDir()
-	if err := WriteBare(context.Background(), bare, objs); err != nil {
-		t.Fatal(err)
+func (s store) put(kind string, data []byte) plumbing.Hash {
+	h := pack.HashObject(kind, data)
+	s[h] = pack.Object{Type: kind, Data: data, Hash: h}
+	return h
+}
+
+// snapshot writes a commit whose tree holds files (slash-separated paths).
+func (s store) snapshot(t *testing.T, parent string, files map[string]fileSpec) string {
+	t.Helper()
+	root := s.tree(t, files, "")
+	body := "tree " + root.String() + "\n"
+	if parent != "" {
+		body += "parent " + parent + "\n"
 	}
-	plantHook(t, bare)
-	res, err := Raw(context.Background(), bare, base, head, SemanticsFullMR, objs, Limits{})
+	body += "author A <a@a> 1 +0000\ncommitter A <a@a> 1 +0000\n\nmsg\n"
+	return s.put("commit", []byte(body)).String()
+}
+
+func (s store) tree(t *testing.T, files map[string]fileSpec, prefix string) plumbing.Hash {
+	t.Helper()
+	var entries []tree.TreeEntry
+	dirs := map[string]map[string]fileSpec{}
+	for p, f := range files {
+		name, rest, nested := strings.Cut(p, "/")
+		if nested {
+			if dirs[name] == nil {
+				dirs[name] = map[string]fileSpec{}
+			}
+			dirs[name][rest] = f
+			continue
+		}
+		if f.mode == tree.ModeCommit {
+			entries = append(entries, tree.TreeEntry{Mode: f.mode, Name: name, Hash: plumbing.NewHash(f.sha)})
+			continue
+		}
+		entries = append(entries, tree.TreeEntry{Mode: f.mode, Name: name, Hash: s.put("blob", []byte(f.data))})
+	}
+	for name, sub := range dirs {
+		entries = append(entries, tree.TreeEntry{Mode: tree.ModeTree, Name: name, Hash: s.tree(t, sub, prefix+name+"/")})
+	}
+	return s.put("tree", encodeTree(entries))
+}
+
+// encodeTree writes git tree bytes without the cache's name validation so
+// fixtures can carry spaces and other legal path bytes.
+func encodeTree(entries []tree.TreeEntry) []byte {
+	key := func(e tree.TreeEntry) string {
+		if e.Mode == tree.ModeTree {
+			return e.Name + "/"
+		}
+		return e.Name
+	}
+	sort.Slice(entries, func(i, j int) bool { return key(entries[i]) < key(entries[j]) })
+	var body []byte
+	for _, e := range entries {
+		body = append(body, e.Mode+" "+e.Name+"\x00"...)
+		body = append(body, e.Hash[:]...)
+	}
+	return body
+}
+
+func bg() context.Context { return context.Background() }
+
+func TestCompareKindsPathsAndModes(t *testing.T) {
+	s := store{}
+	sub1, sub2 := strings.Repeat("a", 40), strings.Repeat("b", 40)
+	lines := strings.Repeat("line of rename-me content\n", 20)
+	base := s.snapshot(t, "", map[string]fileSpec{
+		"keep.txt":             reg("keep\n"),
+		"gone.txt":             reg("gone\n"),
+		"old name.txt":         reg(lines),
+		"mode.txt":             reg("mode\n"),
+		"bin.dat":              reg("a\x00b"),
+		"file with spaces.txt": reg("spaces\n"),
+		"dir/sub/deep.txt":     reg("deep\n"),
+		"vendor/mod":           link(sub1),
+	})
+	head := s.snapshot(t, base, map[string]fileSpec{
+		"keep.txt":             reg("keep\n"),
+		"new name.txt":         reg(lines),
+		"mode.txt":             exec("mode\n"),
+		"added.txt":            reg("add\n"),
+		"bin.dat":              reg("a\x00c"),
+		"file with spaces.txt": reg("spaces-changed\n"),
+		"dir/sub/deep.txt":     reg("deep-changed\n"),
+		"vendor/mod":           link(sub2),
+	})
+	t.Setenv("PATH", "")
+	cmp, err := Compare(bg(), base, head, SemanticsFullMR, s, Limits{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.Partial {
-		t.Fatalf("partial: %#v", res)
+	res := cmp.Result
+	if res.Partial || res.Command != RawCommand || res.From != base || res.To != head || res.Semantics != SemanticsFullMR {
+		t.Fatalf("result %#v", res)
 	}
-	if _, err := os.Stat(filepath.Join(bare, "hooks", "fired")); !os.IsNotExist(err) {
-		t.Fatal("hook executed")
+	if res.RawBytes <= 0 {
+		t.Fatalf("raw bytes %d", res.RawBytes)
 	}
 	byNew := map[string]File{}
 	for _, f := range res.Files {
 		byNew[f.NewPath] = f
 	}
-	if f, ok := byNew["added.txt"]; !ok || !f.NewFile {
+	if f, ok := byNew["added.txt"]; !ok || !f.NewFile || f.AMode != "0" || f.BMode != "100644" || f.Status != "A" {
 		t.Fatalf("added %#v", res.Files)
 	}
-	if f, ok := byNew["gone.txt"]; !ok || !f.DeletedFile {
+	if f, ok := byNew["gone.txt"]; !ok || !f.DeletedFile || f.BMode != "0" || f.Status != "D" || f.OldPath != "gone.txt" {
 		t.Fatalf("deleted %#v", res.Files)
 	}
-	if f, ok := byNew["new name.txt"]; !ok || !f.RenamedFile || f.OldPath != "old name.txt" {
+	if f, ok := byNew["new name.txt"]; !ok || !f.RenamedFile || f.OldPath != "old name.txt" || f.Status != "R" {
 		t.Fatalf("rename %#v", res.Files)
 	}
 	if f, ok := byNew["bin.dat"]; !ok || !f.Binary {
 		t.Fatalf("binary %#v", res.Files)
 	}
-	if _, ok := byNew["file with spaces.txt"]; !ok {
-		t.Fatalf("spaces missing %#v", res.Files)
+	if f, ok := byNew["file with spaces.txt"]; !ok || f.Binary || f.Submodule {
+		t.Fatalf("spaces %#v", res.Files)
 	}
-	if _, ok := byNew["new\nline.txt"]; !ok {
-		t.Fatalf("newline path missing %#v", res.Files)
+	if _, ok := byNew["dir/sub/deep.txt"]; !ok {
+		t.Fatalf("nested path missing %#v", res.Files)
 	}
-	if f, ok := byNew["vendor/mod"]; !ok || !f.Submodule {
+	if f, ok := byNew["vendor/mod"]; !ok || !f.Submodule || f.AMode != "160000" {
 		t.Fatalf("submodule %#v", res.Files)
 	}
-	if f, ok := byNew["mode.txt"]; !ok || f.AMode == f.BMode {
+	if f, ok := byNew["mode.txt"]; !ok || f.AMode != "100644" || f.BMode != "100755" {
 		t.Fatalf("mode %#v", res.Files)
+	}
+	if _, ok := byNew["keep.txt"]; ok {
+		t.Fatalf("unchanged file listed: %#v", res.Files)
 	}
 }
 
-func TestRawMissingCommitFailsClosed(t *testing.T) {
-	requireGit(t)
-	objs := map[plumbing.Hash]pack.Object{}
-	_, err := Raw(context.Background(), t.TempDir(), strings.Repeat("a", 40), strings.Repeat("b", 40), SemanticsStraight, objs, Limits{})
-	if !errorsIs(err, ErrObject) {
+func TestCompareMissingCommitFailsClosed(t *testing.T) {
+	cmp, err := Compare(bg(), strings.Repeat("a", 40), strings.Repeat("b", 40), SemanticsStraight, store{}, Limits{})
+	if !errors.Is(err, ErrObject) || cmp == nil {
 		t.Fatalf("err=%v", err)
 	}
 }
 
-func TestRawOutputLimitIsPartial(t *testing.T) {
-	requireGit(t)
-	objs, base, head := manyFiles(t, 80)
-	bare := t.TempDir()
-	if err := WriteBare(context.Background(), bare, objs); err != nil {
-		t.Fatal(err)
+func TestCompareMissingTreeOrBlobFailsClosed(t *testing.T) {
+	s := store{}
+	base := s.snapshot(t, "", map[string]fileSpec{"a.txt": reg("1\n")})
+	head := s.snapshot(t, base, map[string]fileSpec{"a.txt": reg("2\n")})
+	for h, o := range s {
+		if o.Type == "tree" {
+			delete(s, h)
+			break
+		}
 	}
-	res, err := Raw(context.Background(), bare, base, head, SemanticsStraight, objs, Limits{MaxBytes: 64, Timeout: 5 * time.Second})
-	if !errorsIs(err, ErrPartial) || !res.Partial {
-		t.Fatalf("want partial: %#v %v", res, err)
-	}
-}
-
-func TestRawTimeLimitIsPartial(t *testing.T) {
-	requireGit(t)
-	objs, base, head := manyFiles(t, 80)
-	bare := t.TempDir()
-	if err := WriteBare(context.Background(), bare, objs); err != nil {
-		t.Fatal(err)
-	}
-	res, err := Raw(context.Background(), bare, base, head, SemanticsStraight, objs, Limits{MaxBytes: 8 << 20, Timeout: time.Nanosecond})
-	if !errorsIs(err, ErrPartial) || !res.Partial {
-		t.Fatalf("want time partial: %#v %v", res, err)
+	if _, err := Compare(bg(), base, head, SemanticsStraight, s, Limits{}); !errors.Is(err, ErrObject) {
+		t.Fatalf("missing tree: %v", err)
 	}
 }
 
-func TestNoExternalTextconvOrDiff(t *testing.T) {
-	requireGit(t)
-	repo := t.TempDir()
-	gitCmd(t, repo, "init", "-q", "--initial-branch=main")
-	gitCmd(t, repo, "config", "user.email", "t@t")
-	gitCmd(t, repo, "config", "user.name", "t")
-	write(t, filepath.Join(repo, "x.txt"), "one\n")
-	write(t, filepath.Join(repo, ".gitattributes"), "* diff=evil\n")
-	gitCmd(t, repo, "add", "-A")
-	gitCmd(t, repo, "commit", "-qm", "base")
-	base := strings.TrimSpace(string(gitCmd(t, repo, "rev-parse", "HEAD")))
-	write(t, filepath.Join(repo, "x.txt"), "two\n")
-	gitCmd(t, repo, "commit", "-am", "head")
-	head := strings.TrimSpace(string(gitCmd(t, repo, "rev-parse", "HEAD")))
-	objs := loadObjects(t, filepath.Join(repo, ".git"))
-	bare := t.TempDir()
-	if err := WriteBare(context.Background(), bare, objs); err != nil {
-		t.Fatal(err)
+func TestCompareRejectsTamperedObject(t *testing.T) {
+	s := store{}
+	base := s.snapshot(t, "", map[string]fileSpec{"a.txt": reg("1\n")})
+	head := s.snapshot(t, base, map[string]fileSpec{"a.txt": reg("2\n")})
+	for h, o := range s {
+		if o.Type == "tree" {
+			o.Data = append([]byte(nil), o.Data...)
+			o.Data[len(o.Data)-1] ^= 0xff
+			s[h] = o
+		}
 	}
-	script := filepath.Join(bare, "evil.sh")
-	write(t, script, "#!/bin/sh\necho fired > \"$(dirname \"$0\")/evil.out\"\n")
-	if err := os.Chmod(script, 0o755); err != nil {
-		t.Fatal(err)
+	if _, err := Compare(bg(), base, head, SemanticsStraight, s, Limits{}); !errors.Is(err, ErrObject) {
+		t.Fatalf("tampered: %v", err)
 	}
-	t.Setenv("GIT_EXTERNAL_DIFF", script)
-	res, err := Raw(context.Background(), bare, base, head, SemanticsStraight, objs, Limits{})
-	if err != nil {
-		t.Fatal(err)
+	other := pack.Object{Type: "commit", Data: []byte("x"), Hash: plumbing.NewHash(strings.Repeat("c", 40))}
+	if err := RequireCommits(map[plumbing.Hash]pack.Object{other.Hash: other}, other.Hash.String()); err != nil {
+		t.Fatalf("require commit: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(bare, "evil.out")); !os.IsNotExist(err) {
-		t.Fatal("external diff ran")
+}
+
+func TestCompareOutputLimitIsPartial(t *testing.T) {
+	objs, base, head := manyFiles(t, 80)
+	cmp, err := Compare(bg(), base, head, SemanticsStraight, objs, Limits{MaxBytes: 64, Timeout: 5 * time.Second})
+	if !errors.Is(err, ErrPartial) || !cmp.Partial || cmp.Reason != "output limit" {
+		t.Fatalf("want partial: %#v %v", cmp.Result, err)
 	}
-	if len(res.Files) == 0 {
-		t.Fatal("empty")
+	if cmp.RawBytes > 64 {
+		t.Fatalf("raw bytes %d exceed cap", cmp.RawBytes)
+	}
+}
+
+func TestCompareTimeLimitIsPartial(t *testing.T) {
+	objs, base, head := manyFiles(t, 80)
+	cmp, err := Compare(bg(), base, head, SemanticsStraight, objs, Limits{MaxBytes: 8 << 20, Timeout: time.Nanosecond})
+	if !errors.Is(err, ErrPartial) || !cmp.Partial || cmp.Reason != "time limit" {
+		t.Fatalf("want time partial: %#v %v", cmp.Result, err)
+	}
+}
+
+func TestCompareCanceledContext(t *testing.T) {
+	objs, base, head := manyFiles(t, 5)
+	ctx, cancel := context.WithCancel(bg())
+	cancel()
+	if _, err := Compare(ctx, base, head, SemanticsStraight, objs, Limits{}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancel: %v", err)
+	}
+}
+
+func TestCompareNilContext(t *testing.T) {
+	objs, base, head := manyFiles(t, 3)
+	//nolint:staticcheck // nil context is tolerated deliberately
+	cmp, err := Compare(nil, base, head, SemanticsStraight, objs, Limits{})
+	if err != nil || len(cmp.Files) != 3 {
+		t.Fatalf("%v %#v", err, cmp.Result)
+	}
+	res, err := cmp.Patches(nil, nil, Limits{}) //nolint:staticcheck
+	if err != nil || len(res.Patches) != 3 {
+		t.Fatalf("%v %#v", err, res)
 	}
 }
 
 func TestLargeManifestMetadata(t *testing.T) {
-	requireGit(t)
 	objs, base, head := manyFiles(t, 3500)
-	bare := t.TempDir()
-	if err := WriteBare(context.Background(), bare, objs); err != nil {
-		t.Fatal(err)
-	}
-	res, err := Raw(context.Background(), bare, base, head, SemanticsFullMR, objs, Limits{MaxBytes: 16 << 20, Timeout: 30 * time.Second})
+	cmp, err := Compare(bg(), base, head, SemanticsFullMR, objs, Limits{MaxBytes: 16 << 20, Timeout: 30 * time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(res.Files) < 3475 {
-		t.Fatalf("files=%d", len(res.Files))
+	if len(cmp.Files) != 3500 {
+		t.Fatalf("files=%d", len(cmp.Files))
 	}
-	for _, f := range res.Files {
+	for _, f := range cmp.Files {
 		if f.NewPath == "" && f.OldPath == "" {
 			t.Fatal("empty path")
 		}
 	}
 }
 
-func TestPatchAgreesWithRaw(t *testing.T) {
-	requireGit(t)
-	repo := t.TempDir()
-	gitCmd(t, repo, "init", "-q", "--initial-branch=main")
-	gitCmd(t, repo, "config", "user.email", "t@t")
-	gitCmd(t, repo, "config", "user.name", "t")
-	write(t, filepath.Join(repo, "a.txt"), "1\n2\n3\n")
-	gitCmd(t, repo, "add", "a.txt")
-	gitCmd(t, repo, "commit", "-qm", "base")
-	base := strings.TrimSpace(string(gitCmd(t, repo, "rev-parse", "HEAD")))
-	write(t, filepath.Join(repo, "a.txt"), "1\nX\n3\n")
-	gitCmd(t, repo, "commit", "-am", "head")
-	head := strings.TrimSpace(string(gitCmd(t, repo, "rev-parse", "HEAD")))
-	objs := loadObjects(t, filepath.Join(repo, ".git"))
-	bare := t.TempDir()
-	if err := WriteBare(context.Background(), bare, objs); err != nil {
+func TestPatchAgreesWithManifest(t *testing.T) {
+	s := store{}
+	base := s.snapshot(t, "", map[string]fileSpec{"a.txt": reg("1\n2\n3\n"), "b.txt": reg("b\n")})
+	head := s.snapshot(t, base, map[string]fileSpec{"a.txt": reg("1\nX\n3\n"), "b.txt": reg("b2\n")})
+	cmp, err := Compare(bg(), base, head, SemanticsStraight, s, Limits{})
+	if err != nil || len(cmp.Files) != 2 {
+		t.Fatalf("%#v %v", cmp.Result, err)
+	}
+	res, err := cmp.Patches(bg(), []string{"a.txt"}, Limits{})
+	if err != nil || res.Partial || res.Command != PatchCommand || len(res.Patches) != 1 {
+		t.Fatalf("patch %#v err=%v", res, err)
+	}
+	p := res.Patches[0]
+	if p.OldPath != "a.txt" || p.NewPath != "a.txt" || !strings.Contains(p.Text, "+X") || !strings.Contains(p.Text, "-2") {
+		t.Fatalf("text %q", p.Text)
+	}
+	if res.Bytes != len(p.Text) {
+		t.Fatalf("bytes %d vs %d", res.Bytes, len(p.Text))
+	}
+	all, err := cmp.Patches(bg(), nil, Limits{})
+	if err != nil || len(all.Patches) != 2 {
+		t.Fatalf("all %#v %v", all, err)
+	}
+}
+
+func TestPatchPathsAreLiteralAndRenameAware(t *testing.T) {
+	s := store{}
+	lines := strings.Repeat("shared rename body\n", 30)
+	base := s.snapshot(t, "", map[string]fileSpec{"old.txt": reg(lines), "other.txt": reg("o\n")})
+	head := s.snapshot(t, base, map[string]fileSpec{"new.txt": reg(lines + "extra\n"), "other.txt": reg("o2\n")})
+	cmp, err := Compare(bg(), base, head, SemanticsStraight, s, Limits{})
+	if err != nil {
 		t.Fatal(err)
 	}
-	res, err := Raw(context.Background(), bare, base, head, SemanticsStraight, objs, Limits{})
-	if err != nil || len(res.Files) != 1 {
-		t.Fatalf("%#v %v", res, err)
+	glob, err := cmp.Patches(bg(), []string{"*.txt"}, Limits{})
+	if err != nil || len(glob.Patches) != 0 {
+		t.Fatalf("globbing leaked: %#v %v", glob, err)
 	}
-	text, partial, _, err := Patch(context.Background(), bare, base, head, []string{"a.txt"}, Limits{})
-	if err != nil || partial || !strings.Contains(text, "X") {
-		t.Fatalf("patch %q partial=%v err=%v", text, partial, err)
+	for _, side := range []string{"old.txt", "new.txt"} {
+		res, err := cmp.Patches(bg(), []string{side}, Limits{})
+		if err != nil || len(res.Patches) != 1 {
+			t.Fatalf("side %s: %#v %v", side, res, err)
+		}
+		if p := res.Patches[0]; p.OldPath != "old.txt" || p.NewPath != "new.txt" || !strings.Contains(p.Text, "+extra") {
+			t.Fatalf("side %s: %#v", side, p)
+		}
+	}
+}
+
+func TestPatchSkipsSubmodulesAndHandlesBinary(t *testing.T) {
+	s := store{}
+	base := s.snapshot(t, "", map[string]fileSpec{"vendor/mod": link(strings.Repeat("a", 40)), "bin.dat": reg("a\x00b")})
+	head := s.snapshot(t, base, map[string]fileSpec{"vendor/mod": link(strings.Repeat("b", 40)), "bin.dat": reg("a\x00c")})
+	cmp, err := Compare(bg(), base, head, SemanticsStraight, s, Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := cmp.Patches(bg(), nil, Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Patches) != 1 || res.Patches[0].NewPath != "bin.dat" {
+		t.Fatalf("patches %#v", res.Patches)
+	}
+	res, err = cmp.Patches(bg(), []string{"vendor/mod"}, Limits{})
+	if err != nil || len(res.Patches) != 0 {
+		t.Fatalf("submodule patch: %#v %v", res, err)
+	}
+}
+
+func TestPatchOutputLimitOmitsOversizedFile(t *testing.T) {
+	s := store{}
+	big := strings.Repeat("0123456789\n", 400)
+	base := s.snapshot(t, "", map[string]fileSpec{"big.txt": reg(""), "small.txt": reg("s\n")})
+	head := s.snapshot(t, base, map[string]fileSpec{"big.txt": reg(big), "small.txt": reg("t\n")})
+	cmp, err := Compare(bg(), base, head, SemanticsStraight, s, Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := cmp.Patches(bg(), nil, Limits{MaxBytes: 300})
+	if !errors.Is(err, ErrPartial) || !res.Partial || res.Reason != "output limit" {
+		t.Fatalf("want partial: %#v %v", res, err)
+	}
+	for _, p := range res.Patches {
+		if p.NewPath == "big.txt" {
+			t.Fatalf("truncated patch returned: %#v", p)
+		}
+	}
+	if res.Bytes > 300 {
+		t.Fatalf("bytes %d exceed cap", res.Bytes)
+	}
+	exhausted, err := cmp.Patches(bg(), nil, Limits{MaxBytes: 1})
+	if !errors.Is(err, ErrPartial) || len(exhausted.Patches) != 0 {
+		t.Fatalf("exhausted: %#v %v", exhausted, err)
+	}
+}
+
+func TestPatchTimeAndCancel(t *testing.T) {
+	objs, base, head := manyFiles(t, 5)
+	cmp, err := Compare(bg(), base, head, SemanticsStraight, objs, Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := cmp.Patches(bg(), nil, Limits{Timeout: time.Nanosecond})
+	if !errors.Is(err, ErrPartial) || !res.Partial || res.Reason != "time limit" {
+		t.Fatalf("time: %#v %v", res, err)
+	}
+	ctx, cancel := context.WithCancel(bg())
+	cancel()
+	if _, err := cmp.Patches(ctx, nil, Limits{}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancel: %v", err)
+	}
+}
+
+func TestObjectStoreContract(t *testing.T) {
+	s := store{}
+	base := s.snapshot(t, "", map[string]fileSpec{"a.txt": reg("1\n")})
+	st := memStore(s)
+	h := plumbing.NewHash(base)
+	if err := st.HasEncodedObject(h); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.HasEncodedObject(plumbing.NewHash(strings.Repeat("e", 40))); !errors.Is(err, plumbing.ErrObjectNotFound) {
+		t.Fatalf("has: %v", err)
+	}
+	if n, err := st.EncodedObjectSize(h); err != nil || n != int64(len(s[h].Data)) {
+		t.Fatalf("size %d %v", n, err)
+	}
+	if _, err := st.EncodedObjectSize(plumbing.ZeroHash); err == nil {
+		t.Fatal("size of missing object")
+	}
+	if _, err := st.EncodedObject(plumbing.BlobObject, h); !errors.Is(err, plumbing.ErrObjectNotFound) {
+		t.Fatalf("type mismatch: %v", err)
+	}
+	if _, err := st.EncodedObject(plumbing.AnyObject, h); err != nil {
+		t.Fatal(err)
+	}
+	it, err := st.IterEncodedObjects(plumbing.BlobObject)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	_ = it.ForEach(func(plumbing.EncodedObject) error { n++; return nil })
+	if n != 1 {
+		t.Fatalf("iter count %d", n)
+	}
+	all, err := st.IterEncodedObjects(plumbing.AnyObject)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n = 0
+	_ = all.ForEach(func(plumbing.EncodedObject) error { n++; return nil })
+	if n != len(s) {
+		t.Fatalf("iter all %d want %d", n, len(s))
+	}
+	if st.NewEncodedObject() == nil {
+		t.Fatal("new object")
+	}
+	if _, err := st.SetEncodedObject(st.NewEncodedObject()); err == nil {
+		t.Fatal("store must be read-only")
+	}
+	if err := st.AddAlternate("x"); err == nil {
+		t.Fatal("alternates must be refused")
+	}
+	bad := store{plumbing.NewHash(strings.Repeat("d", 40)): {Type: "bogus", Data: []byte("x"), Hash: plumbing.NewHash(strings.Repeat("d", 40))}}
+	if _, err := memStore(bad).EncodedObject(plumbing.AnyObject, plumbing.NewHash(strings.Repeat("d", 40))); err == nil {
+		t.Fatal("unknown type accepted")
+	}
+}
+
+func TestRequireCommits(t *testing.T) {
+	if err := RequireCommits(nil, ""); !errors.Is(err, ErrObject) {
+		t.Fatalf("empty sha: %v", err)
+	}
+	if err := RequireCommits(map[plumbing.Hash]pack.Object{}, strings.Repeat("b", 40)); !errors.Is(err, ErrObject) {
+		t.Fatalf("missing: %v", err)
+	}
+	h := plumbing.NewHash(strings.Repeat("a", 40))
+	blob := map[plumbing.Hash]pack.Object{h: {Type: "blob", Data: []byte("x"), Hash: h}}
+	if err := RequireCommits(blob, h.String()); !errors.Is(err, ErrObject) {
+		t.Fatalf("non-commit: %v", err)
+	}
+}
+
+func TestPackageNeverImportsExec(t *testing.T) {
+	files, err := filepath.Glob("*.go")
+	if err != nil || len(files) == 0 {
+		t.Fatalf("glob: %v %d", err, len(files))
+	}
+	fset := token.NewFileSet()
+	for _, name := range files {
+		f, err := parser.ParseFile(fset, name, nil, parser.ImportsOnly)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, imp := range f.Imports {
+			switch strings.Trim(imp.Path.Value, `"`) {
+			case "os/exec", "os":
+				t.Fatalf("%s imports %s; comparison must stay in-process", name, imp.Path.Value)
+			}
+		}
+	}
+}
+
+func TestRawRowSizeAndModeString(t *testing.T) {
+	plain := rawRowSize(File{OldPath: "a", NewPath: "a", AMode: "100644", BMode: "100644", Status: "M"})
+	renamed := rawRowSize(File{OldPath: "a", NewPath: "bb", AMode: "100644", BMode: "100644", Status: "R", RenamedFile: true})
+	if renamed <= plain {
+		t.Fatalf("rename row %d not larger than %d", renamed, plain)
+	}
+	if modeString(0) != "0" {
+		t.Fatal("empty mode")
+	}
+}
+
+func TestLimitsDefaults(t *testing.T) {
+	l := Limits{}.apply(123)
+	if l.MaxBytes != 123 || l.Timeout != defaultTimeout {
+		t.Fatalf("%#v", l)
+	}
+	keep := Limits{MaxBytes: 5, Timeout: time.Second}.apply(123)
+	if keep.MaxBytes != 5 || keep.Timeout != time.Second {
+		t.Fatalf("%#v", keep)
 	}
 }
 
 func manyFiles(t *testing.T, n int) (map[plumbing.Hash]pack.Object, string, string) {
 	t.Helper()
-	blob := pack.Object{Type: "blob", Data: []byte("x\n")}
-	blob.Hash = pack.HashObject("blob", blob.Data)
-	headEntries := make([]tree.TreeEntry, 0, n)
+	s := store{}
+	files := map[string]fileSpec{}
 	for i := 0; i < n; i++ {
-		headEntries = append(headEntries, tree.TreeEntry{Mode: tree.ModeFile, Name: fmt.Sprintf("f-%04d.txt", i), Hash: blob.Hash})
+		files[fmt.Sprintf("f-%04d.txt", i)] = reg("x\n")
 	}
-	tb, err := tree.EncodeTree(nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	th, err := tree.EncodeTree(headEntries)
-	if err != nil {
-		t.Fatal(err)
-	}
-	baseTree := pack.Object{Type: "tree", Data: tb, Hash: pack.HashObject("tree", tb)}
-	headTree := pack.Object{Type: "tree", Data: th, Hash: pack.HashObject("tree", th)}
-	baseBody := []byte("tree " + baseTree.Hash.String() + "\nauthor A <a@a> 1 +0000\ncommitter A <a@a> 1 +0000\n\nbase\n")
-	base := pack.Object{Type: "commit", Data: baseBody, Hash: pack.HashObject("commit", baseBody)}
-	headBody := []byte("tree " + headTree.Hash.String() + "\nparent " + base.Hash.String() + "\nauthor A <a@a> 1 +0000\ncommitter A <a@a> 1 +0000\n\nhead\n")
-	head := pack.Object{Type: "commit", Data: headBody, Hash: pack.HashObject("commit", headBody)}
-	objs := map[plumbing.Hash]pack.Object{
-		blob.Hash: blob, baseTree.Hash: baseTree, headTree.Hash: headTree, base.Hash: base, head.Hash: head,
-	}
-	return objs, base.Hash.String(), head.Hash.String()
+	base := s.snapshot(t, "", map[string]fileSpec{})
+	head := s.snapshot(t, base, files)
+	return s, base, head
 }
 
-func loadObjects(t *testing.T, gitDir string) map[plumbing.Hash]pack.Object {
-	t.Helper()
-	out := gitCmd(t, "", "--git-dir="+gitDir, "cat-file", "--batch-check", "--batch-all-objects")
-	objs := map[plumbing.Hash]pack.Object{}
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		if line == "" {
-			continue
+func TestComparePathsWithQuotesAndControlBytes(t *testing.T) {
+	s := store{}
+	oneTree := func(name, data string) plumbing.Hash {
+		return s.put("tree", encodeTree([]tree.TreeEntry{{Mode: tree.ModeFile, Name: name, Hash: s.put("blob", []byte(data))}}))
+	}
+	commit := func(root plumbing.Hash, parent string) string {
+		body := "tree " + root.String() + "\n"
+		if parent != "" {
+			body += "parent " + parent + "\n"
 		}
-		f := strings.Fields(line)
-		if len(f) < 3 || f[1] == "unreachable" {
-			continue
-		}
-		kind, sha := f[1], f[0]
-		if kind != "blob" && kind != "tree" && kind != "commit" {
-			continue
-		}
-		cmd := exec.Command("git", "--git-dir="+gitDir, "cat-file", kind, sha)
-		data, err := cmd.Output()
-		if err != nil {
-			t.Fatalf("cat-file %s %s: %v", kind, sha, err)
-		}
-		obj := pack.Object{Type: kind, Data: data, Hash: plumbing.NewHash(sha)}
-		if pack.HashObject(kind, data) != obj.Hash {
-			t.Fatalf("hash %s", sha)
-		}
-		objs[obj.Hash] = obj
+		return s.put("commit", []byte(body+"author A <a@a> 1 +0000\ncommitter A <a@a> 1 +0000\n\nm\n")).String()
 	}
-	if len(objs) == 0 {
-		t.Fatal("no objects")
+	quoted := `we "ird".txt`
+	base := commit(oneTree(quoted, "one\n"), "")
+	head := commit(oneTree(quoted, "two\n"), base)
+	cmp, err := Compare(bg(), base, head, SemanticsStraight, s, Limits{})
+	if err != nil || len(cmp.Files) != 1 || cmp.Files[0].NewPath != quoted {
+		t.Fatalf("%v %#v", err, cmp.Result)
 	}
-	return objs
-}
+	res, err := cmp.Patches(bg(), []string{quoted}, Limits{})
+	if err != nil || len(res.Patches) != 1 || !strings.Contains(res.Patches[0].Text, "+two") {
+		t.Fatalf("%v %#v", err, res)
+	}
 
-func plantHook(t *testing.T, gitDir string) {
-	t.Helper()
-	p := filepath.Join(gitDir, "hooks", "pre-commit")
-	write(t, p, "#!/bin/sh\necho fired > \"$(dirname \"$0\")/fired\"\n")
-	if err := os.Chmod(p, 0o755); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func gitCmd(t *testing.T, dir string, args ...string) []byte {
-	t.Helper()
-	cmd := exec.Command("git", args...)
-	if dir != "" {
-		cmd.Dir = dir
-	}
-	cmd.Env = append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1", "GIT_TERMINAL_PROMPT=0")
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("git %v: %v\n%s", args, err, out)
-	}
-	return bytes.TrimRight(out, "\n")
-}
-
-func write(t *testing.T, path, body string) {
-	t.Helper()
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func errorsIs(err, target error) bool {
-	return err != nil && (err == target || strings.Contains(err.Error(), target.Error()))
-}
-
-func TestWriteBareAndRequireCommits(t *testing.T) {
-	if err := WriteBare(context.Background(), t.TempDir(), nil); !errorsIs(err, ErrObject) {
-		t.Fatalf("empty: %v", err)
-	}
-	h := plumbing.NewHash(strings.Repeat("a", 40))
-	bad := map[plumbing.Hash]pack.Object{h: {Type: "blob", Data: []byte("x"), Hash: plumbing.ZeroHash}}
-	if err := WriteBare(context.Background(), t.TempDir(), bad); !errorsIs(err, ErrObject) {
-		t.Fatalf("mismatch: %v", err)
-	}
-	if err := RequireCommits(nil, ""); !errorsIs(err, ErrObject) {
-		t.Fatalf("empty sha: %v", err)
-	}
-	if err := RequireCommits(map[plumbing.Hash]pack.Object{}, strings.Repeat("b", 40)); !errorsIs(err, ErrObject) {
-		t.Fatalf("missing: %v", err)
-	}
-	if err := LookPath(); err != nil {
-		t.Skip(err.Error())
-	}
-}
-
-func TestSplitPatchesKeys(t *testing.T) {
-	if len(SplitPatches("")) != 0 {
-		t.Fatal("empty")
-	}
-	text := "diff --git a/old.txt b/new.txt\n--- a/old.txt\n+++ b/new.txt\n@@ -1 +1 @@\n-a\n+b\n"
-	got := SplitPatches(text)
-	if got["old.txt"] == "" || got["new.txt"] == "" {
-		t.Fatalf("%#v", got)
-	}
-}
-
-func TestSplitPatchesQuotedPaths(t *testing.T) {
-	text := "diff --git \"a/file with spaces.txt\" \"b/file with spaces.txt\"\n--- \"a/file with spaces.txt\"\n+++ \"b/file with spaces.txt\"\n@@ -1 +1 @@\n-a\n+b\n"
-	got := SplitPatches(text)
-	if got["file with spaces.txt"] == "" {
-		t.Fatalf("%#v", got)
-	}
-}
-
-func TestWriteBareHonorsCancel(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	blob := pack.Object{Type: "blob", Data: []byte("x")}
-	blob.Hash = pack.HashObject("blob", blob.Data)
-	if err := WriteBare(ctx, t.TempDir(), map[plumbing.Hash]pack.Object{blob.Hash: blob}); !errorsIs(err, context.Canceled) {
-		t.Fatalf("cancel: %v", err)
+	badBase := commit(oneTree("new\nline.txt", "one\n"), "")
+	badHead := commit(oneTree("new\nline.txt", "two\n"), badBase)
+	if cmp, err := Compare(bg(), badBase, badHead, SemanticsStraight, s, Limits{}); err == nil || len(cmp.Files) != 0 {
+		t.Fatalf("control-byte path must fail closed: %v %#v", err, cmp.Result)
 	}
 }
