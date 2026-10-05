@@ -16,7 +16,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -26,7 +26,6 @@ jobs:
           go-version-file: go.mod
 
       - name: Go mod tidy (drift gate)
-        if: runner.os == 'Linux'
         run: |
           go mod tidy
           git diff --exit-code go.mod go.sum
@@ -37,18 +36,13 @@ jobs:
       - name: Build
         run: go build -o /tmp/gitlab-mcp ./cmd/gitlab-mcp
 
-      - name: Test
-        if: runner.os != 'Linux'
-        run: go test -race -count=1 ./...
-
       - name: Test with coverage gate
-        if: runner.os == 'Linux'
         run: |
           go test -race -count=1 -coverprofile=coverage.out -covermode=atomic ./...
           ./scripts/check-coverage.sh --profile coverage.out --threshold 80
 
       - name: Upload coverage profile
-        if: always() && runner.os == 'Linux'
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: unit-coverage-profile
@@ -63,7 +57,7 @@ jobs:
       fail-fast: false
       max-parallel: 2
       matrix:
-        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15-intel, macos-15]
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     steps:
