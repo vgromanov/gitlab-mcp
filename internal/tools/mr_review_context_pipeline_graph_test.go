@@ -350,4 +350,7 @@ func TestReviewContext_childJobPagesStayOffRootJobs(t *testing.T) {
 	if childJobs < 21 {
 		t.Fatalf("child jobs stayed off nodes: %#v", item.PipelineGraph.Nodes)
 	}
+	if got := item.PipelineGraph.Section.HeadSHA; got == nil || *got != shaN(1) {
+		t.Fatalf("aggregate graph section head_sha %v, want root %s", got, shaN(1))
+	}
 }

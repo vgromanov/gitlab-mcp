@@ -191,8 +191,12 @@ func restoreGraphWalk(pipe *pipelineView, gc *cursor.GraphCont, depth, nodes int
 		relSHA:           gc.RS,
 		stickyIncomplete: gc.Inc,
 	}
-	if w.current.Project != pidOf(pipe) && pipe != nil {
-		// current node identity is the continuation NP, not necessarily root.
+	for _, a := range gc.Anc {
+		p, id, ok := splitVisitKey(a)
+		if !ok {
+			return nil, fmt.Errorf("%s: graph continuation missing", cursor.ResyncRequired)
+		}
+		w.ancestors = append(w.ancestors, graphNodeKey{Project: p, Pipeline: id})
 	}
 	for _, v := range gc.Vis {
 		w.visited[v] = struct{}{}
@@ -337,6 +341,10 @@ func (w *graphWalk) snapshotCont() *cursor.GraphCont {
 		}
 	}
 	rsn := uniqueGraphReasons(w.reasons)
+	var anc []string
+	for _, a := range w.ancestors {
+		anc = append(anc, a.String())
+	}
 	return &cursor.GraphCont{
 		V:     cursor.GraphContSchemaG1,
 		Phase: w.phase,
@@ -345,6 +353,7 @@ func (w *graphWalk) snapshotCont() *cursor.GraphCont {
 		D:     w.depth,
 		Vis:   vis,
 		Q:     q,
+		Anc:   anc,
 		N:     w.nodeCount,
 		Block: w.block,
 		Part:  w.partial,

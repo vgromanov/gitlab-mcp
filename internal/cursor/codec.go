@@ -196,6 +196,7 @@ type GraphCont struct {
 	D     int      `json:"d"`
 	Vis   []string `json:"vis,omitempty"`
 	Q     []string `json:"q,omitempty"`
+	Anc   []string `json:"anc,omitempty"`
 	N     int      `json:"n"`
 	Block bool     `json:"block,omitempty"`
 	Part  bool     `json:"part,omitempty"`
@@ -1270,6 +1271,9 @@ func validateGraphCont(c *GraphCont) error {
 	if len(c.Vis)+len(c.Q) > MaxGraphVisited {
 		return ErrResyncRequired
 	}
+	if err := validateGraphAncestry(c.Anc, c.D); err != nil {
+		return err
+	}
 	if c.RI < 0 || (c.RI == 0 && c.RP != "") {
 		return ErrResyncRequired
 	}
@@ -1290,6 +1294,25 @@ func validateGraphCont(c *GraphCont) error {
 		return ErrResyncRequired
 	}
 	return validateGraphReasons(c.Rsn)
+}
+
+// validateGraphAncestry checks the active node's root-to-parent path.
+// Order is meaningful, so unlike Vis it is not sorted.
+func validateGraphAncestry(items []string, depth int) error {
+	if len(items) > depth || len(items) > MaxGraphVisited {
+		return ErrResyncRequired
+	}
+	seen := map[string]struct{}{}
+	for _, item := range items {
+		if item != strings.TrimSpace(item) || !validGraphVisitKey(item) {
+			return ErrResyncRequired
+		}
+		if _, dup := seen[item]; dup {
+			return ErrResyncRequired
+		}
+		seen[item] = struct{}{}
+	}
+	return nil
 }
 
 func validateGraphReasons(items []string) error {

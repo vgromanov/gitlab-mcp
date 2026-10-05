@@ -1200,7 +1200,9 @@ func mergePipelineGraph(dst *pipelineGraphOut, src pipelineGraphOut) {
 		}
 		return
 	}
+	rootHead := dst.Section.HeadSHA
 	dst.Section = src.Section
+	dst.Section.HeadSHA = rootHead
 	dst.Assessment = src.Assessment
 	dst.DownstreamCoverage = src.DownstreamCoverage
 	dst.BridgesVisited = dst.BridgesVisited || src.BridgesVisited

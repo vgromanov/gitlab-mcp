@@ -730,3 +730,55 @@ func TestPipelineGraph_unacceptedBridgeNextPageNotComplete(t *testing.T) {
 		t.Fatalf("unaccepted X-Next-Page completed the graph %#v", out)
 	}
 }
+
+func TestPipelineGraph_pausedChildKeepsAncestryForCycle(t *testing.T) {
+	h := &walkServer{
+		pipes: map[string]string{
+			"42/100": walkPipe(100, 42, graphPipeSHA, "feature"),
+			"99/200": walkPipe(200, 99, graphChildSHA, "child"),
+		},
+		jobs: map[string]string{
+			"42/100/1": "[" + jobJSON(1, "parent", "success", "false") + "]",
+			"99/200/1": "[" + jobJSON(10, "child-a", "success", "false") + "]",
+			"99/200/2": "[" + jobJSON(11, "child-b", "success", "false") + "]",
+		},
+		bridges: map[string]string{
+			"42/100/1": "[" + bridgeJSON(50, "to-child", 99, 200, graphChildSHA) + "]",
+			"99/200/1": "[" + bridgeJSON(60, "to-root", 42, 100, graphPipeSHA) + "]",
+		},
+		mr:      graphMR("feature"),
+		mrPipes: graphPipes("feature"),
+	}
+	in := pipelineGraphIn{ProjectID: "42", MergeRequestIID: 7, PerPage: 1}
+	clk := &cursor.FakeClock{T: time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)}
+	d := newCursorDeps(t, h, nil, clk)
+	var last map[string]any
+	var sawAncestry bool
+	tok := ""
+	for i := 0; i < 8; i++ {
+		in.Cursor = tok
+		_, raw, err := getMergeRequestPipelineGraph(context.Background(), nil, in, d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		last = raw.(map[string]any)
+		tok, _ = graphSection(t, last)["next_cursor"].(string)
+		if tok == "" {
+			break
+		}
+		payload, err := cursor.Decode(d.Config.CursorKey, tok, clk.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if gc := payload.GraphCont; gc != nil && gc.NI == 200 && len(gc.Anc) == 1 && gc.Anc[0] == "42:100" {
+			sawAncestry = true
+		}
+	}
+	if !sawAncestry {
+		t.Fatal("continuation for the paused child did not carry its ancestors")
+	}
+	kinds := edgeKinds(t, last)
+	if !hasKind(kinds, edgeKindCycle) || hasKind(kinds, edgeKindShared) {
+		t.Fatalf("back-edge from resumed child misclassified: %#v", kinds)
+	}
+}
