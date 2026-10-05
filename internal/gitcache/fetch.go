@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -148,7 +149,7 @@ func fetchHTTPS(ctx context.Context, target origin.Target, opt FetchOptions, tim
 		MaxIdleConns:          1,
 	}
 	hc := &http.Client{
-		Transport: &limitedTransport{base: rt, max: maxBytes},
+		Transport: &limitedTransport{base: rt, max: maxBytes, prelude: bounds.MaxPackPrelude},
 		Timeout:   timeout,
 		CheckRedirect: func(*http.Request, []*http.Request) error {
 			return errors.New("redirects are disabled")
@@ -330,8 +331,9 @@ func readLimited(ctx context.Context, r io.Reader, max int64) ([]byte, error) {
 }
 
 type limitedTransport struct {
-	base http.RoundTripper
-	max  int64
+	base    http.RoundTripper
+	max     int64
+	prelude int64
 }
 
 func (t *limitedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -339,7 +341,17 @@ func (t *limitedTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 	if err != nil || resp == nil || resp.Body == nil {
 		return resp, err
 	}
-	resp.Body = &limitedBody{ReadCloser: resp.Body, max: t.max}
+	limit := t.max
+	// Advertised refs stay on max. The upload-pack POST also carries the
+	// protocol prelude, which is not part of the raw-pack cap.
+	if req != nil && req.Method == http.MethodPost && t.prelude > 0 {
+		if t.max > math.MaxInt64-t.prelude {
+			limit = math.MaxInt64
+		} else {
+			limit = t.max + t.prelude
+		}
+	}
+	resp.Body = &limitedBody{ReadCloser: resp.Body, max: limit}
 	return resp, nil
 }
 

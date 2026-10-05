@@ -27,4 +27,13 @@ func TestIndexV2SHA1BytesAndCharges(t *testing.T) {
 	if bounds.ReservationFormula() == "" {
 		t.Fatal("ReservationFormula empty")
 	}
+	if bounds.PackResponseLimit(0) != bounds.MaxPackPrelude {
+		t.Fatalf("prelude only: %d", bounds.PackResponseLimit(0))
+	}
+	if bounds.PackResponseLimit(10) != bounds.MaxPackPrelude+10 {
+		t.Fatal("pack plus prelude")
+	}
+	if bounds.MaxPackPrelude <= 8 {
+		t.Fatal("prelude does not leave room for a NAK pkt-line")
+	}
 }

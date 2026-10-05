@@ -18,6 +18,7 @@ import (
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 
+	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/gitcache/bounds"
 	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/gitcache/origin"
 	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/gitcache/sshconfig"
 	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/gitcache/sshtrust"
@@ -196,7 +197,7 @@ func NewSSHUploadPackSession(ctx context.Context, rawURL string, opt Options) (t
 
 type sshUploadSession struct {
 	mu      sync.Mutex
-	stdout  io.Reader
+	stdout  *limitedReader
 	stdin   io.WriteCloser
 	session *ssh.Session
 	client  *ssh.Client
@@ -265,6 +266,9 @@ func (s *sshUploadSession) UploadPack(ctx context.Context, req *packp.UploadPack
 		return nil, ErrSSH
 	}
 	_ = s.stdin.Close()
+	// The advertisement already spent s.stdout's counter. The pack stream,
+	// including its NAK and shallow pkt-lines, gets a new one.
+	s.stdout = &limitedReader{r: s.stdout.r, max: bounds.PackResponseLimit(s.maxBytes)}
 	resp := packp.NewUploadPackResponse(req)
 	rc := io.NopCloser(s.stdout)
 	if err := resp.Decode(rc); err != nil {

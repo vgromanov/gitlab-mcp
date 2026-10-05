@@ -8,17 +8,32 @@ package bounds
 
 import (
 	"errors"
+	"math"
 	"time"
 )
 
 var errIndexCount = errors.New("bounds: index object count")
 
 const (
-	// MaxRefBytes is the maximum advertised-refs or upload-pack HTTP body.
+	// MaxRefBytes is the maximum advertised-refs response. The upload-pack
+	// response that follows has its own limit.
 	MaxRefBytes int64 = 32 << 20
 
 	// MaxPackBytes is the maximum raw pack accepted after the protocol prelude.
 	MaxPackBytes int64 = 32 << 20
+
+	// unshallowPktLine is the on-wire size of one "unshallow <sha>\n" pkt-line:
+	// 4-byte length, "unshallow ", 40 hex digits, and LF.
+	unshallowPktLine int64 = 55
+
+	// packPreludeTail is the flush that ends the shallow section plus one
+	// "0008NAK\n" pkt-line.
+	packPreludeTail int64 = 4 + 8
+
+	// MaxPackPrelude is upload-pack framing before the raw pack. It allows one
+	// unshallow or shallow pkt-line per MaxObjects, then the flush and NAK.
+	// Those bytes are not part of MaxPackBytes.
+	MaxPackPrelude int64 = unshallowPktLine*MaxObjects + packPreludeTail
 
 	// MaxObjectBytes is the maximum inflated size of one object, one delta
 	// base, or one delta output.
@@ -95,6 +110,18 @@ func IndexV2SHA1Bytes(n int) (int64, error) {
 		return 0, errIndexCount
 	}
 	return 1072 + 28*int64(n), nil
+}
+
+// PackResponseLimit is the upload-pack response budget: one raw pack plus the
+// protocol prelude. The extracted pack remains capped at packMax.
+func PackResponseLimit(packMax int64) int64 {
+	if packMax < 0 {
+		return MaxPackPrelude
+	}
+	if packMax > math.MaxInt64-MaxPackPrelude {
+		return math.MaxInt64
+	}
+	return packMax + MaxPackPrelude
 }
 
 // GenerationCharge is the durable reservation charged before any generation

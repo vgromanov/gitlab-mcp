@@ -63,7 +63,9 @@ affect only the GitLab API client.
 
 | Cap | Value | Meaning |
 |---|---:|---|
-| Advertisement / transport / pack body | 32 MiB | Per bounded reader/body; combined role pack payloads also ≤32 MiB |
+| Advertisement | 32 MiB | Its own HTTP response or SSH read |
+| Raw pack | 32 MiB | After the protocol prelude; combined role pack payloads also ≤32 MiB |
+| Upload-pack prelude | separate | Shallow lines, flush, and the NAK pkt-line. Not charged against the raw pack. SSH counts this stream apart from the ref advertisement. |
 | Single object / delta base / delta output | 8 MiB | Inflated |
 | Pack / walk entries | 20 000 | 20,000 wire objects across role fetches; separate bounded walks |
 | Delta depth | 32 | Undeltified base is depth 0 |

@@ -11,6 +11,8 @@ import (
 
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/protocol/packp"
+
+	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/gitcache/bounds"
 )
 
 func TestAdvertisedHash(t *testing.T) {
@@ -99,6 +101,47 @@ func TestValidateCloneURLAcceptsGitLabSCP(t *testing.T) {
 		if err := ValidateCloneURL(raw, "https://gitlab.example/api/v4", "group/proj", false); !errors.Is(err, ErrAuthz) {
 			t.Fatalf("%q: %v", raw, err)
 		}
+	}
+}
+
+func TestUploadPackPostLeavesPreludeHeadroom(t *testing.T) {
+	const max = int64(32)
+	nak := []byte("0008NAK\n")
+	pack := bytes.Repeat([]byte("P"), int(max))
+	okBody := append(append([]byte{}, nak...), pack...)
+	if int64(len(okBody)) > max+bounds.MaxPackPrelude {
+		t.Fatal("fixture exceeds the upload-pack response budget")
+	}
+	read := func(method string, body []byte) ([]byte, error) {
+		t.Helper()
+		rt := &limitedTransport{
+			base: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: 200,
+					Body:       io.NopCloser(bytes.NewReader(body)),
+					Request:    req,
+				}, nil
+			}),
+			max:     max,
+			prelude: bounds.MaxPackPrelude,
+		}
+		resp, err := rt.RoundTrip(&http.Request{Method: method})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		return io.ReadAll(resp.Body)
+	}
+	got, err := read(http.MethodPost, okBody)
+	if err != nil || !bytes.Equal(got, okBody) {
+		t.Fatalf("NAK plus pack at cap: n=%d err=%v", len(got), err)
+	}
+	over := bytes.Repeat([]byte("Q"), int(max+bounds.MaxPackPrelude)+1)
+	if _, err := read(http.MethodPost, over); !errors.Is(err, ErrLimit) {
+		t.Fatalf("POST over prelude headroom: %v", err)
+	}
+	if _, err := read(http.MethodGet, bytes.Repeat([]byte("a"), int(max)+1)); !errors.Is(err, ErrLimit) {
+		t.Fatalf("GET advertisement used pack headroom: %v", err)
 	}
 }
 
