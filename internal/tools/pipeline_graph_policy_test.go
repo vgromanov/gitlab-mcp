@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"fmt"
 	"testing"
 
 	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/tools/readmeta"
@@ -166,7 +167,7 @@ func TestLineageKeepsHistory(t *testing.T) {
 		{ID: 2, Name: "test", NameKnown: true, Status: "success", StatusKnown: true, Allow: readmeta.PresenceFalse, AllowValid: true},
 		{ID: 1, Name: "test", NameKnown: true, Status: "failed", StatusKnown: true, Allow: readmeta.PresenceFalse, AllowValid: true},
 	}
-	groups := buildLineage(jobs, nil)
+	groups := buildLineage(jobs, lineageCarry{})
 	if len(groups) != 1 || !groups[0].LatestKnown || groups[0].LatestIDs[0] != 2 || len(groups[0].HistoryIDs) != 1 || groups[0].HistoryIDs[0] != 1 {
 		t.Fatalf("%+v", groups[0])
 	}
@@ -182,7 +183,7 @@ func TestLineageKeepsHistory(t *testing.T) {
 		{ID: 3, Name: "test", NameKnown: true, Status: "success", StatusKnown: true, Allow: readmeta.PresenceFalse, AllowValid: true},
 		{ID: 4, Name: "test", NameKnown: true, Status: "failed", StatusKnown: true, Allow: readmeta.PresenceFalse, AllowValid: true},
 	}
-	groups = buildLineage(failedLatest, nil)
+	groups = buildLineage(failedLatest, lineageCarry{})
 	assessment, _ = assessParent(assessInput{RelationProven: true, Outcomes: groups[0].Outcomes})
 	if assessment != assessBlocked {
 		t.Fatalf("latest failure must block: %s", assessment)
@@ -191,7 +192,7 @@ func TestLineageKeepsHistory(t *testing.T) {
 	olderPage := []graphJob{
 		{ID: 1, Name: "test", NameKnown: true, Status: "failed", StatusKnown: true, Allow: readmeta.PresenceFalse, AllowValid: true},
 	}
-	groups = buildLineage(olderPage, map[string]int64{"test": 2})
+	groups = buildLineage(olderPage, lineageCarry{max: map[uint64]int64{jobNameFP("test"): 2}})
 	if groups[0].LatestKnown || groups[0].Attempts[1] != attemptHistory {
 		t.Fatalf("older page treated as latest: %+v", groups[0])
 	}
@@ -212,5 +213,32 @@ func TestParseGraphJobPresence(t *testing.T) {
 	}
 	if _, err := parseGraphJob([]byte(`{"name":"x"}`)); err == nil {
 		t.Fatal("missing id")
+	}
+}
+
+func TestLineageCarryCapsFingerprints(t *testing.T) {
+	jobs := make([]graphJob, 0, lineageFPCap+2)
+	for i := 0; i < lineageFPCap+2; i++ {
+		jobs = append(jobs, graphJob{ID: int64(i + 1), Name: fmt.Sprintf("name-%d", i), NameKnown: true})
+	}
+	carry := mergeLineageCarry(lineageCarry{}, jobs)
+	if !carry.saturated || len(carry.max) != lineageFPCap {
+		t.Fatalf("saturated %v len %d", carry.saturated, len(carry.max))
+	}
+	enc := encodeLineageCarry(carry)
+	if len(enc) != lineageFPCap+1 || enc[0] != "*" {
+		t.Fatalf("encoded %#v", enc)
+	}
+	got, err := decodeLineageCarry(enc)
+	if err != nil || !got.saturated || len(got.max) != lineageFPCap {
+		t.Fatalf("decode %+v err %v", got, err)
+	}
+	if _, err := decodeLineageCarry([]string{"2 test"}); err == nil {
+		t.Fatal("name token accepted")
+	}
+	unseen := []graphJob{{ID: 99, Name: "brand-new", NameKnown: true, Status: "failed", StatusKnown: true, Allow: readmeta.PresenceFalse, AllowValid: true}}
+	groups := buildLineage(unseen, carry)
+	if groups[0].LatestKnown || len(groups[0].Outcomes) != 0 || groups[0].Attempts[99] != attemptUnknown {
+		t.Fatalf("saturated unseen %+v", groups[0])
 	}
 }

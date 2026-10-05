@@ -127,8 +127,10 @@ type Filters struct {
 
 // PageState is signed pagination/guard state for the last returned page.
 // LineageMax is used only by the parent pipeline graph. Each entry is
-// "<job id> <job name>" for the greatest id of that name seen so far.
-// Other tools leave it empty, and omitempty keeps their tokens unchanged.
+// "<16 hex digits> <job id>" for an FNV-64a fingerprint of a job name and
+// the greatest id seen for it. A leading "*" means further names were
+// omitted so the payload stays under the size cap. Other tools leave it
+// empty, and omitempty keeps their tokens unchanged.
 type PageState struct {
 	Page             int      `json:"page"`
 	PerPage          int      `json:"per_page"`

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"sort"
 	"strconv"
 	"strings"
@@ -11,6 +12,11 @@ import (
 	igl "gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/gitlab"
 	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/tools/readmeta"
 )
+
+// lineageFPCap bounds persisted name fingerprints so a continuation cursor
+// stays under the 8 KiB payload cap. Past the cap, unseen names on later
+// pages are incomplete rather than latest, and the cursor is still issued.
+const lineageFPCap = 48
 
 const (
 	policyPass    = "pass"
@@ -201,12 +207,27 @@ func allowTerminal(job graphJob, allowKnown bool, blockReason string) policyOutc
 	return policyOutcome{Outcome: policyPass}
 }
 
+// lineageCarry is the greatest job id already observed for each name
+// fingerprint. Saturated means further names were dropped so the cursor
+// stays small; those names are not treated as latest on a later page.
+type lineageCarry struct {
+	max       map[uint64]int64
+	saturated bool
+}
+
+func jobNameFP(name string) uint64 {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(name))
+	return h.Sum64()
+}
+
 // buildLineage groups jobs by name, keeps every attempt, and emits policy
 // outcomes for the latest attempt only. History is never dropped.
-// The latest attempt is the greatest job id in the group. prior maps a name
-// to the greatest id already observed on an earlier page. An attempt at or
-// below that id is history and cannot block.
-func buildLineage(jobs []graphJob, prior map[string]int64) []lineageGroup {
+// The latest attempt is the greatest job id in the group. prior is the
+// greatest id already observed for that name on an earlier page. An attempt
+// at or below that id is history and cannot block. A name omitted because
+// the carry is saturated is incomplete and cannot block.
+func buildLineage(jobs []graphJob, prior lineageCarry) []lineageGroup {
 	order := []string{}
 	byKey := map[string][]graphJob{}
 	for _, job := range jobs {
@@ -226,7 +247,7 @@ func buildLineage(jobs []graphJob, prior map[string]int64) []lineageGroup {
 	return out
 }
 
-func lineageOne(jobs []graphJob, prior map[string]int64) lineageGroup {
+func lineageOne(jobs []graphJob, prior lineageCarry) lineageGroup {
 	g := lineageGroup{Attempts: map[int64]string{}, LatestIDs: []int64{}, HistoryIDs: []int64{}}
 	if len(jobs) == 0 {
 		return g
@@ -241,11 +262,17 @@ func lineageOne(jobs []graphJob, prior map[string]int64) lineageGroup {
 			latest = job
 		}
 	}
-	priorMax := int64(0)
-	if jobs[0].NameKnown && prior != nil {
-		priorMax = prior[jobs[0].Name]
+	priorMax, seen := int64(0), false
+	if jobs[0].NameKnown {
+		priorMax, seen = prior.max[jobNameFP(jobs[0].Name)]
 	}
-	if priorMax >= latest.ID {
+	if jobs[0].NameKnown && prior.saturated && !seen {
+		for _, job := range jobs {
+			g.Attempts[job.ID] = attemptUnknown
+		}
+		return g
+	}
+	if seen && priorMax >= latest.ID {
 		for _, job := range jobs {
 			g.HistoryIDs = append(g.HistoryIDs, job.ID)
 			g.Attempts[job.ID] = attemptHistory
@@ -268,59 +295,100 @@ func lineageOne(jobs []graphJob, prior map[string]int64) lineageGroup {
 	return g
 }
 
-// mergeLineageMax records the greatest id seen for each named job.
-func mergeLineageMax(prior map[string]int64, jobs []graphJob) map[string]int64 {
-	out := make(map[string]int64, len(prior)+len(jobs))
-	for name, id := range prior {
-		out[name] = id
+// mergeLineageCarry records the greatest id seen for each named job.
+// At most lineageFPCap fingerprints are stored. Further names set
+// saturated and are omitted so the signed cursor stays small.
+func mergeLineageCarry(prior lineageCarry, jobs []graphJob) lineageCarry {
+	out := lineageCarry{max: make(map[uint64]int64, len(prior.max)+len(jobs)), saturated: prior.saturated}
+	for fp, id := range prior.max {
+		out.max[fp] = id
 	}
 	for _, job := range jobs {
 		if !job.NameKnown {
 			continue
 		}
-		if job.ID > out[job.Name] {
-			out[job.Name] = job.ID
+		fp := jobNameFP(job.Name)
+		if cur, ok := out.max[fp]; ok {
+			if job.ID > cur {
+				out.max[fp] = job.ID
+			}
+			continue
 		}
+		if out.saturated || len(out.max) >= lineageFPCap {
+			out.saturated = true
+			continue
+		}
+		out.max[fp] = job.ID
+	}
+	if len(out.max) == 0 {
+		out.max = nil
 	}
 	return out
 }
 
-func encodeLineageMax(in map[string]int64) []string {
-	if len(in) == 0 {
+func encodeLineageCarry(in lineageCarry) []string {
+	if len(in.max) == 0 && !in.saturated {
 		return nil
 	}
-	names := make([]string, 0, len(in))
-	for name := range in {
-		names = append(names, name)
+	keys := make([]uint64, 0, len(in.max))
+	for fp := range in.max {
+		keys = append(keys, fp)
 	}
-	sort.Strings(names)
-	out := make([]string, 0, len(names))
-	for _, name := range names {
-		out = append(out, strconv.FormatInt(in[name], 10)+" "+name)
+	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+	out := make([]string, 0, len(keys)+1)
+	if in.saturated {
+		out = append(out, "*")
+	}
+	for _, fp := range keys {
+		out = append(out, fmt.Sprintf("%016x %d", fp, in.max[fp]))
 	}
 	return out
 }
 
-func decodeLineageMax(items []string) (map[string]int64, error) {
+func decodeLineageCarry(items []string) (lineageCarry, error) {
 	if len(items) == 0 {
-		return nil, nil
+		return lineageCarry{}, nil
 	}
-	out := make(map[string]int64, len(items))
-	prev := ""
-	for _, item := range items {
-		i := strings.IndexByte(item, ' ')
-		if i <= 0 || i == len(item)-1 {
-			return nil, fmt.Errorf("malformed lineage")
+	out := lineageCarry{max: make(map[uint64]int64, len(items))}
+	start := 0
+	if items[0] == "*" {
+		out.saturated = true
+		start = 1
+	}
+	var prev uint64
+	seenPrev := false
+	for _, item := range items[start:] {
+		fp, id, err := parseLineageFP(item)
+		if err != nil || (seenPrev && fp <= prev) {
+			return lineageCarry{}, fmt.Errorf("malformed lineage")
 		}
-		id, err := strconv.ParseInt(item[:i], 10, 64)
-		name := item[i+1:]
-		if err != nil || id < 1 || name <= prev {
-			return nil, fmt.Errorf("malformed lineage")
-		}
-		prev = name
-		out[name] = id
+		prev = fp
+		seenPrev = true
+		out.max[fp] = id
+	}
+	if len(out.max) == 0 {
+		out.max = nil
+	}
+	if len(out.max) > lineageFPCap {
+		return lineageCarry{}, fmt.Errorf("malformed lineage")
 	}
 	return out, nil
+}
+
+func parseLineageFP(item string) (uint64, int64, error) {
+	i := strings.IndexByte(item, ' ')
+	if i != 16 || i == len(item)-1 {
+		return 0, 0, fmt.Errorf("malformed lineage")
+	}
+	fp, err := strconv.ParseUint(item[:i], 16, 64)
+	if err != nil {
+		return 0, 0, err
+	}
+	id, err := strconv.ParseInt(item[i+1:], 10, 64)
+	if err != nil || id < 1 {
+		return 0, 0, fmt.Errorf("malformed lineage")
+	}
+	return fp, id, nil
 }
 
 // assessParent never returns ready. Downstream coverage is unknown until

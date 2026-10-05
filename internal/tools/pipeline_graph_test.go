@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -271,8 +272,35 @@ func TestPipelineGraph_missingFilterPartialAndRetry(t *testing.T) {
 		if len(lineage) != 1 || lineage[0].(map[string]any)["name"] != "test" {
 			t.Fatalf("filtered lineage %#v", lineage)
 		}
+		if lineageHasID(lineage, 2) || lineageHasID(lineage, 3) {
+			t.Fatalf("filtered ids in lineage %#v", lineage)
+		}
 		if graphSection(t, out)["content_complete"] == readmeta.ContentCompleteTrue {
 			t.Fatal("filter must not be content complete")
+		}
+	})
+	t.Run("status filter drops excluded attempt ids", func(t *testing.T) {
+		jobs := map[string]string{"1": "[" + jobJSON(2, "test", "success", "false") + "," + jobJSON(4, "test", "failed", "false") + "]"}
+		h := graphHandler(nil, map[int]string{100: graphPipe("feature", "push")}, jobs, graphMR("feature"), graphPipes("feature"), false)
+		out, err := callGraph(t, h, pipelineGraphIn{ProjectID: "42", MergeRequestIID: 7, JobStatuses: []string{"success"}}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		requireNotReady(t, out)
+		if out["assessment"] != assessBlocked {
+			t.Fatalf("filtered latest failure must still block: %v", out["assessment"])
+		}
+		jobsOut := out["jobs"].([]any)
+		if len(jobsOut) != 1 || jobsOut[0].(map[string]any)["id"] != float64(2) {
+			t.Fatalf("jobs %#v", jobsOut)
+		}
+		lineage := out["lineage"].([]any)
+		if len(lineage) != 1 || lineage[0].(map[string]any)["latest_known"] != false || lineageHasID(lineage, 4) {
+			t.Fatalf("lineage %#v", lineage)
+		}
+		history := lineage[0].(map[string]any)["history_ids"].([]any)
+		if len(history) != 1 || history[0] != float64(2) {
+			t.Fatalf("history %#v", history)
 		}
 	})
 	t.Run("retry history", func(t *testing.T) {
@@ -509,6 +537,180 @@ func TestPipelineGraph_stopsAtHeadPipeline(t *testing.T) {
 	if lists != 1 {
 		t.Fatalf("pipeline list requests %d %#v", lists, hits)
 	}
+}
+
+func TestPipelineGraph_headFoundDoesNotExhaustBudget(t *testing.T) {
+	var hits []graphHit
+	jobs := map[string]string{"1": "[" + jobJSON(1, "test", "success", "false") + "]"}
+	base := graphHandler(&hits, map[int]string{100: graphPipe("feature", "push")}, jobs, graphMR("feature"), "", false)
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/merge_requests/7/pipelines") {
+			hits = append(hits, graphHit{method: r.Method, path: r.URL.Path, raw: r.URL.RawQuery})
+			page := r.URL.Query().Get("page")
+			if page == "" || page == "1" {
+				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("X-Next-Page", "2")
+				_, _ = io.WriteString(w, graphPipes("feature"))
+				return
+			}
+			n, _ := strconv.Atoi(page)
+			w.Header().Set("Content-Type", "application/json")
+			if n >= 20 {
+				w.Header().Set("X-Next-Page", "0")
+				_, _ = io.WriteString(w, `[]`)
+				return
+			}
+			w.Header().Set("X-Next-Page", strconv.Itoa(n+1))
+			_, _ = fmt.Fprintf(w, `[{"id":%d,"project_id":42,"sha":%q,"ref":"old","status":"success"}]`, 200+n, graphPipeSHA)
+			return
+		}
+		base.ServeHTTP(w, r)
+	})
+	out, err := callGraph(t, h, pipelineGraphIn{ProjectID: "42", MergeRequestIID: 7, MaxRequests: 8}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireNotReady(t, out)
+	if out["pipeline"] == nil || out["pipeline"].(map[string]any)["id"] != float64(100) {
+		t.Fatalf("pipeline %#v", out["pipeline"])
+	}
+	lists := 0
+	for _, hit := range hits {
+		if strings.HasSuffix(hit.path, "/merge_requests/7/pipelines") {
+			lists++
+		}
+	}
+	if lists != 1 {
+		t.Fatalf("pipeline list requests %d", lists)
+	}
+}
+
+func TestPipelineGraph_noHeadWalksPipelineList(t *testing.T) {
+	var hits []graphHit
+	mr := fmt.Sprintf(`{"id":1,"iid":7,"project_id":42,"source_branch":"feature","sha":%q}`, graphSrcSHA)
+	pipe := fmt.Sprintf(`{"id":200,"project_id":42,"sha":%q,"ref":"feature","status":"success","source":"push"}`, graphPipeSHA)
+	jobs := map[string]string{"1": "[" + jobJSON(1, "test", "success", "false") + "]"}
+	base := graphHandler(&hits, map[int]string{200: pipe}, jobs, mr, "", false)
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/merge_requests/7/pipelines") {
+			hits = append(hits, graphHit{method: r.Method, path: r.URL.Path, raw: r.URL.RawQuery})
+			w.Header().Set("Content-Type", "application/json")
+			page := r.URL.Query().Get("page")
+			if page == "" || page == "1" {
+				w.Header().Set("X-Next-Page", "2")
+				_, _ = fmt.Fprintf(w, `[{"id":200,"project_id":42,"sha":%q,"ref":"feature","status":"success"}]`, graphPipeSHA)
+				return
+			}
+			w.Header().Set("X-Next-Page", "0")
+			_, _ = io.WriteString(w, `[]`)
+			return
+		}
+		base.ServeHTTP(w, r)
+	})
+	out, err := callGraph(t, h, pipelineGraphIn{ProjectID: "42", MergeRequestIID: 7}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireNotReady(t, out)
+	if out["pipeline"] == nil || out["pipeline"].(map[string]any)["id"] != float64(200) {
+		t.Fatalf("pipeline %#v", out["pipeline"])
+	}
+	lists := 0
+	for _, hit := range hits {
+		if strings.HasSuffix(hit.path, "/merge_requests/7/pipelines") {
+			lists++
+		}
+	}
+	if lists != 2 {
+		t.Fatalf("pipeline list requests %d", lists)
+	}
+}
+
+func TestPipelineGraph_compactLineageCursor(t *testing.T) {
+	page1 := make([]string, 50)
+	names := make([]string, 50)
+	for i := 0; i < 50; i++ {
+		names[i] = fmt.Sprintf("job-%03d-%s", i, strings.Repeat("n", 180))
+		page1[i] = jobJSON(1000+i, names[i], "success", "false")
+	}
+	page2 := []string{
+		jobJSON(1, names[0], "failed", "false"),
+		jobJSON(9000, "unseen-required-failure", "failed", "false"),
+	}
+	jobs := map[string]string{
+		"1": "[" + strings.Join(page1, ",") + "]",
+		"2": "[" + strings.Join(page2, ",") + "]",
+	}
+	h := graphHandler(nil, map[int]string{100: graphPipe("feature", "push")}, jobs, graphMR("feature"), graphPipes("feature"), false)
+	clk := &cursor.FakeClock{T: time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)}
+	d := newCursorDeps(t, h, nil, clk)
+	in := pipelineGraphIn{ProjectID: "42", MergeRequestIID: 7, PerPage: 50}
+	_, out, err := getMergeRequestPipelineGraph(context.Background(), nil, in, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := out.(map[string]any)
+	tok, _ := graphSection(t, page)["next_cursor"].(string)
+	if tok == "" {
+		t.Fatalf("cursor not issued: %#v", graphSection(t, page)["limitations"])
+	}
+	payload, err := cursor.Decode(d.Config.CursorKey, tok, clk.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) > cursor.MaxPayloadBytes {
+		t.Fatalf("payload %d exceeds %d", len(raw), cursor.MaxPayloadBytes)
+	}
+	if len(payload.PageState.LineageMax) != lineageFPCap+1 || payload.PageState.LineageMax[0] != "*" {
+		t.Fatalf("lineage state %#v", payload.PageState.LineageMax)
+	}
+	for _, item := range payload.PageState.LineageMax {
+		if strings.Contains(item, "job-") {
+			t.Fatalf("job name stored in cursor: %s", item)
+		}
+	}
+	in.Cursor = tok
+	_, out2, err := getMergeRequestPipelineGraph(context.Background(), nil, in, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := out2.(map[string]any)
+	requireNotReady(t, next)
+	if next["assessment"] == assessBlocked {
+		t.Fatal("saturated or historical failure blocked")
+	}
+	for _, item := range next["lineage"].([]any) {
+		if item.(map[string]any)["latest_known"] != false {
+			t.Fatalf("lineage %#v", next["lineage"])
+		}
+	}
+	attempts := map[float64]string{}
+	for _, item := range next["jobs"].([]any) {
+		job := item.(map[string]any)
+		attempts[job["id"].(float64)] = job["attempt"].(string)
+	}
+	if attempts[1] != attemptHistory || attempts[9000] != attemptUnknown {
+		t.Fatalf("attempts %#v", attempts)
+	}
+}
+
+func lineageHasID(lineage []any, id float64) bool {
+	for _, item := range lineage {
+		g := item.(map[string]any)
+		for _, key := range []string{"latest_ids", "history_ids"} {
+			ids, _ := g[key].([]any)
+			for _, raw := range ids {
+				if raw == id {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 func TestSelectParentID(t *testing.T) {
