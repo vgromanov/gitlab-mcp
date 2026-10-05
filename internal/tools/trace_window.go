@@ -162,13 +162,15 @@ func selectPrefix(data []byte, base int64, lines, maxOut, maxLine int, token str
 			whole = false
 		}
 	}
-	text, spans := redactRange(data, start, end, token)
+	// A scan that stops before EOF can end inside a credential. Withhold that
+	// suffix; bytes kept only as line context are still searched.
+	text, spans := redactRangeEdges(data, start, end, token, false, !eof)
 	p := finishPiece(text, spans, base+int64(start), base+int64(end), true, maxOut, maxLine, eof, whole && end == len(data), false)
 	p.full = p.full && whole
 	return p
 }
 
-func selectTail(data []byte, base int64, lead, lines, maxOut, maxLine int, token string, eof, proven, hideHead bool) tracePiece {
+func selectTail(data []byte, base int64, lead, lines, maxOut, maxLine int, token string, eof, proven bool) tracePiece {
 	if !proven {
 		return tracePiece{}
 	}
@@ -182,7 +184,8 @@ func selectTail(data []byte, base int64, lead, lines, maxOut, maxLine int, token
 	if lines > 0 {
 		start = lead + tailStart(data[lead:], lines)
 	}
-	text, spans := redactRangeEdges(data, start, len(data), token, hideHead, false)
+	// hideHead withholds a credential that began before the fetched buffer.
+	text, spans := redactRangeEdges(data, start, len(data), token, base > 0, false)
 	whole := start == 0 && lead == 0 && eof
 	p := finishPiece(text, spans, base+int64(start), base+int64(len(data)), true, maxOut, maxLine, eof || proven, whole, true)
 	p.proven = proven
@@ -202,7 +205,7 @@ func selectError(data []byte, base int64, match string, maxOut, maxLine int, tok
 		return tracePiece{}
 	}
 	lineClosed := e < len(data) || (e == len(data) && (len(data) == 0 || data[len(data)-1] == '\n' || eof))
-	text, spans := redactRange(data, s, e, token)
+	text, spans := redactRangeEdges(data, s, e, token, false, !eof)
 	p := finishPiece(text, spans, base+int64(s), base+int64(e), true, maxOut, maxLine, eof, s == 0 && e == len(data), false)
 	p.proven = lineClosed && !p.lineCapped && !p.outCapped
 	return p
@@ -226,10 +229,12 @@ func selectRange(data []byte, observedStart, wantStart int64, wantEnd *int64, ma
 			end = rel
 		}
 	}
-	hideHead := start == 0 && observedStart > 0
 	observedEnd := observedStart + int64(len(data))
 	reachedEnd := sizeKnown && observedEnd == total
-	hideTail := end == len(data) && !reachedEnd
+	// Lookahead may stop inside a credential. Seal that open suffix unless
+	// the fetched buffer is the end of the trace.
+	hideHead := observedStart > 0
+	hideTail := !reachedEnd
 	text, spans := redactRangeEdges(data, start, end, token, hideHead, hideTail)
 	windowEnd := observedStart + int64(end)
 	// A 206 body ends when the requested bytes end. That is the full trace

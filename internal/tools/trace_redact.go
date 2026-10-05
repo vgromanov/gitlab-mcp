@@ -9,8 +9,9 @@ import (
 
 const (
 	redactPlaceholder = "[REDACTED]"
-	// tracePatternMax caps a single credential match so a pathological line
-	// cannot force an unbounded hold.
+	// tracePatternMax bounds how far a boundary check looks backward for a
+	// keyword. Credential values run through the next delimiter; a fixed cap
+	// would copy the rest of a longer secret.
 	tracePatternMax = 512
 	traceTokenHold  = 4096
 	glpatMin        = 16
@@ -111,13 +112,23 @@ func redactRangeEdges(src []byte, from, to int, token string, hideHead, hideTail
 	}
 	spans := matchSpans(src, []byte(token))
 	if hideHead {
-		if s, e, ok := ambiguousHead(src, from, token); ok {
+		// Bytes before the buffer were not fetched. A credential that begins
+		// there is withheld only where it overlaps the returned window.
+		if s, e, ok := ambiguousHead(src, 0, token); ok && s < to && e > from {
 			spans = append(spans, [2]int{s, e})
 		}
 	}
 	if hideTail {
-		if s, e, ok := ambiguousTail(src, to, token); ok {
-			spans = append(spans, [2]int{s, e})
+		// The buffer is not a proven end of the trace. Suppress a credential
+		// that is still open at the last fetched byte when it overlaps the
+		// window, including when a short lookahead does not finish it.
+		if s, e, ok := ambiguousTail(src, len(src), token); ok && s < to && e > from {
+			if e > to {
+				e = to
+			}
+			if e > s {
+				spans = append(spans, [2]int{s, e})
+			}
 		}
 	}
 	spans = mergeSpans(spans)
@@ -628,7 +639,7 @@ func parseAuthHeader(src []byte, i int) (int, int, bool) {
 	}
 	j = skipSpace(src, j)
 	start := j
-	for j < len(src) && j-start < tracePatternMax && src[j] > ' ' && src[j] != '"' {
+	for j < len(src) && src[j] > ' ' && src[j] != '"' {
 		j++
 	}
 	if j == start {
@@ -650,7 +661,7 @@ func parseBearer(src []byte, i int) (int, int, bool) {
 	}
 	j = skipSpace(src, j)
 	start := j
-	for j < len(src) && j-start < tracePatternMax && isTokenChar(src[j]) {
+	for j < len(src) && isTokenChar(src[j]) {
 		j++
 	}
 	if j-start < 8 {
@@ -671,7 +682,7 @@ func parsePrivateToken(src []byte, i int) (int, int, bool) {
 	j++
 	j = skipSpace(src, j)
 	start := j
-	for j < len(src) && j-start < tracePatternMax && src[j] > ' ' {
+	for j < len(src) && src[j] > ' ' {
 		j++
 	}
 	if j == start {

@@ -82,6 +82,45 @@ func TestRedact_authorizationSpamLinear(t *testing.T) {
 	}
 }
 
+func TestRedact_longAuthorizationAndPrivateToken(t *testing.T) {
+	authVal := strings.Repeat("S", 600)
+	privVal := strings.Repeat("P", 600)
+	src := []byte("Authorization: Bearer " + authVal + "\nPRIVATE-TOKEN: " + privVal + "\nnext\n")
+	out, n := redactBytes(src, nil)
+	s := string(out)
+	if strings.Contains(s, authVal) || strings.Contains(s, authVal[512:]) || strings.Contains(s, privVal) || strings.Contains(s, privVal[512:]) {
+		t.Fatalf("leaked long credential %q", s)
+	}
+	if n < 2 || !strings.Contains(s, "next") {
+		t.Fatalf("n %d out %q", n, s)
+	}
+}
+
+func TestSelectPrefix_redactionCountFollowsReturnedWindow(t *testing.T) {
+	secret := "glpat-" + strings.Repeat("b", 16)
+	dropped := selectPrefix([]byte("ok\n"+secret), 0, 0, len("ok"), jobTraceHardLine, "", true)
+	if dropped.redactions != 0 || strings.Contains(dropped.text, redactPlaceholder) || strings.Contains(dropped.text, "glpat-") {
+		t.Fatalf("trimmed count %d text %q", dropped.redactions, dropped.text)
+	}
+	capped := selectPrefix([]byte(strings.Repeat("a", 40)+secret), 0, 0, 1<<20, 16, "", true)
+	if capped.redactions != 0 || strings.Contains(capped.text, redactPlaceholder) || strings.Contains(capped.text, "glpat-") {
+		t.Fatalf("line cap count %d text %q", capped.redactions, capped.text)
+	}
+}
+
+func TestSelectPrefix_scanCutWithholdsShortCredential(t *testing.T) {
+	data := []byte("aaaa\nBearer abc")
+	p := selectPrefix(data, 0, 0, 1<<20, jobTraceHardLine, "", false)
+	if strings.Contains(p.text, "Bearer") || strings.Contains(p.text, "abc") {
+		t.Fatalf("prefix cut %q", p.text)
+	}
+	errData := []byte("ERROR Bearer abc")
+	ep := selectError(errData, 0, "", 1<<20, jobTraceHardLine, "", false)
+	if strings.Contains(ep.text, "Bearer") || strings.Contains(ep.text, "abc") {
+		t.Fatalf("error cut %q", ep.text)
+	}
+}
+
 func TestTrimOutputBytes_runeBoundary(t *testing.T) {
 	s := "ok" + string(rune(0x1F600)) + "tail"
 	cut, trimmed := trimOutputBytes(s, len("ok")+1)

@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	gitlab "gitlab.com/gitlab-org/api/client-go/v2"
@@ -212,16 +213,18 @@ func getPipelineJobOutput(ctx context.Context, _ *mcp.CallToolRequest, in getPip
 	}
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	if igl.BudgetFromContext(ctx) == nil {
-		b := igl.DefaultBudget()
-		b.MaxBytes = int64(q.scan) + 1
-		b.MaxRequests = 4
-		b.MaxElapsed = 30 * time.Second
-		ctx = igl.WithBudget(ctx, b)
-	}
 	token := ""
 	if d.Config != nil {
 		token = d.Config.Token
+	}
+	if igl.BudgetFromContext(ctx) == nil {
+		b := igl.DefaultBudget()
+		// Tail and range reads keep a redaction margin outside the retained
+		// window, and the copier needs one extra byte to observe EOF.
+		b.MaxBytes = traceBudgetBytes(q.scan, traceContextMargin(token))
+		b.MaxRequests = 4
+		b.MaxElapsed = 30 * time.Second
+		ctx = igl.WithBudget(ctx, b)
 	}
 	res, meta, err := readJobTrace(ctx, d, pid, in.JobID, q)
 	if err != nil {
@@ -240,6 +243,20 @@ type traceReadMeta struct {
 	rangeIgnored bool
 	unprovenTail bool
 	scanStopped  bool
+}
+
+// traceBudgetBytes is the body cap installed when the caller has no budget.
+// A tail reads scan+margin and then one peek byte. A range also keeps
+// lookbehind, so the largest read is scan plus both margins, plus the peek.
+func traceBudgetBytes(scan, margin int) int64 {
+	n := int64(scan) + 2*int64(margin) + 1
+	if n > int64(jobTraceHardScan)+1 {
+		n = int64(jobTraceHardScan) + 1
+	}
+	if n < 1 {
+		n = 1
+	}
+	return n
 }
 
 func traceContextMargin(token string) int {
@@ -306,9 +323,17 @@ func readJobTrace(ctx context.Context, d Deps, pid string, jobID int64, q traceQ
 		if q.end != nil {
 			end := *q.end + lb
 			req.RangeEndExcl = &end
+			// Keep both the lookbehind and the trailing margin inside the read,
+			// even when the requested window already fills max_scan_bytes.
+			fetch := int64(q.scan) + 2*lb
+			if fetch > int64(jobTraceHardScan) {
+				fetch = int64(jobTraceHardScan)
+			}
 			span := end - reqStart
-			if span > 0 && span < int64(q.scan) {
+			if span > 0 && span < fetch {
 				req.MaxScanBytes = span
+			} else if fetch > req.MaxScanBytes {
+				req.MaxScanBytes = fetch
 			}
 		}
 		res := igl.StreamJobTrace(ctx, d.Client, req)
@@ -362,8 +387,7 @@ func buildTraceWindow(q traceQuery, res igl.JobTraceResult, meta traceReadMeta, 
 		if q.scan > 0 && len(res.Data) > q.scan {
 			lead = len(res.Data) - q.scan
 		}
-		hideHead := lead == 0 && base > 0
-		piece = selectTail(res.Data, base, lead, q.lines, q.output, q.line, token, res.EOF || res.SuffixAnchored, true, hideHead)
+		piece = selectTail(res.Data, base, lead, q.lines, q.output, q.line, token, res.EOF || res.SuffixAnchored, true)
 	case q.selector == "error":
 		piece = selectError(res.Data, base, q.errorMatch, q.output, q.line, token, res.EOF)
 	case q.selector == "range":
@@ -374,6 +398,9 @@ func buildTraceWindow(q traceQuery, res igl.JobTraceResult, meta traceReadMeta, 
 	win.TailProven = q.selector == "tail" && piece.proven && !meta.unprovenTail
 	win.ErrorRegionProven = q.selector == "error" && piece.proven
 	win.LineCapped = piece.lineCapped
+	if !utf8.ValidString(piece.text) {
+		piece.text, _ = normalizeUTF8Spans(piece.text, nil)
+	}
 	win.OutputBytes = len(piece.text)
 	win.RedactionCount = piece.redactions
 	win.SourceStart = piece.start

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"unicode/utf8"
 
 	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/config"
 	igl "gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/gitlab"
@@ -536,5 +537,194 @@ func TestGetPipelineJobOutput_outputBytesMatchUTF8(t *testing.T) {
 	quoted := enc[1 : len(enc)-1]
 	if int(w["output_bytes"].(float64)) != len(text) || len(text) > 4 || len(quoted) > 4 {
 		t.Fatalf("text %q json %s window %#v", text, enc, w)
+	}
+}
+
+func TestGetPipelineJobOutput_tailBeyondScanUsesMargin(t *testing.T) {
+	scan := 64
+	raw := bytes.Repeat([]byte("x"), 8000)
+	secret := []byte("glpat-" + strings.Repeat("a", 20))
+	tailAt := len(raw) - scan
+	copy(raw[tailAt-1:], secret)
+	copy(raw[len(raw)-5:], []byte(" END\n"))
+	d := authzDeps(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, "/trace") {
+			_, _ = io.WriteString(w, `{"id":42}`)
+			return
+		}
+		var n int
+		if _, err := fmt.Sscanf(r.Header.Get("Range"), "bytes=-%d", &n); err != nil || n <= scan {
+			t.Errorf("suffix range %q", r.Header.Get("Range"))
+			n = scan
+		}
+		if n > len(raw) {
+			n = len(raw)
+		}
+		start := len(raw) - n
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, len(raw)-1, len(raw)))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(raw[start:])
+	}))
+	_, out, err := getPipelineJobOutput(context.Background(), nil, getPipelineJobOutputIn{
+		ProjectID: "42", JobID: 8, Selector: "tail", MaxScanBytes: scan, MaxBytes: scan,
+	}, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := decodeTrace(t, out)["trace"].(string)
+	win := traceWindow(t, out)
+	if win["tail_proven"] != true {
+		t.Fatalf("unproven %#v text %q", win, text)
+	}
+	if strings.Contains(text, "lpat-") || strings.Contains(text, string(secret)) || !strings.Contains(text, "END") {
+		t.Fatalf("tail %q", text)
+	}
+}
+
+func TestGetPipelineJobOutput_tailBoundaryWithheldWithoutLead(t *testing.T) {
+	scan := 64
+	raw := bytes.Repeat([]byte("x"), 8000)
+	secret := []byte("glpat-" + strings.Repeat("a", 20))
+	tailAt := len(raw) - scan
+	copy(raw[tailAt-1:], secret)
+	d := authzDeps(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, "/trace") {
+			_, _ = io.WriteString(w, `{"id":42}`)
+			return
+		}
+		start := len(raw) - scan
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, len(raw)-1, len(raw)))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(raw[start:])
+	}))
+	_, out, err := getPipelineJobOutput(context.Background(), nil, getPipelineJobOutputIn{
+		ProjectID: "42", JobID: 8, Selector: "tail", MaxScanBytes: scan, MaxBytes: scan,
+	}, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := decodeTrace(t, out)["trace"].(string)
+	if strings.Contains(text, "lpat-") || strings.Contains(text, string(secret)) || !strings.Contains(text, redactPlaceholder) {
+		t.Fatalf("boundary tail %q", text)
+	}
+}
+
+func TestGetPipelineJobOutput_rangeShortLookaheadWithheld(t *testing.T) {
+	secret := "glpat-" + strings.Repeat("b", 20)
+	body := []byte("pre " + secret + " post")
+	start := int64(strings.Index(string(body), "glpat-"))
+	end := start + int64(len("glpat-")+4)
+	d := authzDeps(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, "/trace") {
+			_, _ = io.WriteString(w, `{"id":42}`)
+			return
+		}
+		var from, to int
+		if _, err := fmt.Sscanf(r.Header.Get("Range"), "bytes=%d-%d", &from, &to); err != nil {
+			t.Fatalf("range %q", r.Header.Get("Range"))
+		}
+		if to < int(end) {
+			t.Errorf("range stopped at end_byte: %q", r.Header.Get("Range"))
+		}
+		// One byte past end_byte, not enough to finish the token.
+		to = int(end)
+		if from < 0 {
+			from = 0
+		}
+		if to >= len(body) {
+			to = len(body) - 1
+		}
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", from, to, len(body)))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(body[from : to+1])
+	}))
+	_, out, err := getPipelineJobOutput(context.Background(), nil, getPipelineJobOutputIn{
+		ProjectID: "42", JobID: 8, Selector: "range", StartByte: &start, EndByte: &end, MaxScanBytes: int(end - start), MaxBytes: 1 << 20,
+	}, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := decodeTrace(t, out)["trace"].(string)
+	if strings.Contains(text, "glpat-") || strings.Contains(text, "bbbb") {
+		t.Fatalf("range prefix %q", text)
+	}
+}
+
+func TestGetPipelineJobOutput_prefixAndErrorCutOffCredential(t *testing.T) {
+	head := "aaaa\nBearer abc"
+	body := head + "DEFGHIJKLMNOP\nERROR later\n"
+	d := authzDeps(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/trace") {
+			_, _ = io.WriteString(w, body)
+			return
+		}
+		_, _ = io.WriteString(w, `{"id":42}`)
+	}))
+	_, out, err := getPipelineJobOutput(context.Background(), nil, getPipelineJobOutputIn{
+		ProjectID: "42", JobID: 8, MaxScanBytes: len(head), MaxBytes: 1 << 20,
+	}, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := decodeTrace(t, out)["trace"].(string)
+	if strings.Contains(text, "Bearer") || strings.Contains(text, "abc") {
+		t.Fatalf("prefix %q", text)
+	}
+
+	errBody := "ERROR Bearer abc" + strings.Repeat("Z", 40)
+	d2 := authzDeps(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/trace") {
+			_, _ = io.WriteString(w, errBody)
+			return
+		}
+		_, _ = io.WriteString(w, `{"id":42}`)
+	}))
+	_, out, err = getPipelineJobOutput(context.Background(), nil, getPipelineJobOutputIn{
+		ProjectID: "42", JobID: 8, Selector: "error", MaxScanBytes: len("ERROR Bearer abc"), MaxBytes: 1 << 20,
+	}, d2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text = decodeTrace(t, out)["trace"].(string)
+	if strings.Contains(text, "Bearer") || strings.Contains(text, "abc") {
+		t.Fatalf("error %q", text)
+	}
+}
+
+func TestGetPipelineJobOutput_outputBytesMatchJSONReplacement(t *testing.T) {
+	d := authzDeps(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/trace") {
+			_, _ = w.Write([]byte{0xff})
+			return
+		}
+		_, _ = io.WriteString(w, `{"id":42}`)
+	}))
+	_, out, err := getPipelineJobOutput(context.Background(), nil, getPipelineJobOutputIn{
+		ProjectID: "42", JobID: 8,
+	}, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := decodeTrace(t, out)
+	text := m["trace"].(string)
+	w := traceWindow(t, out)
+	sec := traceSection(t, out)
+	counts, _ := sec["counts"].(map[string]any)
+	if !utf8.ValidString(text) || len(text) != 3 || int(w["output_bytes"].(float64)) != len(text) {
+		t.Fatalf("text %q window %#v", text, w)
+	}
+	if counts == nil || int(counts["bytes"].(float64)) != len(text) {
+		t.Fatalf("counts %#v", counts)
+	}
+	_, capped, err := getPipelineJobOutput(context.Background(), nil, getPipelineJobOutputIn{
+		ProjectID: "42", JobID: 8, MaxBytes: 1,
+	}, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctext := decodeTrace(t, capped)["trace"].(string)
+	cw := traceWindow(t, capped)
+	if len(ctext) != int(cw["output_bytes"].(float64)) || len(ctext) > 1 || !utf8.ValidString(ctext) {
+		t.Fatalf("capped %q window %#v", ctext, cw)
 	}
 }
