@@ -17,6 +17,13 @@ When a CLI flag is explicitly provided, it overrides the environment value.
 | `GITLAB_ALLOWED_PROJECT_IDS` | — | empty | Comma-separated project id/path allowlist. |
 | `GITLAB_ALLOWED_GROUP_IDS` | — | empty | Comma-separated group id/path roots; descendants allowed via canonical `parent_id` ancestry (not path-prefix). |
 | `GITLAB_MCP_CURSOR_KEY` | — | empty | Raw operator secret (≥32 bytes) for signed opaque cursors. Missing key keeps legacy startup; cursor-mode tools fail closed with an actionable configuration error. No CLI flag. Fixed TTL **2h** (not configurable). See [cursors.md](cursors.md). |
+| `GITLAB_MCP_INTENT_DB` | — | empty | Absolute path of the private publication-intent database. No default and no CLI flag. Directory mode `0700`, file mode `0600`. Unset is valid while no publishing handler is registered. `review_write` still has no guarded writes. |
+
+`GITLAB_MCP_INTENT_DB` is a separate SQLite file. The server identifies it by its own
+`application_id` and schema metadata, and refuses unrelated databases, symlinks, and
+loose permissions. It stores payload hashes and minimal receipts, not note bodies or
+tokens. Finalized receipt details are compacted after 30 days; tombstones stay for the
+database epoch.
 
 When **both** `GITLAB_ALLOWED_PROJECT_IDS` and `GITLAB_ALLOWED_GROUP_IDS` are empty, the
 server keeps legacy **allow-all** behavior. That empty policy is a compatibility

@@ -12,6 +12,7 @@ import (
 
 	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/config"
 	glclient "gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/gitlab"
+	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/intentstore"
 	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/mcpsrv"
 	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/version"
 )
@@ -36,6 +37,14 @@ func runWithConfig(parent context.Context, cfg *config.Config) int {
 	// without network use (even when a fake token is present).
 	if err := cfg.Validate(); err != nil {
 		slog.Error("config", "err", err)
+		return 1
+	}
+	if err := intentstore.RequireConfigured(cfg.ToolProfile, cfg.IntentDB, intentstore.PublishingHandlerEnabled()); err != nil {
+		slog.Error("intent store", "err", err)
+		return 1
+	}
+	if err := intentstore.Check(cfg.IntentDB); err != nil {
+		slog.Error("intent store", "err", err)
 		return 1
 	}
 	if cfg.Token == "" {

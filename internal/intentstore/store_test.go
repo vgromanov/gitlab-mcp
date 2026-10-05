@@ -1,0 +1,548 @@
+package intentstore
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+const (
+	plantedBody  = "NOTE-BODY-secret-do-not-store"
+	plantedToken = "glpat-PLANTED-TOKEN-VALUE"
+)
+
+func privateDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+func fixedNow(t *testing.T) (Config, *time.Time) {
+	t.Helper()
+	now := time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)
+	cfg := Config{
+		Path: filepath.Join(privateDir(t), "intent.db"),
+		Now:  func() time.Time { return now },
+	}
+	return cfg, &now
+}
+
+func openStore(t *testing.T, cfg Config) *Store {
+	t.Helper()
+	s, err := Open(cfg)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	return s
+}
+
+func ident(key string) Identity {
+	return Identity{
+		Instance:  "https://gitlab.example/api/v4",
+		Actor:     "reviewer",
+		Project:   "group/proj",
+		MR:        "7",
+		Kind:      "create_note",
+		CallerKey: key,
+	}
+}
+
+func TestPublishingHandlerDisabled(t *testing.T) {
+	if PublishingHandlerEnabled() {
+		t.Fatal("publishing handler must stay disabled")
+	}
+	if err := RequireConfigured("review_write", "", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := RequireConfigured("review_write", "", true); err == nil {
+		t.Fatal("review_write with a handler requires the intent database")
+	}
+	if err := RequireConfigured("review_read", "", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := Check(""); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCloseReopen(t *testing.T) {
+	cfg, _ := fixedNow(t)
+	s := openStore(t, cfg)
+	ctx := context.Background()
+	hash := PayloadHash([]byte("same-payload"))
+	rec, err := s.Begin(ctx, ident("k"), hash, BeginOptions{ExpectedHead: "abc123"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.State != StatePrepared || rec.ExpectedHead != "abc123" {
+		t.Fatalf("receipt %+v", rec)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s2 := openStore(t, cfg)
+	got, err := s2.Get(ctx, rec.OperationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != StatePrepared || got.PayloadHash != hash || got.OperationID != rec.OperationID {
+		t.Fatalf("reopened %+v", got)
+	}
+	again, err := s2.Begin(ctx, ident("k"), hash, BeginOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.OperationID != rec.OperationID {
+		t.Fatalf("replay id %s want %s", again.OperationID, rec.OperationID)
+	}
+}
+
+func TestPayloadConflictAndClaim(t *testing.T) {
+	cfg, now := fixedNow(t)
+	s := openStore(t, cfg)
+	ctx := context.Background()
+	hash := PayloadHash([]byte("payload-a"))
+	rec, err := s.Begin(ctx, ident("k"), hash, BeginOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	published := false
+	_, err = s.Begin(ctx, ident("k"), PayloadHash([]byte("payload-b")), BeginOptions{})
+	if !errors.Is(err, ErrPayloadConflict) {
+		t.Fatalf("conflict: %v", err)
+	}
+	if published {
+		t.Fatal("conflict must not publish")
+	}
+	got, err := s.GetByIdentity(ctx, ident("k"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.PayloadHash != hash || got.OperationID != rec.OperationID {
+		t.Fatalf("row changed: %+v", got)
+	}
+	claimed, err := s.ClaimSending(ctx, rec.OperationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed.State != StateSending || claimed.SendingAt.IsZero() {
+		t.Fatalf("claim %+v", claimed)
+	}
+	if _, err := s.ClaimSending(ctx, rec.OperationID); !errors.Is(err, ErrAlreadySending) {
+		t.Fatalf("second claim: %v", err)
+	}
+	done, err := s.RecordOutcome(ctx, rec.OperationID, Outcome{
+		State:             StatePublished,
+		ObservedHead:      "abc123",
+		UpstreamIDs:       []string{"note-1"},
+		VerificationState: "verified",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if done.State != StatePublished || done.FinalizedAt.IsZero() || done.UpstreamIDs[0] != "note-1" {
+		t.Fatalf("outcome %+v", done)
+	}
+	if _, err := s.ClaimSending(ctx, rec.OperationID); !errors.Is(err, ErrTerminal) {
+		t.Fatalf("terminal claim: %v", err)
+	}
+	_ = now
+}
+
+func TestExpiredPreparedCannotDispatch(t *testing.T) {
+	cfg, now := fixedNow(t)
+	s := openStore(t, cfg)
+	ctx := context.Background()
+	hash := PayloadHash([]byte("payload-a"))
+	exp := now.Add(time.Minute)
+	rec, err := s.Begin(ctx, ident("k"), hash, BeginOptions{ExpiresAt: exp})
+	if err != nil {
+		t.Fatal(err)
+	}
+	*now = exp
+	if _, err := s.ClaimSending(ctx, rec.OperationID); !errors.Is(err, ErrExpired) {
+		t.Fatalf("expired claim: %v", err)
+	}
+	again, err := s.Begin(ctx, ident("k"), hash, BeginOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.OperationID != rec.OperationID || again.State != StatePrepared {
+		t.Fatalf("reuse allocated a new intent: %+v", again)
+	}
+}
+
+func TestCompactFinalizedOnly(t *testing.T) {
+	cfg, now := fixedNow(t)
+	cfg.Retention = 30 * 24 * time.Hour
+	s := openStore(t, cfg)
+	ctx := context.Background()
+	pubHash := PayloadHash([]byte("published-body"))
+	uncHash := PayloadHash([]byte("uncertain-body"))
+	pub, err := s.Begin(ctx, ident("pub"), pubHash, BeginOptions{ExpectedHead: "head-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ClaimSending(ctx, pub.OperationID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RecordOutcome(ctx, pub.OperationID, Outcome{
+		State:             StatePublished,
+		ObservedHead:      "head-1",
+		UpstreamIDs:       []string{"disc-9"},
+		VerificationState: "verified",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	unc, err := s.Begin(ctx, ident("unc"), uncHash, BeginOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ClaimSending(ctx, unc.OperationID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RecordOutcome(ctx, unc.OperationID, Outcome{
+		State:       StateUncertain,
+		UpstreamIDs: []string{"maybe-1"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	*now = now.Add(29 * 24 * time.Hour)
+	n, err := s.Compact(ctx)
+	if err != nil || n != 0 {
+		t.Fatalf("early compact n=%d err=%v", n, err)
+	}
+	*now = now.Add(2 * 24 * time.Hour)
+	n, err = s.Compact(ctx)
+	if err != nil || n != 1 {
+		t.Fatalf("compact n=%d err=%v", n, err)
+	}
+	got, err := s.Get(ctx, pub.OperationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Compacted || got.State != StatePublished || got.PayloadHash != pubHash || got.ObservedHead != "" || len(got.UpstreamIDs) != 0 {
+		t.Fatalf("tombstone %+v", got)
+	}
+	uncGot, err := s.Get(ctx, unc.OperationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if uncGot.Compacted || uncGot.State != StateUncertain || len(uncGot.UpstreamIDs) != 1 {
+		t.Fatalf("uncertain compacted: %+v", uncGot)
+	}
+	if _, err := s.Begin(ctx, ident("pub"), PayloadHash([]byte("other")), BeginOptions{}); !errors.Is(err, ErrPayloadConflict) {
+		t.Fatalf("post-compact conflict: %v", err)
+	}
+	if _, err := s.ClaimSending(ctx, pub.OperationID); !errors.Is(err, ErrTerminal) {
+		t.Fatalf("post-compact claim: %v", err)
+	}
+}
+
+func TestFullReadOnlyCorrupt(t *testing.T) {
+	cfg, _ := fixedNow(t)
+	cfg.MaxRows = 1
+	s := openStore(t, cfg)
+	ctx := context.Background()
+	if _, err := s.Begin(ctx, ident("one"), PayloadHash([]byte("a")), BeginOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	publish := func() error { called = true; return nil }
+	_, err := s.Begin(ctx, ident("two"), PayloadHash([]byte("b")), BeginOptions{})
+	if !errors.Is(err, ErrFull) {
+		t.Fatalf("full: %v", err)
+	}
+	if called {
+		t.Fatal("full store published")
+	}
+	_ = publish
+
+	path := s.path
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	cfg.MaxRows = 0
+	cfg.MaxBytes = 1
+	s2 := openStore(t, cfg)
+	if _, err := s2.GetByIdentity(ctx, ident("one")); err != nil {
+		t.Fatal(err)
+	}
+	called = false
+	_, err = s2.Begin(ctx, ident("three"), PayloadHash([]byte("c")), BeginOptions{})
+	if !errors.Is(err, ErrFull) {
+		t.Fatalf("byte cap: %v", err)
+	}
+	if called {
+		t.Fatal("over-capacity store published")
+	}
+	if err := s2.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.Chmod(path, 0o400); err != nil {
+		t.Fatal(err)
+	}
+	called = false
+	if _, err := Open(cfg); !errors.Is(err, ErrReadOnly) {
+		t.Fatalf("read-only: %v", err)
+	}
+	if called {
+		t.Fatal("read-only store published")
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	corrupt := filepath.Join(filepath.Dir(path), "corrupt.db")
+	if err := os.WriteFile(corrupt, []byte(plantedToken+plantedBody), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err = Open(Config{Path: corrupt})
+	if !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("corrupt: %v", err)
+	}
+	if strings.Contains(err.Error(), plantedToken) || strings.Contains(err.Error(), plantedBody) {
+		t.Fatalf("corrupt error leaked: %v", err)
+	}
+}
+
+func TestRejectPermissionsAndUnrelated(t *testing.T) {
+	wideParent := privateDir(t)
+	wide := filepath.Join(wideParent, "wide")
+	if err := os.Mkdir(wide, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(wide, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(Config{Path: filepath.Join(wide, "intent.db")}); !errors.Is(err, ErrUnsafePermissions) {
+		t.Fatalf("dir mode: %v", err)
+	}
+
+	dir := privateDir(t)
+	loose := filepath.Join(dir, "loose.db")
+	if err := os.WriteFile(loose, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(loose, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(Config{Path: loose}); !errors.Is(err, ErrUnsafePermissions) {
+		t.Fatalf("file mode: %v", err)
+	}
+
+	real := filepath.Join(dir, "real.db")
+	if err := os.WriteFile(real, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link.db")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(Config{Path: link}); !errors.Is(err, ErrSymlink) {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	other := filepath.Join(dir, "controller.db")
+	createUnrelated(t, other)
+	_, err := Open(Config{Path: other})
+	if !errors.Is(err, ErrUnrelatedDatabase) {
+		t.Fatalf("unrelated: %v", err)
+	}
+	if strings.Contains(err.Error(), plantedBody) {
+		t.Fatalf("unrelated error leaked: %v", err)
+	}
+	if !rawHasTable(t, other, "controller") {
+		t.Fatal("unrelated database was modified")
+	}
+	if rawHasTable(t, other, "intents") {
+		t.Fatal("intent schema was applied to an unrelated database")
+	}
+}
+
+func TestNoSecretLeak(t *testing.T) {
+	cfg, _ := fixedNow(t)
+	s := openStore(t, cfg)
+	ctx := context.Background()
+	hash := PayloadHash([]byte(plantedBody + plantedToken))
+	if _, err := s.Begin(ctx, ident("k"), plantedToken, BeginOptions{}); !errors.Is(err, ErrInvalidHash) {
+		t.Fatalf("token as hash: %v", err)
+	}
+	if _, err := s.Begin(ctx, ident("k"), hash, BeginOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := s.Begin(ctx, ident("k"), PayloadHash([]byte("different")), BeginOptions{})
+	if !errors.Is(err, ErrPayloadConflict) {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	blob := readSidecars(t, cfg.Path)
+	blob += err.Error()
+	if strings.Contains(blob, plantedBody) || strings.Contains(blob, plantedToken) {
+		t.Fatal("planted body or token leaked into the database, sidecars, or error")
+	}
+}
+
+func TestMigrationRollback(t *testing.T) {
+	cfg, _ := fixedNow(t)
+	s := openStore(t, cfg)
+	ctx := context.Background()
+	if _, err := s.Begin(ctx, ident("k"), PayloadHash([]byte("a")), BeginOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	_, err := open(ctx, cfg, 2, func(tx *sql.Tx, from, to int) error {
+		if from != 1 || to != 2 {
+			t.Fatalf("migration range %d -> %d", from, to)
+		}
+		if _, err := tx.Exec(`ALTER TABLE intents ADD COLUMN boom TEXT`); err != nil {
+			return err
+		}
+		return errors.New("abort migration")
+	})
+	if !errors.Is(err, ErrMigration) {
+		t.Fatalf("migration: %v", err)
+	}
+	if rawColumn(t, cfg.Path, "boom") {
+		t.Fatal("failed migration left a column")
+	}
+	if rawUserVersion(t, cfg.Path) != 1 {
+		t.Fatalf("user_version %d", rawUserVersion(t, cfg.Path))
+	}
+	s2 := openStore(t, cfg)
+	if _, err := s2.Begin(ctx, ident("k2"), PayloadHash([]byte("b")), BeginOptions{}); err != nil {
+		t.Fatalf("writes after rolled-back migration: %v", err)
+	}
+}
+
+func TestEpochResetKeepsTombstones(t *testing.T) {
+	cfg, _ := fixedNow(t)
+	s := openStore(t, cfg)
+	ctx := context.Background()
+	hash := PayloadHash([]byte("a"))
+	rec, err := s.Begin(ctx, ident("k"), hash, BeginOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ResetEpoch(ctx, EpochResetConfirmation); !errors.Is(err, ErrDispatchEnabled) {
+		t.Fatalf("reset while enabled: %v", err)
+	}
+	s.DisableDispatch()
+	if err := s.ResetEpoch(ctx, "nope"); !errors.Is(err, ErrConfirmation) {
+		t.Fatalf("bad confirmation: %v", err)
+	}
+	if err := s.ResetEpoch(ctx, EpochResetConfirmation); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Begin(ctx, ident("new"), PayloadHash([]byte("b")), BeginOptions{}); !errors.Is(err, ErrWritesDisabled) {
+		t.Fatalf("dispatch after disable: %v", err)
+	}
+	s.dispatch = true
+	if _, err := s.ClaimSending(ctx, rec.OperationID); !errors.Is(err, ErrStaleEpoch) {
+		t.Fatalf("stale claim: %v", err)
+	}
+	if _, err := s.Begin(ctx, ident("k"), PayloadHash([]byte("other")), BeginOptions{}); !errors.Is(err, ErrPayloadConflict) {
+		t.Fatalf("old key after epoch reset: %v", err)
+	}
+	fresh, err := s.Begin(ctx, ident("new"), PayloadHash([]byte("b")), BeginOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fresh.EpochCurrent || fresh.Epoch == rec.Epoch {
+		t.Fatalf("new epoch row %+v old %s", fresh, rec.Epoch)
+	}
+}
+
+func createUnrelated(t *testing.T, path string) {
+	t.Helper()
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE TABLE controller (body TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO controller(body) VALUES (?)`, plantedBody); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func rawHasTable(t *testing.T, path, name string) bool {
+	t.Helper()
+	db, err := sql.Open("sqlite", "file:"+path+"?mode=ro")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, name).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n == 1
+}
+
+func rawColumn(t *testing.T, path, name string) bool {
+	t.Helper()
+	db, err := sql.Open("sqlite", "file:"+path+"?mode=ro")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('intents') WHERE name=?`, name).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n == 1
+}
+
+func rawUserVersion(t *testing.T, path string) int {
+	t.Helper()
+	db, err := sql.Open("sqlite", "file:"+path+"?mode=ro")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var n int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+func readSidecars(t *testing.T, path string) string {
+	t.Helper()
+	var b strings.Builder
+	for _, p := range sidecarPaths(path) {
+		buf, err := os.ReadFile(p)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			t.Fatal(err)
+		}
+		b.Write(buf)
+	}
+	return b.String()
+}

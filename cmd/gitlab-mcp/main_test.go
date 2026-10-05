@@ -1,8 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
 	"net"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/config"
@@ -80,5 +87,44 @@ func TestRunWithConfig_stdioCancelled(t *testing.T) {
 	// Cancelled parent should make stdio return an error (exit 1) or succeed quickly (0).
 	if code != 0 && code != 1 {
 		t.Fatalf("unexpected code %d", code)
+	}
+}
+
+func TestRunWithConfig_badIntentDB(t *testing.T) {
+	hits := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		http.Error(w, "should not be called", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "bad.db")
+	planted := []byte("NOTE-BODY-secret-do-not-store glpat-PLANTED-TOKEN-VALUE")
+	if err := os.WriteFile(path, planted, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	code := runWithConfig(context.Background(), &config.Config{
+		Token:    "fake-token-not-live",
+		APIURL:   srv.URL + "/api/v4",
+		IntentDB: path,
+	})
+	if code != 1 {
+		t.Fatalf("corrupt intent db must exit 1 before the GitLab client, got %d", code)
+	}
+	if hits != 0 {
+		t.Fatalf("gitlab client was contacted %d times", hits)
+	}
+	logged := buf.String()
+	if strings.Contains(logged, "NOTE-BODY-secret-do-not-store") || strings.Contains(logged, "glpat-PLANTED-TOKEN-VALUE") {
+		t.Fatalf("startup log leaked planted secret: %s", logged)
 	}
 }

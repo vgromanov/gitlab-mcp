@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -46,6 +47,9 @@ type Config struct {
 	// CursorKey is the raw operator secret from GITLAB_MCP_CURSOR_KEY.
 	// Empty allows legacy startup; cursor-dependent paths fail closed at use.
 	CursorKey []byte
+	// IntentDB is the absolute path from GITLAB_MCP_INTENT_DB.
+	// Empty leaves the intent store unopened. There is no default path.
+	IntentDB string
 }
 
 func envBool(key string, def bool) bool {
@@ -118,6 +122,9 @@ func Load() *Config {
 	// Cursor key: raw secret bytes; do not trim (operators may intentionally include spaces).
 	if v, ok := os.LookupEnv("GITLAB_MCP_CURSOR_KEY"); ok {
 		c.CursorKey = []byte(v)
+	}
+	if v, ok := os.LookupEnv("GITLAB_MCP_INTENT_DB"); ok {
+		c.IntentDB = strings.TrimSpace(v)
 	}
 
 	var (
@@ -304,6 +311,9 @@ func (c *Config) Validate() error {
 	}
 	if err := cursor.ValidateKey(c.CursorKey); err != nil {
 		return err
+	}
+	if c.IntentDB != "" && !filepath.IsAbs(c.IntentDB) {
+		return fmt.Errorf("GITLAB_MCP_INTENT_DB must be an absolute path")
 	}
 	return nil
 }
