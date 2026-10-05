@@ -3,6 +3,7 @@
 package intentstore
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -93,36 +94,98 @@ func identifyFile(path string) (fileID, error) {
 	}, nil
 }
 
+// makeParents creates the missing components of path one at a time. Each
+// component is opened with FILE_FLAG_OPEN_REPARSE_POINT and rejected if it is
+// a reparse point, and the handle is held without FILE_SHARE_DELETE so the
+// validated name cannot be renamed away and replaced by a junction while the
+// next component is created beneath it. New directories are created with an
+// owner-only descriptor, so no ACL is ever applied to a pre-existing path.
 func makeParents(path string) error {
-	clean := filepath.Clean(path)
-	if clean == "" || clean == `\` || (len(clean) == 3 && clean[1] == ':') {
-		return nil
-	}
-	var missing []string
-	cur := clean
-	for {
-		if _, err := os.Lstat(cur); err == nil {
-			break
-		} else if !os.IsNotExist(err) {
+	var pins []windows.Handle
+	defer func() {
+		for _, h := range pins {
+			windows.CloseHandle(h)
+		}
+	}()
+	for _, acc := range windowsPathPrefixes(filepath.Clean(path)) {
+		h, err := openDirNoReparse(acc)
+		created := false
+		if err != nil && errors.Is(err, os.ErrNotExist) {
+			if err := createPrivateDir(acc); err != nil {
+				return err
+			}
+			created = true
+			h, err = openDirNoReparse(acc)
+		}
+		if err != nil {
 			return err
 		}
-		missing = append(missing, cur)
-		next := parentDir(cur)
-		if next == cur {
-			break
+		pins = append(pins, h)
+		if created {
+			if err := verifyOwnerOnly(acc, true); err != nil {
+				return err
+			}
 		}
-		cur = next
 	}
-	if len(missing) == 0 {
-		return nil
+	return nil
+}
+
+func openDirNoReparse(path string) (windows.Handle, error) {
+	name, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return 0, err
 	}
-	if err := os.MkdirAll(clean, 0o700); err != nil {
+	h, err := windows.CreateFile(
+		name,
+		windows.FILE_READ_ATTRIBUTES,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE,
+		nil,
+		windows.OPEN_EXISTING,
+		windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OPEN_REPARSE_POINT,
+		0,
+	)
+	if err != nil {
+		return 0, err
+	}
+	var info windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(h, &info); err != nil {
+		windows.CloseHandle(h)
+		return 0, err
+	}
+	if info.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		windows.CloseHandle(h)
+		return 0, ErrSymlink
+	}
+	if info.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY == 0 {
+		windows.CloseHandle(h)
+		return 0, ErrUnsafePermissions
+	}
+	return h, nil
+}
+
+// createPrivateDir creates a single directory with a protected owner-only
+// DACL set atomically at creation. CreateDirectory does not follow a reparse
+// point at the final component and fails if the name already exists.
+func createPrivateDir(path string) error {
+	sid, err := currentUserSID()
+	if err != nil {
 		return err
 	}
-	for i := len(missing) - 1; i >= 0; i-- {
-		if err := establishPrivate(missing[i], true); err != nil {
-			return err
-		}
+	str := sid.String()
+	sd, err := windows.SecurityDescriptorFromString("O:" + str + "D:P(A;OICI;GA;;;" + str + ")")
+	if err != nil {
+		return err
+	}
+	sa := &windows.SecurityAttributes{SecurityDescriptor: sd}
+	sa.Length = uint32(unsafe.Sizeof(*sa))
+	name, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return err
+	}
+	err = windows.CreateDirectory(name, sa)
+	runtime.KeepAlive(sd)
+	if err != nil && !errors.Is(err, os.ErrExist) {
+		return err
 	}
 	return nil
 }
