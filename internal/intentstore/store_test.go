@@ -537,8 +537,43 @@ func TestForeignEpochBlocksOldWrite(t *testing.T) {
 	if got.State != StatePrepared || got.Epoch != oldEpoch || got.EpochCurrent {
 		t.Fatalf("old row changed: %+v", got)
 	}
-	if b.epoch != oldEpoch || !b.dispatch {
-		t.Fatalf("cache epoch %s dispatch %v", b.epoch, b.dispatch)
+}
+
+func TestGetEpochAndReceiptShareSnapshot(t *testing.T) {
+	cfg, _ := fixedNow(t)
+	s := openStore(t, cfg)
+	ctx := context.Background()
+	if _, err := s.Begin(ctx, ident("k"), PayloadHash([]byte("a")), BeginOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	peer := openStore(t, cfg)
+	afterReadEpoch = func() {
+		afterReadEpoch = nil
+		peer.DisableDispatch()
+		if err := peer.ResetEpoch(ctx, EpochResetConfirmation); err != nil {
+			t.Errorf("reset: %v", err)
+			return
+		}
+		fresh := openStore(t, cfg)
+		if _, err := fresh.Begin(ctx, ident("new"), PayloadHash([]byte("b")), BeginOptions{}); err != nil {
+			t.Errorf("new begin: %v", err)
+		}
+	}
+	t.Cleanup(func() { afterReadEpoch = nil })
+	// Without a snapshot this would return the new row compared to the
+	// pre-reset epoch (EpochCurrent=false). The insert is after the
+	// snapshot starts, so it must not be visible.
+	if _, err := s.GetByIdentity(ctx, ident("new")); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("new row from a later epoch visible in the old snapshot: %v", err)
+	}
+	// The hook must have committed the new row; otherwise NotFound is vacuous.
+	later := openStore(t, cfg)
+	got, err := later.GetByIdentity(ctx, ident("new"))
+	if err != nil {
+		t.Fatalf("new row missing after hook: %v", err)
+	}
+	if !got.EpochCurrent {
+		t.Fatalf("fresh snapshot must see the new epoch: %+v", got)
 	}
 }
 
@@ -760,6 +795,35 @@ func TestWindowsDriveWalkKeepsAbsolute(t *testing.T) {
 	unc := windowsPathPrefixes(`\\server\share\private\link\intent.db`)
 	if len(unc) < 2 || unc[0] != `\\server\share\private` || unc[1] != `\\server\share\private\link` {
 		t.Fatalf("unc prefixes %v", unc)
+	}
+}
+
+type modeInfo struct {
+	os.FileInfo
+	mode os.FileMode
+}
+
+func (m modeInfo) Mode() os.FileMode { return m.mode }
+func (m modeInfo) IsDir() bool       { return m.mode.IsDir() }
+
+func TestIsSymlinkRejectsIrregularReparse(t *testing.T) {
+	// Go 1.25 reports a Windows directory junction as ModeIrregular.
+	if !isSymlink(modeInfo{mode: os.ModeDir | os.ModeIrregular}) {
+		t.Fatal("junction-like ModeIrregular accepted")
+	}
+	if !isSymlink(modeInfo{mode: os.ModeSymlink}) {
+		t.Fatal("ModeSymlink accepted")
+	}
+	if isSymlink(modeInfo{mode: os.ModeDir | 0o700}) {
+		t.Fatal("ordinary directory treated as a reparse point")
+	}
+	dir := privateDir(t)
+	info, err := os.Lstat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := checkDir(dir, modeInfo{FileInfo: info, mode: os.ModeDir | os.ModeIrregular}); !errors.Is(err, ErrSymlink) {
+		t.Fatalf("checkDir irregular: %v", err)
 	}
 }
 

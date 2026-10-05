@@ -5,7 +5,9 @@ package intentstore
 import (
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"syscall"
 	"testing"
 )
@@ -119,6 +121,69 @@ func TestMkdirRaceDoesNotChmodSymlinkTarget(t *testing.T) {
 	}
 	if info.Mode().Perm() != 0o755 {
 		t.Fatalf("target mode %o, chmod followed the symlink", info.Mode().Perm())
+	}
+}
+
+func TestAccessACLRejected(t *testing.T) {
+	dir := privateDir(t)
+	path := filepath.Join(dir, "intent.db")
+	if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	grantAccessACL(t, path)
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := checkFileAccess(path, info); !errors.Is(err, ErrUnsafePermissions) {
+		t.Fatalf("file ACL: %v", err)
+	}
+
+	parent := privateDir(t)
+	grantAccessACL(t, parent)
+	dinfo, err := os.Lstat(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := checkDirAccess(parent, dinfo); !errors.Is(err, ErrUnsafePermissions) {
+		t.Fatalf("parent ACL: %v", err)
+	}
+}
+
+func TestOpenRejectsAccessACL(t *testing.T) {
+	cfg, _ := fixedNow(t)
+	s := openStore(t, cfg)
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	grantAccessACL(t, cfg.Path)
+	if _, err := Open(cfg); !errors.Is(err, ErrUnsafePermissions) {
+		t.Fatalf("file ACL open: %v", err)
+	}
+
+	cfg2, _ := fixedNow(t)
+	grantAccessACL(t, filepath.Dir(cfg2.Path))
+	if _, err := Open(cfg2); !errors.Is(err, ErrUnsafePermissions) {
+		t.Fatalf("parent ACL open: %v", err)
+	}
+}
+
+func grantAccessACL(t *testing.T, path string) {
+	t.Helper()
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin", "ios":
+		cmd = exec.Command("chmod", "+a", "everyone allow read", path)
+	case "linux":
+		if _, err := exec.LookPath("setfacl"); err != nil {
+			t.Skip("setfacl not installed")
+		}
+		cmd = exec.Command("setfacl", "-m", "u:nobody:r", path)
+	default:
+		t.Skip("no ACL grant helper")
+	}
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("grant ACL: %v\n%s", err, out)
 	}
 }
 

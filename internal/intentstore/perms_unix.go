@@ -12,14 +12,17 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func checkDirAccess(_ string, info os.FileInfo) error {
+func checkDirAccess(path string, info os.FileInfo) error {
 	if info.Mode().Perm() != 0o700 {
 		return ErrUnsafePermissions
 	}
-	return checkOwner(info)
+	if err := checkOwner(info); err != nil {
+		return err
+	}
+	return rejectAccessACL(path)
 }
 
-func checkFileAccess(_ string, info os.FileInfo) error {
+func checkFileAccess(path string, info os.FileInfo) error {
 	perm := info.Mode().Perm()
 	if perm&0o200 == 0 {
 		return ErrReadOnly
@@ -27,7 +30,10 @@ func checkFileAccess(_ string, info os.FileInfo) error {
 	if perm != 0o600 {
 		return ErrUnsafePermissions
 	}
-	return checkOwner(info)
+	if err := checkOwner(info); err != nil {
+		return err
+	}
+	return rejectAccessACL(path)
 }
 
 // checkOwner rejects a directory or store file owned by another user.

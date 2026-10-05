@@ -214,11 +214,9 @@ func (s *Store) Get(ctx context.Context, operationID string) (Receipt, error) {
 	if err := s.readyLocked(); err != nil {
 		return Receipt{}, err
 	}
-	epoch, err := readEpoch(ctx, s.db)
-	if err != nil {
-		return Receipt{}, err
-	}
-	return getByIDTx(ctx, s.db, operationID, epoch)
+	return s.receiptSnapshot(ctx, func(tx *sql.Tx, epoch string) (Receipt, error) {
+		return getByIDTx(ctx, tx, operationID, epoch)
+	})
 }
 
 // GetByIdentity loads the receipt for an idempotency key.
@@ -231,11 +229,28 @@ func (s *Store) GetByIdentity(ctx context.Context, id Identity) (Receipt, error)
 	if err := s.readyLocked(); err != nil {
 		return Receipt{}, err
 	}
-	epoch, err := readEpoch(ctx, s.db)
+	return s.receiptSnapshot(ctx, func(tx *sql.Tx, epoch string) (Receipt, error) {
+		return getByIdentityTx(ctx, tx, id, epoch)
+	})
+}
+
+// receiptSnapshot loads meta.epoch and the receipt from one read
+// transaction. A reset committed between standalone queries could
+// otherwise mark an old row current and a new row stale.
+func (s *Store) receiptSnapshot(ctx context.Context, load func(*sql.Tx, string) (Receipt, error)) (Receipt, error) {
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return Receipt{}, mapDriver(err)
+	}
+	defer tx.Rollback()
+	epoch, err := readEpoch(ctx, tx)
 	if err != nil {
 		return Receipt{}, err
 	}
-	return getByIdentityTx(ctx, s.db, id, epoch)
+	if afterReadEpoch != nil {
+		afterReadEpoch()
+	}
+	return load(tx, epoch)
 }
 
 // Compact drops finalized receipt details older than the retention window.

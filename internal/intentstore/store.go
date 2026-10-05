@@ -59,6 +59,10 @@ var afterPrepare func(*Store) error
 // Tests use it to swap an ancestor for a symlink in that gap.
 var beforeSQLOpen func(path string)
 
+// afterReadEpoch runs after meta.epoch is read inside a Get snapshot
+// and before the receipt is loaded. Tests use it to reset the epoch.
+var afterReadEpoch func()
+
 type migrateFunc func(tx *sql.Tx, from, to int) error
 
 // PublishingHandlerEnabled reports whether this process registers a publisher.

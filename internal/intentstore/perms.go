@@ -8,7 +8,11 @@ import (
 )
 
 func isSymlink(info os.FileInfo) bool {
-	return info.Mode()&os.ModeSymlink != 0
+	m := info.Mode()
+	// Go 1.25 reports a Windows directory junction or mount point as
+	// ModeIrregular (reparse point), not ModeSymlink. sql.Open would
+	// otherwise follow it after the walk accepted the component.
+	return m&os.ModeSymlink != 0 || m&os.ModeIrregular != 0
 }
 
 // rejectDotDot refuses a path that still contains `..`. filepath.Clean
