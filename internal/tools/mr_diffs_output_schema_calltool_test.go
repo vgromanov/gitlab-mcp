@@ -392,6 +392,276 @@ func TestDocsReadEnvelopesExamplesValidateRegisteredOutputSchema(t *testing.T) {
 	if contentCount < 3 {
 		t.Fatalf("expected ≥3 content-mode docs examples, got %d", contentCount)
 	}
+	// Actual registered CallTool projection oracles for the three content docs examples.
+	oracles := registeredContentDocsOracles(t)
+	contentIdx := 0
+	for i, block := range blocks {
+		var fixture map[string]any
+		if err := json.Unmarshal([]byte(block), &fixture); err != nil {
+			t.Fatalf("docs example %d not JSON: %v", i, err)
+		}
+		if classifyDocsEnvelopeExample(fixture) != "get_merge_request_diff_window_content" {
+			continue
+		}
+		contentIdx++
+		var oracle map[string]any
+		var label string
+		switch contentIdx {
+		case 1:
+			oracle, label = oracles["version"], "version"
+		case 2:
+			oracle, label = oracles["straight"], "straight"
+		case 3:
+			oracle, label = oracles["drift"], "drift"
+		default:
+			t.Fatalf("unexpected content example index %d", contentIdx)
+		}
+		assertDocsContentMatchesCallToolOracle(t, i, label, fixture, oracle)
+	}
+	// Negative controls: mutate documented fields; oracle comparison must fail.
+	t.Run("negative_mutate_selection_kind", func(t *testing.T) {
+		bad := cloneMap(oracles["version"])
+		sel := asMap(t, bad["selection"])
+		sel["kind"] = "version" // not emitted
+		bad["selection"] = sel
+		err := docsContentOracleMismatch(oracles["version"], bad)
+		if err == nil {
+			t.Fatal("mutated selection.kind must fail oracle")
+		}
+	})
+	t.Run("negative_mutate_limitation_detail", func(t *testing.T) {
+		bad := cloneMap(oracles["straight"])
+		sec := asMap(t, bad["section"])
+		sec["limitations"] = []any{map[string]any{"code": "partial", "detail": "compare"}}
+		bad["section"] = sec
+		err := docsContentOracleMismatch(oracles["straight"], bad)
+		if err == nil {
+			t.Fatal("mutated limitation detail must fail oracle")
+		}
+	})
+	t.Run("negative_mutate_drift_selectors_empty", func(t *testing.T) {
+		bad := cloneMap(oracles["drift"])
+		bad["selectors"] = []any{}
+		err := docsContentOracleMismatch(oracles["drift"], bad)
+		if err == nil {
+			t.Fatal("erased drift selectors must fail oracle")
+		}
+	})
+}
+
+func cloneMap(m map[string]any) map[string]any {
+	b, _ := json.Marshal(m)
+	var out map[string]any
+	_ = json.Unmarshal(b, &out)
+	return out
+}
+
+func registeredContentDocsOracles(t *testing.T) map[string]map[string]any {
+	t.Helper()
+	head, base, start := shaN(1), shaN(2), shaN(3)
+	from, to := shaN(4), shaN(5)
+	patch := "@@ -1 +1 @@\n-a\n+b\n"
+	out := map[string]map[string]any{}
+
+	// version success
+	body := versionObject(1, 5001, head, base, start, "collected", "1", oneDiff("a.go", patch))
+	hVer := serveDiffBase(&pathLog{}, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/versions/1"):
+			_, _ = io.WriteString(w, body)
+		case strings.Contains(r.URL.Path, "/merge_requests/"):
+			_, _ = io.WriteString(w, `{"id":5001,"iid":1,"project_id":42,"source_project_id":42}`)
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	ver, err := callDiffWindow(t, diffDeps(t, hVer), nil, map[string]any{
+		"project_id": "42", "merge_request_iid": 1, "diff_version_id": 1,
+		"mode": "content", "paths": []any{"a.go"},
+	})
+	if err != nil {
+		t.Fatalf("version oracle CallTool: %v", err)
+	}
+	out["version"] = ver
+
+	// straight partial (matched + unobserved)
+	hStr := serveDiffBase(&pathLog{}, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/repository/commits/"):
+			sha := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
+			fmt.Fprintf(w, `{"id":%q}`, sha)
+		case strings.Contains(r.URL.Path, "/repository/compare"):
+			fmt.Fprintf(w, `{"commit":{"id":%q},"diffs":[{"old_path":"a.go","new_path":"a.go","a_mode":"100644","b_mode":"100644","diff":%q}]}`, to, patch)
+		case strings.Contains(r.URL.Path, "/merge_requests/"):
+			_, _ = io.WriteString(w, `{"id":5001,"iid":1,"project_id":42,"source_project_id":42}`)
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	str, err := callDiffWindow(t, diffDeps(t, hStr), nil, map[string]any{
+		"project_id": "42", "merge_request_iid": 1, "from_sha": from, "to_sha": to, "straight": true,
+		"mode": "content", "paths": []any{"a.go", "missing.go"},
+	})
+	if err != nil {
+		t.Fatalf("straight oracle CallTool: %v", err)
+	}
+	out["straight"] = str
+
+	// closing path drift
+	var n int
+	hDrift := serveDiffBase(&pathLog{}, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/repository/commits/"):
+			sha := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
+			fmt.Fprintf(w, `{"id":%q}`, sha)
+		case strings.Contains(r.URL.Path, "/repository/compare"):
+			n++
+			p := "a.go"
+			if n > 1 {
+				p = "b.go"
+			}
+			fmt.Fprintf(w, `{"commit":{"id":%q},"diffs":[{"old_path":%q,"new_path":%q,"a_mode":"100644","b_mode":"100644","diff":%q}]}`, to, p, p, patch)
+		case strings.Contains(r.URL.Path, "/merge_requests/"):
+			_, _ = io.WriteString(w, `{"id":5001,"iid":1,"project_id":42,"source_project_id":42}`)
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	drift, err := callDiffWindow(t, diffDeps(t, hDrift), nil, map[string]any{
+		"project_id": "42", "merge_request_iid": 1, "from_sha": from, "to_sha": to, "straight": true,
+		"mode": "content", "paths": []any{"a.go"},
+	})
+	if err != nil {
+		t.Fatalf("drift oracle CallTool: %v", err)
+	}
+	out["drift"] = drift
+	return out
+}
+
+func assertDocsContentMatchesCallToolOracle(t *testing.T, docIdx int, label string, doc, oracle map[string]any) {
+	t.Helper()
+	oSec := asMap(t, oracle["section"])
+	dSec, _ := doc["section"].(map[string]any)
+	if dSec == nil {
+		t.Fatalf("docs %d/%s missing section", docIdx, label)
+	}
+	// Exact mandatory fields from registered CallTool (docs may abridge other readmeta keys).
+	for _, k := range []string{"content_complete", "manifest_coverage", "patch_coverage", "consistency"} {
+		if dSec[k] != nil && dSec[k] != oSec[k] {
+			t.Fatalf("docs %d/%s section.%s=%v want oracle %v (CallTool)", docIdx, label, k, dSec[k], oSec[k])
+		}
+		if dSec[k] == nil {
+			t.Fatalf("docs %d/%s section.%s omitted; required by content contract (mark abridgement only for non-mandatory keys)", docIdx, label, k)
+		}
+	}
+	if oSel, _ := oracle["selection"].(map[string]any); oSel != nil {
+		dSel, _ := doc["selection"].(map[string]any)
+		if dSel == nil || dSel["kind"] != oSel["kind"] {
+			t.Fatalf("docs %d/%s selection.kind=%v want %v", docIdx, label, dSel, oSel["kind"])
+		}
+	}
+	// Limitations: when present in docs, code+message must match oracle (not detail).
+	if dLims, ok := dSec["limitations"].([]any); ok && len(dLims) > 0 {
+		oLims, _ := oSec["limitations"].([]any)
+		if len(oLims) == 0 {
+			t.Fatalf("docs %d/%s has limitations but oracle has none", docIdx, label)
+		}
+		d0 := asMap(t, dLims[0])
+		o0 := asMap(t, oLims[0])
+		if d0["code"] != o0["code"] || d0["message"] != o0["message"] {
+			t.Fatalf("docs %d/%s limitation %#v want %#v", docIdx, label, d0, o0)
+		}
+		if _, has := d0["detail"]; has {
+			t.Fatalf("docs %d/%s limitation uses detail", docIdx, label)
+		}
+	}
+	// Selectors: docs must retain requested path outcomes matching oracle statuses.
+	oSels := asSlice(t, oracle["selectors"])
+	dSels, _ := doc["selectors"].([]any)
+	if len(dSels) == 0 && len(oSels) > 0 {
+		t.Fatalf("docs %d/%s erased selectors; oracle keeps %#v", docIdx, label, oSels)
+	}
+	byPath := map[string]string{}
+	for _, raw := range oSels {
+		m := asMap(t, raw)
+		byPath[asString(m["path"])] = asString(m["status"])
+	}
+	for _, raw := range dSels {
+		m, _ := raw.(map[string]any)
+		if m == nil {
+			continue
+		}
+		p := asString(m["path"])
+		if want, ok := byPath[p]; ok && asString(m["status"]) != want {
+			t.Fatalf("docs %d/%s selector %s status=%v want %s", docIdx, label, p, m["status"], want)
+		}
+	}
+	// Hash nullability
+	if label == "drift" {
+		if oracle["returned_content_hash"] != nil {
+			t.Fatalf("drift oracle unexpectedly trusted hash")
+		}
+		if doc["returned_content_hash"] != nil {
+			t.Fatalf("docs %d/drift returned_content_hash must be null", docIdx)
+		}
+	} else if doc["returned_content_hash"] == nil {
+		t.Fatalf("docs %d/%s missing returned_content_hash (illustrative value ok)", docIdx, label)
+	}
+	if doc["full_patch_hash"] != nil {
+		t.Fatalf("docs %d/%s full_patch_hash must be null", docIdx, label)
+	}
+}
+
+func docsContentOracleMismatch(oracle, candidate map[string]any) error {
+	// Minimal oracle equality for negative controls on documented fields.
+	oSec, _ := oracle["section"].(map[string]any)
+	cSec, _ := candidate["section"].(map[string]any)
+	if cSec == nil {
+		return fmt.Errorf("missing section")
+	}
+	for _, k := range []string{"content_complete", "manifest_coverage", "patch_coverage", "consistency"} {
+		if cSec[k] != oSec[k] {
+			return fmt.Errorf("section.%s", k)
+		}
+	}
+	oSel, _ := oracle["selection"].(map[string]any)
+	cSel, _ := candidate["selection"].(map[string]any)
+	if oSel != nil && (cSel == nil || cSel["kind"] != oSel["kind"]) {
+		return fmt.Errorf("selection.kind")
+	}
+	oLims, _ := oSec["limitations"].([]any)
+	cLims, _ := cSec["limitations"].([]any)
+	if len(oLims) > 0 {
+		if len(cLims) == 0 {
+			return fmt.Errorf("limitations missing")
+		}
+		o0, _ := oLims[0].(map[string]any)
+		c0, _ := cLims[0].(map[string]any)
+		if c0["code"] != o0["code"] || c0["message"] != o0["message"] || c0["detail"] != nil {
+			return fmt.Errorf("limitation")
+		}
+	}
+	oSels, _ := oracle["selectors"].([]any)
+	cSels, _ := candidate["selectors"].([]any)
+	if len(oSels) > 0 && len(cSels) == 0 {
+		return fmt.Errorf("selectors")
+	}
+	return nil
+}
+
+func assertDocsContentEnvelopeContract(t *testing.T, i int, fixture map[string]any) {
+	t.Helper()
+	// Structural guards only; field truth comes from registeredContentDocsOracles CallTool.
+	if _, ok := fixture["diffs"]; ok {
+		t.Fatalf("content example %d must not fabricate list-diff fields", i)
+	}
+	if _, ok := fixture["pagination"]; ok {
+		t.Fatalf("content example %d must not fabricate list pagination", i)
+	}
+	sec, _ := fixture["section"].(map[string]any)
+	if sec == nil {
+		t.Fatalf("content example %d missing section", i)
+	}
 }
 
 func classifyDocsEnvelopeExample(fixture map[string]any) string {
@@ -409,76 +679,6 @@ func classifyDocsEnvelopeExample(fixture map[string]any) string {
 		return "get_merge_request_diff_window_content"
 	}
 	return ""
-}
-
-func assertDocsContentEnvelopeContract(t *testing.T, i int, fixture map[string]any) {
-	t.Helper()
-	// Contract checks against registered content CallTool projection (no OutputSchema fabrication).
-	if _, ok := fixture["diffs"]; ok {
-		t.Fatalf("content example %d must not fabricate list-diff fields", i)
-	}
-	if _, ok := fixture["pagination"]; ok {
-		t.Fatalf("content example %d must not fabricate list pagination", i)
-	}
-	sec, _ := fixture["section"].(map[string]any)
-	if sec == nil {
-		t.Fatalf("content example %d missing section", i)
-	}
-	if files, ok := fixture["files"]; ok {
-		if _, isSlice := files.([]any); !isSlice && files != nil {
-			t.Fatalf("content example %d files must be array", i)
-		}
-	}
-	if sels, ok := fixture["selectors"]; ok {
-		arr, isSlice := sels.([]any)
-		if !isSlice && sels != nil {
-			t.Fatalf("content example %d selectors must be array", i)
-		}
-		// Fail-closed/drift examples must retain requested selectors when present in docs.
-		_ = arr
-	}
-	if sel, _ := fixture["selection"].(map[string]any); sel != nil {
-		if kind, ok := sel["kind"].(string); ok {
-			switch kind {
-			case "full_version", "full_tuple", "incremental", "version":
-				if kind == "version" {
-					t.Fatalf("content example %d selection.kind %q is not emitted; use full_version", i, kind)
-				}
-			default:
-				t.Fatalf("content example %d unexpected selection.kind %q", i, kind)
-			}
-		}
-	}
-	if mc, ok := sec["manifest_coverage"].(string); ok && mc == "full" {
-		// Version/straight content mode does not emit manifest_coverage=full.
-		t.Fatalf("content example %d manifest_coverage=full is not emitted by content mode", i)
-	}
-	if lims, ok := sec["limitations"].([]any); ok {
-		for _, raw := range lims {
-			lim, _ := raw.(map[string]any)
-			if lim == nil {
-				continue
-			}
-			if _, hasDetail := lim["detail"]; hasDetail {
-				t.Fatalf("content example %d limitation uses detail; readmeta emits message", i)
-			}
-			if _, hasMsg := lim["message"]; lim["code"] != nil && !hasMsg {
-				t.Fatalf("content example %d limitation missing message", i)
-			}
-		}
-	}
-	// Hash nullability: fail-closed examples may set returned_content_hash null.
-	if h, exists := fixture["returned_content_hash"]; exists && h != nil {
-		hm, _ := h.(map[string]any)
-		if hm == nil {
-			t.Fatalf("content example %d returned_content_hash shape", i)
-		}
-	}
-	if _, ok := fixture["full_patch_hash"]; ok {
-		if fixture["full_patch_hash"] != nil {
-			t.Fatalf("content example %d full_patch_hash must be null", i)
-		}
-	}
 }
 
 func mapKeys(m map[string]any) []string {

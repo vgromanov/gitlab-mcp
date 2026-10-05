@@ -1529,65 +1529,57 @@ func TestDiffContentRepair_F3_phaseReachabilityBudgets(t *testing.T) {
 		assertNoTrustedContent(t, out, err, "straight_opening_request_budget")
 	})
 	t.Run("straight_item_budget", func(t *testing.T) {
-		// Charge during decoder traversal (do NOT preconsume with AddItem). Stream two diffs;
-		// MaxItems=1 must stop owned reader mid-opening compare with observable Done.
+		// Decoder item charge with owned-reader join (client-side ReadCloser), not server Done.
 		const secret = "ITEM-BUDGET-SECRET-PATCH"
-		var sawRead, sawClose atomic.Bool
-		var compares2 int32
-		var bodyRead atomic.Int64
-		streamDone := make(chan struct{})
-		var streamOnce sync.Once
-		h2 := serveDiffBase(&pathLog{}, func(w http.ResponseWriter, r *http.Request) {
-			switch {
-			case strings.Contains(r.URL.Path, "/repository/commits/"):
-				sha := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
-				fmt.Fprintf(w, `{"id":%q}`, sha)
-			case strings.Contains(r.URL.Path, "/repository/compare"):
-				atomic.AddInt32(&compares2, 1)
-				flusher, _ := w.(http.Flusher)
-				prefix := fmt.Sprintf(`{"commit":{"id":%q},"diffs":[`, to)
-				d1 := fmt.Sprintf(`{"old_path":"a.go","new_path":"a.go","a_mode":"100644","b_mode":"100644","diff":%q}`, "@@ -1 +1 @@\n-a\n+"+secret+"\n")
-				d2 := fmt.Sprintf(`{"old_path":"b.go","new_path":"b.go","a_mode":"100644","b_mode":"100644","diff":%q}`, "@@ -1 +1 @@\n-c\n+"+secret+"\n")
-				body := prefix + d1 + `,` + d2 + `]}`
-				// Write in chunks so item-budget stop can cancel mid-stream.
-				chunk := 64
-				for i := 0; i < len(body); {
-					if r.Context().Err() != nil {
-						sawClose.Store(true)
-						streamOnce.Do(func() { close(streamDone) })
-						return
-					}
-					end := i + chunk
-					if end > len(body) {
-						end = len(body)
-					}
-					n, err := w.Write([]byte(body[i:end]))
-					bodyRead.Add(int64(n))
-					if n > 0 {
-						sawRead.Store(true)
-					}
-					if err != nil {
-						sawClose.Store(true)
-						streamOnce.Do(func() { close(streamDone) })
-						return
-					}
-					if flusher != nil {
-						flusher.Flush()
-					}
-					i = end
+		from, to := shaN(4), shaN(5)
+		straightArgs := map[string]any{
+			"project_id": "42", "merge_request_iid": 1, "from_sha": from, "to_sha": to, "straight": true,
+			"mode": "content", "paths": []any{"a.go", "b.go"},
+		}
+		mkHandler := func(compares *int32) http.Handler {
+			return serveDiffBase(&pathLog{}, func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case strings.Contains(r.URL.Path, "/repository/commits/"):
+					sha := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
+					fmt.Fprintf(w, `{"id":%q}`, sha)
+				case strings.Contains(r.URL.Path, "/repository/compare"):
+					atomic.AddInt32(compares, 1)
+					prefix := fmt.Sprintf(`{"commit":{"id":%q},"diffs":[`, to)
+					d1 := fmt.Sprintf(`{"old_path":"a.go","new_path":"a.go","a_mode":"100644","b_mode":"100644","diff":%q}`, "@@ -1 +1 @@\n-a\n+"+secret+"\n")
+					d2 := fmt.Sprintf(`{"old_path":"b.go","new_path":"b.go","a_mode":"100644","b_mode":"100644","diff":%q}`, "@@ -1 +1 @@\n-c\n+"+secret+"\n")
+					_, _ = io.WriteString(w, prefix+d1+`,`+d2+`]}`)
+				case strings.Contains(r.URL.Path, "/merge_requests/"):
+					_, _ = io.WriteString(w, `{"id":5001,"iid":1,"project_id":42,"source_project_id":42}`)
+				default:
+					http.NotFound(w, r)
 				}
-				select {
-				case <-r.Context().Done():
-					sawClose.Store(true)
-					streamOnce.Do(func() { close(streamDone) })
-				case <-time.After(2 * time.Second):
-					// If the full body was small enough to finish before cancel, still require typed budget stop.
-				}
-			case strings.Contains(r.URL.Path, "/merge_requests/"):
-				_, _ = io.WriteString(w, `{"id":5001,"iid":1,"project_id":42,"source_project_id":42}`)
-			default:
-				http.NotFound(w, r)
-			}
+			})
+		}
+		// Fault-free baseline: sane MaxItems, opening+closing compare, trusted hash.
+		var compares0 int32
+		probe0 := newOwnedBodyProbe()
+		d0 := diffDepsOwnedBodyProbe(t, mkHandler(&compares0), probe0, func(req *http.Request) bool {
+			return strings.Contains(req.URL.Path, "/repository/compare")
+		})
+		b0 := igl.DefaultBudget()
+		b0.MaxItems = 50
+		b0.MaxRequests = 64
+		b0.MaxBytes = 1 << 20
+		ctx0 := igl.WithBudget(context.Background(), b0)
+		out0, err0 := callDiffWindow(t, d0, ctx0, straightArgs)
+		if err0 != nil || atomic.LoadInt32(&compares0) != 2 || out0["returned_content_hash"] == nil {
+			t.Fatalf("fault-free baseline err=%v compares=%d out=%#v", err0, atomic.LoadInt32(&compares0), out0)
+		}
+		waitOwnedBodyJoin(t, probe0)
+		if probe0.reads.Load() == 0 || probe0.closes.Load() == 0 {
+			t.Fatalf("baseline owned body reads=%d closes=%d", probe0.reads.Load(), probe0.closes.Load())
+		}
+
+		// Inject MaxItems=1: charge during decoder on opening compare; prove stop + join.
+		var compares int32
+		probe := newOwnedBodyProbe()
+		d := diffDepsOwnedBodyProbe(t, mkHandler(&compares), probe, func(req *http.Request) bool {
+			return strings.Contains(req.URL.Path, "/repository/compare")
 		})
 		b := igl.DefaultBudget()
 		b.MaxItems = 1
@@ -1597,26 +1589,20 @@ func TestDiffContentRepair_F3_phaseReachabilityBudgets(t *testing.T) {
 		ctx := igl.WithBudget(parent, b)
 		sibling, stopSibling := context.WithCancel(ctx)
 		defer stopSibling()
-		out, err := callDiffWindow(t, diffDeps(t, h2), ctx, map[string]any{
-			"project_id": "42", "merge_request_iid": 1, "from_sha": from, "to_sha": to, "straight": true,
-			"mode": "content", "paths": []any{"a.go", "b.go"},
-		})
+		out, err := callDiffWindow(t, d, ctx, straightArgs)
 		if err == nil || !strings.Contains(err.Error(), igl.ErrBudgetItems.Error()) {
-			t.Fatalf("want budget_items (decoder charge) err=%v compares=%d", err, atomic.LoadInt32(&compares2))
+			t.Fatalf("want budget_items (decoder charge) err=%v compares=%d", err, atomic.LoadInt32(&compares))
 		}
-		if strings.Contains(err.Error(), context.Canceled.Error()) && !strings.Contains(err.Error(), igl.ErrBudgetItems.Error()) {
-			t.Fatalf("caller-cancel must not masquerade as sole failure: %v", err)
+		if strings.Contains(err.Error(), context.Canceled.Error()) {
+			t.Fatalf("caller-cancel must not masquerade as item-budget failure: %v", err)
 		}
 		assertNoTrustedContent(t, out, err, "straight_item_budget")
-		if atomic.LoadInt32(&compares2) != 1 {
-			t.Fatalf("item budget must stop during opening compare compares=%d", atomic.LoadInt32(&compares2))
-		}
-		if !sawRead.Load() {
-			t.Fatal("expected observable body read before item-budget stop")
+		if atomic.LoadInt32(&compares) != 1 {
+			t.Fatalf("item budget must stop during opening compare compares=%d", atomic.LoadInt32(&compares))
 		}
 		select {
 		case <-ctx.Done():
-			t.Fatal("borrowed budget context cancelled (reader-local termination must not cancel owner)")
+			t.Fatal("borrowed budget context cancelled (reader-local stop must not cancel owner)")
 		default:
 		}
 		if sibling.Err() != nil {
@@ -1628,15 +1614,16 @@ func TestDiffContentRepair_F3_phaseReachabilityBudgets(t *testing.T) {
 		if _, _, items := b.Stats(); items != 1 {
 			t.Fatalf("items charged during traversal want 1 got %d", items)
 		}
-		// Prefer observing owned-reader cleanup; tolerate fully-buffered small bodies.
-		select {
-		case <-streamDone:
-		case <-time.After(500 * time.Millisecond):
-			if bodyRead.Load() == 0 {
-				t.Fatal("no body bytes observed")
-			}
+		if probe.created.Load() != 1 {
+			t.Fatalf("want exactly one instrumented opening compare body, created=%d", probe.created.Load())
 		}
-		_ = sawClose
+		waitOwnedBodyJoin(t, probe)
+		if probe.reads.Load() == 0 {
+			t.Fatal("owned-reader Read not observed")
+		}
+		if probe.closes.Load() != 1 {
+			t.Fatalf("owned-reader Close count=%d want 1", probe.closes.Load())
+		}
 	})
 	t.Run("version_closing_request_budget", func(t *testing.T) {
 		head, base, start := shaN(1), shaN(2), shaN(3)
@@ -2171,6 +2158,91 @@ func diffDepsNoRetry(t *testing.T, h http.Handler) Deps {
 		gitlab.WithBaseURL(cfg.APIURL),
 		gitlab.WithoutRetries(),
 		gitlab.WithInterceptor(igl.BudgetInterceptor()),
+	)
+	if err != nil {
+		t.Fatalf("client: %v", err)
+	}
+	return Deps{Config: cfg, Client: cli, Clock: &cursor.FakeClock{T: time.Date(2026, 10, 4, 12, 0, 0, 0, time.UTC)}}
+}
+
+// ownedBodyProbe is a TEST-ONLY client-side ReadCloser instrument (not shared transport).
+type ownedBodyProbe struct {
+	wg      sync.WaitGroup
+	reads   atomic.Int64
+	closes  atomic.Int64
+	created atomic.Int32
+}
+
+func newOwnedBodyProbe() *ownedBodyProbe { return &ownedBodyProbe{} }
+
+type ownedBodyInstrument struct {
+	next  http.RoundTripper
+	probe *ownedBodyProbe
+	match func(*http.Request) bool
+}
+
+func (t *ownedBodyInstrument) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.next.RoundTrip(req)
+	if err != nil || resp == nil || resp.Body == nil || t.probe == nil {
+		return resp, err
+	}
+	if t.match != nil && !t.match(req) {
+		return resp, err
+	}
+	t.probe.created.Add(1)
+	t.probe.wg.Add(1)
+	resp.Body = &ownedProbeBody{ReadCloser: resp.Body, probe: t.probe}
+	return resp, err
+}
+
+type ownedProbeBody struct {
+	io.ReadCloser
+	probe  *ownedBodyProbe
+	closed sync.Once
+}
+
+func (b *ownedProbeBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if n > 0 {
+		b.probe.reads.Add(int64(n))
+	}
+	return n, err
+}
+
+func (b *ownedProbeBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.closed.Do(func() {
+		b.probe.closes.Add(1)
+		b.probe.wg.Done()
+	})
+	return err
+}
+
+func waitOwnedBodyJoin(t *testing.T, probe *ownedBodyProbe) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		probe.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("owned-reader Close/join not observed (created=%d closes=%d reads=%d)", probe.created.Load(), probe.closes.Load(), probe.reads.Load())
+	}
+}
+
+// diffDepsOwnedBodyProbe wraps compare response bodies after BudgetInterceptor (test-only seam).
+func diffDepsOwnedBodyProbe(t *testing.T, h http.Handler, probe *ownedBodyProbe, match func(*http.Request) bool) Deps {
+	t.Helper()
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+	cfg := &config.Config{Token: "test-token", APIURL: srv.URL + "/api/v4", CursorKey: bytes.Repeat([]byte("k"), 32), AllowedProjectIDs: []string{"42"}}
+	budgeted := igl.BudgetInterceptor()(http.DefaultTransport)
+	cli, err := gitlab.NewClient(cfg.Token,
+		gitlab.WithBaseURL(cfg.APIURL),
+		gitlab.WithoutRetries(),
+		gitlab.WithHTTPClient(&http.Client{Transport: &ownedBodyInstrument{next: budgeted, probe: probe, match: match}}),
 	)
 	if err != nil {
 		t.Fatalf("client: %v", err)
