@@ -1088,7 +1088,7 @@ func (rt *reviewRuntime) readPipelineGraph(item reviewContextItemIn, owner Canon
 	}
 	if !startedFromCursor && merged.DownstreamCoverage == downstreamCoverageComplete && merged.Section.NextCursor == nil && !sectionHasCode(merged.Section, readmeta.CodePartial) {
 		if merged.Digest == nil || *merged.Digest == "" {
-			dig := encodeGraphDigest(merged.Nodes, merged.Edges, merged.Assessment, merged.DownstreamCoverage)
+			dig := encodeGraphDigest(merged.Nodes, merged.Edges, merged.Assessment, merged.DownstreamCoverage, merged.Reasons)
 			if dig != "" {
 				merged.Digest = &dig
 			}

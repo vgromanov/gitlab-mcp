@@ -690,12 +690,13 @@ func (w *graphWalk) popNext() (queuedGraphNode, bool) {
 	return n, true
 }
 
-func encodeGraphDigest(nodes []graphNodeView, edges []graphEdgeView, assessment, coverage string) string {
+func encodeGraphDigest(nodes []graphNodeView, edges []graphEdgeView, assessment, coverage string, reasons []string) string {
 	type row struct {
 		Nodes      []string `json:"nodes"`
 		Edges      []string `json:"edges"`
 		Assessment string   `json:"assessment"`
 		Coverage   string   `json:"coverage"`
+		Reasons    []string `json:"reasons"`
 	}
 	nkeys := make([]string, 0, len(nodes))
 	for _, n := range nodes {
@@ -707,7 +708,9 @@ func encodeGraphDigest(nodes []graphNodeView, edges []graphEdgeView, assessment,
 		ekeys = append(ekeys, graphEdgeDigest(e))
 	}
 	sort.Strings(ekeys)
-	raw, err := json.Marshal(row{Nodes: nkeys, Edges: ekeys, Assessment: assessment, Coverage: coverage})
+	rkeys := append([]string(nil), reasons...)
+	sort.Strings(rkeys)
+	raw, err := json.Marshal(row{Nodes: nkeys, Edges: ekeys, Assessment: assessment, Coverage: coverage, Reasons: rkeys})
 	if err != nil {
 		return ""
 	}

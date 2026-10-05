@@ -508,8 +508,8 @@ func TestEncodeGraphDigestIncludesJobEvidence(t *testing.T) {
 	}}
 	alt := base
 	alt.Jobs = []jobView{{ID: 2, Name: &name, Stage: &stage, Status: &failStatus, AllowFailure: "false", Attempt: attemptLatest, Policy: policyBlock}}
-	a := encodeGraphDigest([]graphNodeView{base}, nil, assessReady, downstreamCoverageComplete)
-	b := encodeGraphDigest([]graphNodeView{alt}, nil, assessReady, downstreamCoverageComplete)
+	a := encodeGraphDigest([]graphNodeView{base}, nil, assessReady, downstreamCoverageComplete, nil)
+	b := encodeGraphDigest([]graphNodeView{alt}, nil, assessReady, downstreamCoverageComplete, nil)
 	if a == "" || a == b {
 		t.Fatalf("digest ignored job evidence %s %s", a, b)
 	}
@@ -527,8 +527,8 @@ func TestEncodeGraphDigestDistinguishesJobFieldDelimiters(t *testing.T) {
 	right := graphNodeView{ProjectID: "42", PipelineID: 100, Role: nodeRoleParent, Jobs: []jobView{
 		{ID: 1, Name: &nameA, Stage: &stageComma, Status: &status, AllowFailure: "false", Attempt: attemptLatest, Policy: policyPass},
 	}}
-	a := encodeGraphDigest([]graphNodeView{left}, nil, assessReady, downstreamCoverageComplete)
-	b := encodeGraphDigest([]graphNodeView{right}, nil, assessReady, downstreamCoverageComplete)
+	a := encodeGraphDigest([]graphNodeView{left}, nil, assessReady, downstreamCoverageComplete, nil)
+	b := encodeGraphDigest([]graphNodeView{right}, nil, assessReady, downstreamCoverageComplete, nil)
 	if a == "" || a == b {
 		t.Fatalf("digest collided on unescaped job delimiters %s %s", a, b)
 	}
@@ -558,18 +558,41 @@ func TestEncodeGraphDigestIncludesPipelineMetadata(t *testing.T) {
 	altStatus.Pipeline = &stPipe
 	altDepth := base
 	altDepth.Depth = 1
-	got := encodeGraphDigest([]graphNodeView{base}, nil, assessReady, downstreamCoverageComplete)
+	got := encodeGraphDigest([]graphNodeView{base}, nil, assessReady, downstreamCoverageComplete, nil)
 	if got == "" {
 		t.Fatal("empty digest")
 	}
-	if got == encodeGraphDigest([]graphNodeView{altSHA}, nil, assessReady, downstreamCoverageComplete) {
+	if got == encodeGraphDigest([]graphNodeView{altSHA}, nil, assessReady, downstreamCoverageComplete, nil) {
 		t.Fatal("digest ignored pipeline SHA")
 	}
-	if got == encodeGraphDigest([]graphNodeView{altStatus}, nil, assessReady, downstreamCoverageComplete) {
+	if got == encodeGraphDigest([]graphNodeView{altStatus}, nil, assessReady, downstreamCoverageComplete, nil) {
 		t.Fatal("digest ignored pipeline status")
 	}
-	if got == encodeGraphDigest([]graphNodeView{altDepth}, nil, assessReady, downstreamCoverageComplete) {
+	if got == encodeGraphDigest([]graphNodeView{altDepth}, nil, assessReady, downstreamCoverageComplete, nil) {
 		t.Fatal("digest ignored node depth")
+	}
+}
+
+func TestEncodeGraphDigestIncludesReasons(t *testing.T) {
+	ok := "success"
+	name := "bridge"
+	stage := "test"
+	node := graphNodeView{
+		ProjectID: "42", PipelineID: 100, Role: nodeRoleParent,
+		Jobs: []jobView{{ID: 1, Name: &name, Stage: &stage, Status: &ok, AllowFailure: "false", Attempt: attemptLatest, Policy: policyPass}},
+	}
+	bridgeID := int64(50)
+	edge := graphEdgeView{
+		FromProject: "42", FromPipeline: 100,
+		ToProject: "99", ToPipeline: 200,
+		BridgeID:  &bridgeID,
+		Kind:      edgeKindBridge,
+		Provenance: []string{"bridge_edge"},
+	}
+	base := encodeGraphDigest([]graphNodeView{node}, []graphEdgeView{edge}, assessBlocked, downstreamCoverageComplete, []string{"failed_required"})
+	alt := encodeGraphDigest([]graphNodeView{node}, []graphEdgeView{edge}, assessBlocked, downstreamCoverageComplete, []string{"canceled_required"})
+	if base == "" || base == alt {
+		t.Fatalf("digest ignored assessment reasons %s %s", base, alt)
 	}
 }
 

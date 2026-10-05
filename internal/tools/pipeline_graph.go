@@ -798,7 +798,7 @@ func finishGraph(ctx context.Context, section readmeta.Section, pid, pipePID str
 		}
 	}
 	if graphComplete {
-		dig := encodeGraphDigest(out.Nodes, out.Edges, assessment, coverage)
+		dig := encodeGraphDigest(out.Nodes, out.Edges, assessment, coverage, reasons)
 		if dig != "" {
 			out.Digest = &dig
 		}
