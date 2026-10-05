@@ -271,11 +271,20 @@ func finalizeJobTrace(out *JobTraceResult, req JobTraceRequest, hdr http.Header,
 			out.SizeKnown = true
 			out.Size = crTotal
 		}
-		if req.SuffixBytes <= 0 && req.RangeStart != nil && crStart != *req.RangeStart {
-			out.Data = []byte{}
-			out.Err = fmt.Errorf("Content-Range start mismatch")
-			out.RangeHonored = false
-			return
+		// An un-ranged prefix/error GET wants start 0. A nonzero 206 would
+		// otherwise skip this check (RangeStart is nil) and treat a mid-object
+		// slice as offset 0, leaking a credential that began before crStart.
+		if req.SuffixBytes <= 0 {
+			wantStart := int64(0)
+			if req.RangeStart != nil {
+				wantStart = *req.RangeStart
+			}
+			if crStart != wantStart {
+				out.Data = []byte{}
+				out.Err = fmt.Errorf("Content-Range start mismatch")
+				out.RangeHonored = false
+				return
+			}
 		}
 		retained := int64(len(out.Data))
 		if out.Truncated {

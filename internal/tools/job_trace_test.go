@@ -389,6 +389,98 @@ func TestGetPipelineJobOutput_newlineTerminatedLineCount(t *testing.T) {
 	}
 }
 
+func TestGetPipelineJobOutput_maxLinesKeepsTerminator(t *testing.T) {
+	d := authzDeps(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/trace") {
+			_, _ = io.WriteString(w, "one\n")
+			return
+		}
+		_, _ = io.WriteString(w, `{"id":42}`)
+	}))
+	_, raw, err := getPipelineJobOutput(context.Background(), nil, getPipelineJobOutputIn{
+		ProjectID: "42", JobID: 9, MaxLines: 1,
+	}, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := decodeTrace(t, raw)
+	if m["trace"] != "one\n" {
+		t.Fatalf("trace %q", m["trace"])
+	}
+	sec := traceSection(t, raw)
+	if sec["content_complete"] != readmeta.ContentCompleteTrue {
+		t.Fatalf("complete %#v", sec)
+	}
+}
+
+func TestGetPipelineJobOutput_shortConfiguredTokenIsRedacted(t *testing.T) {
+	d := authzDeps(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/trace") {
+			_, _ = io.WriteString(w, "pre secret post\n")
+			return
+		}
+		_, _ = io.WriteString(w, `{"id":42}`)
+	}))
+	d.Config.Token = "secret"
+	_, raw, err := getPipelineJobOutput(context.Background(), nil, getPipelineJobOutputIn{
+		ProjectID: "42", JobID: 9,
+	}, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := decodeTrace(t, raw)["trace"].(string)
+	if strings.Contains(text, "secret") {
+		t.Fatalf("leaked %q", text)
+	}
+	if !strings.Contains(text, "pre") || !strings.Contains(text, "post") {
+		t.Fatalf("trace %q", text)
+	}
+}
+
+type unexpected206RT struct{}
+
+func (unexpected206RT) RoundTrip(req *http.Request) (*http.Response, error) {
+	if strings.Contains(req.URL.Path, "/trace") {
+		secret := "lpat-" + strings.Repeat("a", 20)
+		h := make(http.Header)
+		h.Set("Content-Type", "text/plain")
+		h.Set("Content-Range", "bytes 4-28/100")
+		return &http.Response{
+			StatusCode:    http.StatusPartialContent,
+			Header:        h,
+			Body:          io.NopCloser(strings.NewReader(secret)),
+			ContentLength: -1,
+			Request:       req,
+		}, nil
+	}
+	body := []byte(`{"id":42}`)
+	return &http.Response{
+		StatusCode:    http.StatusOK,
+		Header:        http.Header{"Content-Type": []string{"application/json"}},
+		Body:          io.NopCloser(bytes.NewReader(body)),
+		ContentLength: int64(len(body)),
+		Request:       req,
+	}, nil
+}
+
+func TestGetPipelineJobOutput_unexpected206DoesNotLeakGlpatSuffix(t *testing.T) {
+	cli, err := gitlab.NewClient("t",
+		gitlab.WithBaseURL("https://example.test/api/v4"),
+		gitlab.WithoutRetries(),
+		gitlab.WithHTTPClient(&http.Client{Transport: igl.BudgetInterceptor()(unexpected206RT{})}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := Deps{Config: &config.Config{Token: "fixture-pat"}, Client: cli}
+	_, _, err = getPipelineJobOutput(context.Background(), nil, getPipelineJobOutputIn{
+		ProjectID: "42", JobID: 9,
+	}, d)
+	if err == nil || !strings.Contains(err.Error(), readmeta.CodeHTTPError) {
+		t.Fatalf("err %v", err)
+	}
+}
+
 type overlongContentLengthRT struct{}
 
 func (overlongContentLengthRT) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -914,6 +1006,7 @@ func TestGetPipelineJobOutput_shortCompleteBearer(t *testing.T) {
 		}
 		_, _ = io.WriteString(w, `{"id":42}`)
 	}))
+	d.Config.Token = ""
 	_, out, err := getPipelineJobOutput(context.Background(), nil, getPipelineJobOutputIn{
 		ProjectID: "42", JobID: 8,
 	}, d)

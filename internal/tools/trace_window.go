@@ -255,7 +255,7 @@ func prefixEnd(data []byte, lines int) int {
 		if c == '\n' {
 			seen++
 			if seen == lines {
-				return i
+				return i + 1
 			}
 		}
 	}

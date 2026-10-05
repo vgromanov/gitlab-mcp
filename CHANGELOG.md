@@ -19,8 +19,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   treat that prefix as a finished search. Quoted `Authorization` Bearer/Basic
   credentials are redacted through the closing delimiter. `counts.items` is the
   number of output lines and does not add a synthetic line when the text
-  already ends in a newline. Tail and
-  range windows keep redaction context outside the returned bytes, a partial
+  already ends in a newline. `max_lines` keeps the Nth line's terminating
+  newline, so a one-line `"one\n"` prefix is complete. An un-ranged prefix or
+  error GET that is answered with a nonzero 206 is rejected. A nonempty
+  configured token is always scanned, including values shorter than eight
+  bytes. Tail and range windows keep redaction context outside the returned
+  bytes, a partial
   206 is not a complete trace, redaction is linear in the trace size, and
   `output_bytes` / `redaction_count` follow the UTF-8 text actually returned.
   The trace byte budget includes the redaction margin, a scan that stops

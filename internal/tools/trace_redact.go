@@ -594,7 +594,7 @@ func candidateStarts(src, token []byte) []int {
 	pos = addIndexes(pos, lower, "private-token")
 	pos = addIndexes(pos, src, "glpat-")
 	pos = addIndexes(pos, src, "://")
-	if len(token) >= 8 {
+	if len(token) > 0 {
 		pos = addIndexes(pos, src, string(token))
 	}
 	if len(pos) == 0 {
@@ -793,7 +793,7 @@ func parseUserinfo(src []byte, i int) (int, int, bool) {
 }
 
 func parseExactToken(src []byte, i int, token []byte) (int, int, bool) {
-	if len(token) < 8 || !bytes.HasPrefix(src[i:], token) {
+	if len(token) == 0 || !bytes.HasPrefix(src[i:], token) {
 		return 0, 0, false
 	}
 	return i, i + len(token), true

@@ -121,6 +121,32 @@ func TestSelectPrefix_scanCutWithholdsShortCredential(t *testing.T) {
 	}
 }
 
+func TestSelectPrefix_newlineTerminatedMaxLines(t *testing.T) {
+	p := selectPrefix([]byte("one\n"), 0, 1, 1<<20, jobTraceHardLine, "", true)
+	if p.text != "one\n" || !p.full || p.end == nil || *p.end != 4 {
+		t.Fatalf("terminated %#v text %q", p, p.text)
+	}
+	cut := selectPrefix([]byte("one\ntwo\n"), 0, 1, 1<<20, jobTraceHardLine, "", true)
+	if cut.text != "one\n" || cut.full {
+		t.Fatalf("cut %#v text %q", cut, cut.text)
+	}
+}
+
+func TestRedact_shortConfiguredToken(t *testing.T) {
+	out, n := redactBytes([]byte("pre secret post\n"), []byte("secret"))
+	s := string(out)
+	if strings.Contains(s, "secret") || n < 1 {
+		t.Fatalf("n %d out %q", n, s)
+	}
+	if !strings.Contains(s, "pre") || !strings.Contains(s, "post") {
+		t.Fatalf("out %q", s)
+	}
+	empty, n := redactBytes([]byte("secret\n"), nil)
+	if n != 0 || !strings.Contains(string(empty), "secret") {
+		t.Fatalf("empty token n %d out %q", n, empty)
+	}
+}
+
 func TestRedact_quotedAuthorizationAndBearer(t *testing.T) {
 	cases := []string{
 		`Authorization: Bearer "secret" next`,

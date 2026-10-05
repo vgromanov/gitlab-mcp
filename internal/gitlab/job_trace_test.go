@@ -78,6 +78,21 @@ func TestStreamJobTrace_scanCapStops(t *testing.T) {
 	}
 }
 
+func TestStreamJobTrace_unexpectedNonzero206Rejected(t *testing.T) {
+	body := []byte("lpat-" + string(bytes.Repeat([]byte("a"), 20)))
+	rt := &scriptedRT{
+		status:  http.StatusPartialContent,
+		headers: http.Header{"Content-Range": []string{"bytes 4-28/100"}},
+		body:    io.NopCloser(bytes.NewReader(body)),
+	}
+	res := StreamJobTrace(context.Background(), clientWithRT(t, rt), JobTraceRequest{
+		ProjectID: "42", JobID: 1, MaxScanBytes: 4096,
+	})
+	if res.Err == nil || len(res.Data) != 0 || res.RangeHonored || res.ObservedStart != nil {
+		t.Fatalf("unexpected 206 accepted: %+v %q", res, res.Data)
+	}
+}
+
 func TestStreamJobTrace_shortContentLengthIsIncomplete(t *testing.T) {
 	var n atomic.Int64
 	var closes atomic.Int64
