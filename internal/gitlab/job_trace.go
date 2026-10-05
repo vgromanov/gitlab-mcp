@@ -286,6 +286,12 @@ func finalizeJobTrace(out *JobTraceResult, req JobTraceRequest, hdr http.Header,
 				return
 			}
 		}
+		if boundedRangeProviderShort(req, endExcl, out.SizeKnown, out.Size) {
+			out.Data = []byte{}
+			out.Err = fmt.Errorf("Content-Range shorter than requested range")
+			out.RangeHonored = false
+			return
+		}
 		retained := int64(len(out.Data))
 		if out.Truncated {
 			// A local scan cap may keep a prefix of the attested span. A body
@@ -374,6 +380,19 @@ func finalizeJobTrace(out *JobTraceResult, req JobTraceRequest, hdr http.Header,
 			out.Data = []byte{}
 		}
 	}
+}
+
+// boundedRangeProviderShort is true when a bounded Range GET is answered with
+// a 206 that ends before both the requested (context-expanded) end and the
+// known object total. bytes 0-49/1000 for a request of 0-611 is not honored.
+func boundedRangeProviderShort(req JobTraceRequest, endExcl int64, sizeKnown bool, size int64) bool {
+	if req.SuffixBytes > 0 || req.RangeEndExcl == nil {
+		return false
+	}
+	if sizeKnown && endExcl == size {
+		return false
+	}
+	return endExcl < *req.RangeEndExcl
 }
 
 // applyJobTraceObjectEOF clears EOF when a 206 does not cover the whole

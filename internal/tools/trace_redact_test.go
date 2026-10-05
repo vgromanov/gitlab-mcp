@@ -251,6 +251,25 @@ func TestRedact_shortCompleteBearer(t *testing.T) {
 	}
 }
 
+func TestRedact_shortQuotedBearerAtScanCut(t *testing.T) {
+	cut := selectPrefix([]byte(`pre Bearer "abc"`), 0, 0, 1<<20, jobTraceHardLine, "", false)
+	if strings.Contains(cut.text, "abc") || strings.Contains(cut.text, "Bearer") {
+		t.Fatalf("prefix cut %q", cut.text)
+	}
+	errCut := selectError([]byte(`ERROR Bearer "abc"`), 0, "", 1<<20, jobTraceHardLine, "", false)
+	if strings.Contains(errCut.text, "abc") || strings.Contains(errCut.text, "Bearer") {
+		t.Fatalf("error cut %q", errCut.text)
+	}
+	eof := selectPrefix([]byte(`Bearer "abc"`), 0, 0, 1<<20, jobTraceHardLine, "", true)
+	if strings.Contains(eof.text, "abc") || strings.Contains(eof.text, "Bearer") || eof.redactions < 1 {
+		t.Fatalf("eof %q count %d", eof.text, eof.redactions)
+	}
+	unquoted := selectPrefix([]byte("pre Bearer abc"), 0, 0, 1<<20, jobTraceHardLine, "", false)
+	if strings.Contains(unquoted.text, "abc") || strings.Contains(unquoted.text, "Bearer") {
+		t.Fatalf("unquoted cut %q", unquoted.text)
+	}
+}
+
 func TestRedact_longUserinfo(t *testing.T) {
 	pass := strings.Repeat("p", 300)
 	user := strings.Repeat("u", 300)

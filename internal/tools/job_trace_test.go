@@ -234,9 +234,9 @@ func TestGetPipelineJobOutput_errorRegionAndRange(t *testing.T) {
 		if r.Header.Get("Range") == "" {
 			t.Errorf("missing Range")
 		}
-		w.Header().Set("Content-Range", "bytes 0-1/5")
+		w.Header().Set("Content-Range", "bytes 0-4/5")
 		w.WriteHeader(http.StatusPartialContent)
-		_, _ = io.WriteString(w, "ab")
+		_, _ = io.WriteString(w, "abcde")
 	}))
 	_, raw, err = getPipelineJobOutput(context.Background(), nil, getPipelineJobOutputIn{
 		ProjectID: "42", JobID: 5, Selector: "range", StartByte: &start, EndByte: &end,
@@ -657,9 +657,9 @@ func TestGetPipelineJobOutput_partial206IsNotFullTrace(t *testing.T) {
 			_, _ = io.WriteString(w, `{"id":42}`)
 			return
 		}
-		w.Header().Set("Content-Range", "bytes 0-1/5")
+		w.Header().Set("Content-Range", "bytes 0-4/5")
 		w.WriteHeader(http.StatusPartialContent)
-		_, _ = io.WriteString(w, "ab")
+		_, _ = io.WriteString(w, "abcde")
 	}))
 	_, raw, err := getPipelineJobOutput(context.Background(), nil, getPipelineJobOutputIn{
 		ProjectID: "42", JobID: 8, Selector: "range", StartByte: &start, EndByte: &end,
@@ -1486,6 +1486,50 @@ func TestGetPipelineJobOutput_rangeEndNearMaxIntDoesNotCollapse(t *testing.T) {
 	}
 	if to <= from || to < end-1 {
 		t.Fatalf("collapsed range %q", rng)
+	}
+}
+
+func TestGetPipelineJobOutput_shortQuotedBearerAtScanBudget(t *testing.T) {
+	payload := `pre Bearer "abc"`
+	body := payload + strings.Repeat("Z", 400)
+	d := authzDeps(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, "/trace") {
+			_, _ = io.WriteString(w, `{"id":42}`)
+			return
+		}
+		_, _ = io.WriteString(w, body)
+	}))
+	d.Config.Token = "fixture-pat"
+	_, raw, err := getPipelineJobOutput(context.Background(), nil, getPipelineJobOutputIn{
+		ProjectID: "42", JobID: 8, MaxScanBytes: len(payload),
+	}, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := decodeTrace(t, raw)["trace"].(string)
+	if strings.Contains(text, "abc") || strings.Contains(text, "Bearer") {
+		t.Fatalf("quoted bearer leaked %q", text)
+	}
+}
+
+func TestGetPipelineJobOutput_boundedRangeShort206IsRejected(t *testing.T) {
+	start := int64(0)
+	end := int64(100)
+	d := authzDeps(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, "/trace") {
+			_, _ = io.WriteString(w, `{"id":42}`)
+			return
+		}
+		w.Header().Set("Content-Range", "bytes 0-49/1000")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(bytes.Repeat([]byte("a"), 50))
+	}))
+	d.Config.Token = "fixture-pat"
+	_, _, err := getPipelineJobOutput(context.Background(), nil, getPipelineJobOutputIn{
+		ProjectID: "42", JobID: 8, Selector: "range", StartByte: &start, EndByte: &end, MaxScanBytes: 1 << 20,
+	}, d)
+	if err == nil {
+		t.Fatal("short provider 206 accepted")
 	}
 }
 

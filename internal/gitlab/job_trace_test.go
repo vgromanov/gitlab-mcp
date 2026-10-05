@@ -143,6 +143,52 @@ func TestStreamJobTrace_starTotal206IsNotObjectEOF(t *testing.T) {
 	}
 }
 
+func TestStreamJobTrace_boundedRangeShortProviderSpanRejected(t *testing.T) {
+	start := int64(0)
+	wantEnd := int64(612)
+	rt := &scriptedRT{
+		status:  http.StatusPartialContent,
+		headers: http.Header{"Content-Range": []string{"bytes 0-49/1000"}},
+		body:    io.NopCloser(bytes.NewReader(bytes.Repeat([]byte("a"), 50))),
+	}
+	res := StreamJobTrace(context.Background(), clientWithRT(t, rt), JobTraceRequest{
+		ProjectID: "42", JobID: 1, RangeStart: &start, RangeEndExcl: &wantEnd, MaxScanBytes: 4096,
+	})
+	if res.Err == nil || len(res.Data) != 0 || res.RangeHonored {
+		t.Fatalf("short 206 honored: %+v %q", res, res.Data)
+	}
+	full := bytes.Repeat([]byte("b"), 50)
+	rt2 := &scriptedRT{
+		status:  http.StatusPartialContent,
+		headers: http.Header{"Content-Range": []string{"bytes 0-49/50"}},
+		body:    io.NopCloser(bytes.NewReader(full)),
+	}
+	res = StreamJobTrace(context.Background(), clientWithRT(t, rt2), JobTraceRequest{
+		ProjectID: "42", JobID: 1, RangeStart: &start, RangeEndExcl: &wantEnd, MaxScanBytes: 4096,
+	})
+	if res.Err != nil {
+		t.Fatal(res.Err)
+	}
+	if string(res.Data) != string(full) || !res.RangeHonored || !res.EOF || !res.SizeKnown || res.Size != 50 {
+		t.Fatalf("object-end 206 %+v %q", res, res.Data)
+	}
+	covered := bytes.Repeat([]byte("c"), 612)
+	rt3 := &scriptedRT{
+		status:  http.StatusPartialContent,
+		headers: http.Header{"Content-Range": []string{"bytes 0-611/1000"}},
+		body:    io.NopCloser(bytes.NewReader(covered)),
+	}
+	res = StreamJobTrace(context.Background(), clientWithRT(t, rt3), JobTraceRequest{
+		ProjectID: "42", JobID: 1, RangeStart: &start, RangeEndExcl: &wantEnd, MaxScanBytes: 4096,
+	})
+	if res.Err != nil {
+		t.Fatal(res.Err)
+	}
+	if len(res.Data) != 612 || !res.RangeHonored || res.EOF || !res.SizeKnown {
+		t.Fatalf("requested-end 206 %+v len=%d", res, len(res.Data))
+	}
+}
+
 func TestStreamJobTrace_shortContentLengthIsIncomplete(t *testing.T) {
 	var n atomic.Int64
 	var closes atomic.Int64

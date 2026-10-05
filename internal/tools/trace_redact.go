@@ -820,8 +820,11 @@ func parseBearer(src []byte, i int, atEOF bool) (int, int, bool) {
 	}
 	// A delimiter, or a proven EOF, finishes the value. Bearer abc is still
 	// a secret. A short value that runs off a truncated buffer is a scan cut;
-	// hideTail withholds that unless this read is the end of the trace.
-	if j == len(src) && j-start < 8 && !atEOF {
+	// hideTail withholds that unless this read is the end of the trace. A
+	// closing quote is already a delimiter, so Bearer "abc" at a scan
+	// boundary is complete even when atEOF is false.
+	closedQuote := j-start >= 2 && (src[start] == '"' || src[start] == '\'') && src[j-1] == src[start]
+	if j == len(src) && j-start < 8 && !atEOF && !closedQuote {
 		return 0, 0, false
 	}
 	return i, j, true
