@@ -218,3 +218,23 @@ func TestOpenRejectsDotDotPastSymlink(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = s.Close() })
 }
+
+func TestAncestorOwnedByOtherUserRejected(t *testing.T) {
+	base := privateDir(t)
+	path := filepath.Join(base, "store", "intent.db")
+	prev := ancestorUID
+	defer func() { ancestorUID = prev }()
+	ancestorUID = func() uint32 { return uint32(os.Geteuid()) + 1 }
+	if _, err := Open(Config{Path: path}); !errors.Is(err, ErrUnsafePermissions) {
+		t.Fatalf("ancestor owned by another user: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(base, "store")); err == nil {
+		t.Fatal("parent was created beneath an untrusted ancestor")
+	}
+	ancestorUID = prev
+	s, err := Open(Config{Path: path})
+	if err != nil {
+		t.Fatalf("own ancestors: %v", err)
+	}
+	_ = s.Close()
+}

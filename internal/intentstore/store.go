@@ -389,9 +389,34 @@ func refuseUnrelated(path string) error {
 		return mapDriver(err)
 	}
 	if uint32(appID) == ApplicationID {
-		return nil
+		return verifySchemaName(db)
 	}
 	if appID != 0 || n > 0 {
+		return ErrUnrelatedDatabase
+	}
+	return nil
+}
+
+// verifySchemaName confirms, still read-only, that an application_id match
+// is this store. A foreign database can reuse the id; opening it with the
+// write DSN would convert it to WAL before initialize could refuse it.
+func verifySchemaName(db *sql.DB) error {
+	var tables int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='meta'`).Scan(&tables); err != nil {
+		return mapDriver(err)
+	}
+	if tables == 0 {
+		return ErrUnrelatedDatabase
+	}
+	var name string
+	err := db.QueryRow(`SELECT value FROM meta WHERE key='schema_name'`).Scan(&name)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrUnrelatedDatabase
+	}
+	if err != nil {
+		return mapDriver(err)
+	}
+	if name != SchemaName {
 		return ErrUnrelatedDatabase
 	}
 	return nil

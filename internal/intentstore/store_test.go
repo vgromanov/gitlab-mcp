@@ -1675,3 +1675,45 @@ func readSidecars(t *testing.T, path string) string {
 	}
 	return b.String()
 }
+
+func TestForeignDatabaseWithApplicationIDNotConvertedToWAL(t *testing.T) {
+	cases := map[string][]string{
+		"no meta table":    {`CREATE TABLE controller (body TEXT)`},
+		"wrong schema":     {`CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)`, `INSERT INTO meta VALUES ('schema_name', 'other')`},
+		"meta without key": {`CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)`},
+	}
+	for name, stmts := range cases {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(privateDir(t), "foreign.db")
+			db, err := sql.Open("sqlite", "file:"+path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, stmt := range append(stmts, fmt.Sprintf("PRAGMA application_id = %d", ApplicationID)) {
+				if _, err := db.Exec(stmt); err != nil {
+					t.Fatalf("%s: %v", stmt, err)
+				}
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(path, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			before, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Open(Config{Path: path}); !errors.Is(err, ErrUnrelatedDatabase) {
+				t.Fatalf("open: %v", err)
+			}
+			after, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(before) != string(after) {
+				t.Fatal("foreign database was modified (WAL conversion)")
+			}
+		})
+	}
+}

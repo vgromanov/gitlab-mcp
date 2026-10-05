@@ -248,11 +248,21 @@ func openComponent(dirfd int, name, full string) (int, error) {
 	return nfd, nil
 }
 
-// checkSharedDirMode rejects a non-sticky directory that group or other
-// can write. Such an ancestor can be renamed and replaced with a symlink
-// between the path walk and sql.Open.
+// ancestorUID reports the effective UID whose directories count as trusted.
+// Tests replace it to simulate an ancestor owned by another user.
+var ancestorUID = func() uint32 { return uint32(os.Geteuid()) }
+
+// checkSharedDirMode rejects an ancestor that someone other than root or this
+// process's user can rename, and a non-sticky directory that group or other
+// can write. The owner of a directory can rename its entries whatever the
+// mode, so a 0700 directory owned by another user (for example
+// /tmp/alice when running as root) lets that user swap a symlink in between
+// the path walk and sql.Open.
 func checkSharedDirMode(st unix.Stat_t) error {
 	if st.Mode&unix.S_IFMT != unix.S_IFDIR {
+		return ErrUnsafePermissions
+	}
+	if st.Uid != 0 && st.Uid != ancestorUID() {
 		return ErrUnsafePermissions
 	}
 	if st.Mode&0o022 != 0 && st.Mode&unix.S_ISVTX == 0 {
