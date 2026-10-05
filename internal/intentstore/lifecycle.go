@@ -267,10 +267,13 @@ func (s *Store) Compact(ctx context.Context) (int, error) {
 
 // ResetEpoch records a new epoch. Dispatch must already be disabled.
 // Existing rows, including tombstones, are not deleted. The cached epoch
-// changes only after the meta update commits. Begin and ClaimSending reload
-// meta.epoch inside the same immediate transaction and stamp or claim a row
-// only when that value is still this store's epoch. The schema triggers
-// abort a commit that would tag a prepared or sending row with any other epoch.
+// changes only after the meta update commits. The update requires
+// meta.epoch to still equal this handle's epoch, so a disabled store
+// cannot reset a newer epoch written by another process. Begin and
+// ClaimSending reload meta.epoch inside the same immediate transaction
+// and stamp or claim a row only when that value is still this store's
+// epoch. The schema triggers abort a commit that would tag a prepared or
+// sending row with any other epoch.
 func (s *Store) ResetEpoch(ctx context.Context, confirmation string) error {
 	if confirmation != EpochResetConfirmation {
 		return ErrConfirmation
@@ -280,11 +283,14 @@ func (s *Store) ResetEpoch(ctx context.Context, confirmation string) error {
 		if s.dispatch {
 			return ErrDispatchEnabled
 		}
+		if err := s.requireCurrentEpoch(ctx, tx); err != nil {
+			return err
+		}
 		epoch, err := newID()
 		if err != nil {
 			return err
 		}
-		res, err := tx.ExecContext(ctx, `UPDATE meta SET value=? WHERE key='epoch'`, epoch)
+		res, err := tx.ExecContext(ctx, `UPDATE meta SET value=? WHERE key='epoch' AND value=?`, epoch, s.epoch)
 		if err != nil {
 			return mapDriver(err)
 		}
@@ -293,7 +299,7 @@ func (s *Store) ResetEpoch(ctx context.Context, confirmation string) error {
 			return mapDriver(err)
 		}
 		if affected != 1 {
-			return ErrUnrelatedDatabase
+			return ErrStaleEpoch
 		}
 		next = epoch
 		return nil

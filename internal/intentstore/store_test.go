@@ -542,6 +542,65 @@ func TestForeignEpochBlocksOldWrite(t *testing.T) {
 	}
 }
 
+func TestDisabledHandleCannotResetNewerEpoch(t *testing.T) {
+	cfg, _ := fixedNow(t)
+	a := openStore(t, cfg)
+	b := openStore(t, cfg)
+	ctx := context.Background()
+	old := b.epoch
+	a.DisableDispatch()
+	b.DisableDispatch()
+	if err := a.ResetEpoch(ctx, EpochResetConfirmation); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.ResetEpoch(ctx, EpochResetConfirmation); !errors.Is(err, ErrStaleEpoch) {
+		t.Fatalf("stale reset: %v", err)
+	}
+	if b.epoch != old {
+		t.Fatalf("stale handle adopted %s", b.epoch)
+	}
+	if got := rawMeta(t, cfg.Path, "epoch"); got != a.epoch {
+		t.Fatalf("persisted %s, current %s", got, a.epoch)
+	}
+	a.dispatch = true
+	if _, err := a.Begin(ctx, ident("k"), PayloadHash([]byte("a")), BeginOptions{}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestGetCanceledContextIsNotUnrelated(t *testing.T) {
+	cfg, _ := fixedNow(t)
+	s := openStore(t, cfg)
+	ctx := context.Background()
+	rec, err := s.Begin(ctx, ident("k"), PayloadHash([]byte("a")), BeginOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	_, err = s.Get(canceled, rec.OperationID)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("get: %v", err)
+	}
+	if errors.Is(err, ErrUnrelatedDatabase) {
+		t.Fatal("canceled get reported an unrelated database")
+	}
+	_, err = s.GetByIdentity(canceled, ident("k"))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("identity: %v", err)
+	}
+	if errors.Is(err, ErrUnrelatedDatabase) {
+		t.Fatal("canceled identity lookup reported an unrelated database")
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE meta SET value='' WHERE key='epoch'`); err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.Get(ctx, rec.OperationID)
+	if !errors.Is(err, ErrUnrelatedDatabase) {
+		t.Fatalf("blank epoch: %v", err)
+	}
+}
+
 func TestStaleHandleCannotFinalizeCurrentEpoch(t *testing.T) {
 	cfg, _ := fixedNow(t)
 	current := openStore(t, cfg)
@@ -1032,6 +1091,44 @@ func TestSQLiteFileURIEncodesReservedBytes(t *testing.T) {
 	got := sqliteFileURI("/tmp/a#b%23.db", "mode=ro")
 	if strings.Contains(got, "#") || !strings.Contains(got, "a%23b%2523.db") || !strings.Contains(got, "mode=ro") {
 		t.Fatal(got)
+	}
+}
+
+func TestWalAutocheckpointDisabled(t *testing.T) {
+	if !strings.Contains(writeDSNQuery, "wal_autocheckpoint(0)") {
+		t.Fatal(writeDSNQuery)
+	}
+	cfg, _ := fixedNow(t)
+	s := openStore(t, cfg)
+	var n int
+	if err := s.db.QueryRow(`PRAGMA wal_autocheckpoint`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("wal_autocheckpoint=%d", n)
+	}
+}
+
+func TestCheckpointCommitStaysUnderCap(t *testing.T) {
+	// 1200 commits cross the default 1000-frame autocheckpoint. With that
+	// checkpoint, the main file grows while the WAL stays allocated. A 6 MiB
+	// cap sits above one copy of those frames and below db+wal doubled.
+	cfg, _ := fixedNow(t)
+	cfg.MaxBytes = 6 << 20
+	s := openStore(t, cfg)
+	ctx := context.Background()
+	for i := 0; i < 1200; i++ {
+		key := fmt.Sprintf("k%04d", i)
+		if _, err := s.Begin(ctx, ident(key), PayloadHash([]byte(key)), BeginOptions{}); err != nil {
+			t.Fatalf("begin %s: %v", key, err)
+		}
+		n, err := bytesOnDisk(s.path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n > s.maxBytes {
+			t.Fatalf("size %d above cap %d after %s", n, s.maxBytes, key)
+		}
 	}
 }
 

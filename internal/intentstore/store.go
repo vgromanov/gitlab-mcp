@@ -166,7 +166,7 @@ func prepare(cfg Config) (store *Store, created bool, err error) {
 	if err != nil {
 		return nil, false, err
 	}
-	dsn := sqliteFileURI(path, "_txlock=immediate&_busy_timeout=5000&_journal_mode=WAL&_synchronous=FULL&_foreign_keys=on")
+	dsn := sqliteFileURI(path, writeDSNQuery)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, false, mapDriver(err)
@@ -305,9 +305,9 @@ func (s *Store) initialize(ctx context.Context, targetVersion int, migrate migra
 				return mapDriver(err)
 			}
 		}
-		var epoch string
-		if err := tx.QueryRowContext(ctx, `SELECT value FROM meta WHERE key='epoch'`).Scan(&epoch); err != nil || epoch == "" {
-			return ErrUnrelatedDatabase
+		epoch, err := readEpoch(ctx, tx)
+		if err != nil {
+			return err
 		}
 		s.epoch = epoch
 	}
@@ -458,6 +458,9 @@ func (s *Store) commitWrite(ctx context.Context, requireDispatch bool, fn func(*
 		if afterCommit != nil {
 			afterCommit()
 		}
+		// Automatic checkpoints are off. Truncate here so WAL frames are
+		// copied into the main file only after the cap has been checked.
+		_, _ = s.db.ExecContext(context.Background(), `PRAGMA wal_checkpoint(TRUNCATE)`)
 		return lockDownNewSidecars(s.path, before)
 	})
 	if errors.Is(err, ErrFull) {
@@ -483,15 +486,20 @@ func (s *Store) requireCurrentEpoch(ctx context.Context, q rowQuery) error {
 func readEpoch(ctx context.Context, q rowQuery) (string, error) {
 	var epoch string
 	err := q.QueryRowContext(ctx, `SELECT value FROM meta WHERE key='epoch'`).Scan(&epoch)
-	if err != nil || epoch == "" {
+	if errors.Is(err, sql.ErrNoRows) || (err == nil && epoch == "") {
 		return "", ErrUnrelatedDatabase
+	}
+	if err != nil {
+		return "", mapDriver(err)
 	}
 	return epoch, nil
 }
 
 // guardBytes rejects a write whose committed db+wal+shm would exceed the cap.
-// Dirty pages stay out of the WAL until they are flushed. Commit then appends
-// one more frame, so the flushed size alone is not the committed size.
+// Dirty pages stay out of the WAL until they are flushed. Automatic WAL
+// checkpointing is disabled, so Commit cannot copy those frames into the
+// main file while the WAL stays allocated. Commit then appends one more
+// frame, so the flushed size alone is not the committed size.
 func (s *Store) guardBytes(ctx context.Context, tx *sql.Tx, changesBefore int64) error {
 	var changes int64
 	if err := tx.QueryRowContext(ctx, `SELECT total_changes()`).Scan(&changes); err != nil {
@@ -713,6 +721,11 @@ func uncShare(path string) string {
 		return ""
 	}
 }
+
+// writeDSNQuery disables the 1000-frame automatic checkpoint. Commit would
+// otherwise copy WAL pages into the main file while leaving the WAL
+// allocated, so db+wal+shm can finish above MaxBytes after the cap check.
+const writeDSNQuery = `_txlock=immediate&_busy_timeout=5000&_journal_mode=WAL&_synchronous=FULL&_foreign_keys=on&_pragma=wal_autocheckpoint(0)`
 
 // sqliteFileURI encodes path so `#` and `%` stay inside the file name.
 // A raw file: concatenation lets SQLite treat those bytes as URI syntax.
