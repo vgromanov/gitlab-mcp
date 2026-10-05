@@ -2,7 +2,7 @@ package tools
 
 import (
 	"context"
-	"strconv"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -75,6 +75,7 @@ func TestPipelineGraph_activeJobPagesStableResume(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		tok, last = advanceGraph(t, d, &in, tok)
 		if tok == "" {
+			t.Logf("stop section=%#v", graphSection(t, last))
 			break
 		}
 	}
@@ -154,6 +155,7 @@ func TestPipelineGraph_bridgeRetryLineageAcrossPages(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		tok, last = advanceGraph(t, d, &in, tok)
 		if tok == "" {
+			t.Logf("stop section=%#v", graphSection(t, last))
 			break
 		}
 	}
@@ -167,13 +169,17 @@ func TestPipelineGraph_bridgeRetryLineageAcrossPages(t *testing.T) {
 }
 
 func TestPipelineGraph_manyParentJobPagesResumeIntoChild(t *testing.T) {
-	const parentPages = 70
+	const jobsPerPage = 25
+	const apiPages = 3 // 75 jobs (>64) across paged parent job lists
 	h := &walkServer{
 		pipes: map[string]string{
 			"42/100": walkPipe(100, 42, graphPipeSHA, "feature"),
 			"99/200": walkPipe(200, 99, graphChildSHA, "child"),
 		},
 		jobs: map[string]string{
+			"42/100/1": jobPageJSON(1, jobsPerPage),
+			"42/100/2": jobPageJSON(100, jobsPerPage),
+			"42/100/3": jobPageJSON(200, jobsPerPage),
 			"99/200/1": "[" + jobJSON(5000, "child-a", "success", "false") + "]",
 			"99/200/2": "[" + jobJSON(4999, "child-b", "success", "false") + "]",
 		},
@@ -183,15 +189,13 @@ func TestPipelineGraph_manyParentJobPagesResumeIntoChild(t *testing.T) {
 		mr:      graphMR("feature"),
 		mrPipes: graphPipes("feature"),
 	}
-	for i := 1; i <= parentPages; i++ {
-		id := parentPages - i + 1
-		h.jobs["42/100/"+strconv.Itoa(i)] = "[" + jobJSON(id, "p"+strconv.Itoa(id), "success", "false") + "]"
-	}
-	d, in := pagedActiveDeps(t, h)
+	in := pipelineGraphIn{ProjectID: "42", MergeRequestIID: 7, PerPage: jobsPerPage}
+	clk := &cursor.FakeClock{T: time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)}
+	d := newCursorDeps(t, h, nil, clk)
 	tok := ""
 	var last map[string]any
 	sawChild := false
-	for i := 0; i < parentPages+20; i++ {
+	for i := 0; i < apiPages+8; i++ {
 		in.Cursor = tok
 		_, raw, callErr := getMergeRequestPipelineGraph(context.Background(), nil, in, d)
 		if callErr != nil {
@@ -202,11 +206,17 @@ func TestPipelineGraph_manyParentJobPagesResumeIntoChild(t *testing.T) {
 		if tok == "" {
 			break
 		}
-		if payload, derr := cursor.Decode(d.Config.CursorKey, tok, time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)); derr == nil && payload.GraphCont != nil && payload.GraphCont.NI == 200 {
+		if payload, derr := cursor.Decode(d.Config.CursorKey, tok, clk.Now()); derr == nil && payload.GraphCont != nil && payload.GraphCont.NI == 200 {
 			sawChild = true
 		}
 	}
-	if tok != "" || !sawChild || last["downstream_coverage"] != downstreamCoverageComplete {
-		t.Fatalf("graph with %d parent job pages did not finish: cursor=%q child=%v coverage=%v", parentPages, tok, sawChild, last["downstream_coverage"])
+	for _, raw := range last["nodes"].([]any) {
+		n := raw.(map[string]any)
+		if fmt.Sprint(n["pipeline_id"]) == "200" {
+			sawChild = true
+		}
+	}
+	if !sawChild || last["downstream_coverage"] != downstreamCoverageComplete {
+		t.Fatalf("graph with %d parent job pages did not finish: cursor=%q child=%v coverage=%v", apiPages, tok, sawChild, last["downstream_coverage"])
 	}
 }

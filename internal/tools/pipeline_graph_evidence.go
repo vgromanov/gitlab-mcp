@@ -13,13 +13,6 @@ import (
 	igl "gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/gitlab"
 )
 
-const (
-	// Revalidation re-reads already-certified work, so it must not draw down the
-	// caller's per-call item and request budget that paged the graph in the first place.
-	evidenceMaxItems    = 2000
-	evidenceMaxRequests = 128
-)
-
 // chainEvidence folds ordered guard tokens into a running page-size-independent digest.
 func chainEvidence(state string, tokens ...string) string {
 	for _, tok := range tokens {
@@ -76,7 +69,7 @@ func (w *graphWalk) completeNode(k graphNodeKey, pipe *pipelineView) {
 
 // revalidateCompleted re-reads every node whose jobs and bridges the walk has
 // already completed, ancestors and finished siblings alike, and compares each
-// with the evidence recorded at completion.
+// with the evidence recorded at completion. Reads draw from the caller budget.
 func (w *graphWalk) revalidateCompleted(ctx context.Context, d Deps, perPage int) error {
 	drift := fmt.Errorf("%s: completed node evidence drift", cursor.ResyncRequired)
 	for _, a := range w.ancestors {
@@ -92,9 +85,7 @@ func (w *graphWalk) revalidateCompleted(ctx context.Context, d Deps, perPage int
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	budget := newEvidenceBudget()
-	ctx = igl.WithBudget(ctx, budget)
-	defer budget.Cancel()
+	budget := igl.BudgetFromContext(ctx)
 	for _, key := range keys {
 		want := w.evidence[key]
 		project, pipeline, ok := splitVisitKey(key)
@@ -131,21 +122,15 @@ func (w *graphWalk) revalidateCompleted(ctx context.Context, d Deps, perPage int
 	return nil
 }
 
-func newEvidenceBudget() *igl.Budget {
-	return &igl.Budget{
-		MaxItems:    evidenceMaxItems,
-		MaxBytes:    igl.DefaultMaxBytes,
-		MaxElapsed:  igl.DefaultMaxElapsed,
-		MaxRequests: evidenceMaxRequests,
-	}
-}
-
 // readJobEvidence chains guard tokens for job pages from..until-1, or from..end
 // when until is 0. A bounded read requires every page to continue to the next.
 func readJobEvidence(ctx context.Context, d Deps, budget *igl.Budget, project string, pipelineID int64, perPage int, state string, from, until int) (string, error) {
 	drift := fmt.Errorf("%s: completed node evidence drift", cursor.ResyncRequired)
 	for page := from; until == 0 || page < until; {
 		gp, err := collectJobPage(ctx, d, budget, project, pipelineID, page, perPage, nil)
+		if be := evidenceBudgetErr(gp.Reason, err); be != nil {
+			return "", be
+		}
 		if err != nil {
 			return "", err
 		}
@@ -170,6 +155,9 @@ func readBridgeEvidence(ctx context.Context, d Deps, budget *igl.Budget, project
 	drift := fmt.Errorf("%s: completed node evidence drift", cursor.ResyncRequired)
 	for page := from; until == 0 || page < until; {
 		bp, err := collectBridgePage(ctx, d, budget, project, pipelineID, page, perPage, nil)
+		if be := evidenceBudgetErr(bp.Reason, err); be != nil {
+			return "", be
+		}
 		if err != nil {
 			return "", err
 		}
@@ -200,9 +188,7 @@ func readBridgeEvidence(ctx context.Context, d Deps, budget *igl.Budget, project
 // signed running digest.
 func (w *graphWalk) revalidateActiveJobs(ctx context.Context, d Deps, project string, pipelineID int64, perPage, through int, guard graphPage) error {
 	drift := fmt.Errorf("%s: active node evidence drift", cursor.ResyncRequired)
-	budget := newEvidenceBudget()
-	ctx = igl.WithBudget(ctx, budget)
-	defer budget.Cancel()
+	budget := igl.BudgetFromContext(ctx)
 	state, err := readJobEvidence(ctx, d, budget, project, pipelineID, perPage, "", 1, through)
 	if err != nil {
 		return err
@@ -217,9 +203,7 @@ func (w *graphWalk) revalidateActiveJobs(ctx context.Context, d Deps, project st
 // pages 1..through-1, and checks them against the signed running digests.
 func (w *graphWalk) revalidateActiveBridges(ctx context.Context, d Deps, project string, pipelineID int64, perPage, through int, guard bridgePage) error {
 	drift := fmt.Errorf("%s: active node evidence drift", cursor.ResyncRequired)
-	budget := newEvidenceBudget()
-	ctx = igl.WithBudget(ctx, budget)
-	defer budget.Cancel()
+	budget := igl.BudgetFromContext(ctx)
 	jobs, err := readJobEvidence(ctx, d, budget, project, pipelineID, perPage, "", 1, 0)
 	if err != nil {
 		return err
@@ -233,6 +217,19 @@ func (w *graphWalk) revalidateActiveBridges(ctx context.Context, d Deps, project
 	}
 	if chainEvidence(state, bridgePageTokens(guard)...) != w.bridgesEv {
 		return drift
+	}
+	return nil
+}
+
+func evidenceBudgetErr(reason string, err error) error {
+	if err != nil {
+		if errors.Is(err, igl.ErrBudgetItems) || errors.Is(err, igl.ErrBudgetBytes) || errors.Is(err, igl.ErrBudgetRequests) || errors.Is(err, igl.ErrBudgetElapsed) {
+			return err
+		}
+	}
+	switch reason {
+	case "budget_items", "budget":
+		return igl.ErrBudgetItems
 	}
 	return nil
 }

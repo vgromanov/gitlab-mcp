@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 
 	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/config"
 	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/cursor"
+	igl "gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/gitlab"
 	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/tools/readmeta"
 )
 
@@ -983,35 +985,15 @@ func TestPipelineGraph_childCursorDetectsCompletedSiblingDrift(t *testing.T) {
 	}
 }
 
-func TestPipelineGraph_revalidationNotChargedToCallBudget(t *testing.T) {
+func TestPipelineGraph_revalidationChargesCallBudget(t *testing.T) {
 	h := ancestorDriftServer()
-	h.jobs["42/100/1"] = jobPageJSON(100, 40)
-	h.jobs["42/100/2"] = jobPageJSON(200, 40)
-	h.jobs["42/100/3"] = jobPageJSON(300, 40)
-	h.bridges["42/100/1"] = "[" + bridgeJSON(50, "to-child", 99, 200, graphChildSHA) + "]"
-	in := pipelineGraphIn{ProjectID: "42", MergeRequestIID: 7, PerPage: 40}
-	clk := &cursor.FakeClock{T: time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)}
-	d := newCursorDeps(t, h, nil, clk)
-	var last map[string]any
-	tok := ""
-	sawChild := false
-	for i := 0; i < 8; i++ {
-		in.Cursor = tok
-		_, raw, err := getMergeRequestPipelineGraph(context.Background(), nil, in, d)
-		if err != nil {
-			t.Fatalf("call %d: %v", i, err)
-		}
-		last = raw.(map[string]any)
-		tok, _ = graphSection(t, last)["next_cursor"].(string)
-		if tok == "" {
-			break
-		}
-		if payload, derr := cursor.Decode(d.Config.CursorKey, tok, clk.Now()); derr == nil && payload.GraphCont != nil && payload.GraphCont.NI == 200 {
-			sawChild = true
-		}
-	}
-	if !sawChild || last["downstream_coverage"] != downstreamCoverageComplete {
-		t.Fatalf("large-root graph did not resume through child: child=%v coverage=%v", sawChild, last["downstream_coverage"])
+	h.jobs["42/100/1"] = jobPageJSON(1, 12)
+	d, in, tok := childContinuation(t, h)
+	in.Cursor = tok
+	in.MaxItems = 3
+	_, _, err := getMergeRequestPipelineGraph(context.Background(), nil, in, d)
+	if err == nil || !errors.Is(err, igl.ErrBudgetItems) {
+		t.Fatalf("revalidation should charge caller budget: %v", err)
 	}
 }
 
