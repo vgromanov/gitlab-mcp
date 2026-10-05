@@ -63,6 +63,10 @@ var beforeSQLOpen func(path string)
 // and before the receipt is loaded. Tests use it to reset the epoch.
 var afterReadEpoch func()
 
+// afterDurableCommit runs after Commit and before reclaimWAL.
+// Tests use it to open a reader snapshot in that gap.
+var afterDurableCommit func()
+
 type migrateFunc func(tx *sql.Tx, from, to int) error
 
 // PublishingHandlerEnabled reports whether this process registers a publisher.
@@ -502,6 +506,9 @@ func (s *Store) commitWrite(ctx context.Context, requireDispatch bool, fn func(*
 		if afterCommit != nil {
 			afterCommit()
 		}
+		if afterDurableCommit != nil {
+			afterDurableCommit()
+		}
 		// Automatic checkpoints are off. Truncate here so WAL frames are
 		// copied into the main file only after the cap has been checked.
 		s.reclaimWAL()
@@ -608,24 +615,33 @@ func (s *Store) reclaimWAL() {
 	// TRUNCATE copies WAL frames into the main file first. A reader
 	// snapshot can then block deleting the WAL, so db+wal+shm grows
 	// by that second copy. Skip when the copy would exceed the cap
-	// unless no other snapshot is live (BEGIN EXCLUSIVE succeeds).
-	if n+wal > s.maxBytes && !s.exclusiveIdle() {
+	// unless this connection can take WAL exclusive (BEGIN IMMEDIATE
+	// after locking_mode=EXCLUSIVE). BEGIN EXCLUSIVE alone is only
+	// IMMEDIATE in WAL mode and still succeeds while readers exist.
+	if n+wal > s.maxBytes {
+		s.checkpointIfExclusive()
 		return
 	}
 	_, _ = s.db.ExecContext(context.Background(), `PRAGMA wal_checkpoint(TRUNCATE)`)
 }
 
-func (s *Store) exclusiveIdle() bool {
+func (s *Store) checkpointIfExclusive() {
 	ctx := context.Background()
 	if _, err := s.db.ExecContext(ctx, `PRAGMA busy_timeout=0`); err != nil {
-		return false
+		return
 	}
-	defer func() { _, _ = s.db.ExecContext(ctx, `PRAGMA busy_timeout=5000`) }()
-	if _, err := s.db.ExecContext(ctx, `BEGIN EXCLUSIVE`); err != nil {
-		return false
+	defer func() {
+		_, _ = s.db.ExecContext(ctx, `PRAGMA locking_mode=NORMAL`)
+		_, _ = s.db.ExecContext(ctx, `PRAGMA busy_timeout=5000`)
+	}()
+	if _, err := s.db.ExecContext(ctx, `PRAGMA locking_mode=EXCLUSIVE`); err != nil {
+		return
+	}
+	if _, err := s.db.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		return
 	}
 	_, _ = s.db.ExecContext(ctx, `ROLLBACK`)
-	return true
+	_, _ = s.db.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`)
 }
 
 func (s *Store) noteAccepted() {

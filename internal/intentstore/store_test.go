@@ -1237,6 +1237,122 @@ func TestCheckpointDoesNotDoubleWALWithReader(t *testing.T) {
 	}
 }
 
+func TestCheckpointDoesNotDoubleWALWithPostCommitReader(t *testing.T) {
+	// A reader that starts after Commit is the case BEGIN EXCLUSIVE
+	// missed: that lock is IMMEDIATE in WAL mode and still succeeds.
+	// locking_mode=EXCLUSIVE plus BEGIN IMMEDIATE must refuse, so
+	// TRUNCATE cannot copy the WAL while the snapshot holds it.
+	n, wal := measureMultiRowCommit(t, 20)
+	if wal == 0 {
+		t.Fatal("calibration write left no WAL")
+	}
+	cfg, _ := fixedNow(t)
+	s := openStore(t, cfg)
+	ctx := context.Background()
+	if _, err := s.db.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		t.Fatal(err)
+	}
+	// Room for the flushed write, not for a second copy of the WAL.
+	s.maxBytes = n + 4220
+	if s.maxBytes >= n+wal {
+		s.maxBytes = n + wal - 1
+	}
+	var rtx *sql.Tx
+	afterDurableCommit = func() {
+		afterDurableCommit = nil
+		reader := openStore(t, cfg)
+		var err error
+		rtx, err = reader.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+		if err != nil {
+			t.Errorf("reader: %v", err)
+			return
+		}
+		var epoch string
+		if err := rtx.QueryRowContext(ctx, `SELECT value FROM meta WHERE key='epoch'`).Scan(&epoch); err != nil {
+			t.Errorf("snapshot: %v", err)
+		}
+	}
+	t.Cleanup(func() {
+		afterDurableCommit = nil
+		if rtx != nil {
+			_ = rtx.Rollback()
+		}
+	})
+	if err := insertPreparedRows(ctx, s, 20); err != nil {
+		t.Fatalf("write: %v (max %d calibrated n %d wal %d)", err, s.maxBytes, n, wal)
+	}
+	after, err := bytesOnDisk(s.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after > s.maxBytes {
+		t.Fatalf("size %d over cap %d; post-commit reader let TRUNCATE copy the WAL", after, s.maxBytes)
+	}
+}
+
+func measureMultiRowCommit(t *testing.T, rows int) (n, wal int64) {
+	t.Helper()
+	cfg, _ := fixedNow(t)
+	s := openStore(t, cfg)
+	ctx := context.Background()
+	if _, err := s.db.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		t.Fatal(err)
+	}
+	afterDurableCommit = func() {
+		afterDurableCommit = nil
+		var err error
+		n, err = bytesOnDisk(s.path)
+		if err != nil {
+			t.Errorf("calibrate n: %v", err)
+		}
+		wal, err = fileSize(s.path + "-wal")
+		if err != nil {
+			t.Errorf("calibrate wal: %v", err)
+		}
+		// Keep the calibration WAL so the sizes match the real write.
+		s.maxBytes = n
+	}
+	t.Cleanup(func() { afterDurableCommit = nil })
+	if err := insertPreparedRows(ctx, s, rows); err != nil {
+		t.Fatalf("calibrate: %v", err)
+	}
+	return n, wal
+}
+
+func insertPreparedRows(ctx context.Context, s *Store, rows int) error {
+	return s.writeTx(ctx, true, func(tx *sql.Tx) error {
+		now := s.now().UnixNano()
+		for i := 0; i < rows; i++ {
+			op, err := newID()
+			if err != nil {
+				return err
+			}
+			id := ident(fmt.Sprintf("k%d", i))
+			hash := PayloadHash([]byte(id.CallerKey))
+			res, err := tx.ExecContext(ctx, `INSERT INTO intents (
+				operation_id, instance_id, actor, project, mr, operation_kind, caller_key,
+				payload_hash, state, expected_head, created_unix_nano, updated_unix_nano, expires_unix_nano,
+				compacted, row_epoch
+			) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, NULL, 0, value
+				FROM meta WHERE key='epoch' AND value=?`,
+				op, id.Instance, id.Actor, id.Project, id.MR, id.Kind, id.CallerKey,
+				hash, string(StatePrepared), now, now, s.epoch,
+			)
+			if err != nil {
+				return mapDriver(err)
+			}
+			inserted, err := res.RowsAffected()
+			if err != nil {
+				return mapDriver(err)
+			}
+			if inserted != 1 {
+				return ErrStaleEpoch
+			}
+		}
+		return nil
+	})
+}
+
 func TestFailedInitLeavesFileForBlockedPeer(t *testing.T) {
 	cfg, _ := fixedNow(t)
 	ctx := context.Background()
