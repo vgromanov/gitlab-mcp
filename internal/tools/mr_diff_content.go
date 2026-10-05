@@ -783,7 +783,10 @@ func selectDiffWindows(parsed diffParsedPatch, contextLines int, budget *content
 				if crop {
 					return windows, true, true, omittedContext
 				}
-				continue
+				// Non-crop rejection (e.g. detached/orphan marker in range): fail the
+				// file selection so callers clear all windows via malformed handling.
+				// Do not silently skip and relabel lost changes as omitted_context.
+				return nil, false, false, false
 			}
 			windows = append(windows, w)
 			if crop {

@@ -3038,3 +3038,247 @@ func TestDiffContentRepair_R3_compareTimeoutSymmetric(t *testing.T) {
 		})
 	}
 }
+
+// ---- RVG-143 P2: non-crop window rejection must not become text+omitted_context ----
+
+// Exact adjudication patch: context EOF marker then addition; context_lines=0.
+const p2MarkerThenAdditionPatch = "@@ -1 +1,2 @@\n a\n\\ No newline at end of file\n+b\n"
+
+func TestDiffContentRepair_P2_markerNonCropPropagatesMalformed(t *testing.T) {
+	budget := &contentEmitBudget{maxLines: 1000, maxBytes: 262144}
+
+	t.Run("helper_exact_patch_context0_must_fail_selection", func(t *testing.T) {
+		parsed := parseUnifiedDiff(p2MarkerThenAdditionPatch)
+		if !parsed.ok {
+			// Parser may reject (also valid closure); selection path must not silently succeed as text.
+			t.Skip("parser rejected malformed marker sequence; selection path N/A")
+		}
+		wins, ok, trunc, omitted := selectDiffWindows(parsed, 0, budget)
+		if ok {
+			t.Fatalf("non-crop window rejection must fail selection; got ok=true wins=%d trunc=%v omitted=%v", len(wins), trunc, omitted)
+		}
+		if len(wins) != 0 {
+			t.Fatalf("failed selection must clear windows; got %#v", wins)
+		}
+	})
+
+	t.Run("helper_buildDiffContentFiles_malformed_zero_windows", func(t *testing.T) {
+		files := []retainedDiffFile{{
+			entry:   diffManifestEntry{OldPath: strPtr("bad.go"), NewPath: strPtr("bad.go")},
+			patch:   p2MarkerThenAdditionPatch,
+			patchOK: true,
+		}}
+		built, retHash, _, _ := buildDiffContentFiles(files, []int{0}, diffContentOpts{
+			ContextLines: 0, MaxLines: 1000, MaxContentBytes: 262144,
+		})
+		if len(built) != 1 {
+			t.Fatalf("files=%d", len(built))
+		}
+		if built[0].Status != diffFileStatusMalformed {
+			t.Fatalf("expected status=malformed, got %q limitations=%v windows=%d (must not keep text+omitted_context)",
+				built[0].Status, built[0].Limitations, len(built[0].Windows))
+		}
+		if len(built[0].Windows) != 0 {
+			t.Fatalf("malformed file must clear all windows; got %#v", built[0].Windows)
+		}
+		if hasLimitation(built[0], "omitted_context") && built[0].Status == diffFileStatusText {
+			t.Fatal("lost changed range must not be relabelled as ordinary omitted_context on text")
+		}
+		if retHash != nil {
+			t.Fatalf("solo malformed must not emit returned_content_hash: %#v", retHash)
+		}
+	})
+
+	t.Run("helper_earlier_valid_hunk_cleared_on_later_failure", func(t *testing.T) {
+		// First hunk fully valid; second is the same marker-then-addition pathology on a
+		// non-overlapping later range so the parser accepts both (N1-monotonic).
+		patch := "@@ -1 +1 @@\n-a\n+b\n@@ -2 +2,2 @@\n c\n\\ No newline at end of file\n+d\n"
+		parsed := parseUnifiedDiff(patch)
+		if !parsed.ok {
+			t.Fatal("setup: combined patch must parse so failure is selection/window, not header order")
+		}
+		files := []retainedDiffFile{{
+			entry:   diffManifestEntry{OldPath: strPtr("bad.go"), NewPath: strPtr("bad.go")},
+			patch:   patch,
+			patchOK: true,
+		}}
+		built, _, _, _ := buildDiffContentFiles(files, []int{0}, diffContentOpts{
+			ContextLines: 0, MaxLines: 1000, MaxContentBytes: 262144,
+		})
+		if len(built) != 1 || built[0].Status != diffFileStatusMalformed {
+			t.Fatalf("expected malformed after later hunk window failure, got status=%v lims=%v wins=%d",
+				built[0].Status, built[0].Limitations, len(built[0].Windows))
+		}
+		if len(built[0].Windows) != 0 {
+			t.Fatalf("valid earlier hunk must not leave trusted windows on malformed file; got %#v", built[0].Windows)
+		}
+	})
+
+	// Independent expected good sibling bytes/hashes (literal; not from production builder).
+	const goodSiblingPatch = "@@ -1 +1 @@\n-a\n+b\n"
+	wantGoodWindow := goodSiblingPatch
+	wantGoodWindowSHA := "e66fa3de3ec593c4b23137378a0b59e5d819381338db5491eac41874b05c698c"
+	wantReturnedConcatSHA := wantGoodWindowSHA // single surviving window
+
+	t.Run("mcp_bad_selected_good_sibling_independent_hashes", func(t *testing.T) {
+		head, base, start := shaN(1), shaN(2), shaN(3)
+		diffs := fmt.Sprintf(
+			`[{"old_path":"bad.go","new_path":"bad.go","a_mode":"100644","b_mode":"100644","diff":%q},{"old_path":"keep.go","new_path":"keep.go","a_mode":"100644","b_mode":"100644","diff":%q}]`,
+			p2MarkerThenAdditionPatch, goodSiblingPatch,
+		)
+		body := versionObject(1, 5001, head, base, start, "collected", "2", diffs)
+		h := serveDiffBase(&pathLog{}, func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case strings.Contains(r.URL.Path, "/versions/1"):
+				_, _ = io.WriteString(w, body)
+			case strings.Contains(r.URL.Path, "/merge_requests/"):
+				_, _ = io.WriteString(w, `{"id":5001,"iid":1,"project_id":42,"source_project_id":42}`)
+			default:
+				http.NotFound(w, r)
+			}
+		})
+		out, err := callDiffWindow(t, diffDeps(t, h), nil, map[string]any{
+			"project_id": "42", "merge_request_iid": 1, "diff_version_id": 1,
+			"mode": "content", "paths": []any{"bad.go", "keep.go"}, "context_lines": 0,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		files := asSlice(t, out["files"])
+		if len(files) != 2 {
+			t.Fatalf("files=%#v", files)
+		}
+		byPath := map[string]map[string]any{}
+		for _, raw := range files {
+			m := asMap(t, raw)
+			byPath[asString(m["new_path"])] = m
+		}
+		badF, keepF := byPath["bad.go"], byPath["keep.go"]
+		if badF == nil || keepF == nil {
+			t.Fatalf("missing paths %#v", byPath)
+		}
+		if asString(badF["status"]) != diffFileStatusMalformed {
+			t.Fatalf("bad status=%v want malformed limitations=%v", badF["status"], badF["limitations"])
+		}
+		if wins, _ := badF["windows"].([]any); len(wins) != 0 {
+			t.Fatalf("bad windows must be empty; got %#v", wins)
+		}
+		if asString(keepF["status"]) != diffFileStatusText {
+			t.Fatalf("keep status=%v", keepF["status"])
+		}
+		wins := asSlice(t, keepF["windows"])
+		if len(wins) != 1 {
+			t.Fatalf("keep windows %#v", wins)
+		}
+		gotText := asString(asMap(t, wins[0])["text"])
+		if gotText != wantGoodWindow {
+			t.Fatalf("keep window text=%q want %q", gotText, wantGoodWindow)
+		}
+		wh := asMap(t, asMap(t, wins[0])["window_hash"])
+		if asString(wh["scope"]) != diffContentWindowHashScope || asString(wh["value"]) != wantGoodWindowSHA {
+			t.Fatalf("keep window_hash=%#v want scope=%s value=%s", wh, diffContentWindowHashScope, wantGoodWindowSHA)
+		}
+		sum := sha256.Sum256([]byte(wantGoodWindow))
+		if hex.EncodeToString(sum[:]) != wantGoodWindowSHA {
+			t.Fatalf("test oracle drift: %s", hex.EncodeToString(sum[:]))
+		}
+		rc := asMap(t, out["returned_content_hash"])
+		if asString(rc["scope"]) != diffContentReturnHashScope || asString(rc["value"]) != wantReturnedConcatSHA {
+			t.Fatalf("returned_content_hash=%#v want %s/%s", rc, diffContentReturnHashScope, wantReturnedConcatSHA)
+		}
+	})
+
+	t.Run("helper_valid_addition_eof_marker_context0", func(t *testing.T) {
+		patch := "@@ -1 +1 @@\n-old\n+new\n\\ No newline at end of file\n"
+		parsed := parseUnifiedDiff(patch)
+		if !parsed.ok {
+			t.Fatal("valid addition EOF marker must parse")
+		}
+		wins, ok, trunc, _ := selectDiffWindows(parsed, 0, budget)
+		if !ok || trunc || len(wins) != 1 {
+			t.Fatalf("ok=%v trunc=%v wins=%d", ok, trunc, len(wins))
+		}
+		if !strings.Contains(wins[0].Text, "+new") || !strings.Contains(wins[0].Text, `\ No newline at end of file`) {
+			t.Fatalf("marker must stay attached: %q", wins[0].Text)
+		}
+	})
+
+	t.Run("helper_valid_deletion_eof_marker_context0", func(t *testing.T) {
+		patch := "@@ -1 +0,0 @@\n-old\n\\ No newline at end of file\n"
+		parsed := parseUnifiedDiff(patch)
+		if !parsed.ok {
+			t.Fatal("valid deletion EOF marker must parse")
+		}
+		wins, ok, trunc, _ := selectDiffWindows(parsed, 0, budget)
+		if !ok || trunc || len(wins) != 1 {
+			t.Fatalf("ok=%v trunc=%v wins=%d", ok, trunc, len(wins))
+		}
+		if !strings.Contains(wins[0].Text, "-old") || !strings.Contains(wins[0].Text, `\ No newline at end of file`) {
+			t.Fatalf("marker must stay attached: %q", wins[0].Text)
+		}
+	})
+
+	t.Run("helper_valid_final_context_eof_marker", func(t *testing.T) {
+		patch := "@@ -1,2 +1 @@\n-a\n b\n\\ No newline at end of file\n"
+		parsed := parseUnifiedDiff(patch)
+		if !parsed.ok {
+			t.Fatal("valid final context EOF must parse")
+		}
+		wins, ok, _, _ := selectDiffWindows(parsed, 1, budget)
+		if !ok || len(wins) == 0 {
+			t.Fatalf("ok=%v wins=%d", ok, len(wins))
+		}
+		if !strings.Contains(wins[0].Text, `\ No newline at end of file`) {
+			t.Fatalf("final context marker must remain: %q", wins[0].Text)
+		}
+	})
+
+	t.Run("helper_ordinary_intentional_context_omission", func(t *testing.T) {
+		patch := samplePatchAdditionDeletionContext()
+		files := []retainedDiffFile{{
+			entry:   diffManifestEntry{OldPath: strPtr("a.go"), NewPath: strPtr("a.go")},
+			patch:   patch,
+			patchOK: true,
+		}}
+		built, _, _, _ := buildDiffContentFiles(files, []int{0}, diffContentOpts{
+			ContextLines: 0, MaxLines: 1000, MaxContentBytes: 262144,
+		})
+		if len(built) != 1 || built[0].Status != diffFileStatusText {
+			t.Fatalf("ordinary omission must remain text: %#v", built)
+		}
+		if len(built[0].Windows) == 0 {
+			t.Fatal("ordinary omission must retain changed windows")
+		}
+		if !hasLimitation(built[0], "omitted_context") {
+			t.Fatalf("ordinary context0 omission must set omitted_context; lims=%v", built[0].Limitations)
+		}
+	})
+
+	t.Run("helper_marker_budget_boundary_keeps_attachment", func(t *testing.T) {
+		patch := "@@ -0,0 +1 @@\n+new\n\\ No newline at end of file\n"
+		parsed := parseUnifiedDiff(patch)
+		if !parsed.ok {
+			t.Fatal("parse")
+		}
+		hdr := len("@@ -0,0 +1 @@\n")
+		unit := len("+new\n") + len("\\ No newline at end of file\n")
+		exact := &contentEmitBudget{maxLines: 1 + 2, maxBytes: hdr + unit}
+		wins, ok, trunc, _ := selectDiffWindows(parsed, 0, exact)
+		if !ok || trunc || len(wins) != 1 {
+			t.Fatalf("exact budget ok=%v trunc=%v wins=%d", ok, trunc, len(wins))
+		}
+		if !strings.Contains(wins[0].Text, `\ No newline at end of file`) {
+			t.Fatalf("exact budget must keep marker: %q", wins[0].Text)
+		}
+		below := &contentEmitBudget{maxLines: 1 + 2, maxBytes: hdr + unit - 1}
+		wins2, ok2, trunc2, _ := selectDiffWindows(parsed, 0, below)
+		if !ok2 || !trunc2 {
+			t.Fatalf("below-budget must truncate ok=%v trunc=%v", ok2, trunc2)
+		}
+		for _, w := range wins2 {
+			if strings.Contains(w.Text, "+new") && !strings.Contains(w.Text, `\ No newline`) {
+				t.Fatalf("must not emit detached line without marker: %q", w.Text)
+			}
+		}
+	})
+}
