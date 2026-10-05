@@ -34,6 +34,7 @@ type walkServer struct {
 	status           map[string]int
 	omitBridgePaging bool
 	bridgeNextPage   string
+	jobNextPage      string
 }
 
 func (s *walkServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -111,6 +112,8 @@ func (s *walkServer) writePaged(w http.ResponseWriter, r *http.Request, pages ma
 		// Missing X-Next-Page must not be treated as exhaustion.
 	} else if strings.Contains(path, "/bridges") && s.bridgeNextPage != "" {
 		w.Header().Set("X-Next-Page", s.bridgeNextPage)
+	} else if strings.HasSuffix(path, "/jobs") && s.jobNextPage != "" {
+		w.Header().Set("X-Next-Page", s.jobNextPage)
 	} else {
 		w.Header().Set("X-Next-Page", next)
 	}
@@ -748,6 +751,37 @@ func TestPipelineGraph_missingBridgeNextPageNotComplete(t *testing.T) {
 	}
 	if graphSection(t, out)["content_complete"] == readmeta.ContentCompleteTrue {
 		t.Fatal("complete evidence without bridge exhaustion")
+	}
+}
+
+func TestPipelineGraph_unacceptedChildJobNextPageNotComplete(t *testing.T) {
+	h := &walkServer{
+		pipes: map[string]string{
+			"42/100": walkPipe(100, 42, graphPipeSHA, "feature"),
+			"99/200": walkPipe(200, 99, graphChildSHA, "child"),
+		},
+		jobs: map[string]string{
+			"42/100/1": "[" + jobJSON(1, "parent", "success", "false") + "]",
+			"99/200/1": "[" + jobJSON(10, "child", "success", "false") + "]",
+		},
+		bridges: map[string]string{
+			"42/100/1": "[" + bridgeJSON(50, "one", 99, 200, graphChildSHA) + "]",
+			"99/200/1": "[]",
+		},
+		mr:          graphMR("feature"),
+		mrPipes:     graphPipes("feature"),
+		jobNextPage: "9",
+	}
+	out, _, err := callWalk(t, h, pipelineGraphIn{ProjectID: "42", MergeRequestIID: 7}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireNotReady(t, out)
+	if out["downstream_coverage"] == downstreamCoverageComplete {
+		t.Fatalf("unaccepted child job X-Next-Page completed the graph %#v", out)
+	}
+	if graphSection(t, out)["content_complete"] == readmeta.ContentCompleteTrue {
+		t.Fatal("complete evidence with skipped child job pages")
 	}
 }
 

@@ -1053,7 +1053,7 @@ func walkQueuedChildren(ctx context.Context, section *readmeta.Section, rootPID 
 		})
 		childSHA, _ := readmeta.ObservedHeadSHA(deref(child.SHA))
 		nextJobs, moreJobs := pagingContinues(page.Paging, 1)
-		childJobsExhausted := !moreJobs && !page.Partial && page.Paging.PagingKnown
+		childJobsExhausted := !page.Partial && page.Paging.PagingKnown && page.Paging.ExhaustedObserved
 		if !childJobsExhausted {
 			walk.unseen = true
 			walk.coverage = downstreamCoveragePartial
@@ -1062,6 +1062,8 @@ func walkQueuedChildren(ctx context.Context, section *readmeta.Section, rootPID 
 				if tok, err := mintGraphCursor(d, actorID, scope, child.ID, childSHA, sel, upper, expires, 1, jobGuardTokens(page.Jobs), nextJobs, len(page.Jobs), rootPID, nextLineage, walk.snapshotCont()); err == nil {
 					section.NextCursor = &tok
 				}
+			} else if page.Paging.PagingKnown && !page.Paging.ExhaustedObserved {
+				section.AddLimitation(readmeta.CodeUnknownCount, "paging metadata unavailable")
 			}
 			return nil
 		}
