@@ -72,7 +72,7 @@ func recoverCacheManifest(ctx context.Context, d Deps, q diffQuery, sec readmeta
 	if !ok {
 		return diffWindowOut{}, false
 	}
-	defer hold.Release()
+	defer func() { _ = hold.Release() }()
 	lim := gitdiff.Limits{MaxBytes: manifestByteCap(ctx), Timeout: remainingOrDefault(ctx)}
 	cmp, err := gitdiff.Compare(ctx, from, to, sem, hold.Objects, lim)
 	res := cmp.Result
@@ -128,7 +128,7 @@ func recoverCacheContent(ctx context.Context, d Deps, q diffQuery, sec readmeta.
 	if !ok {
 		return diffContentOut{}, false
 	}
-	defer hold.Release()
+	defer func() { _ = hold.Release() }()
 	rawLim := gitdiff.Limits{MaxBytes: manifestByteCap(ctx), Timeout: remainingOrDefault(ctx)}
 	cmp, err := gitdiff.Compare(ctx, from, to, sem, hold.Objects, rawLim)
 	if err != nil {
@@ -159,7 +159,7 @@ func recoverCacheContent(ctx context.Context, d Deps, q diffQuery, sec readmeta.
 		}
 		files = append(files, f)
 	}
-	patchLim := gitdiff.Limits{MaxBytes: patchByteCap(ctx, opts), Timeout: remainingOrDefault(ctx)}
+	patchLim := gitdiff.Limits{MaxBytes: patchByteCap(ctx), Timeout: remainingOrDefault(ctx)}
 	pres, err := cmp.Patches(ctx, patchPathspec(opts.Paths, files), patchLim)
 	partial := pres.Partial
 	if err != nil && !partial {
@@ -400,7 +400,6 @@ func patchPathspec(requested []string, files []retainedDiffFile) []string {
 	seen := map[string]struct{}{}
 	var out []string
 	add := func(p string) {
-		p = strings.TrimSpace(p)
 		if p == "" {
 			return
 		}
@@ -478,11 +477,10 @@ func manifestByteCap(ctx context.Context) int {
 	return 8 << 20
 }
 
-func patchByteCap(ctx context.Context, opts diffContentOpts) int {
+// patchByteCap bounds the raw patch candidates independently of the emitted
+// max_content_bytes crop, like the API path, while honoring max_bytes.
+func patchByteCap(ctx context.Context) int {
 	cap := 1 << 20
-	if opts.MaxContentBytes > 0 && opts.MaxContentBytes < cap {
-		cap = opts.MaxContentBytes
-	}
 	if b := igl.BudgetFromContext(ctx); b != nil {
 		if left := b.RemainingBytes(); left >= 0 && int(left) < cap {
 			if left == 0 {

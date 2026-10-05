@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/object"
 
 	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/gitcache/pack"
 	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/gitcache/tree"
@@ -528,5 +529,115 @@ func TestComparePathsWithQuotesAndControlBytes(t *testing.T) {
 	badHead := commit(oneTree("new\nline.txt", "two\n"), badBase)
 	if cmp, err := Compare(bg(), badBase, badHead, SemanticsStraight, s, Limits{}); err == nil || len(cmp.Files) != 0 {
 		t.Fatalf("control-byte path must fail closed: %v %#v", err, cmp.Result)
+	}
+}
+
+func TestPatchEmptyAddAndDeleteAreNotBinary(t *testing.T) {
+	cases := map[string]struct{ before, after map[string]fileSpec }{
+		"add":    {map[string]fileSpec{"keep.txt": reg("k\n")}, map[string]fileSpec{"keep.txt": reg("k\n"), "fresh.txt": reg("")}},
+		"delete": {map[string]fileSpec{"keep.txt": reg("k\n"), "gone.txt": reg("")}, map[string]fileSpec{"keep.txt": reg("k\n")}},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			s := store{}
+			base := s.snapshot(t, "", tc.before)
+			head := s.snapshot(t, base, tc.after)
+			cmp, err := Compare(bg(), base, head, SemanticsStraight, s, Limits{})
+			if err != nil || len(cmp.Files) != 1 || cmp.Files[0].Binary {
+				t.Fatalf("files %#v %v", cmp.Files, err)
+			}
+			res, err := cmp.Patches(bg(), nil, Limits{})
+			if err != nil || len(res.Patches) != 1 || res.Patches[0].Text != "" {
+				t.Fatalf("empty file patch must be empty: %#v %v", res, err)
+			}
+		})
+	}
+}
+
+func TestPatchBinaryAddStillFramedBinary(t *testing.T) {
+	s := store{}
+	base := s.snapshot(t, "", map[string]fileSpec{"keep.txt": reg("k\n")})
+	head := s.snapshot(t, base, map[string]fileSpec{"keep.txt": reg("k\n"), "new.bin": reg("a\x00b")})
+	cmp, err := Compare(bg(), base, head, SemanticsStraight, s, Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := cmp.Patches(bg(), []string{"new.bin"}, Limits{})
+	if err != nil || len(res.Patches) != 1 || !strings.Contains(res.Patches[0].Text, "Binary files") {
+		t.Fatalf("patches %#v %v", res, err)
+	}
+}
+
+func TestObjectStoreLiveCheckStopsReadsUntilCleared(t *testing.T) {
+	s := store{}
+	h := s.put("blob", []byte("x"))
+	stop := errors.New("deadline")
+	st := &objectStore{objs: s, live: func() error { return stop }}
+	if _, err := st.EncodedObject(plumbing.AnyObject, h); !errors.Is(err, stop) {
+		t.Fatalf("err=%v", err)
+	}
+	st.live = nil
+	if _, err := st.EncodedObject(plumbing.AnyObject, h); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Rename detection hashes blobs through the object store, so a deadline that
+// expires mid-detection must surface instead of letting it run to completion.
+func TestRenameDetectionStopsWhenStoreGoesStale(t *testing.T) {
+	s := store{}
+	oldFiles, newFiles := map[string]fileSpec{}, map[string]fileSpec{}
+	body := strings.Repeat("rename candidate line\n", 40)
+	for i := 0; i < 20; i++ {
+		oldFiles[fmt.Sprintf("old%02d.txt", i)] = reg(fmt.Sprintf("%s%d\n", body, i))
+		newFiles[fmt.Sprintf("new%02d.txt", i)] = reg(fmt.Sprintf("%s%d!\n", body, i))
+	}
+	base := s.snapshot(t, "", oldFiles)
+	head := s.snapshot(t, base, newFiles)
+
+	reads := 0
+	stale := errors.New("deadline")
+	st := &objectStore{objs: s}
+	from, err := commitTree(st, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	to, err := commitTree(st, head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts := &object.DiffTreeOptions{DetectRenames: true, RenameScore: renameScore, RenameLimit: renameLimit}
+
+	st.live = func() error {
+		reads++
+		if reads > 30 {
+			return stale
+		}
+		return nil
+	}
+	if _, err := object.DiffTreeWithOptions(bg(), from, to, opts); !errors.Is(err, stale) {
+		t.Fatalf("rename stage ignored the stale store: %v (reads=%d)", err, reads)
+	}
+
+	st.live = nil
+	changes, err := object.DiffTreeWithOptions(bg(), from, to, opts)
+	if err != nil || len(changes) == 0 {
+		t.Fatalf("cleared store must work: %v", err)
+	}
+}
+
+func TestCompareClearsLiveCheckSoPatchesOutliveDeadline(t *testing.T) {
+	s := store{}
+	base := s.snapshot(t, "", map[string]fileSpec{"a.txt": reg("1\n")})
+	head := s.snapshot(t, base, map[string]fileSpec{"a.txt": reg("2\n")})
+	ctx, cancel := context.WithCancel(bg())
+	cmp, err := Compare(ctx, base, head, SemanticsStraight, s, Limits{})
+	cancel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := cmp.Patches(bg(), nil, Limits{})
+	if err != nil || len(res.Patches) != 1 {
+		t.Fatalf("patches %#v %v", res, err)
 	}
 }

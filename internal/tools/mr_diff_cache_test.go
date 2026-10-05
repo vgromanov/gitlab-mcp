@@ -308,20 +308,21 @@ func twoFileCommitObjects(t *testing.T) (map[plumbing.Hash]pack.Object, string, 
 	}, base.Hash.String(), head.Hash.String()
 }
 
+// singleEntryTree encodes the entry directly so names with leading or trailing
+// whitespace, which tree.EncodeTree rejects, can be exercised.
+func singleEntryTree(name string, h plumbing.Hash) []byte {
+	body := []byte(tree.ModeFile + " " + name + "\x00")
+	return append(body, h[:]...)
+}
+
 func twoCommitObjects(t *testing.T, name, oldBody, newBody string) (map[plumbing.Hash]pack.Object, string, string) {
 	t.Helper()
 	oldBlob := pack.Object{Type: "blob", Data: []byte(oldBody)}
 	oldBlob.Hash = pack.HashObject("blob", oldBlob.Data)
 	newBlob := pack.Object{Type: "blob", Data: []byte(newBody)}
 	newBlob.Hash = pack.HashObject("blob", newBlob.Data)
-	tb, err := tree.EncodeTree([]tree.TreeEntry{{Mode: tree.ModeFile, Name: name, Hash: oldBlob.Hash}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	th, err := tree.EncodeTree([]tree.TreeEntry{{Mode: tree.ModeFile, Name: name, Hash: newBlob.Hash}})
-	if err != nil {
-		t.Fatal(err)
-	}
+	tb := singleEntryTree(name, oldBlob.Hash)
+	th := singleEntryTree(name, newBlob.Hash)
 	baseTree := pack.Object{Type: "tree", Data: tb, Hash: pack.HashObject("tree", tb)}
 	headTree := pack.Object{Type: "tree", Data: th, Hash: pack.HashObject("tree", th)}
 	baseBody := []byte("tree " + baseTree.Hash.String() + "\nauthor A <a@a> 1 +0000\ncommitter A <a@a> 1 +0000\n\nbase\n")
@@ -771,5 +772,75 @@ func TestDiffWindow_cacheRawComparisonIsChargedAgainstMaxBytes(t *testing.T) {
 		if sectionMap(exhausted)["source"] == readmeta.SourceGitCache {
 			t.Fatalf("args=%v recovery must decline once the raw comparison exhausts max_bytes: %#v", args, sectionMap(exhausted))
 		}
+	}
+}
+
+func contentFiles(t *testing.T, out map[string]any) []map[string]any {
+	t.Helper()
+	var files []map[string]any
+	for _, raw := range asSlice(t, out["files"]) {
+		files = append(files, asMap(t, raw))
+	}
+	return files
+}
+
+func TestDiffWindow_cacheContentPreservesSelectorWhitespace(t *testing.T) {
+	const name = " padded name.txt "
+	objs, base, head := twoCommitObjects(t, name, "old\n", "new\n")
+	d := diffDeps(t, overflowHandler(head, base))
+	d.cacheHold = cacheHoldFor(objs, base, head)
+	out, err := callDiffWindow(t, d, nil, map[string]any{
+		"project_id": "42", "merge_request_iid": 1, "diff_version_id": 1,
+		"mode": "content", "paths": []string{name},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sectionMap(out)["source"] != readmeta.SourceGitCache {
+		t.Fatalf("section=%#v", sectionMap(out))
+	}
+	files := contentFiles(t, out)
+	if len(files) != 1 || asString(files[0]["new_path"]) != name || files[0]["status"] != diffFileStatusText {
+		t.Fatalf("files=%#v", files)
+	}
+}
+
+func TestPatchPathspecKeepsWhitespaceBytes(t *testing.T) {
+	p := " a.txt "
+	files := []retainedDiffFile{{entry: diffManifestEntry{OldPath: &p, NewPath: &p}}}
+	got := patchPathspec([]string{p}, files)
+	if len(got) != 1 || got[0] != p {
+		t.Fatalf("pathspec=%q", got)
+	}
+}
+
+func TestDiffWindow_cacheContentCropsPatchLargerThanContentCap(t *testing.T) {
+	var oldB, newB strings.Builder
+	for i := 0; i < 400; i++ {
+		fmt.Fprintf(&oldB, "old line %04d\n", i)
+		fmt.Fprintf(&newB, "new line %04d\n", i)
+	}
+	objs, base, head := twoCommitObjects(t, "big.txt", oldB.String(), newB.String())
+	d := diffDeps(t, overflowHandler(head, base))
+	d.cacheHold = cacheHoldFor(objs, base, head)
+	out, err := callDiffWindow(t, d, nil, map[string]any{
+		"project_id": "42", "merge_request_iid": 1, "diff_version_id": 1,
+		"mode": "content", "paths": []string{"big.txt"}, "max_content_bytes": 512,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := contentFiles(t, out)
+	if len(files) != 1 || files[0]["status"] != diffFileStatusText {
+		t.Fatalf("patch larger than max_content_bytes must be cropped, not dropped: %#v", files)
+	}
+	if sectionMap(out)["content_complete"] != string(readmeta.ContentCompleteFalse) {
+		t.Fatalf("section=%#v", sectionMap(out))
+	}
+}
+
+func TestPatchByteCapIgnoresEmittedContentCap(t *testing.T) {
+	if got := patchByteCap(context.Background()); got != 1<<20 {
+		t.Fatalf("cap=%d", got)
 	}
 }

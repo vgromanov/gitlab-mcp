@@ -144,13 +144,19 @@ func Compare(ctx context.Context, from, to, semantics string, objs map[plumbing.
 	ctx, cancel := context.WithTimeout(ctx, lim.Timeout)
 	defer cancel()
 
-	store := memStore(objs)
+	store := &objectStore{objs: objs, live: ctx.Err}
 	fromTree, err := commitTree(store, from)
 	if err != nil {
+		if ctx.Err() != nil {
+			return c, c.bound(ctx)
+		}
 		return c, err
 	}
 	toTree, err := commitTree(store, to)
 	if err != nil {
+		if ctx.Err() != nil {
+			return c, c.bound(ctx)
+		}
 		return c, err
 	}
 	changes, err := object.DiffTreeWithOptions(ctx, fromTree, toTree, &object.DiffTreeOptions{
@@ -158,6 +164,7 @@ func Compare(ctx context.Context, from, to, semantics string, objs map[plumbing.
 		RenameScore:   renameScore,
 		RenameLimit:   renameLimit,
 	})
+	store.live = nil
 	if err != nil {
 		return c, c.boundOrObject(ctx, err)
 	}
@@ -232,7 +239,7 @@ func (c *Comparison) Patches(ctx context.Context, paths []string, lim Limits) (P
 		if err := ctx.Err(); err != nil {
 			return c.patchBound(out, ctx)
 		}
-		text, err := renderPatch(ctx, ch, lim.MaxBytes-out.Bytes)
+		text, err := renderPatch(ctx, ch, f, lim.MaxBytes-out.Bytes)
 		if err != nil {
 			if errors.Is(err, errCapped) {
 				out.Partial, out.Reason = true, "output limit"
@@ -259,13 +266,18 @@ func (c *Comparison) patchBound(out PatchResult, ctx context.Context) (PatchResu
 
 var errCapped = errors.New("gitdiff: output capped")
 
-func renderPatch(ctx context.Context, ch *object.Change, room int) (string, error) {
+func renderPatch(ctx context.Context, ch *object.Change, f File, room int) (string, error) {
 	if room <= 0 {
 		return "", errCapped
 	}
 	p, err := ch.PatchContext(ctx)
 	if err != nil {
 		return "", err
+	}
+	if !f.Binary && (f.NewFile || f.DeletedFile) && !hasChunks(p) {
+		// go-git frames a patch without chunks as binary, but an empty text
+		// file added or deleted has no patch body, like the API's empty diff.
+		return "", nil
 	}
 	var w capWriter
 	w.max = room
@@ -276,6 +288,15 @@ func renderPatch(ctx context.Context, ch *object.Change, room int) (string, erro
 		return "", err
 	}
 	return w.buf.String(), nil
+}
+
+func hasChunks(p fdiff.Patch) bool {
+	for _, fp := range p.FilePatches() {
+		if len(fp.Chunks()) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // capWriter is a hard-capped writer.
@@ -370,7 +391,15 @@ func memStore(objs map[plumbing.Hash]pack.Object) storer.EncodedObjectStorer {
 	return &objectStore{objs: objs}
 }
 
-type objectStore struct{ objs map[plumbing.Hash]pack.Object }
+// objectStore serves held objects. While live is set, every object read first
+// consults it, which lets the vendored rename detector (it takes a context but
+// ignores it while hashing blobs) stop at the request deadline. Compare clears
+// live once the diff walk is done, because the changes it returns outlive the
+// comparison deadline and Patches applies its own.
+type objectStore struct {
+	objs map[plumbing.Hash]pack.Object
+	live func() error
+}
 
 func (s *objectStore) NewEncodedObject() plumbing.EncodedObject { return &plumbing.MemoryObject{} }
 
@@ -379,6 +408,11 @@ func (s *objectStore) SetEncodedObject(plumbing.EncodedObject) (plumbing.Hash, e
 }
 
 func (s *objectStore) EncodedObject(t plumbing.ObjectType, h plumbing.Hash) (plumbing.EncodedObject, error) {
+	if s.live != nil {
+		if err := s.live(); err != nil {
+			return nil, err
+		}
+	}
 	obj, ok := s.objs[h]
 	if !ok || obj.Hash != h || pack.HashObject(obj.Type, obj.Data) != h {
 		return nil, plumbing.ErrObjectNotFound
