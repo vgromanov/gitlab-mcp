@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1566,17 +1567,22 @@ func TestDiscussionF7ClosingBound(t *testing.T) {
 		page := f7Notes()
 		var versions int
 		var script *reviewScript
+		started := make(chan struct{})
 		cancelled := make(chan struct{})
+		var startOnce sync.Once
 		var d Deps
 		d = newReviewDeps(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if strings.Contains(r.URL.Path, "/versions") {
 				versions++
 				if versions == 4 {
+					startOnce.Do(func() { close(started) })
 					select {
 					case <-r.Context().Done():
 						close(cancelled)
 						return
-					case <-time.After(2 * time.Second):
+					case <-time.After(5 * time.Second):
+						http.Error(w, "parent did not cancel", http.StatusGatewayTimeout)
+						return
 					}
 				}
 			}
@@ -1596,17 +1602,36 @@ func TestDiscussionF7ClosingBound(t *testing.T) {
 			t.Fatal("seed fixture")
 		}
 		item.Cursors = []reviewContextCursorIn{{Section: "discussions", Cursor: *cur}}
-		ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
+		// Cancel only after the closing versions read is in flight. An 80ms
+		// timeout from the call start expires on a slow runner before that
+		// request is issued, so the handler never observes the parent deadline.
+		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		b2 := reviewBudget(128)
 		b2.MaxItems = 11
-		_, _, err = getMergeRequestReviewContext(igl.WithBudget(ctx, b2), nil, getMergeRequestReviewContextIn{Items: []reviewContextItemIn{item}, MaxElapsedMS: ptr64(30000)}, d)
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			_, _, _ = getMergeRequestReviewContext(igl.WithBudget(ctx, b2), nil, getMergeRequestReviewContextIn{Items: []reviewContextItemIn{item}, MaxElapsedMS: ptr64(30000)}, d)
+		}()
+		select {
+		case <-started:
+		case <-done:
+			t.Fatal("review finished before the closing versions request")
+		case <-time.After(10 * time.Second):
+			t.Fatal("closing versions request did not start")
+		}
+		cancel()
 		select {
 		case <-cancelled:
 		case <-time.After(2 * time.Second):
 			t.Fatal("earlier parent deadline did not cancel closing versions")
 		}
-		_ = err
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("review did not return after parent cancel")
+		}
 	})
 }
 
