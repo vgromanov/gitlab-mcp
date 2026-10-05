@@ -51,6 +51,7 @@ type queuedGraphNode struct {
 	Depth     int
 	ParentSHA string
 	Ancestors []graphNodeKey
+	BridgeID  int64
 }
 
 type graphNodeView struct {
@@ -93,28 +94,33 @@ type bridgePage struct {
 }
 
 type graphWalk struct {
-	current   graphNodeKey
-	pipe      *pipelineView
-	depth     int
-	phase     string
-	visited   map[string]struct{}
-	queue     []queuedGraphNode
-	nodes     []graphNodeView
-	edges     []graphEdgeView
-	block     bool
-	partial   bool
-	unknown   bool
-	reasons   []string
-	outcomes  []policyOutcome
-	cap       string
-	coverage  string
-	unseen    bool
-	bridgesOn bool
-	nodeCount int
-	maxDepth  int
-	maxNodes  int
-	ancestors []graphNodeKey
-	authz     map[string]string
+	current          graphNodeKey
+	pipe             *pipelineView
+	depth            int
+	phase            string
+	visited          map[string]struct{}
+	queue            []queuedGraphNode
+	nodes            []graphNodeView
+	edges            []graphEdgeView
+	block            bool
+	partial          bool
+	unknown          bool
+	reasons          []string
+	outcomes         []policyOutcome
+	cap              string
+	coverage         string
+	unseen           bool
+	bridgesOn        bool
+	nodeCount        int
+	maxDepth         int
+	maxNodes         int
+	ancestors        []graphNodeKey
+	authz            map[string]string
+	root             graphNodeKey
+	relKind          string
+	relProven        bool
+	relSHA           string
+	stickyIncomplete bool
 }
 
 var errPipelineForbidden = errors.New("pipeline forbidden")
@@ -154,6 +160,7 @@ func newGraphWalk(pipe *pipelineView, pid string, depth, nodes int) *graphWalk {
 		maxDepth:  depth,
 		maxNodes:  nodes,
 		authz:     map[string]string{},
+		root:      key,
 	}
 }
 
@@ -162,22 +169,27 @@ func restoreGraphWalk(pipe *pipelineView, gc *cursor.GraphCont, depth, nodes int
 		return nil, fmt.Errorf("%s: graph continuation missing", cursor.ResyncRequired)
 	}
 	w := &graphWalk{
-		current:   graphNodeKey{Project: gc.NP, Pipeline: gc.NI},
-		pipe:      pipe,
-		depth:     gc.D,
-		phase:     gc.Phase,
-		visited:   map[string]struct{}{},
-		block:     gc.Block,
-		partial:   gc.Part,
-		unknown:   gc.Unk,
-		coverage:  gc.Cov,
-		unseen:    gc.Cov != downstreamCoverageComplete,
-		cap:       gc.Cap,
-		bridgesOn: gc.Cap == bridgeCapabilityBridges,
-		nodeCount: gc.N,
-		maxDepth:  depth,
-		maxNodes:  nodes,
-		authz:     map[string]string{},
+		current:          graphNodeKey{Project: gc.NP, Pipeline: gc.NI},
+		pipe:             pipe,
+		depth:            gc.D,
+		phase:            gc.Phase,
+		visited:          map[string]struct{}{},
+		block:            gc.Block,
+		partial:          gc.Part,
+		unknown:          gc.Unk,
+		coverage:         gc.Cov,
+		unseen:           gc.Cov != downstreamCoverageComplete || gc.Inc,
+		cap:              gc.Cap,
+		bridgesOn:        gc.Cap == bridgeCapabilityBridges,
+		nodeCount:        gc.N,
+		maxDepth:         depth,
+		maxNodes:         nodes,
+		authz:            map[string]string{},
+		root:             graphNodeKey{Project: gc.RP, Pipeline: gc.RI},
+		relKind:          gc.RK,
+		relProven:        gc.Prv,
+		relSHA:           gc.RS,
+		stickyIncomplete: gc.Inc,
 	}
 	if w.current.Project != pidOf(pipe) && pipe != nil {
 		// current node identity is the continuation NP, not necessarily root.
@@ -192,7 +204,37 @@ func restoreGraphWalk(pipe *pipelineView, gc *cursor.GraphCont, depth, nodes int
 		}
 		w.queue = append(w.queue, qn)
 	}
+	restoreGraphReasons(w, gc.Rsn)
 	return w, nil
+}
+
+func restoreGraphReasons(w *graphWalk, reasons []string) {
+	if w == nil {
+		return
+	}
+	for _, r := range reasons {
+		w.reasons = append(w.reasons, r)
+		switch r {
+		case "failed_required", "required_manual":
+			w.block = true
+			w.outcomes = append(w.outcomes, policyOutcome{Outcome: policyBlock, Reason: r})
+		case "in_progress":
+			w.partial = true
+			w.outcomes = append(w.outcomes, policyOutcome{Outcome: policyPartial, Reason: r})
+		default:
+			w.unknown = true
+			w.outcomes = append(w.outcomes, policyOutcome{Outcome: policyUnknown, Reason: r})
+		}
+	}
+}
+
+func (w *graphWalk) bindRelation(rel relationResult) {
+	if w == nil {
+		return
+	}
+	w.relKind = rel.Kind
+	w.relProven = rel.Proven
+	w.relSHA = rel.SHAComparison
 }
 
 func pidOf(pipe *pipelineView) string {
@@ -209,11 +251,11 @@ func pidOf(pipe *pipelineView) string {
 }
 
 func parseQueuedNode(item string) (queuedGraphNode, bool) {
-	proj, pipe, depth, sha, ancs, ok := cursor.ParseGraphQueueItem(item)
+	proj, pipe, depth, sha, bridge, ancs, ok := cursor.ParseGraphQueueItem(item)
 	if !ok {
 		return queuedGraphNode{}, false
 	}
-	n := queuedGraphNode{Key: graphNodeKey{Project: proj, Pipeline: pipe}, Depth: depth}
+	n := queuedGraphNode{Key: graphNodeKey{Project: proj, Pipeline: pipe}, Depth: depth, BridgeID: bridge}
 	if sha != "-" {
 		n.ParentSHA = sha
 	}
@@ -236,7 +278,7 @@ func encodeQueuedNode(n queuedGraphNode) (string, error) {
 	for _, a := range n.Ancestors {
 		ancs = append(ancs, a.String())
 	}
-	return cursor.FormatGraphQueueItem(n.Key.Project, n.Key.Pipeline, n.Depth, sha, ancs)
+	return cursor.FormatGraphQueueItem(n.Key.Project, n.Key.Pipeline, n.Depth, sha, n.BridgeID, ancs)
 }
 
 func splitVisitKey(item string) (string, int64, bool) {
@@ -288,6 +330,13 @@ func (w *graphWalk) snapshotCont() *cursor.GraphCont {
 	if cov == "" {
 		cov = downstreamCoverageUnknown
 	}
+	root := w.root
+	if root.Pipeline < 1 {
+		if w.depth == 0 {
+			root = w.current
+		}
+	}
+	rsn := uniqueGraphReasons(w.reasons)
 	return &cursor.GraphCont{
 		V:     cursor.GraphContSchemaG1,
 		Phase: w.phase,
@@ -302,7 +351,34 @@ func (w *graphWalk) snapshotCont() *cursor.GraphCont {
 		Unk:   w.unknown,
 		Cov:   cov,
 		Cap:   w.cap,
+		Inc:   w.stickyIncomplete || w.hasIncompleteEdges(),
+		Rsn:   rsn,
+		RP:    root.Project,
+		RI:    root.Pipeline,
+		RK:    w.relKind,
+		Prv:   w.relProven,
+		RS:    w.relSHA,
 	}
+}
+
+func uniqueGraphReasons(in []string) []string {
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(in))
+	for _, r := range in {
+		if r == "" {
+			continue
+		}
+		if _, ok := seen[r]; ok {
+			continue
+		}
+		seen[r] = struct{}{}
+		out = append(out, r)
+		if len(out) == cursor.MaxGraphVisited {
+			break
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 func collectBridgePage(ctx context.Context, d Deps, budget *igl.Budget, pid string, pipelineID int64, page, perPage int, prior map[int64]struct{}) (bridgePage, error) {
@@ -310,7 +386,7 @@ func collectBridgePage(ctx context.Context, d Deps, budget *igl.Budget, pid stri
 	opt := &gitlab.ListJobsOptions{ListOptions: gitlab.ListOptions{Page: int64(page), PerPage: int64(perPage)}}
 	out := bridgePage{}
 	seen := map[int64]struct{}{}
-	resp, err := igl.StreamJSONArray(ctx, d.Client, http.MethodGet, path, opt, func(raw json.RawMessage) error {
+	resp, err := igl.StreamJSONArrayQueue(ctx, d.Client, http.MethodGet, path, opt, func(raw json.RawMessage) error {
 		if err := ctx.Err(); err != nil {
 			out.Partial = true
 			out.Reason = "cancelled"
@@ -413,6 +489,7 @@ func (w *graphWalk) ingestBridges(parent graphNodeKey, parentSHA string, page br
 	if page.Unsupported {
 		w.cap = bridgeCapabilityUnknown
 		w.unseen = true
+		w.stickyIncomplete = true
 		w.coverage = downstreamCoverageUnknown
 		w.edges = append(w.edges, graphEdgeView{
 			FromProject:  parent.Project,
@@ -426,6 +503,7 @@ func (w *graphWalk) ingestBridges(parent graphNodeKey, parentSHA string, page br
 	if page.Inaccessible {
 		w.cap = bridgeCapabilityBridges
 		w.unseen = true
+		w.stickyIncomplete = true
 		w.coverage = downstreamCoveragePartial
 		w.edges = append(w.edges, graphEdgeView{
 			FromProject:  parent.Project,
@@ -437,7 +515,7 @@ func (w *graphWalk) ingestBridges(parent graphNodeKey, parentSHA string, page br
 		return
 	}
 	w.cap = bridgeCapabilityBridges
-	if !w.hasIncompleteEdges() {
+	if !w.hasIncompleteEdges() && !w.stickyIncomplete {
 		w.unseen = false
 	}
 	groups := buildLineage(bridgeJobs(page.Bridges), lineageCarry{})
@@ -480,12 +558,14 @@ func (w *graphWalk) addBridgeEdge(parent graphNodeKey, parentSHA string, br grap
 	if !br.ChildPresent {
 		base.Kind = edgeKindMissing
 		w.unseen = true
+		w.stickyIncomplete = true
 		w.edges = append(w.edges, base)
 		return
 	}
 	if br.ChildProject < 1 {
 		base.Kind = edgeKindIdentity
 		w.unseen = true
+		w.stickyIncomplete = true
 		w.edges = append(w.edges, base)
 		return
 	}
@@ -493,6 +573,7 @@ func (w *graphWalk) addBridgeEdge(parent graphNodeKey, parentSHA string, br grap
 		base.Kind = edgeKindMissing
 		base.ToProject = strconv.FormatInt(br.ChildProject, 10)
 		w.unseen = true
+		w.stickyIncomplete = true
 		w.edges = append(w.edges, base)
 		return
 	}
@@ -503,6 +584,7 @@ func (w *graphWalk) addBridgeEdge(parent graphNodeKey, parentSHA string, br grap
 	if w.depth+1 > w.maxDepth {
 		base.Kind = edgeKindDepthStop
 		w.unseen = true
+		w.stickyIncomplete = true
 		w.coverage = downstreamCoveragePartial
 		w.edges = append(w.edges, base)
 		return
@@ -520,6 +602,7 @@ func (w *graphWalk) addBridgeEdge(parent graphNodeKey, parentSHA string, br grap
 	if w.nodeCount >= w.maxNodes {
 		base.Kind = edgeKindNodeStop
 		w.unseen = true
+		w.stickyIncomplete = true
 		w.coverage = downstreamCoveragePartial
 		w.edges = append(w.edges, base)
 		return
@@ -532,6 +615,7 @@ func (w *graphWalk) addBridgeEdge(parent graphNodeKey, parentSHA string, br grap
 		Depth:     w.depth + 1,
 		ParentSHA: parentSHA,
 		Ancestors: append([]graphNodeKey{}, w.currentAncestors()...),
+		BridgeID:  id,
 	})
 }
 
@@ -579,12 +663,12 @@ func encodeGraphDigest(nodes []graphNodeView, edges []graphEdgeView, assessment,
 	}
 	nkeys := make([]string, 0, len(nodes))
 	for _, n := range nodes {
-		nkeys = append(nkeys, n.ProjectID+":"+strconv.FormatInt(n.PipelineID, 10)+":"+n.Role)
+		nkeys = append(nkeys, graphNodeDigest(n))
 	}
 	sort.Strings(nkeys)
 	ekeys := make([]string, 0, len(edges))
 	for _, e := range edges {
-		ekeys = append(ekeys, strings.Join([]string{e.FromProject, strconv.FormatInt(e.FromPipeline, 10), e.Kind, e.ToProject, strconv.FormatInt(e.ToPipeline, 10)}, ":"))
+		ekeys = append(ekeys, graphEdgeDigest(e))
 	}
 	sort.Strings(ekeys)
 	raw, err := json.Marshal(row{Nodes: nkeys, Edges: ekeys, Assessment: assessment, Coverage: coverage})
@@ -593,6 +677,69 @@ func encodeGraphDigest(nodes []graphNodeView, edges []graphEdgeView, assessment,
 	}
 	sum := sha256.Sum256(raw)
 	return hex.EncodeToString(sum[:])
+}
+
+func graphNodeDigest(n graphNodeView) string {
+	jobs := make([]string, 0, len(n.Jobs))
+	for _, j := range n.Jobs {
+		jobs = append(jobs, strings.Join([]string{
+			strconv.FormatInt(j.ID, 10),
+			deref(j.Name),
+			deref(j.Stage),
+			deref(j.Status),
+			j.AllowFailure,
+			j.Attempt,
+			j.Policy,
+		}, ","))
+	}
+	sort.Strings(jobs)
+	return strings.Join([]string{n.ProjectID, strconv.FormatInt(n.PipelineID, 10), n.Role, strings.Join(jobs, ";")}, ":")
+}
+
+func graphEdgeDigest(e graphEdgeView) string {
+	bridge := "0"
+	if e.BridgeID != nil {
+		bridge = strconv.FormatInt(*e.BridgeID, 10)
+	}
+	prov := append([]string{}, e.Provenance...)
+	sort.Strings(prov)
+	return strings.Join([]string{
+		e.FromProject,
+		strconv.FormatInt(e.FromPipeline, 10),
+		e.Kind,
+		e.ToProject,
+		strconv.FormatInt(e.ToPipeline, 10),
+		bridge,
+		e.Capability,
+		e.SHAComparison,
+		strings.Join(prov, ","),
+	}, ":")
+}
+
+func (w *graphWalk) markQueuedFailure(n queuedGraphNode, kind, provenance string) {
+	if w == nil {
+		return
+	}
+	w.unseen = true
+	w.stickyIncomplete = true
+	w.coverage = downstreamCoveragePartial
+	e := graphEdgeView{
+		ToProject:  n.Key.Project,
+		ToPipeline: n.Key.Pipeline,
+		Kind:       kind,
+		Capability: w.cap,
+		Provenance: []string{provenance},
+	}
+	if len(n.Ancestors) > 0 {
+		from := n.Ancestors[len(n.Ancestors)-1]
+		e.FromProject = from.Project
+		e.FromPipeline = from.Pipeline
+	}
+	if n.BridgeID > 0 {
+		id := n.BridgeID
+		e.BridgeID = &id
+	}
+	w.edges = append(w.edges, e)
 }
 
 func (w *graphWalk) authorize(ctx context.Context, d Deps, projectID string) (string, error) {

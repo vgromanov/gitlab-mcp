@@ -187,7 +187,7 @@ type Payload struct {
 }
 
 // GraphCont is the g1 walk continuation for pipeline_graph.
-// It stores node identities and policy flags only: no job names, SHAs, or traces.
+// It stores node identities and policy flags only: no job names or traces.
 type GraphCont struct {
 	V     string   `json:"v"`
 	Phase string   `json:"phase"`
@@ -202,6 +202,13 @@ type GraphCont struct {
 	Unk   bool     `json:"unk,omitempty"`
 	Cov   string   `json:"cov"`
 	Cap   string   `json:"cap,omitempty"`
+	Inc   bool     `json:"inc,omitempty"`
+	Rsn   []string `json:"rsn,omitempty"`
+	RP    string   `json:"rp,omitempty"`
+	RI    int64    `json:"ri,omitempty"`
+	RK    string   `json:"rk,omitempty"`
+	Prv   bool     `json:"prv,omitempty"`
+	RS    string   `json:"rs,omitempty"`
 }
 
 // DiffWindowCont binds one diff-manifest window. It stores no patch text.
@@ -1263,6 +1270,52 @@ func validateGraphCont(c *GraphCont) error {
 	if len(c.Vis)+len(c.Q) > MaxGraphVisited {
 		return ErrResyncRequired
 	}
+	if c.RI < 0 || (c.RI == 0 && c.RP != "") {
+		return ErrResyncRequired
+	}
+	if c.RI > 0 && !validGraphVisitKey(c.RP+":"+strconv.FormatInt(c.RI, 10)) {
+		return ErrResyncRequired
+	}
+	if c.D > 0 && c.RI < 1 {
+		return ErrResyncRequired
+	}
+	switch c.RK {
+	case "", "merged_result", "branch", "merge_request_head", "unproven":
+	default:
+		return ErrResyncRequired
+	}
+	switch c.RS {
+	case "", "equal", "different", "unknown":
+	default:
+		return ErrResyncRequired
+	}
+	return validateGraphReasons(c.Rsn)
+}
+
+func validateGraphReasons(items []string) error {
+	if len(items) > MaxGraphVisited {
+		return ErrResyncRequired
+	}
+	seen := map[string]struct{}{}
+	for _, item := range items {
+		if item == "" || item != strings.TrimSpace(item) || len(item) > 64 {
+			return ErrResyncRequired
+		}
+		for i := 0; i < len(item); i++ {
+			c := item[i]
+			if c >= 'a' && c <= 'z' {
+				continue
+			}
+			if i > 0 && ((c >= '0' && c <= '9') || c == '_') {
+				continue
+			}
+			return ErrResyncRequired
+		}
+		if _, dup := seen[item]; dup {
+			return ErrResyncRequired
+		}
+		seen[item] = struct{}{}
+	}
 	return nil
 }
 
@@ -1305,14 +1358,15 @@ func validGraphVisitKey(item string) bool {
 }
 
 func validGraphQueueKey(item string) bool {
-	_, _, _, _, _, ok := ParseGraphQueueItem(item)
+	_, _, _, _, _, _, ok := ParseGraphQueueItem(item)
 	return ok
 }
 
 // FormatGraphQueueItem encodes one signed walk-queue entry.
-// Shape: project:pipeline:depth:sha:ancestor,ancestor
-// sha is 40-hex or "-". The ancestor field is always present and may be empty.
-func FormatGraphQueueItem(project string, pipeline int64, depth int, sha string, ancestors []string) (string, error) {
+// Shape: project:pipeline:depth:sha:bridge:ancestor,ancestor
+// sha is 40-hex or "-". bridge is a positive id or "-".
+// The ancestor field is always present and may be empty.
+func FormatGraphQueueItem(project string, pipeline int64, depth int, sha string, bridge int64, ancestors []string) (string, error) {
 	if depth < 1 || pipeline < 1 || strings.TrimSpace(project) == "" || project != strings.TrimSpace(project) {
 		return "", ErrResyncRequired
 	}
@@ -1321,6 +1375,13 @@ func FormatGraphQueueItem(project string, pipeline int64, depth int, sha string,
 	}
 	if sha != "-" && !isGitSHA(sha) {
 		return "", ErrResyncRequired
+	}
+	if bridge < 0 {
+		return "", ErrResyncRequired
+	}
+	bridgeField := "-"
+	if bridge > 0 {
+		bridgeField = strconv.FormatInt(bridge, 10)
 	}
 	seen := map[string]struct{}{}
 	for _, a := range ancestors {
@@ -1332,48 +1393,54 @@ func FormatGraphQueueItem(project string, pipeline int64, depth int, sha string,
 		}
 		seen[a] = struct{}{}
 	}
-	return project + ":" + strconv.FormatInt(pipeline, 10) + ":" + strconv.Itoa(depth) + ":" + sha + ":" + strings.Join(ancestors, ","), nil
+	return project + ":" + strconv.FormatInt(pipeline, 10) + ":" + strconv.Itoa(depth) + ":" + sha + ":" + bridgeField + ":" + strings.Join(ancestors, ","), nil
 }
 
 // ParseGraphQueueItem decodes a signed walk-queue entry.
-func ParseGraphQueueItem(item string) (project string, pipeline int64, depth int, sha string, ancestors []string, ok bool) {
+func ParseGraphQueueItem(item string) (project string, pipeline int64, depth int, sha string, bridge int64, ancestors []string, ok bool) {
 	if item == "" || item != strings.TrimSpace(item) {
-		return "", 0, 0, "", nil, false
+		return "", 0, 0, "", 0, nil, false
 	}
-	parts := strings.SplitN(item, ":", 5)
-	if len(parts) != 5 {
-		return "", 0, 0, "", nil, false
+	parts := strings.SplitN(item, ":", 6)
+	if len(parts) != 6 {
+		return "", 0, 0, "", 0, nil, false
 	}
 	project = parts[0]
 	pipeline, err := strconv.ParseInt(parts[1], 10, 64)
 	if err != nil || pipeline < 1 {
-		return "", 0, 0, "", nil, false
+		return "", 0, 0, "", 0, nil, false
 	}
 	depth, err = strconv.Atoi(parts[2])
 	if err != nil || depth < 1 {
-		return "", 0, 0, "", nil, false
+		return "", 0, 0, "", 0, nil, false
 	}
 	sha = parts[3]
 	if sha != "-" && !isGitSHA(sha) {
-		return "", 0, 0, "", nil, false
+		return "", 0, 0, "", 0, nil, false
+	}
+	if parts[4] != "-" {
+		bridge, err = strconv.ParseInt(parts[4], 10, 64)
+		if err != nil || bridge < 1 {
+			return "", 0, 0, "", 0, nil, false
+		}
 	}
 	if !validGraphVisitKey(project + ":" + parts[1]) {
-		return "", 0, 0, "", nil, false
+		return "", 0, 0, "", 0, nil, false
 	}
-	if parts[4] != "" {
+	if parts[5] != "" {
 		seen := map[string]struct{}{}
-		for _, a := range strings.Split(parts[4], ",") {
+		for _, a := range strings.Split(parts[5], ",") {
 			if !validGraphVisitKey(a) {
-				return "", 0, 0, "", nil, false
+				return "", 0, 0, "", 0, nil, false
 			}
 			if _, dup := seen[a]; dup {
-				return "", 0, 0, "", nil, false
+				return "", 0, 0, "", 0, nil, false
 			}
 			seen[a] = struct{}{}
 			ancestors = append(ancestors, a)
 		}
 	}
-	return project, pipeline, depth, sha, ancestors, true
+	return project, pipeline, depth, sha, bridge, ancestors, true
 }
 
 func splitGraphKey(item string) (string, int64, bool) {

@@ -138,15 +138,22 @@ func getMergeRequestPipelineGraph(ctx context.Context, _ *mcp.CallToolRequest, i
 	if err != nil {
 		return nil, nil, err
 	}
-	budget := igl.DefaultBudget()
+	budget := igl.BudgetFromContext(ctx)
+	ownsBudget := false
+	if budget == nil {
+		budget = igl.DefaultBudget()
+		ownsBudget = true
+		ctx = igl.WithBudget(ctx, budget)
+	}
 	if in.MaxItems > 0 {
 		budget.CapLimits(in.MaxItems, 0, 0)
 	}
 	if in.MaxRequests > 0 {
 		budget.CapLimits(0, 0, in.MaxRequests)
 	}
-	ctx = igl.WithBudget(ctx, budget)
-	defer budget.Cancel()
+	if ownsBudget {
+		defer budget.Cancel()
+	}
 
 	now := d.now()
 	if rawCursor != "" {
@@ -218,6 +225,7 @@ func initialPipelineGraph(ctx context.Context, in pipelineGraphIn, sel graphSele
 	upper := now.UTC().Format(time.RFC3339Nano)
 	expires := now.UTC().Add(d.Config.CursorTTL()).Format(time.RFC3339Nano)
 	walk := newGraphWalk(chosen, pipePID, sel.MaxDepth, sel.MaxNodes)
+	walk.bindRelation(rel)
 	out, err := finishGraph(ctx, section, pid, pipePID, mrIID, chosen, rel, page, sel, d, actorID, upper, expires, 1, true, lineageCarry{}, walk, budget)
 	if err != nil {
 		return nil, nil, err
@@ -302,7 +310,14 @@ func resumePipelineGraph(ctx context.Context, in pipelineGraphIn, sel graphSelec
 		PipelineSHA: deref(pipe.SHA),
 		ExpectedSHA: sel.ExpectedSHA,
 	})
-	if sel.MRIID > 0 {
+	gc := payload.GraphCont
+	childResume := gc != nil && gc.RI > 0 && (gc.D > 0 || gc.RI != *payload.Scope.PipelineID || gc.RP != pipePID)
+	if childResume {
+		rel = relationResult{Kind: gc.RK, Proven: gc.Prv, Evidence: []string{"graph_cursor"}, SHAComparison: gc.RS}
+		if rel.Kind == "" {
+			rel.Kind = relUnproven
+		}
+	} else if sel.MRIID > 0 {
 		linked, exhausted, listErr := pipelineListed(ctx, d, pid, sel.MRIID, pipe.ID)
 		if listErr != nil {
 			return nil, nil, listErr
@@ -328,6 +343,7 @@ func resumePipelineGraph(ctx context.Context, in pipelineGraphIn, sel graphSelec
 	if werr != nil {
 		return nil, nil, werr
 	}
+	walk.bindRelation(rel)
 	if payload.GraphCont != nil && payload.GraphCont.Phase == cursor.GraphPhaseBridges {
 		return resumeGraphBridges(ctx, &section, pid, pipePID, mrIID, pipe, rel, sel, d, actorID, &payload, walk, budget)
 	}
@@ -375,7 +391,7 @@ func resumeGraphBridges(ctx context.Context, section *readmeta.Section, pid, pip
 	}
 	ids := make([]string, 0, len(guard.Bridges))
 	for _, br := range guard.Bridges {
-		ids = append(ids, strconv.FormatInt(br.Job.ID, 10))
+		ids = append(ids, bridgeGuardToken(br))
 	}
 	last := ""
 	if len(ids) > 0 {
@@ -691,13 +707,13 @@ func finishGraph(ctx context.Context, section readmeta.Section, pid, pipePID str
 		coverage = walk.coverage
 		unseen = walk.unseen
 		outcomes = walk.outcomes
-		if walk.block {
+		if walk.block && !hasPolicyOutcome(outcomes, policyBlock) {
 			outcomes = append(outcomes, policyOutcome{Outcome: policyBlock})
 		}
-		if walk.partial {
+		if walk.partial && !hasPolicyOutcome(outcomes, policyPartial) {
 			outcomes = append(outcomes, policyOutcome{Outcome: policyPartial})
 		}
-		if walk.unknown {
+		if walk.unknown && !hasPolicyOutcome(outcomes, policyUnknown) {
 			outcomes = append(outcomes, policyOutcome{Outcome: policyUnknown})
 		}
 		if walk.bridgesOn {
@@ -720,6 +736,9 @@ func finishGraph(ctx context.Context, section readmeta.Section, pid, pipePID str
 		Downstream:     coverage,
 		UnseenEdge:     unseen,
 	})
+	if walk != nil {
+		reasons = appendUniqueReasons(append([]string(nil), walk.reasons...), reasons)
+	}
 	graphComplete := fromStart && exhausted && !sel.Filter.active() && !page.Partial && page.Paging.PagingKnown && coverage == downstreamCoverageComplete && !unseen && section.NextCursor == nil
 	if graphComplete {
 		section.ContentComplete = readmeta.ContentCompleteTrue
@@ -879,7 +898,7 @@ func mintBridgeCursor(section *readmeta.Section, d Deps, actorID int64, pipePID 
 	}
 	ids := make([]string, 0, len(page.Bridges))
 	for _, br := range page.Bridges {
-		ids = append(ids, strconv.FormatInt(br.Job.ID, 10))
+		ids = append(ids, bridgeGuardToken(br))
 	}
 	walk.phase = cursor.GraphPhaseBridges
 	tok, err := mintGraphCursor(d, actorID, pipePID, pipelineID, sha, sel, upper, expires, pageNum, ids, nextPage, len(page.Bridges), mrProject, nil, walk.snapshotCont())
@@ -913,43 +932,19 @@ func walkQueuedChildren(ctx context.Context, section *readmeta.Section, rootPID 
 			return err
 		}
 		if kind != "" {
-			walk.unseen = true
-			walk.coverage = downstreamCoveragePartial
-			walk.edges = append(walk.edges, graphEdgeView{
-				ToProject:  next.Key.Project,
-				ToPipeline: next.Key.Pipeline,
-				Kind:       kind,
-				Capability: walk.cap,
-				Provenance: []string{"authorize_before_content"},
-			})
+			walk.markQueuedFailure(next, kind, "authorize_before_content")
 			continue
 		}
 		child, err := loadPipeline(ctx, d, next.Key.Project, next.Key.Pipeline)
 		if err != nil {
 			if errors.Is(err, errPipelineForbidden) {
-				walk.unseen = true
-				walk.coverage = downstreamCoveragePartial
-				walk.edges = append(walk.edges, graphEdgeView{
-					ToProject:  next.Key.Project,
-					ToPipeline: next.Key.Pipeline,
-					Kind:       edgeKindInaccessible,
-					Capability: walk.cap,
-					Provenance: []string{"child_403"},
-				})
+				walk.markQueuedFailure(next, edgeKindInaccessible, "child_403")
 				continue
 			}
 			return err
 		}
 		if child == nil {
-			walk.unseen = true
-			walk.coverage = downstreamCoveragePartial
-			walk.edges = append(walk.edges, graphEdgeView{
-				ToProject:  next.Key.Project,
-				ToPipeline: next.Key.Pipeline,
-				Kind:       edgeKindInaccessible,
-				Capability: walk.cap,
-				Provenance: []string{"child_missing"},
-			})
+			walk.markQueuedFailure(next, edgeKindInaccessible, "child_missing")
 			continue
 		}
 		scope, err := bindPipelineProject(ctx, d, next.Key.Project, child.ProjectID)
@@ -961,8 +956,7 @@ func walkQueuedChildren(ctx context.Context, section *readmeta.Section, rootPID 
 			if kind == "" {
 				return err
 			}
-			walk.unseen = true
-			walk.edges = append(walk.edges, graphEdgeView{ToProject: next.Key.Project, ToPipeline: next.Key.Pipeline, Kind: kind, Provenance: []string{"bind_child"}})
+			walk.markQueuedFailure(next, kind, "bind_child")
 			continue
 		}
 		child.ScopeProject = scope
@@ -1084,6 +1078,35 @@ func graphFilters(sel graphSelection, upper, mrProject string) cursor.Filters {
 	}
 }
 
+func applySignedGraphBounds(in *pipelineGraphIn, f cursor.Filters) {
+	if in == nil {
+		return
+	}
+	if f.PerPage > 0 {
+		in.PerPage = f.PerPage
+	}
+	if depth, nodes, ok := graphBoundsFromFilterPath(f.Path); ok {
+		in.MaxDepth = depth
+		in.MaxNodes = nodes
+	}
+}
+
+func graphBoundsFromFilterPath(path string) (depth, nodes int, ok bool) {
+	const depthKey = ";depth="
+	const nodesKey = ";nodes="
+	di := strings.LastIndex(path, depthKey)
+	ni := strings.LastIndex(path, nodesKey)
+	if di < 0 || ni <= di {
+		return 0, 0, false
+	}
+	d, derr := strconv.Atoi(path[di+len(depthKey) : ni])
+	n, nerr := strconv.Atoi(path[ni+len(nodesKey):])
+	if derr != nil || nerr != nil || d < 1 || n < 1 {
+		return 0, 0, false
+	}
+	return d, n, true
+}
+
 // lineageViewFor copies a group into the response. Assessment still uses
 // every group on the page. A filter omits a group with no returned job and
 // drops ids that were not returned. LatestKnown stays true when that
@@ -1151,6 +1174,35 @@ func lineageCarryCovers(prior lineageCarry, jobs []graphJob) bool {
 		return false
 	}
 	return true
+}
+
+func hasPolicyOutcome(outcomes []policyOutcome, want string) bool {
+	for _, o := range outcomes {
+		if o.Outcome == want {
+			return true
+		}
+	}
+	return false
+}
+
+func bridgeGuardToken(br graphBridge) string {
+	sha := br.ChildSHA
+	if sha == "" {
+		sha = "-"
+	}
+	present := "0"
+	if br.ChildPresent {
+		present = "1"
+	}
+	return strings.Join([]string{
+		strconv.FormatInt(br.Job.ID, 10),
+		strconv.FormatInt(br.ChildProject, 10),
+		strconv.FormatInt(br.ChildPipeline, 10),
+		sha,
+		present,
+		br.Job.Status,
+		allowPresenceLabel(br.Job.Allow, br.Job.AllowValid),
+	}, ":")
 }
 
 func jobToView(job graphJob, attempt string) jobView {
@@ -1374,7 +1426,7 @@ func fetchMRPipelinePage(ctx context.Context, d Deps, pid string, iid int64, pag
 	opt := &gitlab.ListOptions{Page: int64(page), PerPage: graphDefaultPerPage}
 	var batch []pipelineRef
 	broken := false
-	resp, err := igl.StreamJSONArray(ctx, d.Client, http.MethodGet, path, opt, func(raw json.RawMessage) error {
+	resp, err := igl.StreamJSONArrayQueue(ctx, d.Client, http.MethodGet, path, opt, func(raw json.RawMessage) error {
 		ref, ok := parsePipelineRef(raw)
 		if !ok {
 			broken = true
@@ -1400,7 +1452,7 @@ func collectJobPage(ctx context.Context, d Deps, budget *igl.Budget, pid string,
 	}
 	out := graphPage{}
 	seen := map[int64]struct{}{}
-	resp, err := igl.StreamJSONArray(ctx, d.Client, http.MethodGet, path, opt, func(raw json.RawMessage) error {
+	resp, err := igl.StreamJSONArrayQueue(ctx, d.Client, http.MethodGet, path, opt, func(raw json.RawMessage) error {
 		if err := ctx.Err(); err != nil {
 			out.Partial = true
 			out.Reason = "cancelled"

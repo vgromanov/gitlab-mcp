@@ -1030,7 +1030,7 @@ func (rt *reviewRuntime) readPipelineGraph(item reviewContextItemIn, owner Canon
 		ExpectedSourceSHA: br.SourceSHA,
 		Cursor:            item.graphCursor,
 	}
-	if err := rt.bindReviewGraphCursor(item, owner, br, item.graphCursor); err != nil {
+	if err := rt.bindReviewGraphCursor(item, owner, br, item.graphCursor, &in); err != nil {
 		if strings.HasPrefix(err.Error(), cursor.ResyncRequired) {
 			out.Cause = cursor.ResyncRequired
 			return
@@ -1043,6 +1043,7 @@ func (rt *reviewRuntime) readPipelineGraph(item reviewContextItemIn, owner Canon
 		return
 	}
 	var merged pipelineGraphOut
+	startedFromCursor := strings.TrimSpace(item.graphCursor) != ""
 	tok := item.graphCursor
 	for page := 0; page < cursor.MaxGraphVisited; page++ {
 		in.Cursor = tok
@@ -1079,7 +1080,7 @@ func (rt *reviewRuntime) readPipelineGraph(item reviewContextItemIn, owner Canon
 	if merged.Section.CapabilityVersion == "" {
 		merged.Section = sec
 	}
-	if merged.DownstreamCoverage == downstreamCoverageComplete && merged.Section.NextCursor == nil && !sectionHasCode(merged.Section, readmeta.CodePartial) {
+	if !startedFromCursor && merged.DownstreamCoverage == downstreamCoverageComplete && merged.Section.NextCursor == nil && !sectionHasCode(merged.Section, readmeta.CodePartial) {
 		if merged.Digest == nil || *merged.Digest == "" {
 			dig := encodeGraphDigest(merged.Nodes, merged.Edges, merged.Assessment, merged.DownstreamCoverage)
 			if dig != "" {
@@ -1102,7 +1103,7 @@ func (rt *reviewRuntime) readPipelineGraph(item reviewContextItemIn, owner Canon
 	out.Sections["pipeline_graph"] = merged.Section
 }
 
-func (rt *reviewRuntime) bindReviewGraphCursor(item reviewContextItemIn, owner CanonicalProject, br reviewBracket, tok string) error {
+func (rt *reviewRuntime) bindReviewGraphCursor(item reviewContextItemIn, owner CanonicalProject, br reviewBracket, tok string, in *pipelineGraphIn) error {
 	if strings.TrimSpace(tok) == "" {
 		return nil
 	}
@@ -1123,6 +1124,7 @@ func (rt *reviewRuntime) bindReviewGraphCursor(item reviewContextItemIn, owner C
 	if decoded.Filters.RefName != br.SourceSHA {
 		return fmt.Errorf("%s: graph cursor binding", cursor.ResyncRequired)
 	}
+	applySignedGraphBounds(in, decoded.Filters)
 	parent, _, _, err := resolveParentPipeline(rt.ctx, rt.d, ownerID, 0, graphSelection{ExpectedSHA: br.SourceSHA, MRIID: item.MergeRequestIID})
 	if err != nil {
 		return err

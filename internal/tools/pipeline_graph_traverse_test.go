@@ -257,6 +257,10 @@ func TestPipelineGraph_twoPageBridgesAndJobs(t *testing.T) {
 	if last["downstream_coverage"] != downstreamCoverageComplete {
 		t.Fatalf("paginated graph stuck: assessment=%v coverage=%v cursor=%v nodes=%#v hits=%#v section=%#v", last["assessment"], last["downstream_coverage"], tok, last["nodes"], hits, last["section"])
 	}
+	rel, _ := last["relation"].(map[string]any)
+	if rel["proven"] != true {
+		t.Fatalf("child resume lost root relation %#v", rel)
+	}
 }
 
 func TestPipelineGraph_deniedChildNoContent(t *testing.T) {
@@ -277,6 +281,16 @@ func TestPipelineGraph_deniedChildNoContent(t *testing.T) {
 	requireNotReady(t, out)
 	if !hasKind(edgeKinds(t, out), edgeKindDenied) {
 		t.Fatalf("edges %#v", out["edges"])
+	}
+	found := false
+	for _, raw := range out["edges"].([]any) {
+		e, _ := raw.(map[string]any)
+		if e["kind"] == edgeKindDenied && e["from_project"] == "42" && fmt.Sprint(e["from_pipeline"]) == "100" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("denied edge missing source %#v", out["edges"])
 	}
 	for _, hit := range hits {
 		if strings.Contains(hit.path, "/projects/99/pipelines") {
@@ -461,16 +475,136 @@ func TestParseQueuedNodeRestoresAncestors(t *testing.T) {
 		Depth:     1,
 		ParentSHA: graphPipeSHA,
 		Ancestors: []graphNodeKey{{Project: "42", Pipeline: 100}},
+		BridgeID:  50,
 	}
 	enc, err := encodeQueuedNode(n)
 	if err != nil {
 		t.Fatal(err)
 	}
 	got, ok := parseQueuedNode(enc)
-	if !ok || got.Key != n.Key || got.Depth != 1 || got.ParentSHA != graphPipeSHA || len(got.Ancestors) != 1 || got.Ancestors[0] != n.Ancestors[0] {
+	if !ok || got.Key != n.Key || got.Depth != 1 || got.ParentSHA != graphPipeSHA || got.BridgeID != 50 || len(got.Ancestors) != 1 || got.Ancestors[0] != n.Ancestors[0] {
 		t.Fatalf("roundtrip %#v from %q", got, enc)
 	}
 	if _, ok := parseQueuedNode("99:200:1"); ok {
 		t.Fatal("legacy queue key accepted")
+	}
+}
+
+func TestEncodeGraphDigestIncludesJobEvidence(t *testing.T) {
+	name := "test"
+	stage := "test"
+	okStatus := "success"
+	failStatus := "failed"
+	base := graphNodeView{ProjectID: "42", PipelineID: 100, Role: nodeRoleParent, Jobs: []jobView{
+		{ID: 1, Name: &name, Stage: &stage, Status: &okStatus, AllowFailure: "false", Attempt: attemptLatest, Policy: policyPass},
+	}}
+	alt := base
+	alt.Jobs = []jobView{{ID: 2, Name: &name, Stage: &stage, Status: &failStatus, AllowFailure: "false", Attempt: attemptLatest, Policy: policyBlock}}
+	a := encodeGraphDigest([]graphNodeView{base}, nil, assessReady, downstreamCoverageComplete)
+	b := encodeGraphDigest([]graphNodeView{alt}, nil, assessReady, downstreamCoverageComplete)
+	if a == "" || a == b {
+		t.Fatalf("digest ignored job evidence %s %s", a, b)
+	}
+}
+
+func TestPipelineGraph_resumeKeepsIncompleteEdge(t *testing.T) {
+	h := &walkServer{
+		pipes: map[string]string{
+			"42/100": walkPipe(100, 42, graphPipeSHA, "feature"),
+			"99/201": walkPipe(201, 99, graphChildSHA, "child2"),
+		},
+		jobs: map[string]string{
+			"42/100/1": "[" + jobJSON(1, "parent", "success", "false") + "]",
+			"99/201/1": "[" + jobJSON(12, "child-c", "success", "false") + "]",
+		},
+		bridges: map[string]string{
+			"42/100/1": "[" + bridgeJSON(50, "one", 0, 0, "") + "]",
+			"42/100/2": "[" + bridgeJSON(51, "two", 99, 201, graphChildSHA) + "]",
+		},
+		mr:      graphMR("feature"),
+		mrPipes: graphPipes("feature"),
+	}
+	in := pipelineGraphIn{ProjectID: "42", MergeRequestIID: 7, PerPage: 1}
+	clk := &cursor.FakeClock{T: time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)}
+	d := newCursorDeps(t, h, nil, clk)
+	_, raw, err := getMergeRequestPipelineGraph(context.Background(), nil, in, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tok, _ := graphSection(t, raw.(map[string]any))["next_cursor"].(string)
+	if tok == "" {
+		t.Fatal("need bridge continuation")
+	}
+	in.Cursor = tok
+	_, raw, err = getMergeRequestPipelineGraph(context.Background(), nil, in, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := raw.(map[string]any)
+	if out["downstream_coverage"] == downstreamCoverageComplete {
+		t.Fatalf("incomplete first-page edge was cleared %#v", out)
+	}
+}
+
+func TestPipelineGraph_resumeKeepsReasons(t *testing.T) {
+	h := &walkServer{
+		pipes:   map[string]string{"42/100": walkPipe(100, 42, graphPipeSHA, "feature")},
+		jobs:    map[string]string{"42/100/1": "[" + jobJSON(1, "test", "failed", "false") + "]", "42/100/2": "[" + jobJSON(2, "lint", "success", "false") + "]"},
+		mr:      graphMR("feature"),
+		mrPipes: graphPipes("feature"),
+	}
+	in := pipelineGraphIn{ProjectID: "42", MergeRequestIID: 7, PerPage: 1}
+	clk := &cursor.FakeClock{T: time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)}
+	d := newCursorDeps(t, h, nil, clk)
+	_, raw, err := getMergeRequestPipelineGraph(context.Background(), nil, in, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tok, _ := graphSection(t, raw.(map[string]any))["next_cursor"].(string)
+	if tok == "" {
+		t.Fatal("need jobs continuation")
+	}
+	in.Cursor = tok
+	_, raw, err = getMergeRequestPipelineGraph(context.Background(), nil, in, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := raw.(map[string]any)
+	reasons, _ := out["reasons"].([]any)
+	found := false
+	for _, r := range reasons {
+		if fmt.Sprint(r) == "failed_required" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("lost failed_required %#v", out["reasons"])
+	}
+}
+
+func TestPipelineGraph_bridgeGuardSeesDownstreamChange(t *testing.T) {
+	h := &walkServer{
+		pipes:   map[string]string{"42/100": walkPipe(100, 42, graphPipeSHA, "feature")},
+		jobs:    map[string]string{"42/100/1": "[" + jobJSON(1, "parent", "success", "false") + "]"},
+		bridges: map[string]string{"42/100/1": "[" + bridgeJSON(50, "one", 0, 0, "") + "]", "42/100/2": "[" + bridgeJSON(51, "two", 99, 201, graphChildSHA) + "]"},
+		mr:      graphMR("feature"),
+		mrPipes: graphPipes("feature"),
+	}
+	in := pipelineGraphIn{ProjectID: "42", MergeRequestIID: 7, PerPage: 1}
+	clk := &cursor.FakeClock{T: time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)}
+	d := newCursorDeps(t, h, nil, clk)
+	_, raw, err := getMergeRequestPipelineGraph(context.Background(), nil, in, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tok, _ := graphSection(t, raw.(map[string]any))["next_cursor"].(string)
+	if tok == "" {
+		t.Fatal("need bridge continuation")
+	}
+	h.bridges["42/100/1"] = "[" + bridgeJSON(50, "one", 99, 200, graphChildSHA) + "]"
+	in.Cursor = tok
+	_, _, err = getMergeRequestPipelineGraph(context.Background(), nil, in, d)
+	if err == nil || !strings.Contains(err.Error(), cursor.ResyncRequired) {
+		t.Fatalf("downstream identity change: %v", err)
 	}
 }

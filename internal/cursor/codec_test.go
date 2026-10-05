@@ -1101,26 +1101,26 @@ func TestDiffWindowCursorModes(t *testing.T) {
 
 func TestGraphQueueItemRoundTrip(t *testing.T) {
 	sha := strings.Repeat("ab", 20)
-	enc, err := FormatGraphQueueItem("99", 200, 1, sha, []string{"42:100"})
+	enc, err := FormatGraphQueueItem("99", 200, 1, sha, 50, []string{"42:100"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	proj, pipe, depth, gotSHA, ancs, ok := ParseGraphQueueItem(enc)
-	if !ok || proj != "99" || pipe != 200 || depth != 1 || gotSHA != sha || len(ancs) != 1 || ancs[0] != "42:100" {
-		t.Fatalf("roundtrip %q -> %s %d %d %s %#v", enc, proj, pipe, depth, gotSHA, ancs)
+	proj, pipe, depth, gotSHA, bridge, ancs, ok := ParseGraphQueueItem(enc)
+	if !ok || proj != "99" || pipe != 200 || depth != 1 || gotSHA != sha || bridge != 50 || len(ancs) != 1 || ancs[0] != "42:100" {
+		t.Fatalf("roundtrip %q -> %s %d %d %s %d %#v", enc, proj, pipe, depth, gotSHA, bridge, ancs)
 	}
-	empty, err := FormatGraphQueueItem("99", 200, 2, "-", nil)
+	empty, err := FormatGraphQueueItem("99", 200, 2, "-", 0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, _, _, gotSHA, ancs, ok = ParseGraphQueueItem(empty)
-	if !ok || gotSHA != "-" || ancs != nil {
-		t.Fatalf("empty ancestors %q -> sha=%s ancs=%#v", empty, gotSHA, ancs)
+	_, _, _, gotSHA, bridge, ancs, ok = ParseGraphQueueItem(empty)
+	if !ok || gotSHA != "-" || bridge != 0 || ancs != nil {
+		t.Fatalf("empty ancestors %q -> sha=%s bridge=%d ancs=%#v", empty, gotSHA, bridge, ancs)
 	}
-	if _, _, _, _, _, ok = ParseGraphQueueItem("99:200:1"); ok {
+	if _, _, _, _, _, _, ok = ParseGraphQueueItem("99:200:1"); ok {
 		t.Fatal("legacy three-field queue accepted")
 	}
-	if _, err := FormatGraphQueueItem("99", 200, 1, "not-a-sha", nil); err == nil {
+	if _, err := FormatGraphQueueItem("99", 200, 1, "not-a-sha", 0, nil); err == nil {
 		t.Fatal("short sha accepted")
 	}
 }

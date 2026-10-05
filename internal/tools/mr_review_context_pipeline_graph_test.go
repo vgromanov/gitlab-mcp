@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/cursor"
+	igl "gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/gitlab"
 	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/tools/readmeta"
 )
 
@@ -128,5 +129,94 @@ func TestReviewContext_graphCursorRequiresMRParent(t *testing.T) {
 	}
 	if item.PipelineGraph != nil && item.PipelineGraph.Section.ContentComplete == readmeta.ContentCompleteTrue {
 		t.Fatal("must not complete a pinned non-parent pipeline")
+	}
+}
+
+func TestReviewContext_resumedGraphStaysIncomplete(t *testing.T) {
+	log := &pathLog{}
+	script := &reviewScript{log: log}
+	graph := &walkServer{
+		pipes: map[string]string{
+			"42/100": walkPipe(100, 42, shaN(1), "feature-1"),
+			"99/200": walkPipe(200, 99, shaN(2), "child"),
+			"99/201": walkPipe(201, 99, shaN(2), "child2"),
+		},
+		jobs: map[string]string{
+			"42/100/1": "[" + jobJSON(1, "parent", "success", "false") + "]",
+			"99/200/1": "[" + jobJSON(10, "child-a", "success", "false") + "]",
+			"99/200/2": "[" + jobJSON(11, "child-b", "success", "false") + "]",
+			"99/201/1": "[" + jobJSON(12, "child-c", "success", "false") + "]",
+		},
+		bridges: map[string]string{
+			"42/100/1": "[" + bridgeJSON(50, "one", 99, 200, shaN(2)) + "]",
+			"42/100/2": "[" + bridgeJSON(51, "two", 99, 201, shaN(2)) + "]",
+		},
+		mrPipes: `[{"id":100,"project_id":42,"sha":"` + shaN(1) + `","ref":"feature-1","status":"success"}]`,
+	}
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/pipelines") || strings.Contains(r.URL.Path, "/jobs") || strings.Contains(r.URL.Path, "/bridges") {
+			graph.ServeHTTP(w, r)
+			return
+		}
+		script.serve(w, r)
+	})
+	d := newReviewDeps(t, h)
+	_, raw, err := getMergeRequestPipelineGraph(context.Background(), nil, pipelineGraphIn{
+		ProjectID: "42", MergeRequestIID: 1, PerPage: 1, ExpectedSourceSHA: shaN(1),
+	}, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tok, _ := graphSection(t, raw.(map[string]any))["next_cursor"].(string)
+	if tok == "" {
+		t.Fatal("need graph cursor")
+	}
+	out, err := callReviewDirect(t, d, context.Background(), []reviewContextItemIn{
+		{
+			ProjectID: "42", MergeRequestIID: 1, Sections: []string{"metadata", "pipeline_graph"},
+			Cursors: []reviewContextCursorIn{{Section: "pipeline_graph", Cursor: tok}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item := out.Items[0]
+	if item.PipelineGraph != nil && item.PipelineGraph.Section.ContentComplete == readmeta.ContentCompleteTrue {
+		t.Fatal("resumed tail certified complete")
+	}
+	if item.pipelineGraphDigest != "" {
+		t.Fatal("resumed tail minted digest")
+	}
+}
+
+func TestReviewContext_graphBorrowsBudget(t *testing.T) {
+	log := &pathLog{}
+	script := &reviewScript{log: log}
+	graph := &walkServer{
+		pipes:   map[string]string{"42/100": walkPipe(100, 42, shaN(1), "feature-1")},
+		jobs:    map[string]string{"42/100/1": "[" + jobJSON(1, "test", "success", "false") + "]"},
+		mrPipes: `[{"id":100,"project_id":42,"sha":"` + shaN(1) + `","ref":"feature-1","status":"success"}]`,
+	}
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/pipelines") || strings.Contains(r.URL.Path, "/jobs") || strings.Contains(r.URL.Path, "/bridges") {
+			graph.ServeHTTP(w, r)
+			return
+		}
+		script.serve(w, r)
+	})
+	d := newReviewDeps(t, h)
+	ctx := igl.WithBudget(context.Background(), reviewBudget(3))
+	out, err := callReviewDirect(t, d, ctx, []reviewContextItemIn{
+		{ProjectID: "42", MergeRequestIID: 1, Sections: []string{"metadata", "pipeline_graph"}},
+	})
+	if err != nil {
+		if strings.Contains(err.Error(), readmeta.CodeBudgetRequests) {
+			return
+		}
+		t.Fatal(err)
+	}
+	item := out.Items[0]
+	if item.Cause != readmeta.CodeBudgetRequests && (item.PipelineGraph == nil || item.PipelineGraph.Section.ContentComplete == readmeta.ContentCompleteTrue) {
+		t.Fatalf("graph ignored review budget cause=%s complete=%v", item.Cause, item.Sections["pipeline_graph"])
 	}
 }
