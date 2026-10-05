@@ -12,6 +12,8 @@
 // checkouts, submodules, file:// transport, or subprocess FS helpers.
 //
 // Ordinary API metadata, approval, discussion, and raw-file tools do not
-// require this package. Exact-diff / rename / hunk / GitLab anchor parity is
-// owned by RVG-145 and is not implemented here.
+// require this package. When a service is enabled, get_merge_request acquires
+// that merge request through GitCacheAuthorizer and Service.Acquire. Exact-diff
+// / rename / hunk / GitLab anchor parity is owned by RVG-145 and is not
+// implemented here.
 package gitcache

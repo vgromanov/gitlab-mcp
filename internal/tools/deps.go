@@ -22,7 +22,8 @@ type Deps struct {
 	Clock cursor.Clock
 	// GitCache is the optional native object cache service. Nil/disabled means
 	// ordinary API tools keep working without Git. No public cache tool is
-	// registered from this dependency.
+	// registered from this dependency. An enabled service is used by
+	// get_merge_request to acquire that merge request's authorized objects.
 	GitCache *gitcache.Service
 }
 

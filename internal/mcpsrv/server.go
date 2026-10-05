@@ -31,7 +31,8 @@ func WithGuardedClient(c *gitlab.Client) ServerOption {
 }
 
 // WithGitCache wires the optional native object cache service into tool Deps.
-// No public cache tool is registered.
+// No public cache tool is registered. When the service is enabled,
+// get_merge_request acquires that merge request's authorized objects.
 func WithGitCache(s *gitcache.Service) ServerOption {
 	return func(o *serverOptions) {
 		o.gitCache = s
