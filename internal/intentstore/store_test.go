@@ -1258,6 +1258,36 @@ func TestOverCapStoreRejectsNewRowsOnly(t *testing.T) {
 	}
 }
 
+func TestPeerWithHigherCapGrowthIsHonored(t *testing.T) {
+	cfg, _ := fixedNow(t)
+	low := openStore(t, cfg)
+	ctx := context.Background()
+	if _, err := low.Begin(ctx, ident("seed"), PayloadHash([]byte("s")), BeginOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	low.maxBytes = fileBytes(t, low.path)
+	if err := low.Writable(); err != nil {
+		t.Fatalf("at cap: %v", err)
+	}
+
+	peer := openStore(t, cfg)
+	peer.maxBytes = DefaultMaxBytes
+	for i := 0; i < 40; i++ {
+		if _, err := peer.Begin(ctx, ident(fmt.Sprintf("peer-%d", i)), PayloadHash([]byte{byte(i)}), BeginOptions{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if fileBytes(t, low.path) <= low.maxBytes {
+		t.Fatal("peer did not grow the file past the lower cap")
+	}
+	if err := low.Writable(); !errors.Is(err, ErrFull) {
+		t.Fatalf("writable after peer growth: %v", err)
+	}
+	if _, err := low.Begin(ctx, ident("next"), PayloadHash([]byte("n")), BeginOptions{}); !errors.Is(err, ErrFull) {
+		t.Fatalf("begin after peer growth: %v", err)
+	}
+}
+
 func TestHandlesShareOneFileWithoutSidecars(t *testing.T) {
 	cfg, _ := fixedNow(t)
 	const handles = 6
