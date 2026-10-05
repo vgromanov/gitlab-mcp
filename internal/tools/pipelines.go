@@ -242,12 +242,32 @@ type traceReadMeta struct {
 	scanStopped  bool
 }
 
+func traceContextMargin(token string) int {
+	m := jobTraceLookbehind
+	if len(token) > m {
+		m = len(token)
+	}
+	if m > traceTokenHold {
+		m = traceTokenHold
+	}
+	return m
+}
+
 func readJobTrace(ctx context.Context, d Deps, pid string, jobID int64, q traceQuery) (igl.JobTraceResult, traceReadMeta, error) {
 	var meta traceReadMeta
+	token := ""
+	if d.Config != nil {
+		token = d.Config.Token
+	}
+	margin := traceContextMargin(token)
 	switch q.selector {
 	case "tail":
+		suffix := int64(q.scan) + int64(margin)
+		if suffix > int64(jobTraceHardScan) {
+			suffix = int64(jobTraceHardScan)
+		}
 		first := igl.StreamJobTrace(ctx, d.Client, igl.JobTraceRequest{
-			ProjectID: pid, JobID: jobID, SuffixBytes: int64(q.scan), MaxScanBytes: int64(q.scan),
+			ProjectID: pid, JobID: jobID, SuffixBytes: suffix, MaxScanBytes: suffix,
 		})
 		if errors.Is(first.Err, igl.ErrRangeIgnored) {
 			meta.rangeIgnored = true
@@ -275,14 +295,8 @@ func readJobTrace(ctx context.Context, d Deps, pid string, jobID int64, q traceQ
 		return first, meta, nil
 	case "range":
 		start := *q.start
-		lb := jobTraceLookbehind
-		if d.Config != nil && len(d.Config.Token) > lb {
-			lb = len(d.Config.Token)
-			if lb > traceTokenHold {
-				lb = traceTokenHold
-			}
-		}
-		reqStart := start - int64(lb)
+		lb := int64(margin)
+		reqStart := start - lb
 		if reqStart < 0 {
 			reqStart = 0
 		}
@@ -290,7 +304,7 @@ func readJobTrace(ctx context.Context, d Deps, pid string, jobID int64, q traceQ
 			ProjectID: pid, JobID: jobID, RangeStart: &reqStart, MaxScanBytes: int64(q.scan),
 		}
 		if q.end != nil {
-			end := *q.end
+			end := *q.end + lb
 			req.RangeEndExcl = &end
 			span := end - reqStart
 			if span > 0 && span < int64(q.scan) {
@@ -344,11 +358,16 @@ func buildTraceWindow(q traceQuery, res igl.JobTraceResult, meta traceReadMeta, 
 	case meta.unprovenTail:
 		piece = tracePiece{}
 	case q.selector == "tail":
-		piece = selectTail(res.Data, base, q.lines, q.output, q.line, token, res.EOF || res.SuffixAnchored, true)
+		lead := 0
+		if q.scan > 0 && len(res.Data) > q.scan {
+			lead = len(res.Data) - q.scan
+		}
+		hideHead := lead == 0 && base > 0
+		piece = selectTail(res.Data, base, lead, q.lines, q.output, q.line, token, res.EOF || res.SuffixAnchored, true, hideHead)
 	case q.selector == "error":
 		piece = selectError(res.Data, base, q.errorMatch, q.output, q.line, token, res.EOF)
 	case q.selector == "range":
-		piece = selectRange(res.Data, base, *q.start, q.end, q.output, q.line, token, res.EOF)
+		piece = selectRange(res.Data, base, *q.start, q.end, q.output, q.line, token, res.SizeKnown, res.Size)
 	default:
 		piece = selectPrefix(res.Data, base, q.lines, q.output, q.line, token, res.EOF)
 	}
