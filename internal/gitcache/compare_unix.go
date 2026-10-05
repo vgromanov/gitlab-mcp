@@ -12,8 +12,6 @@ import (
 	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/gitcache/bounds"
 )
 
-const compareDirName = "compare"
-
 // OpenCompareDir reserves comparison scratch under the private cache root.
 // Callers must invoke the returned cleanup.
 func (m *Manager) OpenCompareDir(ctx context.Context, size int64) (string, func() error, error) {

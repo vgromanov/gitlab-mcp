@@ -137,6 +137,47 @@ func TestDiffWindow_cacheRecoversContent(t *testing.T) {
 	}
 }
 
+func TestDiffWindow_cacheItemBudgetLeavesSelectorsUnobserved(t *testing.T) {
+	if err := gitdiff.LookPath(); err != nil {
+		t.Skip(err.Error())
+	}
+	objs, base, head := twoFileCommitObjects(t)
+	hold := &gitcache.ObjectHold{
+		Result: gitcache.AcquireResult{
+			GenerationID: "gen-items",
+			Grant: gitcache.Grant{
+				ProjectID: "42", SourceFork: "42", TargetProjectID: "42",
+				HeadSHA: plumbing.NewHash(head), BaseSHA: plumbing.NewHash(base), StartSHA: plumbing.NewHash(base),
+			},
+		},
+		Objects: objs,
+	}
+	d := diffDeps(t, overflowHandler(head, base))
+	d.cacheHold = &fakeCacheHold{enabled: true, hold: hold}
+	out, err := callDiffWindow(t, d, nil, map[string]any{
+		"project_id": "42", "merge_request_iid": 1, "diff_version_id": 1,
+		"mode": "content", "paths": []string{"a.txt", "b.txt"}, "max_items": 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sec := sectionMap(out)
+	if sec["source"] != readmeta.SourceGitCache || sec["content_complete"] != readmeta.ContentCompleteFalse {
+		t.Fatalf("section=%#v", sec)
+	}
+	byPath := map[string]string{}
+	for _, raw := range asSlice(t, out["selectors"]) {
+		s := asMap(t, raw)
+		byPath[asString(s["path"])] = asString(s["status"])
+	}
+	if byPath["a.txt"] != diffSelectorMatched {
+		t.Fatalf("first selector=%#v", byPath)
+	}
+	if byPath["b.txt"] != diffSelectorUnobserved {
+		t.Fatalf("truncated selector must stay unobserved, got %#v", byPath)
+	}
+}
+
 func TestDiffWindow_cacheMismatchNeverVerified(t *testing.T) {
 	if err := gitdiff.LookPath(); err != nil {
 		t.Skip(err.Error())
@@ -225,6 +266,42 @@ func overflowHandler(head, base string) http.Handler {
 			http.NotFound(w, r)
 		}
 	})
+}
+
+func twoFileCommitObjects(t *testing.T) (map[plumbing.Hash]pack.Object, string, string) {
+	t.Helper()
+	oldA := pack.Object{Type: "blob", Data: []byte("old-a\n")}
+	oldA.Hash = pack.HashObject("blob", oldA.Data)
+	newA := pack.Object{Type: "blob", Data: []byte("new-a\n")}
+	newA.Hash = pack.HashObject("blob", newA.Data)
+	oldB := pack.Object{Type: "blob", Data: []byte("old-b\n")}
+	oldB.Hash = pack.HashObject("blob", oldB.Data)
+	newB := pack.Object{Type: "blob", Data: []byte("new-b\n")}
+	newB.Hash = pack.HashObject("blob", newB.Data)
+	tb, err := tree.EncodeTree([]tree.TreeEntry{
+		{Mode: tree.ModeFile, Name: "a.txt", Hash: oldA.Hash},
+		{Mode: tree.ModeFile, Name: "b.txt", Hash: oldB.Hash},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	th, err := tree.EncodeTree([]tree.TreeEntry{
+		{Mode: tree.ModeFile, Name: "a.txt", Hash: newA.Hash},
+		{Mode: tree.ModeFile, Name: "b.txt", Hash: newB.Hash},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseTree := pack.Object{Type: "tree", Data: tb, Hash: pack.HashObject("tree", tb)}
+	headTree := pack.Object{Type: "tree", Data: th, Hash: pack.HashObject("tree", th)}
+	baseBody := []byte("tree " + baseTree.Hash.String() + "\nauthor A <a@a> 1 +0000\ncommitter A <a@a> 1 +0000\n\nbase\n")
+	base := pack.Object{Type: "commit", Data: baseBody, Hash: pack.HashObject("commit", baseBody)}
+	headBody := []byte("tree " + headTree.Hash.String() + "\nparent " + base.Hash.String() + "\nauthor A <a@a> 1 +0000\ncommitter A <a@a> 1 +0000\n\nhead\n")
+	head := pack.Object{Type: "commit", Data: headBody, Hash: pack.HashObject("commit", headBody)}
+	return map[plumbing.Hash]pack.Object{
+		oldA.Hash: oldA, newA.Hash: newA, oldB.Hash: oldB, newB.Hash: newB,
+		baseTree.Hash: baseTree, headTree.Hash: headTree, base.Hash: base, head.Hash: head,
+	}, base.Hash.String(), head.Hash.String()
 }
 
 func twoCommitObjects(t *testing.T, name, oldBody, newBody string) (map[plumbing.Hash]pack.Object, string, string) {

@@ -137,9 +137,11 @@ func recoverCacheContent(ctx context.Context, d Deps, q diffQuery, sec readmeta.
 	}
 	sec.Limitations = []readmeta.Limitation{}
 	files := make([]retainedDiffFile, 0, len(res.Files))
+	truncated := false
 	for _, f := range res.Files {
 		if b := igl.BudgetFromContext(ctx); b != nil {
 			if err := b.AddItem(); err != nil {
+				truncated = true
 				sec.AddLimitation(readmeta.CodePartial, "item budget")
 				break
 			}
@@ -170,7 +172,7 @@ func recoverCacheContent(ctx context.Context, d Deps, q diffQuery, sec readmeta.
 		}
 	}
 	proved = cacheProved(q, proved, from, to, len(files))
-	outcomes, selected := matchSelectors(opts.Paths, files, true)
+	outcomes, selected := matchSelectors(opts.Paths, files, !truncated)
 	built, retHash, cropped, knownOmit := buildDiffContentFiles(files, selected, opts)
 	sec.Source = readmeta.SourceGitCache
 	sec.Provider = readmeta.ProviderGit
@@ -185,9 +187,11 @@ func recoverCacheContent(ctx context.Context, d Deps, q diffQuery, sec readmeta.
 	sec.PatchCoverage = readmeta.CoveragePartial
 	sec.PaginationExhausted = true
 	sec.NextCursor = nil
-	if cropped || knownOmit || partial {
+	if cropped || knownOmit || partial || truncated {
 		sec.ContentComplete = readmeta.ContentCompleteFalse
-		sec.AddLimitation(readmeta.CodePartial, "content cropped or bounded")
+		if !truncated {
+			sec.AddLimitation(readmeta.CodePartial, "content cropped or bounded")
+		}
 	} else {
 		sec.ContentComplete = readmeta.ContentCompleteUnknown
 	}

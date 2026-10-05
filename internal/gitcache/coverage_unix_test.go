@@ -197,6 +197,16 @@ func TestOpenCompareDirUnderRoot(t *testing.T) {
 	if _, _, err := mgr.OpenCompareDir(context.Background(), bounds.MaxScratchBytes+1); !errors.Is(err, ErrLimit) {
 		t.Fatalf("oversize: %v", err)
 	}
+	if err := mgr.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenManager(root, bounds.BrootBytes+bounds.GenerationCharge())
+	if err != nil {
+		t.Fatalf("compare leftover must not corrupt root: %v", err)
+	}
+	if err := reopened.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestProveGrantDirect(t *testing.T) {

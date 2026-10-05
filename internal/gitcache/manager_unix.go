@@ -23,11 +23,12 @@ import (
 )
 
 const (
-	lockName   = "root.lock"
-	ledgerName = "ledger.bin"
-	ledgerTmp  = "ledger.tmp"
-	gensDir    = "generations"
-	stageDir   = "staging"
+	lockName       = "root.lock"
+	ledgerName     = "ledger.bin"
+	ledgerTmp      = "ledger.tmp"
+	gensDir        = "generations"
+	stageDir       = "staging"
+	compareDirName = "compare"
 )
 
 // Manager owns one private cache root for the process lifetime.
@@ -265,7 +266,7 @@ func (m *Manager) inventoryExistingRoot() error {
 	allowed := map[string]bool{
 		".": true, "..": true,
 		lockName: true, ledgerName: true, ledgerTmp: true,
-		gensDir: true, stageDir: true,
+		gensDir: true, stageDir: true, compareDirName: true,
 	}
 	for _, name := range names {
 		if !allowed[name] {
@@ -291,7 +292,7 @@ func (m *Manager) inventoryExistingRoot() error {
 			if name == ledgerTmp && st.Size > bounds.LedgerBytes {
 				return ErrCorrupt
 			}
-		case gensDir, stageDir:
+		case gensDir, stageDir, compareDirName:
 			fd, err := m.openPrivateDir(int(m.root.Fd()), name)
 			if err != nil {
 				return err
