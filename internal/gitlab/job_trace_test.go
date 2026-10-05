@@ -78,6 +78,48 @@ func TestStreamJobTrace_scanCapStops(t *testing.T) {
 	}
 }
 
+func TestStreamJobTrace_shortContentLengthIsIncomplete(t *testing.T) {
+	var n atomic.Int64
+	var closes atomic.Int64
+	body := &countingReadCloser{r: bytes.NewReader([]byte("ok\n")), n: &n, closes: &closes}
+	rt := &scriptedRT{
+		status:  http.StatusOK,
+		headers: http.Header{"Content-Length": []string{"1000"}},
+		body:    body,
+	}
+	res := StreamJobTrace(context.Background(), clientWithRT(t, rt), JobTraceRequest{
+		ProjectID: "42", JobID: 1, MaxScanBytes: 4096,
+	})
+	if res.Err != nil {
+		t.Fatal(res.Err)
+	}
+	if string(res.Data) != "ok\n" {
+		t.Fatalf("data %q", res.Data)
+	}
+	if res.SizeKnown || res.Size != 0 || res.EOF || res.SuffixAnchored || !res.Truncated {
+		t.Fatalf("short read attested as complete: %+v", res)
+	}
+	if closes.Load() == 0 {
+		t.Fatal("body not closed")
+	}
+
+	full := []byte("ok\n")
+	rt2 := &scriptedRT{
+		status:  http.StatusOK,
+		headers: http.Header{"Content-Length": []string{"3"}},
+		body:    io.NopCloser(bytes.NewReader(full)),
+	}
+	res = StreamJobTrace(context.Background(), clientWithRT(t, rt2), JobTraceRequest{
+		ProjectID: "42", JobID: 1, MaxScanBytes: 4096,
+	})
+	if res.Err != nil {
+		t.Fatal(res.Err)
+	}
+	if !res.EOF || !res.SizeKnown || res.Size != 3 || res.Truncated || !res.SuffixAnchored {
+		t.Fatalf("matching length %+v", res)
+	}
+}
+
 func TestStreamJobTrace_cancelClosesReader(t *testing.T) {
 	body := &gateBody{started: make(chan struct{}), unblock: make(chan struct{})}
 	rt := &scriptedRT{status: http.StatusOK, body: body}

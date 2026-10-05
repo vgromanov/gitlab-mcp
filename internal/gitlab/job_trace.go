@@ -309,7 +309,19 @@ func finalizeJobTrace(out *JobTraceResult, req JobTraceRequest, hdr http.Header,
 		out.ObservedStart = &start
 		out.ObservedEndExcl = &end
 		out.RangeHonored = false
-		if cl, ok := parseContentLength(hdr); ok {
+		cl, hasCL := parseContentLength(hdr)
+		// A clean EOF with fewer bytes than Content-Length is not the declared
+		// object. Keeping that size, or leaving EOF set, lets a prefix look like
+		// a finished trace (content_complete, or an error search with no match).
+		if hasCL && out.EOF && end < cl {
+			out.SizeKnown = false
+			out.Size = 0
+			out.EOF = false
+			out.Truncated = true
+			out.SuffixAnchored = false
+			return
+		}
+		if hasCL {
 			out.SizeKnown = true
 			out.Size = cl
 		}

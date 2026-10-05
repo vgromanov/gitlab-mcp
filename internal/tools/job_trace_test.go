@@ -11,7 +11,10 @@ import (
 	"testing"
 
 	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/config"
+	igl "gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/gitlab"
 	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/tools/readmeta"
+
+	gitlab "gitlab.com/gitlab-org/api/client-go/v2"
 )
 
 func decodeTrace(t *testing.T, raw any) map[string]any {
@@ -311,5 +314,62 @@ func TestGetPipelineJobOutput_outputShorterThanSourceWhenRedacted(t *testing.T) 
 	span := w["source_end_exclusive"].(float64) - w["source_start"].(float64)
 	if w["output_bytes"].(float64) == span || w["redaction_count"].(float64) < 1 {
 		t.Fatalf("window %#v text %q", w, text)
+	}
+}
+
+// shortContentLengthRT returns a 200 trace whose body EOFs before Content-Length.
+// The header is not enforced by net/http, which is the case finalizeJobTrace must reject.
+type shortContentLengthRT struct{}
+
+func (shortContentLengthRT) RoundTrip(req *http.Request) (*http.Response, error) {
+	if strings.Contains(req.URL.Path, "/trace") {
+		h := make(http.Header)
+		h.Set("Content-Type", "text/plain")
+		h.Set("Content-Length", "4096")
+		return &http.Response{
+			StatusCode:    http.StatusOK,
+			Header:        h,
+			Body:          io.NopCloser(bytes.NewReader([]byte("ok\n"))),
+			ContentLength: -1,
+			Request:       req,
+		}, nil
+	}
+	body := []byte(`{"id":42}`)
+	return &http.Response{
+		StatusCode:    http.StatusOK,
+		Header:        http.Header{"Content-Type": []string{"application/json"}},
+		Body:          io.NopCloser(bytes.NewReader(body)),
+		ContentLength: int64(len(body)),
+		Request:       req,
+	}, nil
+}
+
+func TestGetPipelineJobOutput_shortContentLengthIsNotComplete(t *testing.T) {
+	cli, err := gitlab.NewClient("t",
+		gitlab.WithBaseURL("https://example.test/api/v4"),
+		gitlab.WithoutRetries(),
+		gitlab.WithHTTPClient(&http.Client{Transport: igl.BudgetInterceptor()(shortContentLengthRT{})}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := Deps{Config: &config.Config{Token: "t"}, Client: cli}
+	_, raw, err := getPipelineJobOutput(context.Background(), nil, getPipelineJobOutputIn{
+		ProjectID: "42", JobID: 9, Selector: "error", MaxScanBytes: 1 << 20,
+	}, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := decodeTrace(t, raw)
+	if m["trace"] != "" {
+		t.Fatalf("trace %q", m["trace"])
+	}
+	w := traceWindow(t, raw)
+	if w["error_region_proven"] != false || w["total_known"] != false || w["total_bytes"] != nil {
+		t.Fatalf("window %#v", w)
+	}
+	sec := traceSection(t, raw)
+	if sec["content_complete"] == readmeta.ContentCompleteTrue {
+		t.Fatalf("complete %#v", sec)
 	}
 }

@@ -13,7 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (`prefix` / `tail` / `error` / `range`) with source offsets, `total_known`,
   `output_bytes`, and `redaction_count`. Legacy `truncate_lines` still selects
   a prefix. Ignored `Range` responses are not scanned without a bound, and a
-  scan that cannot prove the tail does not invent one (RVG-136).
+  scan that cannot prove the tail does not invent one. A 200 body that ends
+  before `Content-Length` is incomplete: the declared size is dropped, and the
+  error selector does not treat that prefix as a finished search (RVG-136).
 - Legacy MR diff getters (`get_merge_request_diffs`, `get_merge_request_file_diff`,
   `get_merge_request_conflicts`) now include honest `pagination` / `section`
   completeness metadata on their existing object responses (RVG-127 /
