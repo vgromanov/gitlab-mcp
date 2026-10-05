@@ -24,6 +24,7 @@ func RegisterPipelines(s *mcp.Server, d Deps) {
 	AddTool(s, d, false, "pipeline", &mcp.Tool{Name: "list_pipeline_trigger_jobs", Description: "List bridge/trigger jobs in a pipeline"}, listPipelineTriggerJobs)
 	AddTool(s, d, false, "pipeline", &mcp.Tool{Name: "get_pipeline_job", Description: "Get a pipeline job"}, getPipelineJob)
 	AddTool(s, d, false, "pipeline", &mcp.Tool{Name: "get_pipeline_job_output", Description: "Get a bounded redacted job trace window (prefix, tail, error region, or byte range). Credential patterns are always redacted. This tool does not download an unlimited trace."}, getPipelineJobOutput)
+	AddTool(s, d, false, "pipeline", &mcp.Tool{Name: toolPipelineGraph, Description: "Read one parent pipeline and its jobs. Reports retry lineage and a conservative ready/blocked/unknown/partial assessment. Does not traverse downstream pipelines or play jobs. Requires GITLAB_MCP_CURSOR_KEY."}, getMergeRequestPipelineGraph)
 	AddTool(s, d, true, "pipeline", &mcp.Tool{Name: "create_pipeline", Description: "Create a pipeline for a ref"}, createPipeline)
 	AddTool(s, d, true, "pipeline", &mcp.Tool{Name: "retry_pipeline", Description: "Retry failed/canceled jobs in a pipeline"}, retryPipeline)
 	AddTool(s, d, true, "pipeline", &mcp.Tool{Name: "cancel_pipeline", Description: "Cancel a pipeline"}, cancelPipeline)

@@ -48,19 +48,21 @@ lowercased. A CLI flag visit with an empty string clears an env-derived profile.
 |---|---|
 | unset / empty | Exact historical selection (below) — unset does **not** mean daily |
 | `daily` | Exact existing **41**-tool daily census maximum |
-| `review_read` | Exact **28** safe MR/project/repo/pipeline **reads** |
-| `review_write` | Same **28** reads initially; **no guarded writes available yet** |
+| `review_read` | Exact **30** safe MR/project/repo/pipeline **reads** |
+| `review_write` | Same **30** reads initially; **no guarded writes available yet** |
 
 Initial `review_*` set: `get_project`, `get_merge_request`, `list_merge_requests`,
 `get_merge_request_approval_state`, `get_merge_request_conflicts`,
 `get_merge_request_diffs`, `get_merge_request_file_diff`,
 `list_merge_request_changed_files`, `list_merge_request_versions`,
-`get_merge_request_version`, `list_merge_request_diffs`, `mr_discussions`,
+`get_merge_request_version`, `get_merge_request_diff_window`,
+`list_merge_request_diffs`, `mr_discussions`,
 `get_merge_request_notes`, `get_merge_request_discussion`, `get_file_contents`,
 `batch_get_file_contents`, `get_repository_tree`, `list_commits`, `get_commit`,
 `get_commit_diff`, `list_pipelines`, `get_pipeline`, `list_pipeline_jobs`,
 `list_pipeline_trigger_jobs`, `get_pipeline_job`, `get_pipeline_job_output`,
-`get_merge_request_review_queue`, `get_merge_request_review_context`.
+`get_merge_request_pipeline_graph`, `get_merge_request_review_queue`,
+`get_merge_request_review_context`.
 
 Excluded from review profiles: broad search/discovery, `execute_graphql`, merge,
 approve, note/thread writes, artifacts/deployments/environments, pipeline writes.
