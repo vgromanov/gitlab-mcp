@@ -67,7 +67,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   206 that starts after `size - suffix` (for example `bytes 990-999/1000` for
   `bytes=-512`) is rejected instead of reporting `tail_proven`, and a `416`
   with `Content-Range: bytes */0` on a tail or from-start read is an empty
-  completed trace instead of an `http_error` (RVG-136).
+  completed trace instead of an `http_error`, and a `tail` at the 8 MiB
+  `max_scan_bytes` limit still reads the redaction lookbehind on top of the
+  scan window instead of clamping it away (RVG-136).
 - Legacy MR diff getters (`get_merge_request_diffs`, `get_merge_request_file_diff`,
   `get_merge_request_conflicts`) now include honest `pagination` / `section`
   completeness metadata on their existing object responses (RVG-127 /

@@ -21,6 +21,10 @@ const (
 	DefaultJobTraceScanBytes int64 = 1 << 20
 	// HardJobTraceScanBytes is the largest scan cap a caller may request.
 	HardJobTraceScanBytes int64 = 8 << 20
+	// JobTraceMarginReserve is read on top of HardJobTraceScanBytes so a
+	// caller that asks for the full scan still gets redaction lookbehind and
+	// lookahead. It is context, never returned as part of the scan window.
+	JobTraceMarginReserve int64 = 8192
 )
 
 // errScanLimit stops a trace copy after MaxScanBytes plus one peek byte.
@@ -85,8 +89,8 @@ func StreamJobTrace(ctx context.Context, client *gitlab.Client, req JobTraceRequ
 	if maxScan <= 0 {
 		maxScan = DefaultJobTraceScanBytes
 	}
-	if maxScan > HardJobTraceScanBytes {
-		maxScan = HardJobTraceScanBytes
+	if maxScan > HardJobTraceScanBytes+JobTraceMarginReserve {
+		maxScan = HardJobTraceScanBytes + JobTraceMarginReserve
 	}
 
 	hdr, ranged := traceRangeHeader(req)

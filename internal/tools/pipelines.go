@@ -278,8 +278,8 @@ func reserveJobTraceBudget(ctx context.Context, need int64) {
 // lookbehind, so the largest read is scan plus both margins, plus the peek.
 func traceBudgetBytes(scan, margin int) int64 {
 	n := int64(scan) + 2*int64(margin) + 1
-	if n > int64(jobTraceHardScan)+1 {
-		n = int64(jobTraceHardScan) + 1
+	if limit := int64(jobTraceHardScan) + igl.JobTraceMarginReserve + 1; n > limit {
+		n = limit
 	}
 	if n < 1 {
 		n = 1
@@ -323,9 +323,6 @@ func readJobTrace(ctx context.Context, d Deps, pid string, jobID int64, q traceQ
 	switch q.selector {
 	case "tail":
 		suffix := int64(q.scan) + int64(margin)
-		if suffix > int64(jobTraceHardScan) {
-			suffix = int64(jobTraceHardScan)
-		}
 		first := igl.StreamJobTrace(ctx, d.Client, igl.JobTraceRequest{
 			ProjectID: pid, JobID: jobID, SuffixBytes: suffix, MaxScanBytes: suffix,
 		})
@@ -364,8 +361,8 @@ func readJobTrace(ctx context.Context, d Deps, pid string, jobID int64, q traceQ
 			ProjectID: pid, JobID: jobID, RangeStart: &reqStart, MaxScanBytes: int64(q.scan),
 		}
 		fetch := int64(q.scan) + 2*lb
-		if fetch > int64(jobTraceHardScan) {
-			fetch = int64(jobTraceHardScan)
+		if limit := int64(jobTraceHardScan) + igl.JobTraceMarginReserve; fetch > limit {
+			fetch = limit
 		}
 		if q.end != nil {
 			// Adding the margin near math.MaxInt64 wraps to a negative end.

@@ -1713,3 +1713,47 @@ func TestGetPipelineJobOutput_tailUndersizedSuffixIsRejected(t *testing.T) {
 		}
 	}
 }
+
+func TestGetPipelineJobOutput_tailHardScanKeepsLookbehind(t *testing.T) {
+	scan := jobTraceHardScan
+	total := scan + 1<<20
+	raw := bytes.Repeat([]byte("x\n"), total/2)
+	var rng string
+	d := authzDeps(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, "/trace") {
+			_, _ = io.WriteString(w, `{"id":42}`)
+			return
+		}
+		rng = r.Header.Get("Range")
+		var suffix int
+		if _, err := fmt.Sscanf(rng, "bytes=-%d", &suffix); err != nil {
+			t.Fatalf("range %q", rng)
+		}
+		start := len(raw) - suffix
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, len(raw)-1, len(raw)))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(raw[start:])
+	}))
+	_, out, err := getPipelineJobOutput(context.Background(), nil, getPipelineJobOutputIn{
+		ProjectID: "42", JobID: 8, Selector: "tail", MaxScanBytes: scan, MaxBytes: 1 << 10,
+	}, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := fmt.Sprintf("bytes=-%d", scan+jobTraceLookbehind); rng != want {
+		t.Fatalf("range %q want %q", rng, want)
+	}
+	w := traceWindow(t, out)
+	if w["tail_proven"] != true {
+		t.Fatalf("window %#v", w)
+	}
+}
+
+func TestSelectTail_leadKeepsQuotedLookbehind(t *testing.T) {
+	prefix := []byte(`Authorization: Bearer "alpha beta `)
+	data := append(append([]byte{}, prefix...), []byte("gamma SECRETWORD delta\"\nnext line\n")...)
+	p := selectTail(data, 100, len(prefix), 0, 1<<20, jobTraceHardLine, "", true, true)
+	if strings.Contains(p.text, "gamma") || strings.Contains(p.text, "SECRETWORD") || !strings.Contains(p.text, "next line") {
+		t.Fatalf("tail %q", p.text)
+	}
+}
