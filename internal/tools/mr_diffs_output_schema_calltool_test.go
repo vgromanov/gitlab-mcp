@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"sort"
 	"strings"
 	"testing"
 
@@ -288,11 +289,11 @@ func toolErrorText(t *testing.T, res *mcp.CallToolResult) string {
 }
 
 func TestDocsReadEnvelopesExamplesValidateRegisteredOutputSchema(t *testing.T) {
-	// Plan step 5: docs examples validate against registered outputSchema.
-	// Avoid a direct jsonschema-go import (would promote a direct go.mod dep):
-	// fetch the exact registered schema, then validate each docs map through a
-	// temporary mcp.AddTool whose OutputSchema is that schema — CallTool runs
-	// the vendored SDK applySchema path unchanged.
+	// Plan step 5: docs examples validate against the intended tool contract.
+	// List-diff fences keep registered list_merge_request_diffs OutputSchema checks.
+	// Content-mode fences are associated with get_merge_request_diff_window and
+	// validated against the actual serialized content contract (no fabricated
+	// list-diff fields; no unplanned content OutputSchema registration).
 	cli, _ := testutil.NewGitLabClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, `[]`)
 	}))
@@ -303,14 +304,14 @@ func TestDocsReadEnvelopesExamplesValidateRegisteredOutputSchema(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var outSchema any
+	var listDiffSchema any
 	for _, tool := range listed.Tools {
 		if tool != nil && tool.Name == "list_merge_request_diffs" {
-			outSchema = tool.OutputSchema
+			listDiffSchema = tool.OutputSchema
 		}
 	}
-	if outSchema == nil {
-		t.Fatal("missing outputSchema")
+	if listDiffSchema == nil {
+		t.Fatal("missing list_merge_request_diffs outputSchema")
 	}
 
 	_, thisFile, _, ok := runtime.Caller(0)
@@ -327,54 +328,166 @@ func TestDocsReadEnvelopesExamplesValidateRegisteredOutputSchema(t *testing.T) {
 		t.Fatalf("expected ≥2 fenced JSON examples in docs, got %d", len(blocks))
 	}
 
+	listCount, contentCount := 0, 0
 	for i, block := range blocks {
 		var fixture map[string]any
 		if err := json.Unmarshal([]byte(block), &fixture); err != nil {
 			t.Fatalf("docs example %d not JSON: %v\n%s", i, err, block)
 		}
-		// Guard against abbreviated diffs missing SDK fields in advertised examples.
-		diffs, _ := fixture["diffs"].([]any)
-		if len(diffs) > 0 && diffs[0] != nil {
-			item, _ := diffs[0].(map[string]any)
-			for _, k := range []string{"old_path", "new_path", "a_mode", "b_mode", "diff", "new_file", "renamed_file", "deleted_file", "generated_file", "collapsed", "too_large"} {
-				if _, ok := item[k]; !ok {
-					t.Fatalf("docs example %d diffs[0] missing SDK field %q", i, k)
+		toolKind := classifyDocsEnvelopeExample(fixture)
+		switch toolKind {
+		case "list_merge_request_diffs":
+			listCount++
+			// Guard against abbreviated diffs missing SDK fields in advertised examples.
+			diffs, _ := fixture["diffs"].([]any)
+			if len(diffs) > 0 && diffs[0] != nil {
+				item, _ := diffs[0].(map[string]any)
+				for _, k := range []string{"old_path", "new_path", "a_mode", "b_mode", "diff", "new_file", "renamed_file", "deleted_file", "generated_file", "collapsed", "too_large"} {
+					if _, ok := item[k]; !ok {
+						t.Fatalf("docs example %d diffs[0] missing SDK field %q", i, k)
+					}
 				}
 			}
-		}
-		if sec, _ := fixture["section"].(map[string]any); sec != nil {
-			if hs, ok := sec["head_sha"].(string); ok {
-				if _, valid := readmeta.ObservedHeadSHA(hs); !valid {
-					t.Fatalf("docs example %d head_sha %q is not valid 40-hex", i, hs)
+			if sec, _ := fixture["section"].(map[string]any); sec != nil {
+				if hs, ok := sec["head_sha"].(string); ok {
+					if _, valid := readmeta.ObservedHeadSHA(hs); !valid {
+						t.Fatalf("docs example %d head_sha %q is not valid 40-hex", i, hs)
+					}
 				}
 			}
-		}
-
-		toolName := fmt.Sprintf("docs_envelope_validate_%d", i)
-		payload := fixture // capture original map for this iteration
-		valSrv := mcp.NewServer(&mcp.Implementation{Name: "docs-val", Version: "t"}, nil)
-		mcp.AddTool(valSrv, &mcp.Tool{
-			Name:         toolName,
-			Description:  "temporary validator for docs envelope fixture",
-			OutputSchema: outSchema, // exact registered list_merge_request_diffs schema
-		}, func(ctx context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, map[string]any, error) {
-			return nil, payload, nil
-		})
-		valCS := testutil.MCPConnect(t, valSrv)
-		res, err := valCS.CallTool(context.Background(), &mcp.CallToolParams{
-			Name:      toolName,
-			Arguments: map[string]any{},
-		})
-		if err != nil {
-			t.Fatalf("docs example %d failed SDK applySchema via CallTool: %v\n%s", i, err, block)
-		}
-		if res.IsError {
-			t.Fatalf("docs example %d IsError=true: %q", i, toolErrorText(t, res))
-		}
-		if res.StructuredContent == nil {
-			t.Fatalf("docs example %d missing StructuredContent after schema validation", i)
+			toolName := fmt.Sprintf("docs_envelope_validate_%d", i)
+			payload := fixture
+			valSrv := mcp.NewServer(&mcp.Implementation{Name: "docs-val", Version: "t"}, nil)
+			mcp.AddTool(valSrv, &mcp.Tool{
+				Name:         toolName,
+				Description:  "temporary validator for docs list-diff envelope fixture",
+				OutputSchema: listDiffSchema,
+			}, func(ctx context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, map[string]any, error) {
+				return nil, payload, nil
+			})
+			valCS := testutil.MCPConnect(t, valSrv)
+			res, err := valCS.CallTool(context.Background(), &mcp.CallToolParams{
+				Name:      toolName,
+				Arguments: map[string]any{},
+			})
+			if err != nil {
+				t.Fatalf("docs example %d failed SDK applySchema via CallTool: %v\n%s", i, err, block)
+			}
+			if res.IsError {
+				t.Fatalf("docs example %d IsError=true: %q", i, toolErrorText(t, res))
+			}
+			if res.StructuredContent == nil {
+				t.Fatalf("docs example %d missing StructuredContent after schema validation", i)
+			}
+		case "get_merge_request_diff_window_content":
+			contentCount++
+			assertDocsContentEnvelopeContract(t, i, fixture)
+		default:
+			t.Fatalf("docs example %d unrecognized envelope shape: keys=%v", i, mapKeys(fixture))
 		}
 	}
+	if listCount < 2 {
+		t.Fatalf("expected ≥2 list-diff docs examples, got %d", listCount)
+	}
+	if contentCount < 3 {
+		t.Fatalf("expected ≥3 content-mode docs examples, got %d", contentCount)
+	}
+}
+
+func classifyDocsEnvelopeExample(fixture map[string]any) string {
+	if _, ok := fixture["diffs"]; ok {
+		if _, ok := fixture["pagination"]; ok {
+			return "list_merge_request_diffs"
+		}
+	}
+	_, hasFiles := fixture["files"]
+	_, hasSelectors := fixture["selectors"]
+	_, hasSelection := fixture["selection"]
+	_, hasReturned := fixture["returned_content_hash"]
+	_, hasFullPatch := fixture["full_patch_hash"]
+	if hasFiles || hasSelectors || hasSelection || hasReturned || hasFullPatch {
+		return "get_merge_request_diff_window_content"
+	}
+	return ""
+}
+
+func assertDocsContentEnvelopeContract(t *testing.T, i int, fixture map[string]any) {
+	t.Helper()
+	// Contract checks against registered content CallTool projection (no OutputSchema fabrication).
+	if _, ok := fixture["diffs"]; ok {
+		t.Fatalf("content example %d must not fabricate list-diff fields", i)
+	}
+	if _, ok := fixture["pagination"]; ok {
+		t.Fatalf("content example %d must not fabricate list pagination", i)
+	}
+	sec, _ := fixture["section"].(map[string]any)
+	if sec == nil {
+		t.Fatalf("content example %d missing section", i)
+	}
+	if files, ok := fixture["files"]; ok {
+		if _, isSlice := files.([]any); !isSlice && files != nil {
+			t.Fatalf("content example %d files must be array", i)
+		}
+	}
+	if sels, ok := fixture["selectors"]; ok {
+		arr, isSlice := sels.([]any)
+		if !isSlice && sels != nil {
+			t.Fatalf("content example %d selectors must be array", i)
+		}
+		// Fail-closed/drift examples must retain requested selectors when present in docs.
+		_ = arr
+	}
+	if sel, _ := fixture["selection"].(map[string]any); sel != nil {
+		if kind, ok := sel["kind"].(string); ok {
+			switch kind {
+			case "full_version", "full_tuple", "incremental", "version":
+				if kind == "version" {
+					t.Fatalf("content example %d selection.kind %q is not emitted; use full_version", i, kind)
+				}
+			default:
+				t.Fatalf("content example %d unexpected selection.kind %q", i, kind)
+			}
+		}
+	}
+	if mc, ok := sec["manifest_coverage"].(string); ok && mc == "full" {
+		// Version/straight content mode does not emit manifest_coverage=full.
+		t.Fatalf("content example %d manifest_coverage=full is not emitted by content mode", i)
+	}
+	if lims, ok := sec["limitations"].([]any); ok {
+		for _, raw := range lims {
+			lim, _ := raw.(map[string]any)
+			if lim == nil {
+				continue
+			}
+			if _, hasDetail := lim["detail"]; hasDetail {
+				t.Fatalf("content example %d limitation uses detail; readmeta emits message", i)
+			}
+			if _, hasMsg := lim["message"]; lim["code"] != nil && !hasMsg {
+				t.Fatalf("content example %d limitation missing message", i)
+			}
+		}
+	}
+	// Hash nullability: fail-closed examples may set returned_content_hash null.
+	if h, exists := fixture["returned_content_hash"]; exists && h != nil {
+		hm, _ := h.(map[string]any)
+		if hm == nil {
+			t.Fatalf("content example %d returned_content_hash shape", i)
+		}
+	}
+	if _, ok := fixture["full_patch_hash"]; ok {
+		if fixture["full_patch_hash"] != nil {
+			t.Fatalf("content example %d full_patch_hash must be null", i)
+		}
+	}
+}
+
+func mapKeys(m map[string]any) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func extractJSONFencedBlocks(md string) []string {

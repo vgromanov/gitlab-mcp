@@ -209,19 +209,22 @@ Content mode (`mode=content`, capability `readmeta.diff_content.v1`) selects exa
 
 ### Content mode examples
 
-**Success (version, selected text)** — proved complete manifest, selected path text retained, windows hashed, sibling selectors exact:
+Examples below are tool-tagged for documentation validation. List-diff examples earlier in this file remain `list_merge_request_diffs` OutputSchema fixtures. Content examples are **not** validated against that list schema; they mirror registered `get_merge_request_diff_window` (`mode=content`) CallTool projections (abridged window/line detail marked with `…` where noted).
+
+**Success (version, selected text)** — `tool: get_merge_request_diff_window` / content. Actual version-content coverage is `manifest_coverage=unknown`, `patch_coverage=partial`, `selection.kind=full_version`; `content_complete` stays `unknown` when the selected source is syntactically valid but not newly proved complete:
 
 ```json
 {
   "section": {
     "capability_version": "readmeta.diff_content.v1",
     "content_complete": "unknown",
-    "manifest_coverage": "full",
-    "patch_coverage": "unknown",
+    "manifest_coverage": "unknown",
+    "patch_coverage": "partial",
     "consistency": "consistent",
-    "next_cursor": null
+    "next_cursor": null,
+    "limitations": []
   },
-  "selection": {"project_id": "42", "merge_request_iid": 1, "kind": "version", "version_id": 1},
+  "selection": {"project_id": "42", "merge_request_iid": 1, "kind": "full_version", "version_id": 1},
   "files": [{
     "old_path": "a.go", "new_path": "a.go", "a_mode": "100644", "b_mode": "100644",
     "status": "text",
@@ -235,7 +238,7 @@ Content mode (`mode=content`, capability `readmeta.diff_content.v1`) selects exa
 
 `content_complete` stays `unknown` here when the source is syntactically valid but not newly proved complete for selected text; known omissions force `false` instead.
 
-**Partial (straight compare)** — opening+closing compare agree; coverage remains partial; missing selector is `unobserved`, never `absent`:
+**Partial (straight compare)** — `tool: get_merge_request_diff_window` / content. Opening+closing compare agree; coverage remains partial; limitation field is `message` (not `detail`); missing selector is `unobserved`, never `absent`:
 
 ```json
 {
@@ -246,7 +249,7 @@ Content mode (`mode=content`, capability `readmeta.diff_content.v1`) selects exa
     "patch_coverage": "partial",
     "consistency": "consistent",
     "next_cursor": null,
-    "limitations": [{"code": "partial", "detail": "compare"}]
+    "limitations": [{"code": "partial", "message": "compare"}]
   },
   "selection": {"kind": "incremental", "from_sha": "…", "to_sha": "…", "straight": true},
   "files": [{"status": "text", "windows": [{"text": "@@ -1 +1 @@\n-a\n+b\n", "window_hash": {"scope": "diff_content.window_text.v1", "value": "…"}}]}],
@@ -256,13 +259,13 @@ Content mode (`mode=content`, capability `readmeta.diff_content.v1`) selects exa
 }
 ```
 
-**Error / fail-closed** — closing drift, duplicate proof members, budget/cancel, or malformed global JSON: no trusted `files` windows and `returned_content_hash` is null (or the tool returns a typed `budget_*` / cancel error). Example after closing path drift:
+**Error / fail-closed** — `tool: get_merge_request_diff_window` / content. Closing drift, duplicate proof members, budget/cancel, or malformed global JSON: no trusted `files` windows and `returned_content_hash` is null (or the tool returns a typed `budget_*` / cancel error). Closing path drift retains requested selectors as `unobserved`:
 
 ```json
 {
   "section": {"content_complete": "false", "consistency": "inconsistent", "next_cursor": null},
   "files": [],
-  "selectors": [],
+  "selectors": [{"path": "a.go", "status": "unobserved"}],
   "returned_content_hash": null,
   "full_patch_hash": null
 }

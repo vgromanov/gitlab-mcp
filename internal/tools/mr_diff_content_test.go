@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -9,6 +10,8 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,8 +20,12 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/config"
+	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/cursor"
 	igl "gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/gitlab"
 	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/tools/readmeta"
+
+	gitlab "gitlab.com/gitlab-org/api/client-go/v2"
 )
 
 func samplePatchAdditionDeletionContext() string {
@@ -1309,6 +1316,10 @@ func TestDiffContentRepair_F3_phaseReachabilityBudgets(t *testing.T) {
 		})
 		return h, &compares
 	}
+	straightArgs := map[string]any{
+		"project_id": "42", "merge_request_iid": 1, "from_sha": from, "to_sha": to, "straight": true,
+		"mode": "content", "paths": []any{"a.go"},
+	}
 	t.Run("straight_closing_request_budget", func(t *testing.T) {
 		// Diag: success uses 10 requests / 2 compares. MaxRequests=9 reaches opening compare, fails on closing.
 		h, compares := mk(t, nil)
@@ -1317,10 +1328,7 @@ func TestDiffContentRepair_F3_phaseReachabilityBudgets(t *testing.T) {
 		b.MaxRequests = 9
 		ctx := igl.WithBudget(context.Background(), b)
 		beforeReqs, beforeBytes, beforeItems := b.Stats()
-		out, err := callDiffWindow(t, d, ctx, map[string]any{
-			"project_id": "42", "merge_request_iid": 1, "from_sha": from, "to_sha": to, "straight": true,
-			"mode": "content", "paths": []any{"a.go"},
-		})
+		out, err := callDiffWindow(t, d, ctx, straightArgs)
 		afterReqs, afterBytes, afterItems := b.Stats()
 		if atomic.LoadInt32(compares) != 1 {
 			t.Fatalf("registered-MCP: opening compare not proved compares=%d", atomic.LoadInt32(compares))
@@ -1335,18 +1343,46 @@ func TestDiffContentRepair_F3_phaseReachabilityBudgets(t *testing.T) {
 		if b.MaxRequests != 9 {
 			t.Fatalf("borrowed MaxRequests raised/changed: %d", b.MaxRequests)
 		}
-		// Shared owner remains usable afterward.
+		// Shared-owner survival: reuse ORIGINAL borrowed budget/context (no replacement DefaultBudget).
+		select {
+		case <-ctx.Done():
+			t.Fatal("borrowed budget context cancelled after request-budget stop")
+		default:
+		}
+		if igl.BudgetFromContext(ctx) != b {
+			t.Fatal("borrowed budget pointer replaced")
+		}
 		h2, compares2 := mk(t, nil)
 		d2 := diffDeps(t, h2)
-		out2, err2 := callDiffWindow(t, d2, igl.WithBudget(context.Background(), igl.DefaultBudget()), map[string]any{
-			"project_id": "42", "merge_request_iid": 1, "from_sha": from, "to_sha": to, "straight": true,
-			"mode": "content", "paths": []any{"a.go"},
-		})
-		if err2 != nil || atomic.LoadInt32(compares2) != 2 || out2["returned_content_hash"] == nil {
-			t.Fatalf("owner usable afterward err=%v compares=%d out=%#v", err2, atomic.LoadInt32(compares2), out2)
+		out2, err2 := callDiffWindow(t, d2, ctx, straightArgs)
+		if err2 == nil || !strings.Contains(err2.Error(), igl.ErrBudgetRequests.Error()) {
+			t.Fatalf("original owner must still enforce budget_requests err=%v out=%#v", err2, out2)
+		}
+		if atomic.LoadInt32(compares2) != 0 {
+			t.Fatalf("exhausted owner must not start compare compares=%d", atomic.LoadInt32(compares2))
+		}
+		assertNoTrustedContent(t, out2, err2, "straight_closing_request_budget_owner_reuse")
+		if b.MaxRequests != 9 {
+			t.Fatalf("borrowed MaxRequests changed on reuse: %d", b.MaxRequests)
 		}
 	})
 	t.Run("straight_closing_byte_budget", func(t *testing.T) {
+		// Fault-free baseline first: same fixture sans byte-budget fault.
+		h0, compares0 := mk(t, nil)
+		out0, err0 := callDiffWindow(t, diffDeps(t, h0), nil, straightArgs)
+		if err0 != nil || atomic.LoadInt32(compares0) != 2 || out0["returned_content_hash"] == nil {
+			t.Fatalf("fault-free baseline failed err=%v compares=%d out=%#v", err0, atomic.LoadInt32(compares0), out0)
+		}
+		// Probe opening-phase byte consumption (MaxRequests=9 stops before closing request).
+		hProbe, _ := mk(t, nil)
+		bProbe := igl.DefaultBudget()
+		bProbe.MaxRequests = 9
+		bProbe.MaxBytes = 1 << 20
+		_, errProbe := callDiffWindow(t, diffDeps(t, hProbe), igl.WithBudget(context.Background(), bProbe), straightArgs)
+		if errProbe == nil || !strings.Contains(errProbe.Error(), igl.ErrBudgetRequests.Error()) {
+			t.Fatalf("probe want budget_requests err=%v", errProbe)
+		}
+		_, openBytes, _ := bProbe.Stats()
 		h, compares := mk(t, func(n int, w http.ResponseWriter, r *http.Request) bool {
 			if n == 2 {
 				big := strings.Repeat("x", 6000)
@@ -1357,15 +1393,12 @@ func TestDiffContentRepair_F3_phaseReachabilityBudgets(t *testing.T) {
 		})
 		d := diffDeps(t, h)
 		b := igl.DefaultBudget()
-		b.MaxBytes = 2500
+		b.MaxBytes = openBytes + 500 // enough for opening path, not for 6KiB closing body
 		b.MaxRequests = 64
 		ctx := igl.WithBudget(context.Background(), b)
-		out, err := callDiffWindow(t, d, ctx, map[string]any{
-			"project_id": "42", "merge_request_iid": 1, "from_sha": from, "to_sha": to, "straight": true,
-			"mode": "content", "paths": []any{"a.go"},
-		})
-		if atomic.LoadInt32(compares) < 1 {
-			t.Fatalf("opening compare missing compares=%d", atomic.LoadInt32(compares))
+		out, err := callDiffWindow(t, d, ctx, straightArgs)
+		if atomic.LoadInt32(compares) != 2 {
+			t.Fatalf("closing compare must be attempted compares=%d", atomic.LoadInt32(compares))
 		}
 		if err == nil || !strings.Contains(err.Error(), igl.ErrBudgetBytes.Error()) {
 			t.Fatalf("want budget_bytes err=%v out=%#v", err, out)
@@ -1496,22 +1529,114 @@ func TestDiffContentRepair_F3_phaseReachabilityBudgets(t *testing.T) {
 		assertNoTrustedContent(t, out, err, "straight_opening_request_budget")
 	})
 	t.Run("straight_item_budget", func(t *testing.T) {
-		h, compares := mk(t, nil)
+		// Charge during decoder traversal (do NOT preconsume with AddItem). Stream two diffs;
+		// MaxItems=1 must stop owned reader mid-opening compare with observable Done.
+		const secret = "ITEM-BUDGET-SECRET-PATCH"
+		var sawRead, sawClose atomic.Bool
+		var compares2 int32
+		var bodyRead atomic.Int64
+		streamDone := make(chan struct{})
+		var streamOnce sync.Once
+		h2 := serveDiffBase(&pathLog{}, func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case strings.Contains(r.URL.Path, "/repository/commits/"):
+				sha := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
+				fmt.Fprintf(w, `{"id":%q}`, sha)
+			case strings.Contains(r.URL.Path, "/repository/compare"):
+				atomic.AddInt32(&compares2, 1)
+				flusher, _ := w.(http.Flusher)
+				prefix := fmt.Sprintf(`{"commit":{"id":%q},"diffs":[`, to)
+				d1 := fmt.Sprintf(`{"old_path":"a.go","new_path":"a.go","a_mode":"100644","b_mode":"100644","diff":%q}`, "@@ -1 +1 @@\n-a\n+"+secret+"\n")
+				d2 := fmt.Sprintf(`{"old_path":"b.go","new_path":"b.go","a_mode":"100644","b_mode":"100644","diff":%q}`, "@@ -1 +1 @@\n-c\n+"+secret+"\n")
+				body := prefix + d1 + `,` + d2 + `]}`
+				// Write in chunks so item-budget stop can cancel mid-stream.
+				chunk := 64
+				for i := 0; i < len(body); {
+					if r.Context().Err() != nil {
+						sawClose.Store(true)
+						streamOnce.Do(func() { close(streamDone) })
+						return
+					}
+					end := i + chunk
+					if end > len(body) {
+						end = len(body)
+					}
+					n, err := w.Write([]byte(body[i:end]))
+					bodyRead.Add(int64(n))
+					if n > 0 {
+						sawRead.Store(true)
+					}
+					if err != nil {
+						sawClose.Store(true)
+						streamOnce.Do(func() { close(streamDone) })
+						return
+					}
+					if flusher != nil {
+						flusher.Flush()
+					}
+					i = end
+				}
+				select {
+				case <-r.Context().Done():
+					sawClose.Store(true)
+					streamOnce.Do(func() { close(streamDone) })
+				case <-time.After(2 * time.Second):
+					// If the full body was small enough to finish before cancel, still require typed budget stop.
+				}
+			case strings.Contains(r.URL.Path, "/merge_requests/"):
+				_, _ = io.WriteString(w, `{"id":5001,"iid":1,"project_id":42,"source_project_id":42}`)
+			default:
+				http.NotFound(w, r)
+			}
+		})
 		b := igl.DefaultBudget()
 		b.MaxItems = 1
 		b.MaxRequests = 64
-		if err := b.AddItem(); err != nil {
-			t.Fatal(err)
-		}
-		ctx := igl.WithBudget(context.Background(), b)
-		out, err := callDiffWindow(t, diffDeps(t, h), ctx, map[string]any{
+		b.MaxBytes = 1 << 20
+		parent := context.Background()
+		ctx := igl.WithBudget(parent, b)
+		sibling, stopSibling := context.WithCancel(ctx)
+		defer stopSibling()
+		out, err := callDiffWindow(t, diffDeps(t, h2), ctx, map[string]any{
 			"project_id": "42", "merge_request_iid": 1, "from_sha": from, "to_sha": to, "straight": true,
-			"mode": "content", "paths": []any{"a.go"},
+			"mode": "content", "paths": []any{"a.go", "b.go"},
 		})
 		if err == nil || !strings.Contains(err.Error(), igl.ErrBudgetItems.Error()) {
-			t.Fatalf("want budget_items err=%v compares=%d", err, atomic.LoadInt32(compares))
+			t.Fatalf("want budget_items (decoder charge) err=%v compares=%d", err, atomic.LoadInt32(&compares2))
+		}
+		if strings.Contains(err.Error(), context.Canceled.Error()) && !strings.Contains(err.Error(), igl.ErrBudgetItems.Error()) {
+			t.Fatalf("caller-cancel must not masquerade as sole failure: %v", err)
 		}
 		assertNoTrustedContent(t, out, err, "straight_item_budget")
+		if atomic.LoadInt32(&compares2) != 1 {
+			t.Fatalf("item budget must stop during opening compare compares=%d", atomic.LoadInt32(&compares2))
+		}
+		if !sawRead.Load() {
+			t.Fatal("expected observable body read before item-budget stop")
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal("borrowed budget context cancelled (reader-local termination must not cancel owner)")
+		default:
+		}
+		if sibling.Err() != nil {
+			t.Fatal("sibling derived context cancelled")
+		}
+		if igl.BudgetFromContext(ctx) != b || b.MaxItems != 1 {
+			t.Fatal("borrowed budget replaced or caps changed")
+		}
+		if _, _, items := b.Stats(); items != 1 {
+			t.Fatalf("items charged during traversal want 1 got %d", items)
+		}
+		// Prefer observing owned-reader cleanup; tolerate fully-buffered small bodies.
+		select {
+		case <-streamDone:
+		case <-time.After(500 * time.Millisecond):
+			if bodyRead.Load() == 0 {
+				t.Fatal("no body bytes observed")
+			}
+		}
+		_ = sawClose
 	})
 	t.Run("version_closing_request_budget", func(t *testing.T) {
 		head, base, start := shaN(1), shaN(2), shaN(3)
@@ -1610,41 +1735,46 @@ func TestDiffContentRepair_F3_phaseReachabilityBudgets(t *testing.T) {
 	})
 	t.Run("tuple_closing_request_budget", func(t *testing.T) {
 		head, base, start := shaN(1), shaN(2), shaN(3)
-		var versions int32
 		body := versionObject(1, 5001, head, base, start, "collected", "1", oneDiff("a.go", patch))
-		h := serveDiffBase(&pathLog{}, func(w http.ResponseWriter, r *http.Request) {
-			switch {
-			case strings.Contains(r.URL.Path, "/versions"):
-				if strings.Contains(r.URL.Path, "/versions/") && !strings.HasSuffix(strings.TrimSuffix(r.URL.Path, "/"), "versions") {
-					atomic.AddInt32(&versions, 1)
-					_, _ = io.WriteString(w, body)
-					return
-				}
-				// version list for tuple resolution
-				fmt.Fprintf(w, `[{"id":1,"head_commit_sha":%q,"base_commit_sha":%q,"start_commit_sha":%q,"state":"collected"}]`, head, base, start)
-			case strings.Contains(r.URL.Path, "/merge_requests/") && !strings.Contains(r.URL.Path, "/versions"):
-				_, _ = io.WriteString(w, `{"id":5001,"iid":1,"project_id":42,"source_project_id":42}`)
-			default:
-				http.NotFound(w, r)
-			}
-		})
-		b := igl.DefaultBudget()
-		b.MaxRequests = 7
-		ctx := igl.WithBudget(context.Background(), b)
-		out, err := callDiffWindow(t, diffDeps(t, h), ctx, map[string]any{
+		args := map[string]any{
 			"project_id": "42", "merge_request_iid": 1,
 			"base_sha": base, "start_sha": start, "head_sha": head,
 			"mode": "content", "paths": []any{"a.go"},
-		})
-		// Tuple may fail earlier or at closing; must not trust hash without proved closing.
-		if out != nil && out["returned_content_hash"] != nil && atomic.LoadInt32(&versions) < 2 {
-			t.Fatalf("trusted hash without closing versions=%d out=%#v err=%v", atomic.LoadInt32(&versions), out, err)
 		}
-		if err == nil && out != nil && out["returned_content_hash"] != nil {
-			t.Fatalf("tuple budget stop expected failure, got success %#v", out)
+		mkTuple := func(versions *int32) http.Handler {
+			return serveDiffBase(&pathLog{}, func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case strings.Contains(r.URL.Path, "/versions/") && !strings.HasSuffix(strings.TrimSuffix(r.URL.Path, "/"), "versions"):
+					atomic.AddInt32(versions, 1)
+					_, _ = io.WriteString(w, body)
+				case strings.Contains(r.URL.Path, "/versions"):
+					// Required identity + terminal paging so tuple selection reaches version reads.
+					w.Header().Set("X-Next-Page", "")
+					fmt.Fprintf(w, `[{"id":1,"merge_request_id":5001,"head_commit_sha":%q,"base_commit_sha":%q,"start_commit_sha":%q,"state":"collected"}]`, head, base, start)
+				case strings.Contains(r.URL.Path, "/merge_requests/") && !strings.Contains(r.URL.Path, "/versions"):
+					_, _ = io.WriteString(w, `{"id":5001,"iid":1,"project_id":42,"source_project_id":42}`)
+				default:
+					http.NotFound(w, r)
+				}
+			})
 		}
-		if err != nil && !strings.Contains(err.Error(), "budget_") && out != nil && out["returned_content_hash"] != nil {
-			t.Fatalf("unexpected trusted content err=%v", err)
+		// Fault-free baseline: opening+closing version reads and trusted hash.
+		var versions0 int32
+		out0, err0 := callDiffWindow(t, diffDeps(t, mkTuple(&versions0)), nil, args)
+		if err0 != nil || atomic.LoadInt32(&versions0) != 2 || out0["returned_content_hash"] == nil {
+			t.Fatalf("fault-free tuple baseline err=%v versions=%d out=%#v", err0, atomic.LoadInt32(&versions0), out0)
+		}
+		// MaxRequests=6: list+opening version succeed; closing version blocked (diag).
+		var versions int32
+		b := igl.DefaultBudget()
+		b.MaxRequests = 6
+		ctx := igl.WithBudget(context.Background(), b)
+		out, err := callDiffWindow(t, diffDeps(t, mkTuple(&versions)), ctx, args)
+		if atomic.LoadInt32(&versions) != 1 {
+			t.Fatalf("opening version read must be exactly 1 before blocked closing, got %d", atomic.LoadInt32(&versions))
+		}
+		if err == nil || !strings.Contains(err.Error(), igl.ErrBudgetRequests.Error()) {
+			t.Fatalf("want budget_requests after opening version err=%v out=%#v", err, out)
 		}
 		assertNoTrustedContent(t, out, err, "tuple_closing_request_budget")
 	})
@@ -1680,11 +1810,24 @@ func TestDiffContentRepair_oneMiBCaps(t *testing.T) {
 	head, base, start := shaN(1), shaN(2), shaN(3)
 	small := "@@ -1 +1 @@\n-a\n+b\n"
 	// Candidate >1MiB selected (escaped unicode expands after decode).
-	over := strings.Repeat("明", (diffContentMaxCandidateBytes/3)+32)
 	t.Run("selected_candidate_over", func(t *testing.T) {
-		diffs := fmt.Sprintf(`[{"old_path":"big.go","new_path":"big.go","a_mode":"100644","b_mode":"100644","diff":%s}]`, mustJSONString(t, over))
-		// Ensure wire uses escapes for non-ASCII so decode path is exercised.
+		// Wire body must contain actual JSON \u escapes (not ordinary UTF-8 from json.Marshal).
+		overRunes := (diffContentMaxCandidateBytes / 3) + 32
+		var esc strings.Builder
+		esc.WriteString(`"`)
+		for i := 0; i < overRunes; i++ {
+			esc.WriteString(`\u660e`) // 明
+		}
+		esc.WriteString(`"`)
+		wireDiff := esc.String()
+		if !strings.Contains(wireDiff, `\u660e`) || strings.Contains(wireDiff, "明") {
+			t.Fatal("setup: wire fixture must use \\u escapes, not UTF-8 codepoints")
+		}
+		diffs := fmt.Sprintf(`[{"old_path":"big.go","new_path":"big.go","a_mode":"100644","b_mode":"100644","diff":%s}]`, wireDiff)
 		body := versionObject(1, 5001, head, base, start, "collected", "1", diffs)
+		if !strings.Contains(body, `\u660e`) {
+			t.Fatal("setup: version body lost \\u escapes")
+		}
 		h := serveDiffBase(&pathLog{}, func(w http.ResponseWriter, r *http.Request) {
 			switch {
 			case strings.Contains(r.URL.Path, "/versions/1"):
@@ -1717,9 +1860,19 @@ func TestDiffContentRepair_oneMiBCaps(t *testing.T) {
 		}
 	})
 	t.Run("unselected_candidate_over_sibling_survives", func(t *testing.T) {
+		overRunes := (diffContentMaxCandidateBytes / 3) + 32
+		var esc strings.Builder
+		esc.WriteString(`"`)
+		for i := 0; i < overRunes; i++ {
+			esc.WriteString(`\u660e`)
+		}
+		esc.WriteString(`"`)
 		diffs := fmt.Sprintf(`[{"diff":%s,"old_path":"big.go","new_path":"big.go","a_mode":"100644","b_mode":"100644"},{"old_path":"keep.go","new_path":"keep.go","a_mode":"100644","b_mode":"100644","diff":%q}]`,
-			mustJSONString(t, over), small)
+			esc.String(), small)
 		body := versionObject(1, 5001, head, base, start, "collected", "2", diffs)
+		if !strings.Contains(body, `\u660e`) {
+			t.Fatal("setup: unselected over-cap body must keep \\u escapes")
+		}
 		h := serveDiffBase(&pathLog{}, func(w http.ResponseWriter, r *http.Request) {
 			switch {
 			case strings.Contains(r.URL.Path, "/versions/1"):
@@ -1742,17 +1895,24 @@ func TestDiffContentRepair_oneMiBCaps(t *testing.T) {
 			t.Fatalf("selected sibling not retained: %#v", out)
 		}
 		raw, _ := json.Marshal(out)
-		if strings.Contains(string(raw), over[:32]) {
+		if strings.Contains(string(raw), "明") {
 			t.Fatal("unselected over-cap text retained in output")
 		}
 	})
 	t.Run("cumulative_selected_over", func(t *testing.T) {
-		// Two selected patches each under candidate cap but sum > selected aggregate.
-		chunk := strings.Repeat("Z", (diffContentMaxSelectedBytes/2)+1024)
-		p1 := "@@ -1 +1 @@\n-" + chunk + "\n+x\n"
-		p2 := "@@ -1 +1 @@\n-" + chunk + "\n+y\n"
-		if len(p1) > diffContentMaxCandidateBytes || len(p2) > diffContentMaxCandidateBytes {
-			t.Fatal("setup: individual candidate over cap")
+		// Small surviving sibling + large sibling: aggregate exceeds selected source cap,
+		// while each stays under candidate cap and emit defaults still yield a nonempty good hash.
+		smallGood := "@@ -1 +1 @@\n-a\n+b\n"
+		p1 := smallGood
+		overhead := len("@@ -1 +1 @@\n-\n+y\n")
+		need := diffContentMaxSelectedBytes - len(p1) + 1
+		largeLen := need - overhead
+		if largeLen < 1 {
+			t.Fatalf("setup arithmetic largeLen=%d", largeLen)
+		}
+		p2 := "@@ -1 +1 @@\n-" + strings.Repeat("Z", largeLen) + "\n+y\n"
+		if len(p2) > diffContentMaxCandidateBytes {
+			t.Fatalf("setup: individual candidate over cap len=%d cap=%d", len(p2), diffContentMaxCandidateBytes)
 		}
 		if len(p1)+len(p2) <= diffContentMaxSelectedBytes {
 			t.Fatalf("setup: aggregate not over selected cap sum=%d cap=%d", len(p1)+len(p2), diffContentMaxSelectedBytes)
@@ -1772,6 +1932,8 @@ func TestDiffContentRepair_oneMiBCaps(t *testing.T) {
 		out, err := callDiffWindow(t, diffDeps(t, h), nil, map[string]any{
 			"project_id": "42", "merge_request_iid": 1, "diff_version_id": 1,
 			"mode": "content", "paths": []any{"a.go", "b.go"},
+			"max_content_bytes": 262144,
+			"max_lines":         1000,
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -1793,14 +1955,37 @@ func TestDiffContentRepair_oneMiBCaps(t *testing.T) {
 		if textCount != 1 || largeCount != 1 {
 			t.Fatalf("want one text + one too_large, got %v", statuses)
 		}
-		// Surviving selected sibling keeps honest windows; omitted has no fabricated hash windows.
+		var goodText string
 		for _, rawF := range files {
 			f := asMap(t, rawF)
-			if asString(f["status"]) == diffFileStatusTooLarge {
+			switch asString(f["status"]) {
+			case diffFileStatusTooLarge:
 				if wins, _ := f["windows"].([]any); len(wins) != 0 {
 					t.Fatalf("too_large windows: %#v", f)
 				}
+			case diffFileStatusText:
+				wins := asSlice(t, f["windows"])
+				if len(wins) == 0 {
+					t.Fatal("surviving text sibling has empty windows (emit default may have masked source cap)")
+				}
+				w0 := asMap(t, wins[0])
+				goodText = asString(w0["text"])
+				if goodText == "" {
+					t.Fatal("surviving window text empty")
+				}
+				sum := sha256.Sum256([]byte(goodText))
+				wh := asMap(t, w0["window_hash"])
+				if asString(wh["value"]) != hex.EncodeToString(sum[:]) {
+					t.Fatalf("surviving hash mismatch %#v", wh)
+				}
+				wantSum := sha256.Sum256([]byte(smallGood))
+				if asString(wh["value"]) != hex.EncodeToString(wantSum[:]) {
+					t.Fatalf("surviving hash want smallGood got text=%q hash=%v", goodText, wh)
+				}
 			}
+		}
+		if goodText == "" {
+			t.Fatal("no surviving good window")
 		}
 	})
 	t.Run("helper_post_decode_retention_note", func(t *testing.T) {
@@ -1813,15 +1998,6 @@ func TestDiffContentRepair_oneMiBCaps(t *testing.T) {
 			t.Fatalf("collect caps %#v", c)
 		}
 	})
-}
-
-func mustJSONString(t *testing.T, s string) string {
-	t.Helper()
-	b, err := json.Marshal(s)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return string(b)
 }
 
 // --- Additional report-matrix closures (reuse helpers where they already prove the case) ---
@@ -1922,7 +2098,6 @@ func TestDiffContentRepair_F3_closureMatrixExtras(t *testing.T) {
 			}
 			return fmt.Sprintf(`{"commit":{"id":%q},"id":1,"id":1,"diffs":[{"old_path":"a.go","new_path":"a.go","a_mode":"100644","b_mode":"100644","diff":%q}]}`, to, good)
 		}},
-		{"http_error_closing", func(n int) string { return "" }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1934,10 +2109,6 @@ func TestDiffContentRepair_F3_closureMatrixExtras(t *testing.T) {
 					fmt.Fprintf(w, `{"id":%q}`, sha)
 				case strings.Contains(r.URL.Path, "/repository/compare"):
 					compares++
-					if tc.name == "http_error_closing" && compares > 1 {
-						http.Error(w, "boom", http.StatusBadGateway)
-						return
-					}
 					_, _ = io.WriteString(w, tc.mod(compares))
 				case strings.Contains(r.URL.Path, "/merge_requests/"):
 					_, _ = io.WriteString(w, `{"id":5001,"iid":1,"project_id":42,"source_project_id":42}`)
@@ -1949,18 +2120,62 @@ func TestDiffContentRepair_F3_closureMatrixExtras(t *testing.T) {
 				"project_id": "42", "merge_request_iid": 1, "from_sha": from, "to_sha": to, "straight": true,
 				"mode": "content", "paths": []any{"a.go"},
 			})
-			if err != nil && tc.name != "http_error_closing" {
-				// typed budget/cancel not expected here
-			}
-			if compares < 2 && tc.name != "http_error_closing" {
-				// http_error still attempts closing
-			}
-			if compares < 1 {
-				t.Fatalf("opening missing")
+			if compares != 2 {
+				t.Fatalf("%s: want exactly 2 compares, got %d err=%v", tc.name, compares, err)
 			}
 			assertNoTrustedContent(t, out, err, "F3_"+tc.name)
 		})
 	}
+	// Closing HTTP 502: valid opening body, exactly one closing attempt (no-retry client), typed fail-closed.
+	t.Run("http_error_closing", func(t *testing.T) {
+		var compares int
+		h := serveDiffBase(&pathLog{}, func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case strings.Contains(r.URL.Path, "/repository/commits/"):
+				sha := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
+				fmt.Fprintf(w, `{"id":%q}`, sha)
+			case strings.Contains(r.URL.Path, "/repository/compare"):
+				compares++
+				if compares > 1 {
+					http.Error(w, "boom", http.StatusBadGateway)
+					return
+				}
+				fmt.Fprintf(w, `{"commit":{"id":%q},"diffs":[{"old_path":"a.go","new_path":"a.go","a_mode":"100644","b_mode":"100644","diff":%q}]}`, to, good)
+			case strings.Contains(r.URL.Path, "/merge_requests/"):
+				_, _ = io.WriteString(w, `{"id":5001,"iid":1,"project_id":42,"source_project_id":42}`)
+			default:
+				http.NotFound(w, r)
+			}
+		})
+		out, err := callDiffWindow(t, diffDepsNoRetry(t, h), nil, map[string]any{
+			"project_id": "42", "merge_request_iid": 1, "from_sha": from, "to_sha": to, "straight": true,
+			"mode": "content", "paths": []any{"a.go"},
+		})
+		if compares != 2 {
+			t.Fatalf("http_error_closing: want exactly 2 compares (valid opening + one 502 closing), got %d err=%v", compares, err)
+		}
+		if err == nil && (out == nil || out["returned_content_hash"] != nil) {
+			t.Fatalf("http_error_closing must not trust content err=%v out=%#v", err, out)
+		}
+		assertNoTrustedContent(t, out, err, "F3_http_error_closing")
+	})
+}
+
+// diffDepsNoRetry builds content-tool deps without GET retry so closing HTTP 502 is observed once.
+func diffDepsNoRetry(t *testing.T, h http.Handler) Deps {
+	t.Helper()
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+	cfg := &config.Config{Token: "test-token", APIURL: srv.URL + "/api/v4", CursorKey: bytes.Repeat([]byte("k"), 32), AllowedProjectIDs: []string{"42"}}
+	cli, err := gitlab.NewClient(cfg.Token,
+		gitlab.WithBaseURL(cfg.APIURL),
+		gitlab.WithoutRetries(),
+		gitlab.WithInterceptor(igl.BudgetInterceptor()),
+	)
+	if err != nil {
+		t.Fatalf("client: %v", err)
+	}
+	return Deps{Config: cfg, Client: cli, Clock: &cursor.FakeClock{T: time.Date(2026, 10, 4, 12, 0, 0, 0, time.UTC)}}
 }
 
 func TestDiffContentRepair_F5_markerSidesAndCaps(t *testing.T) {
@@ -1972,7 +2187,7 @@ func TestDiffContentRepair_F5_markerSidesAndCaps(t *testing.T) {
 	}{
 		{"old_ctx0", "@@ -1 +0,0 @@\n-old\n\\ No newline at end of file\n", 0, "-old\n\\ No newline at end of file\n"},
 		{"new_ctx0", "@@ -0,0 +1 @@\n+new\n\\ No newline at end of file\n", 0, "+new\n\\ No newline at end of file\n"},
-		{"both_ctx0", "@@ -1,1 +1,1 @@\n-old\n+new\n\\ No newline at end of file\n", 0, "\\ No newline at end of file\n"},
+		{"both_ctx0", "@@ -1,1 +1,1 @@\n-old\n\\ No newline at end of file\n+new\n\\ No newline at end of file\n", 0, "\\ No newline at end of file\n"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1995,6 +2210,14 @@ func TestDiffContentRepair_F5_markerSidesAndCaps(t *testing.T) {
 			for _, ln := range wins[0].Lines {
 				if ln.Kind == diffLineKindMarker {
 					t.Fatal("marker emitted as line")
+				}
+			}
+			if tc.name == "both_ctx0" {
+				if len(wins[0].Lines) != 2 || !wins[0].Lines[0].NoNewline || !wins[0].Lines[1].NoNewline {
+					t.Fatalf("both_ctx0 requires old AND new attached EOF markers; lines=%#v", wins[0].Lines)
+				}
+				if strings.Count(wins[0].Text, `\ No newline at end of file`) != 2 {
+					t.Fatalf("both_ctx0 text must retain both EOF markers: %q", wins[0].Text)
 				}
 			}
 		})
@@ -2170,15 +2393,18 @@ func TestDiffContentRepair_F9_emptyVsNullMissing(t *testing.T) {
 func TestDiffContentRepair_F10_wrongTypeMatrix(t *testing.T) {
 	head, base, start := shaN(1), shaN(2), shaN(3)
 	good := "@@ -1 +1 @@\n-a\n+b\n"
+	wantSum := sha256.Sum256([]byte(good))
+	wantHash := hex.EncodeToString(wantSum[:])
 	for _, tc := range []struct {
-		name  string
-		diffs string
+		name       string
+		diffs      string
+		selectBoth bool
 	}{
-		{"selected_numeric", fmt.Sprintf(`[{"old_path":"bad.go","new_path":"bad.go","diff":123},{"old_path":"keep.go","new_path":"keep.go","diff":%q}]`, good)},
-		{"selected_object", fmt.Sprintf(`[{"old_path":"bad.go","new_path":"bad.go","diff":{}},{"old_path":"keep.go","new_path":"keep.go","diff":%q}]`, good)},
-		{"selected_array", fmt.Sprintf(`[{"old_path":"bad.go","new_path":"bad.go","diff":[]},{"old_path":"keep.go","new_path":"keep.go","diff":%q}]`, good)},
-		{"unselected_null_before", fmt.Sprintf(`[{"diff":null,"old_path":"other.go","new_path":"other.go"},{"old_path":"keep.go","new_path":"keep.go","diff":%q}]`, good)},
-		{"patch_key_numeric_after_paths", fmt.Sprintf(`[{"old_path":"keep.go","new_path":"keep.go","diff":%q},{"old_path":"bad.go","new_path":"bad.go","a_mode":"100644","diff":1}]`, good)},
+		{"selected_numeric", fmt.Sprintf(`[{"old_path":"bad.go","new_path":"bad.go","diff":123},{"old_path":"keep.go","new_path":"keep.go","diff":%q}]`, good), true},
+		{"selected_object", fmt.Sprintf(`[{"old_path":"bad.go","new_path":"bad.go","diff":{}},{"old_path":"keep.go","new_path":"keep.go","diff":%q}]`, good), true},
+		{"selected_array", fmt.Sprintf(`[{"old_path":"bad.go","new_path":"bad.go","diff":[]},{"old_path":"keep.go","new_path":"keep.go","diff":%q}]`, good), true},
+		{"unselected_null_before", fmt.Sprintf(`[{"diff":null,"old_path":"other.go","new_path":"other.go"},{"old_path":"keep.go","new_path":"keep.go","diff":%q}]`, good), false},
+		{"patch_key_numeric_after_paths", fmt.Sprintf(`[{"old_path":"keep.go","new_path":"keep.go","diff":%q},{"old_path":"bad.go","new_path":"bad.go","a_mode":"100644","diff":1}]`, good), true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			body := versionObject(1, 5001, head, base, start, "collected", "2", tc.diffs)
@@ -2192,15 +2418,43 @@ func TestDiffContentRepair_F10_wrongTypeMatrix(t *testing.T) {
 					http.NotFound(w, r)
 				}
 			})
+			paths := []any{"keep.go"}
+			if tc.selectBoth {
+				paths = []any{"bad.go", "keep.go"}
+			}
 			out, err := callDiffWindow(t, diffDeps(t, h), nil, map[string]any{
 				"project_id": "42", "merge_request_iid": 1, "diff_version_id": 1,
-				"mode": "content", "paths": []any{"keep.go"},
+				"mode": "content", "paths": paths,
 			})
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(asSlice(t, out["files"])) != 1 || asMap(t, asSlice(t, out["files"])[0])["status"] != diffFileStatusText {
-				t.Fatalf("%s sibling destroyed %#v", tc.name, out)
+			files := asSlice(t, out["files"])
+			byPath := map[string]map[string]any{}
+			for _, raw := range files {
+				m := asMap(t, raw)
+				byPath[asString(m["new_path"])] = m
+			}
+			keepF := byPath["keep.go"]
+			if keepF == nil || asString(keepF["status"]) != diffFileStatusText {
+				t.Fatalf("%s keep destroyed %#v", tc.name, out)
+			}
+			wins := asSlice(t, keepF["windows"])
+			if len(wins) != 1 {
+				t.Fatalf("%s keep windows %#v", tc.name, wins)
+			}
+			wh := asMap(t, asMap(t, wins[0])["window_hash"])
+			if asString(wh["value"]) != wantHash {
+				t.Fatalf("%s keep hash=%v want %s", tc.name, wh, wantHash)
+			}
+			if tc.selectBoth {
+				badF := byPath["bad.go"]
+				if badF == nil || asString(badF["status"]) != diffFileStatusMalformed {
+					t.Fatalf("%s bad status want malformed got %#v", tc.name, badF)
+				}
+				if bw, _ := badF["windows"].([]any); len(bw) != 0 {
+					t.Fatalf("%s bad windows %#v", tc.name, bw)
+				}
 			}
 		})
 	}
@@ -2310,4 +2564,188 @@ func TestDiffContentRepair_F11_partialAndDriftMatrix(t *testing.T) {
 		}
 		assertNoTrustedContent(t, out, err, "version_state_drift")
 	})
+}
+
+// ---- RVG-143 R1/R3/R4/R5 repair controls (old-source reds first) ----
+
+func TestDiffContentRepair_R1_zeroCountOrdering(t *testing.T) {
+	malformedInsert := "@@ -1 +1 @@\n-a\n+b\n@@ -0,0 +2 @@\n+c\n"
+	malformedDelete := "@@ -1 +1 @@\n-a\n+b\n@@ -2 +0,0 @@\n-c\n"
+	t.Run("helper_malformed_zero_old_after_positive", func(t *testing.T) {
+		parsed := parseUnifiedDiff(malformedInsert)
+		if parsed.ok {
+			t.Fatal("helper: zero-old boundary before prior old line must reject")
+		}
+	})
+	t.Run("helper_malformed_zero_new_after_positive", func(t *testing.T) {
+		parsed := parseUnifiedDiff(malformedDelete)
+		if parsed.ok {
+			t.Fatal("helper: zero-new boundary before prior new line must reject")
+		}
+	})
+	t.Run("helper_backward_zero_after_zero", func(t *testing.T) {
+		// Second zero-old boundary retreats before the first zero boundary.
+		patch := "@@ -2,0 +1 @@\n+a\n@@ -0,0 +2 @@\n+b\n"
+		if parseUnifiedDiff(patch).ok {
+			t.Fatal("helper: backward zero after zero must reject")
+		}
+	})
+	t.Run("helper_integer_limit_zero_boundary", func(t *testing.T) {
+		// Positive hunk ending at MaxInt then zero at 0 must reject; overflow on positive end also rejects.
+		hdr := "@@ -" + strconv.Itoa(math.MaxInt) + " +1 @@\n"
+		// header parse may fail for MaxInt alone; use MaxInt-1 count 1 then zero retreat
+		patch := "@@ -" + strconv.Itoa(math.MaxInt-1) + ",1 +1,1 @@\n-a\n+b\n@@ -0,0 +2 @@\n+c\n"
+		if parseUnifiedDiff(patch).ok {
+			t.Fatal("helper: zero boundary before MaxInt-adjacent end must reject")
+		}
+		_ = hdr
+	})
+	t.Run("helper_positive_legitimate_adjacency", func(t *testing.T) {
+		cases := []string{
+			"@@ -0,0 +1 @@\n+a\n",
+			"@@ -0,0 +1 @@\n+a\n@@ -1 +2 @@\n-b\n+c\n",
+			"@@ -1 +1 @@\n-a\n+b\n@@ -2,0 +3 @@\n+c\n",
+			"@@ -1,1 +1,0 @@\n-a\n@@ -2,0 +1,1 @@\n+b\n",
+		}
+		for _, p := range cases {
+			if !parseUnifiedDiff(p).ok {
+				t.Fatalf("helper: legitimate adjacency rejected: %q", p)
+			}
+		}
+	})
+	t.Run("mcp_malformed_selected_good_sibling", func(t *testing.T) {
+		head, base, start := shaN(1), shaN(2), shaN(3)
+		good := "@@ -1 +1 @@\n-a\n+b\n"
+		bad := malformedInsert
+		diffs := fmt.Sprintf(`[{"old_path":"bad.go","new_path":"bad.go","a_mode":"100644","b_mode":"100644","diff":%q},{"old_path":"keep.go","new_path":"keep.go","a_mode":"100644","b_mode":"100644","diff":%q}]`, bad, good)
+		body := versionObject(1, 5001, head, base, start, "collected", "2", diffs)
+		h := serveDiffBase(&pathLog{}, func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case strings.Contains(r.URL.Path, "/versions/1"):
+				_, _ = io.WriteString(w, body)
+			case strings.Contains(r.URL.Path, "/merge_requests/"):
+				_, _ = io.WriteString(w, `{"id":5001,"iid":1,"project_id":42,"source_project_id":42}`)
+			default:
+				http.NotFound(w, r)
+			}
+		})
+		out, err := callDiffWindow(t, diffDeps(t, h), nil, map[string]any{
+			"project_id": "42", "merge_request_iid": 1, "diff_version_id": 1,
+			"mode": "content", "paths": []any{"bad.go", "keep.go"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		files := asSlice(t, out["files"])
+		if len(files) != 2 {
+			t.Fatalf("files=%#v", files)
+		}
+		byPath := map[string]map[string]any{}
+		for _, raw := range files {
+			m := asMap(t, raw)
+			byPath[asString(m["new_path"])] = m
+		}
+		badF, keepF := byPath["bad.go"], byPath["keep.go"]
+		if badF == nil || keepF == nil {
+			t.Fatalf("missing paths %#v", byPath)
+		}
+		if asString(badF["status"]) != diffFileStatusMalformed {
+			t.Fatalf("bad status=%v", badF["status"])
+		}
+		if wins, _ := badF["windows"].([]any); len(wins) != 0 {
+			t.Fatalf("bad windows %#v", wins)
+		}
+		if asString(keepF["status"]) != diffFileStatusText {
+			t.Fatalf("keep status=%v", keepF["status"])
+		}
+		wins := asSlice(t, keepF["windows"])
+		if len(wins) != 1 {
+			t.Fatalf("keep windows %#v", wins)
+		}
+		wantSum := sha256.Sum256([]byte(good))
+		wh := asMap(t, asMap(t, wins[0])["window_hash"])
+		if asString(wh["value"]) != hex.EncodeToString(wantSum[:]) {
+			t.Fatalf("keep hash=%v want %s", wh, hex.EncodeToString(wantSum[:]))
+		}
+	})
+}
+
+func TestDiffContentRepair_R3_compareTimeoutSymmetric(t *testing.T) {
+	from, to := shaN(4), shaN(5)
+	patch := "@@ -1 +1 @@\n-a\n+b\n"
+	type side struct {
+		raw string // JSON fragment for compare_timeout field including key, or empty if omitted
+	}
+	mkBody := func(timeoutField string) string {
+		if timeoutField == "" {
+			return fmt.Sprintf(`{"commit":{"id":%q},"diffs":[{"old_path":"a.go","new_path":"a.go","a_mode":"100644","b_mode":"100644","diff":%q}]}`, to, patch)
+		}
+		return fmt.Sprintf(`{"commit":{"id":%q},%s,"diffs":[{"old_path":"a.go","new_path":"a.go","a_mode":"100644","b_mode":"100644","diff":%q}]}`, to, timeoutField, patch)
+	}
+	runPair := func(t *testing.T, openField, closeField string) (compares int, out map[string]any, err error) {
+		t.Helper()
+		h := serveDiffBase(&pathLog{}, func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case strings.Contains(r.URL.Path, "/repository/commits/"):
+				sha := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
+				fmt.Fprintf(w, `{"id":%q}`, sha)
+			case strings.Contains(r.URL.Path, "/repository/compare"):
+				compares++
+				field := openField
+				if compares > 1 {
+					field = closeField
+				}
+				_, _ = io.WriteString(w, mkBody(field))
+			case strings.Contains(r.URL.Path, "/merge_requests/"):
+				_, _ = io.WriteString(w, `{"id":5001,"iid":1,"project_id":42,"source_project_id":42}`)
+			default:
+				http.NotFound(w, r)
+			}
+		})
+		out, err = callDiffWindow(t, diffDeps(t, h), nil, map[string]any{
+			"project_id": "42", "merge_request_iid": 1, "from_sha": from, "to_sha": to, "straight": true,
+			"mode": "content", "paths": []any{"a.go"},
+		})
+		return compares, out, err
+	}
+	t.Run("baseline_false_false", func(t *testing.T) {
+		compares, out, err := runPair(t, `"compare_timeout":false`, `"compare_timeout":false`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if compares != 2 {
+			t.Fatalf("baseline compares=%d", compares)
+		}
+		if out["returned_content_hash"] == nil || len(asSlice(t, out["files"])) != 1 {
+			t.Fatalf("baseline trusted content missing %#v", out)
+		}
+		if sectionMap(out)["consistency"] != readmeta.ConsistencyConsistent {
+			t.Fatalf("section=%#v", sectionMap(out))
+		}
+	})
+	driftCases := []struct {
+		name, open, close string
+	}{
+		{"false_to_true", `"compare_timeout":false`, `"compare_timeout":true`},
+		{"true_to_false", `"compare_timeout":true`, `"compare_timeout":false`},
+		{"true_to_true", `"compare_timeout":true`, `"compare_timeout":true`},
+		{"missing_to_false", ``, `"compare_timeout":false`},
+		{"null_to_false", `"compare_timeout":null`, `"compare_timeout":false`},
+		{"wrongtype_to_false", `"compare_timeout":"yes"`, `"compare_timeout":false`},
+	}
+	for _, tc := range driftCases {
+		t.Run(tc.name, func(t *testing.T) {
+			compares, out, err := runPair(t, tc.open, tc.close)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if compares != 2 {
+				t.Fatalf("%s compares=%d want 2 (opening must succeed to exercise closing)", tc.name, compares)
+			}
+			assertNoTrustedContent(t, out, err, "R3_"+tc.name)
+			if sectionMap(out)["consistency"] == readmeta.ConsistencyConsistent {
+				t.Fatalf("%s must not be consistent: %#v", tc.name, sectionMap(out))
+			}
+		})
+	}
 }

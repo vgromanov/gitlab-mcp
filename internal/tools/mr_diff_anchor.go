@@ -1,6 +1,8 @@
 package tools
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"strconv"
 	"strings"
@@ -135,6 +137,9 @@ func validateProofShape(proof diffContentProof) error {
 	seenOld := map[int]string{}
 	seenNew := map[int]string{}
 	for _, w := range proof.Windows {
+		if err := validateWindowProofBinding(w); err != nil {
+			return err
+		}
 		for _, ln := range w.Lines {
 			if ln.Kind == diffLineKindMarker {
 				return diffAnchorRejection{Code: diffAnchorRejectMalformed, Message: "marker line"}
@@ -155,6 +160,98 @@ func validateProofShape(proof diffContentProof) error {
 				seenNew[*ln.NewLine] = ln.Kind
 			}
 		}
+	}
+	return nil
+}
+
+// validateWindowProofBinding binds proof lines to returned window bytes/header/ranges/hash.
+// Cropped fragments keep original header counts; body line counts need not equal those counts,
+// and emitted body may start after omitted leading context (coords need not begin at header starts).
+// Absolute coordinates are bound via private parser-retained offsets set at window construction —
+// never by trusting the first claimed line coordinate as its own origin.
+func validateWindowProofBinding(w diffContentWindow) error {
+	if w.Text == "" || w.Header == "" || len(w.Lines) == 0 {
+		return diffAnchorRejection{Code: diffAnchorRejectMalformed, Message: "empty window"}
+	}
+	if len(w.parserCoords) != len(w.Lines) {
+		return diffAnchorRejection{Code: diffAnchorRejectMalformed, Message: "parser bind"}
+	}
+	sum := sha256.Sum256([]byte(w.Text))
+	want := hex.EncodeToString(sum[:])
+	if w.WindowHash.Algorithm != "sha256" || w.WindowHash.Scope != diffContentWindowHashScope || w.WindowHash.Value != want {
+		return diffAnchorRejection{Code: diffAnchorRejectMalformed, Message: "window hash"}
+	}
+	if !strings.HasPrefix(w.Text, w.Header) {
+		return diffAnchorRejection{Code: diffAnchorRejectMalformed, Message: "header text"}
+	}
+	oldStart, oldCount, newStart, newCount, ok := parseHunkHeader(strings.TrimRight(w.Header, "\r\n"))
+	if !ok {
+		return diffAnchorRejection{Code: diffAnchorRejectMalformed, Message: "header parse"}
+	}
+	if oldStart != w.OldStart || oldCount != w.OldCount || newStart != w.NewStart || newCount != w.NewCount {
+		return diffAnchorRejection{Code: diffAnchorRejectMalformed, Message: "header ranges"}
+	}
+	body := w.Text[len(w.Header):]
+	bodyLines := splitDiffSourceLines(body)
+	bi := 0
+	inOld := func(n int) bool {
+		return oldCount == 0 || (n >= oldStart && n < oldStart+oldCount)
+	}
+	inNew := func(n int) bool {
+		return newCount == 0 || (n >= newStart && n < newStart+newCount)
+	}
+	sameCoord := func(a, b *int) bool {
+		if a == nil || b == nil {
+			return a == nil && b == nil
+		}
+		return *a == *b
+	}
+	for i, ln := range w.Lines {
+		if bi >= len(bodyLines) {
+			return diffAnchorRejection{Code: diffAnchorRejectMalformed, Message: "line/text length"}
+		}
+		if bodyLines[bi].text != ln.Text {
+			return diffAnchorRejection{Code: diffAnchorRejectMalformed, Message: "line text"}
+		}
+		pc := w.parserCoords[i]
+		if !sameCoord(ln.OldLine, pc.oldLine) || !sameCoord(ln.NewLine, pc.newLine) {
+			return diffAnchorRejection{Code: diffAnchorRejectMalformed, Message: "coord bind"}
+		}
+		switch ln.Kind {
+		case diffLineKindAddition:
+			if !strings.HasPrefix(ln.Text, "+") || ln.NewLine == nil || ln.OldLine != nil {
+				return diffAnchorRejection{Code: diffAnchorRejectMalformed, Message: "addition shape"}
+			}
+			if !inNew(*ln.NewLine) {
+				return diffAnchorRejection{Code: diffAnchorRejectMalformed, Message: "addition range"}
+			}
+		case diffLineKindDeletion:
+			if !strings.HasPrefix(ln.Text, "-") || ln.OldLine == nil || ln.NewLine != nil {
+				return diffAnchorRejection{Code: diffAnchorRejectMalformed, Message: "deletion shape"}
+			}
+			if !inOld(*ln.OldLine) {
+				return diffAnchorRejection{Code: diffAnchorRejectMalformed, Message: "deletion range"}
+			}
+		case diffLineKindContext:
+			if !strings.HasPrefix(ln.Text, " ") || ln.OldLine == nil || ln.NewLine == nil {
+				return diffAnchorRejection{Code: diffAnchorRejectMalformed, Message: "context shape"}
+			}
+			if !inOld(*ln.OldLine) || !inNew(*ln.NewLine) {
+				return diffAnchorRejection{Code: diffAnchorRejectMalformed, Message: "context range"}
+			}
+		default:
+			return diffAnchorRejection{Code: diffAnchorRejectMalformed, Message: "line kind"}
+		}
+		bi++
+		if ln.NoNewline {
+			if bi >= len(bodyLines) || bodyLines[bi].text != `\ No newline at end of file` {
+				return diffAnchorRejection{Code: diffAnchorRejectMalformed, Message: "newline marker"}
+			}
+			bi++
+		}
+	}
+	if bi != len(bodyLines) {
+		return diffAnchorRejection{Code: diffAnchorRejectMalformed, Message: "trailing window text"}
 	}
 	return nil
 }

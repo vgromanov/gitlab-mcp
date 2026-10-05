@@ -100,6 +100,16 @@ type diffContentWindow struct {
 	Lines      []diffContentLine `json:"lines"`
 	WindowHash diffContentHash   `json:"window_hash"`
 	Truncated  bool              `json:"truncated"`
+	// parserCoords retains immutable parser-assigned old/new line numbers
+	// parallel to Lines. Unexported so it is not part of the serialized MCP
+	// window API; proofs are provider-constructed and never rebuilt from input.
+	parserCoords []diffParserLineCoords
+}
+
+// diffParserLineCoords is the parser-derived coordinate pair for one emitted body line.
+type diffParserLineCoords struct {
+	oldLine *int
+	newLine *int
 }
 
 type diffContentFile struct {
@@ -449,6 +459,35 @@ func isDiffFramingLine(line string) bool {
 	}
 }
 
+func checkedAdd(a, b int) (int, bool) {
+	if b < 0 {
+		return 0, false
+	}
+	if a > math.MaxInt-b {
+		return 0, false
+	}
+	return a + b, true
+}
+
+func advanceHunkBoundary(start, count int, haveEnd bool, lastEnd int) (int, bool, bool) {
+	// Zero-count start denotes the boundary after that start (exclusive cursor = start).
+	// Positive counts cover [start, start+count). Next hunk must not start before lastEnd.
+	if count == 0 {
+		if haveEnd && start < lastEnd {
+			return 0, false, false
+		}
+		return start, true, true
+	}
+	end, ok := checkedAdd(start, count)
+	if !ok {
+		return 0, false, false
+	}
+	if haveEnd && start < lastEnd {
+		return 0, false, false
+	}
+	return end, true, true
+}
+
 func parseUnifiedDiff(patch string) diffParsedPatch {
 	if patch == "" {
 		return diffParsedPatch{empty: true, ok: true}
@@ -474,19 +513,14 @@ func parseUnifiedDiff(patch string) diffParsedPatch {
 		if !ok {
 			return diffParsedPatch{ok: false}
 		}
-		if oldCount > 0 {
-			if haveOldEnd && oldStart < lastOldEnd {
-				return diffParsedPatch{ok: false}
-			}
-			lastOldEnd = oldStart + oldCount
-			haveOldEnd = true
+		var okBound bool
+		lastOldEnd, haveOldEnd, okBound = advanceHunkBoundary(oldStart, oldCount, haveOldEnd, lastOldEnd)
+		if !okBound {
+			return diffParsedPatch{ok: false}
 		}
-		if newCount > 0 {
-			if haveNewEnd && newStart < lastNewEnd {
-				return diffParsedPatch{ok: false}
-			}
-			lastNewEnd = newStart + newCount
-			haveNewEnd = true
+		lastNewEnd, haveNewEnd, okBound = advanceHunkBoundary(newStart, newCount, haveNewEnd, lastNewEnd)
+		if !okBound {
+			return diffParsedPatch{ok: false}
 		}
 		h := diffParsedHunk{header: lines[i].raw, oldStart: oldStart, oldCount: oldCount, newStart: newStart, newCount: newCount}
 		i++
@@ -665,6 +699,7 @@ func buildWindow(hunk diffParsedHunk, rg lineRange, budget *contentEmitBudget) (
 	budget.add(1, headerBytes)
 
 	var lines []diffContentLine
+	var parserCoords []diffParserLineCoords
 	truncated := false
 	for i := rg.start; i <= rg.end; {
 		ln := hunk.lines[i]
@@ -687,6 +722,11 @@ func buildWindow(hunk diffParsedHunk, rg lineRange, budget *contentEmitBudget) (
 		b.WriteString(unit)
 		out := diffContentLine{Kind: ln.kind, Text: ln.text, OldLine: cloneIntPtr(ln.oldLine), NewLine: cloneIntPtr(ln.newLine), NoNewline: ln.noNewline || j > i+1}
 		lines = append(lines, out)
+		// Retain a separate immutable copy of parser offsets for proof binding.
+		parserCoords = append(parserCoords, diffParserLineCoords{
+			oldLine: cloneIntPtr(ln.oldLine),
+			newLine: cloneIntPtr(ln.newLine),
+		})
 		i = j
 	}
 	if len(lines) == 0 {
@@ -696,6 +736,7 @@ func buildWindow(hunk diffParsedHunk, rg lineRange, budget *contentEmitBudget) (
 	return diffContentWindow{
 		Header: hunk.header, OldStart: hunk.oldStart, OldCount: hunk.oldCount, NewStart: hunk.newStart, NewCount: hunk.newCount,
 		Text: text, Lines: lines, WindowHash: hashDiffContentText(diffContentWindowHashScope, text), Truncated: truncated,
+		parserCoords: parserCoords,
 	}, true, truncated
 }
 
@@ -1161,7 +1202,8 @@ func readIncrementalContent(ctx context.Context, d Deps, q diffQuery, sec readme
 	sec.AddLimitation(readmeta.CodePartial, "compare")
 	sec.CapabilityVersion = capabilityDiffContentV1
 	env := st.fields
-	if timeout := triBool(env["compare_timeout"]); timeout != nil && *timeout {
+	openTimeout, openTimeoutOK := compareTimeoutProofToken(env["compare_timeout"])
+	if openTimeout == "true" {
 		sec.AddLimitation(readmeta.CodePartial, "compare_timeout")
 	}
 	commitID, ok := parseCompareCommitID(env["commit"])
@@ -1197,8 +1239,10 @@ func readIncrementalContent(ctx context.Context, d Deps, q diffQuery, sec readme
 		sec.AddLimitation(readmeta.CodeHTTPError, "compare closing")
 		return emptyContent(sec, q, opts), nil
 	}
-	if timeout := triBool(st2.fields["compare_timeout"]); timeout != nil && *timeout {
+	closeTimeout, closeTimeoutOK := compareTimeoutProofToken(st2.fields["compare_timeout"])
+	if openTimeout != closeTimeout || !openTimeoutOK || !closeTimeoutOK {
 		sec.Consistency = readmeta.ConsistencyInconsistent
+		sec.AddLimitation(readmeta.CodePartial, "compare_timeout")
 		return emptyContent(sec, q, opts), nil
 	}
 	commitID2, ok2 := parseCompareCommitID(st2.fields["commit"])
@@ -1223,6 +1267,26 @@ func readIncrementalContent(ctx context.Context, d Deps, q diffQuery, sec readme
 		Section: sec, Selection: selectionOutFrom(q, provedManifest{}, 0),
 		Files: built, Selectors: outcomes, ReturnedContentHash: retHash, FullPatchHash: nil,
 	}, nil
+}
+
+// compareTimeoutProofToken normalizes compare_timeout JSON for symmetric opening/closing proof.
+// trustable is false for true and malformed values (either side invalidates trusted content).
+func compareTimeoutProofToken(raw json.RawMessage) (token string, trustable bool) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return "absent", true
+	}
+	if string(trimmed) == "null" {
+		return "null", true
+	}
+	var b bool
+	if json.Unmarshal(trimmed, &b) != nil {
+		return "malformed", false
+	}
+	if b {
+		return "true", false
+	}
+	return "false", true
 }
 
 func parseCompareCommitID(raw json.RawMessage) (string, bool) {
