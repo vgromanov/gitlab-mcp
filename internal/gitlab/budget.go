@@ -212,6 +212,20 @@ func (b *Budget) EnsureMinBytes(need int64) {
 	}
 }
 
+// EnsureMinRequests raises a positive MaxRequests cap up to need. A zero or
+// negative cap stays unlimited. Never lowers a cap. requests already charged
+// still count against the new cap.
+func (b *Budget) EnsureMinRequests(need int) {
+	if b == nil || need <= 0 {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.MaxRequests > 0 && b.MaxRequests < need {
+		b.MaxRequests = need
+	}
+}
+
 // CapLimits tightens MaxItems/MaxBytes/MaxRequests under the budget mutex.
 // Each positive argument is applied only when it is stricter than the current
 // cap (or when the current cap is unlimited/non-positive). Never relaxes.

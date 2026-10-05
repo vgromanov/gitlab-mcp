@@ -1200,6 +1200,137 @@ func TestGetPipelineJobOutput_authzUsesBoundedContext(t *testing.T) {
 	}
 }
 
+func TestGetPipelineJobOutput_identityBodyDoesNotStealTailBudget(t *testing.T) {
+	body := "one\nTAIL-END\n"
+	fat := `{"id":42,"description":"` + strings.Repeat("x", 2048) + `","path_with_namespace":"g/p","namespace":{"id":7,"kind":"group","full_path":"g","parent_id":0}}`
+	var traceHits atomic.Int32
+	d := authzDeps(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/trace") {
+			traceHits.Add(1)
+			w.Header().Set("Content-Range", "bytes 0-12/13")
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = io.WriteString(w, body)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, fat)
+	}))
+	d.Config.Token = "fixture-pat"
+	d.Config.AllowedProjectIDs = []string{"42"}
+	_, raw, err := getPipelineJobOutput(context.Background(), nil, getPipelineJobOutputIn{
+		ProjectID: "42", JobID: 8, Selector: "tail", MaxScanBytes: 64, MaxLines: 1,
+	}, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := decodeTrace(t, raw)["trace"].(string)
+	w := traceWindow(t, raw)
+	if traceHits.Load() != 1 || w["tail_proven"] != true || !strings.Contains(text, "TAIL-END") {
+		t.Fatalf("trace %q window %#v hits %d", text, w, traceHits.Load())
+	}
+}
+
+func TestGetPipelineJobOutput_groupAncestryLeavesTraceRequests(t *testing.T) {
+	var traceHits atomic.Int32
+	d := authzDeps(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.Contains(r.URL.Path, "/trace"):
+			traceHits.Add(1)
+			w.Header().Set("Content-Type", "text/plain")
+			_, _ = io.WriteString(w, "ok\n")
+		case strings.Contains(r.URL.Path, "/projects/"):
+			_, _ = io.WriteString(w, `{"id":42,"path_with_namespace":"root/mid/p","namespace":{"id":11,"kind":"group","full_path":"root/mid","parent_id":10}}`)
+		case strings.Contains(r.URL.Path, "/groups/11"):
+			_, _ = io.WriteString(w, `{"id":11,"full_path":"root/mid","parent_id":10}`)
+		case strings.Contains(r.URL.Path, "/groups/10"):
+			_, _ = io.WriteString(w, `{"id":10,"full_path":"root","parent_id":0}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	d.Config.Token = "fixture-pat"
+	d.Config.AllowedGroupIDs = []string{"10"}
+	_, raw, err := getPipelineJobOutput(context.Background(), nil, getPipelineJobOutputIn{
+		ProjectID: "42", JobID: 8,
+	}, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if traceHits.Load() != 1 || decodeTrace(t, raw)["trace"] != "ok\n" {
+		t.Fatalf("hits %d raw %#v", traceHits.Load(), raw)
+	}
+}
+
+func TestGetPipelineJobOutput_errorStarTotalIsNotComplete(t *testing.T) {
+	body := "ok\nfine\nnothing\n"
+	d := authzDeps(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, "/trace") {
+			_, _ = io.WriteString(w, `{"id":42}`)
+			return
+		}
+		if r.Header.Get("Range") != "" {
+			t.Errorf("error selector sent Range %q", r.Header.Get("Range"))
+		}
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-%d/*", len(body)-1))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = io.WriteString(w, body)
+	}))
+	d.Config.Token = "fixture-pat"
+	_, raw, err := getPipelineJobOutput(context.Background(), nil, getPipelineJobOutputIn{
+		ProjectID: "42", JobID: 8, Selector: "error",
+	}, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := traceWindow(t, raw)
+	sec := traceSection(t, raw)
+	if w["total_known"] != false || w["error_region_proven"] != false {
+		t.Fatalf("window %#v", w)
+	}
+	if sec["content_complete"] == readmeta.ContentCompleteTrue || sec["patch_coverage"] == readmeta.CoverageFull {
+		t.Fatalf("complete %#v", sec)
+	}
+}
+
+func TestGetPipelineJobOutput_quotedAuthContinuationAtRangeCut(t *testing.T) {
+	prefix := `Authorization: Bearer "`
+	payload := strings.Repeat("A ", 400) + "SECRET-MARKER"
+	raw := []byte(prefix + payload + "\"\n")
+	start := int64(len(prefix) + 700)
+	end := int64(len(raw))
+	d := authzDeps(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, "/trace") {
+			_, _ = io.WriteString(w, `{"id":42}`)
+			return
+		}
+		var from, to int
+		if _, err := fmt.Sscanf(r.Header.Get("Range"), "bytes=%d-%d", &from, &to); err != nil {
+			t.Fatalf("range %q", r.Header.Get("Range"))
+		}
+		if from < 0 {
+			from = 0
+		}
+		if to >= len(raw) {
+			to = len(raw) - 1
+		}
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", from, to, len(raw)))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(raw[from : to+1])
+	}))
+	d.Config.Token = "fixture-pat"
+	_, out, err := getPipelineJobOutput(context.Background(), nil, getPipelineJobOutputIn{
+		ProjectID: "42", JobID: 8, Selector: "range", StartByte: &start, EndByte: &end, MaxScanBytes: 256, MaxBytes: 1 << 20,
+	}, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := decodeTrace(t, out)["trace"].(string)
+	if strings.Contains(text, "SECRET") {
+		t.Fatalf("quoted continuation leaked %q", text)
+	}
+}
+
 func TestGetPipelineJobOutput_rangeEndNearMaxIntDoesNotCollapse(t *testing.T) {
 	start := int64(0)
 	end := int64(math.MaxInt64 - 10)

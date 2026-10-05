@@ -125,6 +125,12 @@ func redactRangeEdges(src []byte, from, to int, token string, hideHead, hideTail
 		if s, e, ok := leadingUnanchoredToken(src, from, to); ok {
 			spans = append(spans, [2]int{s, e})
 		}
+		// A quoted credential can contain spaces. Those spaces must not end
+		// the withheld span when the opening quote sits in lookbehind or
+		// before the fetched buffer.
+		if s, e, ok := quotedHeadContinuation(src, from, to); ok {
+			spans = append(spans, [2]int{s, e})
+		}
 	}
 	if hideTail {
 		// The buffer is not a proven end of the trace. Suppress a credential
@@ -256,6 +262,71 @@ func leadingUnanchoredToken(src []byte, from, to int) (int, int, bool) {
 
 func isTraceDelim(c byte) bool {
 	return c <= ' ' || c == '"' || c == '\''
+}
+
+// quotedHeadContinuation withholds a quoted Authorization/Bearer value that
+// began before the returned window. Spaces inside the quotes are not
+// delimiters. When the opening quote is in lookbehind, quote state is
+// tracked from the current line. When the opening quote sits before src,
+// the first quote in the window that is followed by a delimiter or the
+// window end is treated as the closer.
+func quotedHeadContinuation(src []byte, from, to int) (int, int, bool) {
+	if from < 0 {
+		from = 0
+	}
+	if to > len(src) {
+		to = len(src)
+	}
+	if from >= to {
+		return 0, 0, false
+	}
+	line := 0
+	for i := 0; i < from; i++ {
+		if src[i] == '\n' || src[i] == '\r' {
+			line = i + 1
+		}
+	}
+	quote := byte(0)
+	for i := line; i < from; i++ {
+		c := src[i]
+		if quote != 0 {
+			if c == quote {
+				quote = 0
+			}
+			continue
+		}
+		if c == '"' || c == '\'' {
+			quote = c
+		}
+	}
+	if quote == 0 {
+		if line != 0 {
+			return 0, 0, false
+		}
+		for i := from; i < to; i++ {
+			if src[i] == '\n' || src[i] == '\r' {
+				return 0, 0, false
+			}
+			if src[i] == '"' || src[i] == '\'' {
+				if i+1 >= to || src[i+1] <= ' ' {
+					return from, i + 1, true
+				}
+				return 0, 0, false
+			}
+		}
+		return 0, 0, false
+	}
+	end := from
+	for end < to && src[end] != quote && src[end] != '\n' && src[end] != '\r' {
+		end++
+	}
+	if end < to && src[end] == quote {
+		end++
+	}
+	if end <= from {
+		return 0, 0, false
+	}
+	return from, end, true
 }
 
 func missingPrefixMatch(data []byte, prefix, token string) int {

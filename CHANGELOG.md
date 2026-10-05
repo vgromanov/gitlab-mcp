@@ -27,6 +27,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   lookbehind and lookahead for redaction, then crops the returned window to
   the scan cap. The 30s timeout and default body budget start before project
   authorization so a stuck identity lookup cannot overrun the deadline.
+  After authorization, the remaining byte and request caps are raised by
+  whatever identity lookups already charged, so a fitting tail is not cut
+  short and group ancestry does not spend the trace GET. A 206 whose
+  `Content-Range` total is `*` does not complete an error search. Quoted
+  Authorization values that continue across a range cut are withheld even
+  when the lookbehind contains spaces.
   Tail and range windows keep redaction context outside the returned
   bytes, a partial
   206 is not a complete trace, redaction is linear in the trace size, and

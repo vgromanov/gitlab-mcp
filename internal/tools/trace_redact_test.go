@@ -278,6 +278,33 @@ func TestRedactRangeEdges_openCredentialBeyondLookbehind(t *testing.T) {
 	}
 }
 
+func TestRedactRangeEdges_quotedContinuationWithSpaces(t *testing.T) {
+	// Opening quote is in lookbehind; spaces inside the value are not delimiters.
+	src := []byte(`Authorization: Bearer "AA BB CC SECRET"`)
+	from := bytes.Index(src, []byte("SECRET"))
+	out, _ := redactRangeEdges(src, from, len(src)-1, "", true, false, false)
+	if strings.Contains(out, "SECRET") {
+		t.Fatalf("opener in lookbehind leaked %q", out)
+	}
+	// Opening quote sits before src. Lookbehind is mid-value and contains spaces.
+	lookbehind := []byte(strings.Repeat("A ", 200))
+	window := []byte("SECRET-MARKER\" next")
+	cut := append(append([]byte{}, lookbehind...), window...)
+	from = len(lookbehind)
+	to := from + len("SECRET-MARKER\"")
+	out, _ = redactRangeEdges(cut, from, to, "", true, false, false)
+	if strings.Contains(out, "SECRET") {
+		t.Fatalf("opener before src leaked %q", out)
+	}
+	// A later quoted word on the same line is an opener, not a closer.
+	plain := []byte(strings.Repeat("x", 20) + ` hello "world"`)
+	from = 20
+	out, _ = redactRangeEdges(plain, from, len(plain), "", true, false, false)
+	if !strings.Contains(out, "hello") {
+		t.Fatalf("plaintext dropped %q", out)
+	}
+}
+
 func TestTrimOutputBytes_runeBoundary(t *testing.T) {
 	s := "ok" + string(rune(0x1F600)) + "tail"
 	cut, trimmed := trimOutputBytes(s, len("ok")+1)

@@ -219,14 +219,15 @@ func getPipelineJobOutput(ctx context.Context, _ *mcp.CallToolRequest, in getPip
 		token = d.Config.Token
 	}
 	// Tail and range reads keep a redaction margin outside the retained window,
-	// and the copier needs one extra byte to observe EOF. A budget already on
-	// the context must be raised to that size: BudgetInterceptor would otherwise
-	// cut the suffix back and a long trace would be cleared as an unproven tail.
+	// and the copier needs one extra byte to observe EOF. Do not pin MaxBytes
+	// to that window before authorization: a project or group identity body is
+	// larger than the lookbehind slack and would spend the trace allowance.
+	// A budget already on the context is raised to the trace size; after
+	// identity lookups we add whatever was already charged so the GET still
+	// has a full window (and at least two requests for a Range retry).
 	need := traceBudgetBytes(q.scan, traceContextMargin(token))
 	if b := igl.BudgetFromContext(ctx); b == nil {
 		b = igl.DefaultBudget()
-		b.MaxBytes = need
-		b.MaxRequests = 4
 		b.MaxElapsed = 30 * time.Second
 		ctx = igl.WithBudget(ctx, b)
 	} else {
@@ -236,6 +237,7 @@ func getPipelineJobOutput(ctx context.Context, _ *mcp.CallToolRequest, in getPip
 	if err != nil {
 		return nil, nil, err
 	}
+	reserveJobTraceBudget(ctx, need)
 	res, meta, err := readJobTrace(ctx, d, pid, in.JobID, q)
 	if err != nil {
 		return nil, nil, err
@@ -253,6 +255,22 @@ type traceReadMeta struct {
 	rangeIgnored bool
 	unprovenTail bool
 	scanStopped  bool
+}
+
+// jobTraceMinRequests is the remaining RoundTrips a trace GET may need after
+// authorization: one read, plus a second if Range is ignored and we fall back.
+const jobTraceMinRequests = 2
+
+// reserveJobTraceBudget raises the shared invocation budget so identity
+// bodies and group ancestry already charged do not steal the trace window.
+func reserveJobTraceBudget(ctx context.Context, need int64) {
+	b := igl.BudgetFromContext(ctx)
+	if b == nil {
+		return
+	}
+	reqs, nbytes, _ := b.Stats()
+	b.EnsureMinBytes(nbytes + need)
+	b.EnsureMinRequests(reqs + jobTraceMinRequests)
 }
 
 // traceBudgetBytes is the body cap installed when the caller has no budget.
@@ -479,12 +497,15 @@ func sectionForTrace(now time.Time, win jobTraceWindow, piece tracePiece, meta t
 			sec.ContentComplete = readmeta.ContentCompleteFalse
 			sec.PatchCoverage = readmeta.CoverageUnknown
 			sec.AddLimitation(readmeta.CodeBudgetBytes, "scan budget exhausted before an error region")
+		} else if !win.TotalKnown {
+			// A 206 with total "*" can EOF the ranged body without proving the
+			// object size. That is not a finished search of the whole trace.
+			sec.ContentComplete = readmeta.ContentCompleteUnknown
+			sec.PatchCoverage = readmeta.CoverageUnknown
 		} else {
 			sec.ContentComplete = readmeta.ContentCompleteTrue
 			sec.PatchCoverage = readmeta.CoverageFull
-			if win.TotalKnown {
-				sec.ManifestCoverage = readmeta.CoverageFull
-			}
+			sec.ManifestCoverage = readmeta.CoverageFull
 		}
 	case piece.full && win.TotalKnown:
 		sec.ContentComplete = readmeta.ContentCompleteTrue

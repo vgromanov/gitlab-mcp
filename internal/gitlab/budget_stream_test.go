@@ -72,6 +72,23 @@ func TestBudget_RemainingBytes(t *testing.T) {
 	}
 }
 
+func TestBudget_EnsureMinRequests(t *testing.T) {
+	b := &Budget{MaxRequests: 4, requests: 4}
+	b.EnsureMinRequests(6)
+	if b.MaxRequests != 6 {
+		t.Fatalf("raised %d", b.MaxRequests)
+	}
+	b.EnsureMinRequests(3)
+	if b.MaxRequests != 6 {
+		t.Fatalf("lowered %d", b.MaxRequests)
+	}
+	unlimited := &Budget{MaxRequests: 0, requests: 10}
+	unlimited.EnsureMinRequests(12)
+	if unlimited.MaxRequests != 0 {
+		t.Fatalf("unlimited %d", unlimited.MaxRequests)
+	}
+}
+
 // TestBudget_CapLimitsConcurrentWithRemainingStatsCharge exercises CapLimits
 // writers against RemainingBytes/Stats/reserveBytes/chargeRequest under -race.
 func TestBudget_CapLimitsConcurrentWithRemainingStatsCharge(t *testing.T) {
