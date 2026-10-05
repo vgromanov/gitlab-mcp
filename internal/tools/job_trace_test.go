@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strings"
 	"sync/atomic"
@@ -802,6 +803,65 @@ func TestGetPipelineJobOutput_presetScanBudgetStillProvesTail(t *testing.T) {
 	win := traceWindow(t, out)
 	if win["tail_proven"] != true || !strings.Contains(text, "END") {
 		t.Fatalf("text %q window %#v", text, win)
+	}
+}
+
+func TestGetPipelineJobOutput_shortCompleteBearer(t *testing.T) {
+	d := authzDeps(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/trace") {
+			_, _ = io.WriteString(w, "pre\nBearer abc\npost\n")
+			return
+		}
+		_, _ = io.WriteString(w, `{"id":42}`)
+	}))
+	_, out, err := getPipelineJobOutput(context.Background(), nil, getPipelineJobOutputIn{
+		ProjectID: "42", JobID: 8,
+	}, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := decodeTrace(t, out)["trace"].(string)
+	if strings.Contains(text, "Bearer") || strings.Contains(text, "abc") || !strings.Contains(text, "pre") || !strings.Contains(text, "post") {
+		t.Fatalf("trace %q", text)
+	}
+}
+
+func TestGetPipelineJobOutput_rangeEndNearMaxIntDoesNotCollapse(t *testing.T) {
+	start := int64(0)
+	end := int64(math.MaxInt64 - 10)
+	var rng string
+	d := authzDeps(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, "/trace") {
+			_, _ = io.WriteString(w, `{"id":42}`)
+			return
+		}
+		rng = r.Header.Get("Range")
+		_, _ = io.WriteString(w, "ok\n")
+	}))
+	_, _, err := getPipelineJobOutput(context.Background(), nil, getPipelineJobOutputIn{
+		ProjectID: "42", JobID: 8, Selector: "range", StartByte: &start, EndByte: &end, MaxScanBytes: 64,
+	}, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var from, to int64
+	if _, scanErr := fmt.Sscanf(rng, "bytes=%d-%d", &from, &to); scanErr != nil {
+		t.Fatalf("range %q", rng)
+	}
+	if to <= from || to < end-1 {
+		t.Fatalf("collapsed range %q", rng)
+	}
+}
+
+func TestTraceEndWithMarginSaturates(t *testing.T) {
+	if got := traceEndWithMargin(math.MaxInt64-10, 512); got != math.MaxInt64 {
+		t.Fatalf("saturated %d", got)
+	}
+	if got := traceEndWithMargin(100, 512); got != 612 {
+		t.Fatalf("plain %d", got)
+	}
+	if got := traceEndWithMargin(math.MaxInt64-512, 512); got != math.MaxInt64 {
+		t.Fatalf("exact %d", got)
 	}
 }
 

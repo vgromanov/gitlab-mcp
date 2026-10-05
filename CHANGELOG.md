@@ -25,7 +25,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   starts inside a long credential withholds that leading token, URL userinfo
   is redacted through `@` past 256 bytes, a scan-capped 206 larger than its
   declared `Content-Range` is rejected, and cancelling a blocked trace read
-  does not deadlock the budget wrapper (RVG-136).
+  does not deadlock the budget wrapper. A complete short `Bearer` value is
+  redacted, and a range end near `math.MaxInt64` does not wrap when the
+  redaction margin is added (RVG-136).
 - Legacy MR diff getters (`get_merge_request_diffs`, `get_merge_request_file_diff`,
   `get_merge_request_conflicts`) now include honest `pagination` / `section`
   completeness metadata on their existing object responses (RVG-127 /

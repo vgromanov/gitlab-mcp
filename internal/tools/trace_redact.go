@@ -709,7 +709,13 @@ func parseBearer(src []byte, i int) (int, int, bool) {
 	for j < len(src) && isTokenChar(src[j]) {
 		j++
 	}
-	if j-start < 8 {
+	if j == start {
+		return 0, 0, false
+	}
+	// A delimiter means the value is complete. Bearer abc is still a secret.
+	// A short value that runs off the end of this buffer is a scan cut, not a
+	// finished token; boundary suppression handles that when the read is not EOF.
+	if j == len(src) && j-start < 8 {
 		return 0, 0, false
 	}
 	return i, j, true

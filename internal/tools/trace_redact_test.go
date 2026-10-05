@@ -121,6 +121,23 @@ func TestSelectPrefix_scanCutWithholdsShortCredential(t *testing.T) {
 	}
 }
 
+func TestRedact_shortCompleteBearer(t *testing.T) {
+	body := []byte("pre\nBearer abc\npost\n")
+	out, n := redactBytes(body, nil)
+	s := string(out)
+	if strings.Contains(s, "abc") || strings.Contains(s, "Bearer") || n < 1 {
+		t.Fatalf("n %d out %q", n, s)
+	}
+	if !strings.Contains(s, "pre") || !strings.Contains(s, "post") {
+		t.Fatalf("out %q", s)
+	}
+	// A scan that stops inside the value is not a finished short token.
+	cut := selectPrefix([]byte("pre\nBearer abc"), 0, 0, 1<<20, jobTraceHardLine, "", false)
+	if strings.Contains(cut.text, "abc") || strings.Contains(cut.text, "Bearer") {
+		t.Fatalf("cut %q", cut.text)
+	}
+}
+
 func TestRedact_longUserinfo(t *testing.T) {
 	pass := strings.Repeat("p", 300)
 	user := strings.Repeat("u", 300)

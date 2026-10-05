@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -264,6 +265,21 @@ func traceBudgetBytes(scan, margin int) int64 {
 	return n
 }
 
+// traceEndWithMargin is the exclusive range end plus a redaction margin.
+// The sum saturates at math.MaxInt64 so it cannot wrap negative.
+func traceEndWithMargin(end, margin int64) int64 {
+	if margin < 0 {
+		margin = 0
+	}
+	if end < 0 {
+		end = 0
+	}
+	if end > math.MaxInt64-margin {
+		return math.MaxInt64
+	}
+	return end + margin
+}
+
 func traceContextMargin(token string) int {
 	m := jobTraceLookbehind
 	if len(token) > m {
@@ -326,7 +342,9 @@ func readJobTrace(ctx context.Context, d Deps, pid string, jobID int64, q traceQ
 			ProjectID: pid, JobID: jobID, RangeStart: &reqStart, MaxScanBytes: int64(q.scan),
 		}
 		if q.end != nil {
-			end := *q.end + lb
+			// Adding the margin near math.MaxInt64 wraps to a negative end.
+			// traceRangeHeader then sends a one-byte range. Saturate instead.
+			end := traceEndWithMargin(*q.end, lb)
 			req.RangeEndExcl = &end
 			// Keep both the lookbehind and the trailing margin inside the read,
 			// even when the requested window already fills max_scan_bytes.
