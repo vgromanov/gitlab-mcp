@@ -27,7 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   declared `Content-Range` is rejected, and cancelling a blocked trace read
   does not deadlock the budget wrapper. A complete short `Bearer` value is
   redacted, and a range end near `math.MaxInt64` does not wrap when the
-  redaction margin is added (RVG-136).
+  redaction margin is added. Password-only URL userinfo (`https://:secret@host`)
+  is redacted, and line-cap span remapping stays linear in the retained
+  window (RVG-136).
 - Legacy MR diff getters (`get_merge_request_diffs`, `get_merge_request_file_diff`,
   `get_merge_request_conflicts`) now include honest `pagination` / `section`
   completeness metadata on their existing object responses (RVG-127 /

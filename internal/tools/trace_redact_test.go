@@ -152,6 +152,31 @@ func TestRedact_longUserinfo(t *testing.T) {
 	}
 }
 
+func TestRedact_passwordOnlyUserinfo(t *testing.T) {
+	body := "see https://:secret@example.com/path and https://example.com/x\n"
+	out, n := redactBytes([]byte(body), nil)
+	s := string(out)
+	if strings.Contains(s, "secret") || n < 1 {
+		t.Fatalf("n %d out %q", n, s)
+	}
+	if !strings.Contains(s, "example.com/path") || !strings.Contains(s, "example.com/x") || !strings.Contains(s, "https://") {
+		t.Fatalf("out %q", s)
+	}
+}
+
+func TestSelectPrefix_manyGlpatSpansStayLinear(t *testing.T) {
+	unit := []byte("glpat-" + strings.Repeat("a", 16) + ":")
+	raw := bytes.Repeat(unit, (1<<20)/len(unit))
+	start := time.Now()
+	p := selectPrefix(raw, 0, 0, len(raw), 64<<10, "", true)
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("line-cap remap took %s", elapsed)
+	}
+	if !p.lineCapped || strings.Contains(p.text, "glpat-") || strings.Contains(p.text, strings.Repeat("a", 16)) {
+		t.Fatalf("capped %v text %q", p.lineCapped, p.text[:min(80, len(p.text))])
+	}
+}
+
 func TestRedactRangeEdges_openCredentialBeyondLookbehind(t *testing.T) {
 	secret := strings.Repeat("s", 600)
 	src := []byte(secret + " next")

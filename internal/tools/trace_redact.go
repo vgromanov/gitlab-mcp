@@ -767,7 +767,9 @@ func parseUserinfo(src []byte, i int) (int, int, bool) {
 	for j < len(src) && j-userStart < 256 && src[j] != ':' && src[j] != '@' && src[j] != '/' && src[j] > ' ' {
 		j++
 	}
-	if j == userStart {
+	// https://:secret@host has an empty username. The colon is the delimiter,
+	// not a failed match.
+	if j == userStart && (j >= len(src) || src[j] != ':') {
 		return 0, 0, false
 	}
 	// 256 bytes only recognizes userinfo. A longer username still runs to ':'.

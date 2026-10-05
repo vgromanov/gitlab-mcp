@@ -3,6 +3,7 @@ package tools
 import (
 	"bytes"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -398,10 +399,30 @@ func remapSpans(spans [][2]int, copied []struct{ src, dst, n int }) [][2]int {
 	if len(spans) == 0 || len(copied) == 0 {
 		return nil
 	}
-	out := make([][2]int, 0, len(spans))
+	if !spansStartOrdered(spans) {
+		spans = append([][2]int(nil), spans...)
+		sort.Slice(spans, func(i, j int) bool { return spans[i][0] < spans[j][0] })
+	}
+	// Spans and copied bytes are both in source order. One cursor walks them
+	// together so a capped line does not rescan every retained byte per span.
+	out := make([][2]int, 0)
+	ci := 0
 	for _, sp := range spans {
+		if sp[1] <= sp[0] {
+			continue
+		}
+		for ci < len(copied) && copied[ci].src+copied[ci].n <= sp[0] {
+			ci++
+		}
+		if ci >= len(copied) {
+			break
+		}
 		dstS, dstE := -1, -1
-		for _, c := range copied {
+		for k := ci; k < len(copied); k++ {
+			c := copied[k]
+			if c.src >= sp[1] {
+				break
+			}
 			a, b := c.src, c.src+c.n
 			if b <= sp[0] || a >= sp[1] {
 				continue
@@ -427,6 +448,15 @@ func remapSpans(spans [][2]int, copied []struct{ src, dst, n int }) [][2]int {
 		}
 	}
 	return out
+}
+
+func spansStartOrdered(spans [][2]int) bool {
+	for i := 1; i < len(spans); i++ {
+		if spans[i][0] < spans[i-1][0] {
+			return false
+		}
+	}
+	return true
 }
 
 func capTraceLines(s string, maxLine int) (string, bool) {
