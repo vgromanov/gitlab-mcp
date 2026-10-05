@@ -93,12 +93,7 @@ func (w *graphWalk) revalidateCompleted(ctx context.Context, d Deps, perPage int
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	budget := &igl.Budget{
-		MaxItems:    evidenceMaxItems,
-		MaxBytes:    igl.DefaultMaxBytes,
-		MaxElapsed:  igl.DefaultMaxElapsed,
-		MaxRequests: evidenceMaxRequests,
-	}
+	budget := newEvidenceBudget()
 	ctx = igl.WithBudget(ctx, budget)
 	defer budget.Cancel()
 	for _, key := range keys {
@@ -122,56 +117,129 @@ func (w *graphWalk) revalidateCompleted(ctx context.Context, d Deps, perPage int
 			}
 			return drift
 		}
-		jobs := ""
-		for page, n := 1, 0; ; n++ {
-			if n >= maxEvidencePages {
-				return drift
-			}
-			gp, err := collectJobPage(ctx, d, budget, a.Project, a.Pipeline, page, perPage, nil)
-			if err != nil {
-				return err
-			}
-			if gp.Partial || !gp.Paging.PagingKnown {
-				return drift
-			}
-			jobs = chainEvidence(jobs, jobGuardTokens(gp.Jobs)...)
-			next, more := pagingContinues(gp.Paging, page)
-			if !more {
-				if !gp.Paging.ExhaustedObserved {
-					return drift
-				}
-				break
-			}
-			page = int(next)
+		jobs, err := readJobEvidence(ctx, d, budget, a.Project, a.Pipeline, perPage, "", 1, 0)
+		if err != nil {
+			return err
 		}
-		bridges := ""
-		for page, n := 1, 0; ; n++ {
-			if n >= maxEvidencePages {
-				return drift
-			}
-			bp, err := collectBridgePage(ctx, d, budget, a.Project, a.Pipeline, page, perPage, nil)
-			if err != nil {
-				return err
-			}
-			if bp.Partial {
-				return drift
-			}
-			bridges = chainEvidence(bridges, bridgePageTokens(bp)...)
-			if bp.Unsupported || bp.Inaccessible {
-				break
-			}
-			next, more := pagingContinues(bp.Paging, page)
-			if !more {
-				if !bridgePagingExhausted(bp) {
-					return drift
-				}
-				break
-			}
-			page = int(next)
+		bridges, err := readBridgeEvidence(ctx, d, budget, a.Project, a.Pipeline, perPage, "", 1, 0)
+		if err != nil {
+			return err
 		}
 		if jobs != want[0] || bridges != want[1] {
 			return drift
 		}
+	}
+	return nil
+}
+
+func newEvidenceBudget() *igl.Budget {
+	return &igl.Budget{
+		MaxItems:    evidenceMaxItems,
+		MaxBytes:    igl.DefaultMaxBytes,
+		MaxElapsed:  igl.DefaultMaxElapsed,
+		MaxRequests: evidenceMaxRequests,
+	}
+}
+
+// readJobEvidence chains guard tokens for job pages from..until-1, or from..end
+// when until is 0. A bounded read requires every page to continue to the next.
+func readJobEvidence(ctx context.Context, d Deps, budget *igl.Budget, project string, pipelineID int64, perPage int, state string, from, until int) (string, error) {
+	drift := fmt.Errorf("%s: completed node evidence drift", cursor.ResyncRequired)
+	for page, n := from, 0; until == 0 || page < until; n++ {
+		if n >= maxEvidencePages {
+			return "", drift
+		}
+		gp, err := collectJobPage(ctx, d, budget, project, pipelineID, page, perPage, nil)
+		if err != nil {
+			return "", err
+		}
+		if gp.Partial || !gp.Paging.PagingKnown {
+			return "", drift
+		}
+		state = chainEvidence(state, jobGuardTokens(gp.Jobs)...)
+		next, more := pagingContinues(gp.Paging, page)
+		if !more {
+			if until > 0 || !gp.Paging.ExhaustedObserved {
+				return "", drift
+			}
+			break
+		}
+		page = int(next)
+	}
+	return state, nil
+}
+
+// readBridgeEvidence is the bridge-list counterpart of readJobEvidence.
+func readBridgeEvidence(ctx context.Context, d Deps, budget *igl.Budget, project string, pipelineID int64, perPage int, state string, from, until int) (string, error) {
+	drift := fmt.Errorf("%s: completed node evidence drift", cursor.ResyncRequired)
+	for page, n := from, 0; until == 0 || page < until; n++ {
+		if n >= maxEvidencePages {
+			return "", drift
+		}
+		bp, err := collectBridgePage(ctx, d, budget, project, pipelineID, page, perPage, nil)
+		if err != nil {
+			return "", err
+		}
+		if bp.Partial {
+			return "", drift
+		}
+		state = chainEvidence(state, bridgePageTokens(bp)...)
+		if bp.Unsupported || bp.Inaccessible {
+			if until > 0 {
+				return "", drift
+			}
+			break
+		}
+		next, more := pagingContinues(bp.Paging, page)
+		if !more {
+			if until > 0 || !bridgePagingExhausted(bp) {
+				return "", drift
+			}
+			break
+		}
+		page = int(next)
+	}
+	return state, nil
+}
+
+// revalidateActiveJobs re-reads job pages 1..through-1 of the active node and
+// checks that, with the already-guarded page through, they reproduce the
+// signed running digest.
+func (w *graphWalk) revalidateActiveJobs(ctx context.Context, d Deps, project string, pipelineID int64, perPage, through int, guard graphPage) error {
+	drift := fmt.Errorf("%s: active node evidence drift", cursor.ResyncRequired)
+	budget := newEvidenceBudget()
+	ctx = igl.WithBudget(ctx, budget)
+	defer budget.Cancel()
+	state, err := readJobEvidence(ctx, d, budget, project, pipelineID, perPage, "", 1, through)
+	if err != nil {
+		return err
+	}
+	if chainEvidence(state, jobGuardTokens(guard.Jobs)...) != w.jobsEv {
+		return drift
+	}
+	return nil
+}
+
+// revalidateActiveBridges re-reads every job page of the active node plus bridge
+// pages 1..through-1, and checks them against the signed running digests.
+func (w *graphWalk) revalidateActiveBridges(ctx context.Context, d Deps, project string, pipelineID int64, perPage, through int, guard bridgePage) error {
+	drift := fmt.Errorf("%s: active node evidence drift", cursor.ResyncRequired)
+	budget := newEvidenceBudget()
+	ctx = igl.WithBudget(ctx, budget)
+	defer budget.Cancel()
+	jobs, err := readJobEvidence(ctx, d, budget, project, pipelineID, perPage, "", 1, 0)
+	if err != nil {
+		return err
+	}
+	if jobs != w.jobsEv {
+		return drift
+	}
+	state, err := readBridgeEvidence(ctx, d, budget, project, pipelineID, perPage, "", 1, through)
+	if err != nil {
+		return err
+	}
+	if chainEvidence(state, bridgePageTokens(guard)...) != w.bridgesEv {
+		return drift
 	}
 	return nil
 }

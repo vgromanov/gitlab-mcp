@@ -516,7 +516,7 @@ func parseGraphBridge(raw json.RawMessage) (graphBridge, error) {
 	return br, nil
 }
 
-func (w *graphWalk) ingestBridges(parent graphNodeKey, parentSHA string, page bridgePage) {
+func (w *graphWalk) ingestBridges(parent graphNodeKey, parentSHA string, page bridgePage, prior lineageCarry) {
 	w.bridgesOn = true
 	w.bridgesEv = chainEvidence(w.bridgesEv, bridgePageTokens(page)...)
 	if page.Unsupported {
@@ -551,7 +551,7 @@ func (w *graphWalk) ingestBridges(parent graphNodeKey, parentSHA string, page br
 	if !w.hasIncompleteEdges() && !w.stickyIncomplete {
 		w.unseen = false
 	}
-	groups := buildLineage(bridgeJobs(page.Bridges), lineageCarry{})
+	groups := buildLineage(bridgeJobs(page.Bridges), prior)
 	w.recordOutcomes(groups)
 	for _, br := range page.Bridges {
 		w.addBridgeEdge(parent, parentSHA, br)
