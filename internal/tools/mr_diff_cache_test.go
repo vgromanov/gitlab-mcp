@@ -13,6 +13,7 @@ import (
 	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/gitcache/gitdiff"
 	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/gitcache/pack"
 	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/gitcache/tree"
+	igl "gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/gitlab"
 	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/tools/readmeta"
 )
 
@@ -465,5 +466,66 @@ func TestDiffWindow_cacheRecoversIncremental(t *testing.T) {
 	prov, _ := out["provenance"].(map[string]any)
 	if prov["semantics"] != gitdiff.SemanticsStraight {
 		t.Fatalf("provenance=%#v", prov)
+	}
+}
+
+func TestDiffWindow_incrementalMaxItemsStillRecovers(t *testing.T) {
+	if err := gitdiff.LookPath(); err != nil {
+		t.Skip(err.Error())
+	}
+	objs, base, head := twoCommitObjects(t, "p.txt", "old\n", "new\n")
+	hold := &gitcache.ObjectHold{
+		Result: gitcache.AcquireResult{
+			GenerationID: "gen-i1",
+			Grant: gitcache.Grant{
+				ProjectID: "42", HeadSHA: plumbing.NewHash(head), BaseSHA: plumbing.NewHash(base), StartSHA: plumbing.NewHash(base),
+			},
+		},
+		Objects: objs,
+	}
+	h := serveDiffBase(&pathLog{}, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/repository/compare"):
+			_, _ = io.WriteString(w, `{"commit":{"id":"`+head+`"},"diffs":[{"old_path":"p.txt","new_path":"p.txt","a_mode":"100644","b_mode":"100644"}]}`)
+		case strings.Contains(r.URL.Path, "/repository/commits/"):
+			sha := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
+			_, _ = io.WriteString(w, `{"id":"`+sha+`"}`)
+		case strings.Contains(r.URL.Path, "/merge_requests/"):
+			_, _ = io.WriteString(w, `{"id":5001,"iid":1,"project_id":42,"source_project_id":42}`)
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	d := diffDeps(t, h)
+	d.cacheHold = &fakeCacheHold{enabled: true, hold: hold}
+	out, err := callDiffWindow(t, d, nil, map[string]any{
+		"project_id": "42", "merge_request_iid": 1, "from_sha": base, "to_sha": head, "straight": true,
+		"per_page": 20, "max_items": 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sec := sectionMap(out)
+	if sec["source"] != readmeta.SourceGitCache {
+		t.Fatalf("section=%#v", sec)
+	}
+	entries, _ := out["entries"].([]any)
+	if len(entries) != 1 || asMap(t, entries[0])["new_path"] != "p.txt" {
+		t.Fatalf("entries=%#v", entries)
+	}
+}
+
+func TestManifestByteCapExhaustedIsZero(t *testing.T) {
+	b := igl.DefaultBudget()
+	b.MaxBytes = 8
+	if err := b.ChargeBytes(8); err != nil {
+		t.Fatal(err)
+	}
+	ctx := igl.WithBudget(context.Background(), b)
+	if got := manifestByteCap(ctx); got != 0 {
+		t.Fatalf("exhausted cap=%d", got)
+	}
+	if got := manifestByteCap(context.Background()); got != 8<<20 {
+		t.Fatalf("unlimited cap=%d", got)
 	}
 }

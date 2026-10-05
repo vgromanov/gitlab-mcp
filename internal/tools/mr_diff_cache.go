@@ -67,6 +67,9 @@ func cacheHoldCtx(ctx context.Context) context.Context {
 }
 
 func recoverCacheManifest(ctx context.Context, d Deps, q diffQuery, sec readmeta.Section, proved provedManifest) (diffWindowOut, bool) {
+	if manifestByteCap(ctx) == 0 {
+		return diffWindowOut{}, false
+	}
 	hold, from, to, sem, prov, ok := prepareCacheCompare(ctx, d, q, proved)
 	if !ok {
 		return diffWindowOut{}, false
@@ -95,10 +98,11 @@ func recoverCacheManifest(ctx context.Context, d Deps, q diffQuery, sec readmeta
 		all = append(all, entryFromGitFile(f))
 	}
 	sortManifestEntries(all)
+	already := alreadyChargedItems(ctx)
 	entries := make([]diffManifestEntry, 0, len(all))
 	full := true
-	for _, e := range all {
-		if b := igl.BudgetFromContext(ctx); b != nil {
+	for i, e := range all {
+		if b := igl.BudgetFromContext(ctx); b != nil && i >= already {
 			if err := b.AddItem(); err != nil {
 				full = false
 				sec.AddLimitation(readmeta.CodePartial, "item budget")
@@ -123,6 +127,9 @@ func recoverCacheManifest(ctx context.Context, d Deps, q diffQuery, sec readmeta
 }
 
 func recoverCacheContent(ctx context.Context, d Deps, q diffQuery, sec readmeta.Section, proved provedManifest, opts diffContentOpts, versionID int64) (diffContentOut, bool) {
+	if manifestByteCap(ctx) == 0 {
+		return diffContentOut{}, false
+	}
 	hold, from, to, sem, prov, ok := prepareCacheCompare(ctx, d, q, proved)
 	if !ok {
 		return diffContentOut{}, false
@@ -149,10 +156,11 @@ func recoverCacheContent(ctx context.Context, d Deps, q diffQuery, sec readmeta.
 	sort.SliceStable(all, func(i, j int) bool {
 		return manifestOrderLess(all[i].entry, all[j].entry)
 	})
+	already := alreadyChargedItems(ctx)
 	files := make([]retainedDiffFile, 0, len(all))
 	truncated := false
-	for _, f := range all {
-		if b := igl.BudgetFromContext(ctx); b != nil {
+	for i, f := range all {
+		if b := igl.BudgetFromContext(ctx); b != nil && i >= already {
 			if err := b.AddItem(); err != nil {
 				truncated = true
 				sec.AddLimitation(readmeta.CodePartial, "item budget")
@@ -418,9 +426,21 @@ func shaOr(primary, fallback string) string {
 	return ""
 }
 
+func alreadyChargedItems(ctx context.Context) int {
+	if b := igl.BudgetFromContext(ctx); b != nil {
+		_, _, items := b.Stats()
+		return items
+	}
+	return 0
+}
+
 func manifestByteCap(ctx context.Context) int {
 	if b := igl.BudgetFromContext(ctx); b != nil {
-		if left := b.RemainingBytes(); left > 0 && left < 8<<20 {
+		left := b.RemainingBytes()
+		if left == 0 {
+			return 0
+		}
+		if left > 0 && left < 8<<20 {
 			return int(left)
 		}
 	}
