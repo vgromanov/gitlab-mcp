@@ -136,6 +136,8 @@ func (s *Store) ClaimSending(ctx context.Context, operationID string) (Receipt, 
 }
 
 // RecordOutcome stores a reconciliation result without starting a dispatch.
+// The write is limited to a row stamped with this handle's epoch, so a store
+// that still has the previous epoch cannot finalize a receipt created after reset.
 func (s *Store) RecordOutcome(ctx context.Context, operationID string, outcome Outcome) (Receipt, error) {
 	if !validHead(outcome.ObservedHead) || !validIDs(outcome.UpstreamIDs) || !validVerification(outcome.VerificationState) {
 		return Receipt{}, ErrInvalidOutcome
@@ -186,11 +188,18 @@ func (s *Store) RecordOutcome(ctx context.Context, operationID string, outcome O
 		if !finalized.IsZero() {
 			finalizedArg = finalized.UTC().UnixNano()
 		}
-		_, err = tx.ExecContext(ctx, `UPDATE intents SET state=?, observed_head=?, upstream_ids=?, verification_state=?,
-			updated_unix_nano=?, finalized_unix_nano=? WHERE operation_id=?`,
-			string(outcome.State), observedArg, upstreamArg, verifyArg, now.UnixNano(), finalizedArg, operationID)
+		res, err := tx.ExecContext(ctx, `UPDATE intents SET state=?, observed_head=?, upstream_ids=?, verification_state=?,
+			updated_unix_nano=?, finalized_unix_nano=? WHERE operation_id=? AND row_epoch=?`,
+			string(outcome.State), observedArg, upstreamArg, verifyArg, now.UnixNano(), finalizedArg, operationID, s.epoch)
 		if err != nil {
 			return mapDriver(err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return mapDriver(err)
+		}
+		if n != 1 {
+			return ErrStaleEpoch
 		}
 		out, err = getByIDTx(ctx, tx, operationID, s.epoch)
 		return err

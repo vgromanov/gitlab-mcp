@@ -542,6 +542,56 @@ func TestForeignEpochBlocksOldWrite(t *testing.T) {
 	}
 }
 
+func TestStaleHandleCannotFinalizeCurrentEpoch(t *testing.T) {
+	cfg, _ := fixedNow(t)
+	current := openStore(t, cfg)
+	stale := openStore(t, cfg)
+	ctx := context.Background()
+	own, err := stale.Begin(ctx, ident("old"), PayloadHash([]byte("old")), BeginOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	current.DisableDispatch()
+	if err := current.ResetEpoch(ctx, EpochResetConfirmation); err != nil {
+		t.Fatal(err)
+	}
+	current.dispatch = true
+	rec, err := current.Begin(ctx, ident("new"), PayloadHash([]byte("new")), BeginOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, state := range []State{StateRejected, StateUncertain} {
+		_, err := stale.RecordOutcome(ctx, rec.OperationID, Outcome{State: state})
+		if !errors.Is(err, ErrStaleEpoch) {
+			t.Fatalf("stale %s: %v", state, err)
+		}
+	}
+	got, err := current.Get(ctx, rec.OperationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != StatePrepared || got.Epoch != rec.Epoch {
+		t.Fatalf("current receipt changed: %+v", got)
+	}
+	if _, err := current.RecordOutcome(ctx, own.OperationID, Outcome{State: StateRejected}); !errors.Is(err, ErrStaleEpoch) {
+		t.Fatalf("new epoch finalizing old receipt: %v", err)
+	}
+	ownGot, err := stale.RecordOutcome(ctx, own.OperationID, Outcome{State: StateRejected})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ownGot.State != StateRejected || ownGot.Epoch != own.Epoch {
+		t.Fatalf("own outcome: %+v", ownGot)
+	}
+	got, err = current.RecordOutcome(ctx, rec.OperationID, Outcome{State: StateUncertain})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != StateUncertain || !got.EpochCurrent {
+		t.Fatalf("current outcome: %+v", got)
+	}
+}
+
 func TestRecordOutcomeAfterDisableDispatch(t *testing.T) {
 	cfg, _ := fixedNow(t)
 	s := openStore(t, cfg)

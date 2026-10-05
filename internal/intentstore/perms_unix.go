@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 
 	"golang.org/x/sys/unix"
 )
@@ -15,7 +16,7 @@ func checkDirAccess(_ string, info os.FileInfo) error {
 	if info.Mode().Perm() != 0o700 {
 		return ErrUnsafePermissions
 	}
-	return nil
+	return checkOwner(info)
 }
 
 func checkFileAccess(_ string, info os.FileInfo) error {
@@ -24,6 +25,20 @@ func checkFileAccess(_ string, info os.FileInfo) error {
 		return ErrReadOnly
 	}
 	if perm != 0o600 {
+		return ErrUnsafePermissions
+	}
+	return checkOwner(info)
+}
+
+// checkOwner rejects a directory or store file owned by another user.
+// Mode 0700/0600 is not enough when this process is root: the directory
+// owner can still replace intent.db and its sidecars.
+func checkOwner(info os.FileInfo) error {
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || st == nil {
+		return ErrUnsafePermissions
+	}
+	if st.Uid != uint32(os.Geteuid()) {
 		return ErrUnsafePermissions
 	}
 	return nil
