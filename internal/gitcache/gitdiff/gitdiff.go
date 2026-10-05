@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/filemode"
@@ -40,6 +41,8 @@ const (
 	contextLines   = 3
 	binarySniff    = 8000
 	gitModeMissing = "0"
+	rawModeMissing = "000000"
+	rawModeWidth   = 6
 )
 
 var (
@@ -241,7 +244,7 @@ func (c *Comparison) Patches(ctx context.Context, paths []string, lim Limits) (P
 		if err := ctx.Err(); err != nil {
 			return c.patchBound(out, ctx)
 		}
-		text, err := renderPatch(ctx, ch, f, lim.MaxBytes-out.Bytes)
+		text, err := renderPatch(ctx, ch, f, lim.MaxBytes-out.Bytes, c.objs)
 		if err != nil {
 			if errors.Is(err, errCapped) {
 				out.Partial, out.Reason = true, "output limit"
@@ -268,11 +271,11 @@ func (c *Comparison) patchBound(out PatchResult, ctx context.Context) (PatchResu
 
 var errCapped = errors.New("gitdiff: output capped")
 
-func renderPatch(ctx context.Context, ch *object.Change, f File, room int) (string, error) {
+func renderPatch(ctx context.Context, ch *object.Change, f File, room int, objs map[plumbing.Hash]pack.Object) (string, error) {
 	if room <= 0 {
 		return "", errCapped
 	}
-	p, err := changePatch(ctx, ch)
+	p, err := changePatch(ctx, ch, objs)
 	if err != nil {
 		return "", err
 	}
@@ -297,23 +300,15 @@ func renderPatch(ctx context.Context, ch *object.Change, f File, room int) (stri
 // context while doing so. Here the diff library gets the time left on ctx, and a
 // diff that used it all is discarded instead of returned as a degraded
 // delete-plus-insert.
-func changePatch(ctx context.Context, ch *object.Change) (fdiff.Patch, error) {
-	from, to, err := ch.Files()
-	if err != nil {
-		return nil, err
-	}
-	fromContent, fromBin, err := fileText(from)
-	if err != nil {
-		return nil, err
-	}
-	toContent, toBin, err := fileText(to)
-	if err != nil {
-		return nil, err
-	}
+func changePatch(ctx context.Context, ch *object.Change, objs map[plumbing.Hash]pack.Object) (fdiff.Patch, error) {
 	fp := &filePatch{from: ch.From, to: ch.To}
-	if fromBin || toBin {
+	fromBytes, fromOK := blobTextBytes(objs, ch.From.TreeEntry)
+	toBytes, toOK := blobTextBytes(objs, ch.To.TreeEntry)
+	if !fromOK || !toOK {
 		return &patch{[]fdiff.FilePatch{fp}}, nil
 	}
+	fromContent := string(fromBytes)
+	toContent := string(toBytes)
 
 	budget := time.Hour
 	if dl, ok := ctx.Deadline(); ok {
@@ -340,18 +335,6 @@ func changePatch(ctx context.Context, ch *object.Change) (fdiff.Patch, error) {
 		fp.chunks = append(fp.chunks, chunk{d.Text, op})
 	}
 	return &patch{[]fdiff.FilePatch{fp}}, nil
-}
-
-func fileText(f *object.File) (string, bool, error) {
-	if f == nil {
-		return "", false, nil
-	}
-	bin, err := f.IsBinary()
-	if err != nil || bin {
-		return "", bin, err
-	}
-	text, err := f.Contents()
-	return text, false, err
 }
 
 type patch struct{ files []fdiff.FilePatch }
@@ -453,7 +436,7 @@ func fileFromChange(ch *object.Change, objs map[plumbing.Hash]pack.Object) (File
 		f.Status = "M"
 	}
 	f.Submodule = ch.From.TreeEntry.Mode == filemode.Submodule || ch.To.TreeEntry.Mode == filemode.Submodule
-	f.Binary = blobBinary(objs, ch.From.TreeEntry) || blobBinary(objs, ch.To.TreeEntry)
+	f.Binary = !blobTextOK(objs, ch.From.TreeEntry) || !blobTextOK(objs, ch.To.TreeEntry)
 	return f, nil
 }
 
@@ -465,29 +448,90 @@ func modeString(m filemode.FileMode) string {
 }
 
 func blobBinary(objs map[plumbing.Hash]pack.Object, e object.TreeEntry) bool {
-	if e.Hash.IsZero() || !e.Mode.IsFile() {
+	data := blobBytes(objs, e)
+	if len(data) == 0 {
 		return false
+	}
+	sniff := data
+	if len(sniff) > binarySniff {
+		sniff = sniff[:binarySniff]
+	}
+	return bytes.IndexByte(sniff, 0) >= 0
+}
+
+func blobBytes(objs map[plumbing.Hash]pack.Object, e object.TreeEntry) []byte {
+	if e.Hash.IsZero() || !e.Mode.IsFile() {
+		return nil
 	}
 	obj, ok := objs[e.Hash]
 	if !ok || obj.Type != "blob" {
-		return false
+		return nil
 	}
-	data := obj.Data
-	if len(data) > binarySniff {
-		data = data[:binarySniff]
+	return obj.Data
+}
+
+// blobTextOK is false for NUL-binary blobs and for text blobs that are not valid UTF-8.
+func blobTextOK(objs map[plumbing.Hash]pack.Object, e object.TreeEntry) bool {
+	_, ok := blobTextBytes(objs, e)
+	return ok
+}
+
+func blobTextBytes(objs map[plumbing.Hash]pack.Object, e object.TreeEntry) ([]byte, bool) {
+	data := blobBytes(objs, e)
+	if len(data) == 0 {
+		return data, true
 	}
-	return bytes.IndexByte(data, 0) >= 0
+	if blobBinary(objs, e) {
+		return data, false
+	}
+	if !utf8.Valid(data) {
+		return data, false
+	}
+	return data, true
 }
 
 // rawRowSize is the size of the equivalent `git diff --raw -z` record, so the
 // charge is comparable to what a subprocess would have emitted.
 func rawRowSize(f File) int {
+	status := rawStatusField(f)
+	amode := rawModeField(f, true)
+	bmode := rawModeField(f, false)
 	// ":" amode " " bmode " " 40 " " 40 " " status NUL path NUL [path NUL]
-	n := 1 + len(f.AMode) + 1 + len(f.BMode) + 1 + 40 + 1 + 40 + 1 + len(f.Status) + 1 + len(f.NewPath) + 1
+	n := 1 + len(amode) + 1 + len(bmode) + 1 + 40 + 1 + 40 + 1 + len(status) + 1 + len(f.NewPath) + 1
 	if f.RenamedFile {
 		n += len(f.OldPath) + 1
 	}
 	return n
+}
+
+func rawModeField(f File, old bool) string {
+	if old && f.NewFile {
+		return rawModeMissing
+	}
+	if !old && f.DeletedFile {
+		return rawModeMissing
+	}
+	if old {
+		return rawModeString(f.AMode)
+	}
+	return rawModeString(f.BMode)
+}
+
+func rawModeString(mode string) string {
+	if mode == gitModeMissing || mode == "" {
+		return rawModeMissing
+	}
+	if len(mode) >= rawModeWidth {
+		return mode
+	}
+	return strings.Repeat("0", rawModeWidth-len(mode)) + mode
+}
+
+func rawStatusField(f File) string {
+	if f.RenamedFile {
+		return fmt.Sprintf("R%03d", renameScore)
+	}
+	return f.Status
 }
 
 // memStore adapts the held objects to go-git's read-only storer.

@@ -470,12 +470,21 @@ func TestPackageNeverImportsExec(t *testing.T) {
 
 func TestRawRowSizeAndModeString(t *testing.T) {
 	plain := rawRowSize(File{OldPath: "a", NewPath: "a", AMode: "100644", BMode: "100644", Status: "M"})
-	renamed := rawRowSize(File{OldPath: "a", NewPath: "bb", AMode: "100644", BMode: "100644", Status: "R", RenamedFile: true})
-	if renamed <= plain {
-		t.Fatalf("rename row %d not larger than %d", renamed, plain)
+	renamedRow := File{OldPath: "a", NewPath: "bb", AMode: "100644", BMode: "100644", Status: "R", RenamedFile: true}
+	renamedSize := rawRowSize(renamedRow)
+	if renamedSize <= plain {
+		t.Fatalf("rename row %d not larger than %d", renamedSize, plain)
 	}
 	if modeString(0) != "0" {
 		t.Fatal("empty mode")
+	}
+	add := File{OldPath: "n.txt", NewPath: "n.txt", AMode: "0", BMode: "100644", Status: "A", NewFile: true}
+	legacyAdd := 1 + len("0") + 1 + len("100644") + 1 + 40 + 1 + 40 + 1 + len("A") + 1 + len("n.txt") + 1
+	if got := rawRowSize(add); got != legacyAdd+5 {
+		t.Fatalf("added file raw row: got %d want %d (six-digit missing mode)", got, legacyAdd+5)
+	}
+	if len(rawStatusField(renamedRow)) != 4 {
+		t.Fatalf("rename raw status=%q", rawStatusField(renamedRow))
 	}
 }
 
@@ -704,7 +713,7 @@ func TestChangePatchMatchesGoGitPatch(t *testing.T) {
 		t.Fatalf("changes=%d", len(cmp.changes))
 	}
 	for _, ch := range cmp.changes {
-		mine, err := changePatch(bg(), ch)
+		mine, err := changePatch(bg(), ch, s)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -722,5 +731,38 @@ func TestChangePatchMatchesGoGitPatch(t *testing.T) {
 		if a.String() != b.String() {
 			t.Fatalf("%s -> %s differs:\n%q\nvs\n%q", ch.From.Name, ch.To.Name, a.String(), b.String())
 		}
+	}
+}
+
+func TestInvalidUTF8BlobMarkedBinaryWithoutMangling(t *testing.T) {
+	latin := string([]byte{0xc3, 0x28}) // invalid UTF-8, no NUL
+	s := store{}
+	base := s.snapshot(t, "", map[string]fileSpec{"ok.txt": reg("fine\n")})
+	head := s.snapshot(t, base, map[string]fileSpec{"ok.txt": reg("fine\n"), "bad.txt": {mode: tree.ModeFile, data: latin}})
+	cmp, err := Compare(bg(), base, head, SemanticsStraight, s, Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var badFile File
+	for _, f := range cmp.Files {
+		if f.NewPath == "bad.txt" {
+			badFile = f
+		}
+	}
+	if !badFile.Binary {
+		t.Fatalf("invalid UTF-8 must be binary: %#v", badFile)
+	}
+	res, err := cmp.Patches(bg(), []string{"bad.txt"}, Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Patches) != 1 {
+		t.Fatalf("patches %#v", res.Patches)
+	}
+	if strings.Contains(res.Patches[0].Text, "\ufffd") {
+		t.Fatalf("patch must not replace invalid UTF-8: %q", res.Patches[0].Text)
+	}
+	if !strings.Contains(res.Patches[0].Text, "Binary files") {
+		t.Fatalf("want binary framing: %q", res.Patches[0].Text)
 	}
 }
