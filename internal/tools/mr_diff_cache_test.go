@@ -137,6 +137,20 @@ func TestDiffWindow_cacheRecoversContent(t *testing.T) {
 	}
 }
 
+func TestSortManifestEntriesMatchesAPI(t *testing.T) {
+	z := "z"
+	a := "a"
+	b := "b"
+	entries := []diffManifestEntry{
+		{OldPath: &z, NewPath: &a},
+		{OldPath: &b, NewPath: &b},
+	}
+	sortManifestEntries(entries)
+	if pathStr(entries[0].OldPath) != "b" || pathStr(entries[1].OldPath) != "z" {
+		t.Fatalf("order=%s then %s", pathStr(entries[0].OldPath), pathStr(entries[1].OldPath))
+	}
+}
+
 func TestDiffWindow_cacheItemBudgetLeavesSelectorsUnobserved(t *testing.T) {
 	if err := gitdiff.LookPath(); err != nil {
 		t.Skip(err.Error())

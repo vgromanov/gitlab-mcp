@@ -713,6 +713,22 @@ func pathStr(v *string) string {
 	return *v
 }
 
+func manifestOrderLess(a, b diffManifestEntry) bool {
+	if pathStr(a.OldPath) != pathStr(b.OldPath) {
+		return pathStr(a.OldPath) < pathStr(b.OldPath)
+	}
+	if pathStr(a.NewPath) != pathStr(b.NewPath) {
+		return pathStr(a.NewPath) < pathStr(b.NewPath)
+	}
+	return flagKey(a) < flagKey(b)
+}
+
+func sortManifestEntries(entries []diffManifestEntry) {
+	sort.SliceStable(entries, func(i, j int) bool {
+		return manifestOrderLess(entries[i], entries[j])
+	})
+}
+
 func flagKey(e diffManifestEntry) string {
 	raw, _ := json.Marshal(e)
 	return string(raw)
@@ -1355,14 +1371,7 @@ func decodeDiffArray(dec *json.Decoder, onEntry func(diffManifestEntry) error, c
 		order[i] = i
 	}
 	sort.Slice(order, func(i, j int) bool {
-		a, b := entries[order[i]], entries[order[j]]
-		if pathStr(a.OldPath) != pathStr(b.OldPath) {
-			return pathStr(a.OldPath) < pathStr(b.OldPath)
-		}
-		if pathStr(a.NewPath) != pathStr(b.NewPath) {
-			return pathStr(a.NewPath) < pathStr(b.NewPath)
-		}
-		return flagKey(a) < flagKey(b)
+		return manifestOrderLess(entries[order[i]], entries[order[j]])
 	})
 	sortedEntries := make([]diffManifestEntry, len(entries))
 	sortedPatches := make([]streamedPatch, len(patches))

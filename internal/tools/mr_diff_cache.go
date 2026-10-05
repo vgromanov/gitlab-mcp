@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -89,9 +90,14 @@ func recoverCacheManifest(ctx context.Context, d Deps, q diffQuery, sec readmeta
 		return diffWindowOut{}, false
 	}
 	sec.Limitations = []readmeta.Limitation{}
-	entries := make([]diffManifestEntry, 0, len(res.Files))
-	full := true
+	all := make([]diffManifestEntry, 0, len(res.Files))
 	for _, f := range res.Files {
+		all = append(all, entryFromGitFile(f))
+	}
+	sortManifestEntries(all)
+	entries := make([]diffManifestEntry, 0, len(all))
+	full := true
+	for _, e := range all {
 		if b := igl.BudgetFromContext(ctx); b != nil {
 			if err := b.AddItem(); err != nil {
 				full = false
@@ -99,7 +105,7 @@ func recoverCacheManifest(ctx context.Context, d Deps, q diffQuery, sec readmeta
 				break
 			}
 		}
-		entries = append(entries, entryFromGitFile(f))
+		entries = append(entries, e)
 	}
 	proved = cacheProved(q, proved, from, to, len(entries))
 	if !full {
@@ -136,9 +142,16 @@ func recoverCacheContent(ctx context.Context, d Deps, q diffQuery, sec readmeta.
 		return diffContentOut{}, false
 	}
 	sec.Limitations = []readmeta.Limitation{}
-	files := make([]retainedDiffFile, 0, len(res.Files))
-	truncated := false
+	all := make([]retainedDiffFile, 0, len(res.Files))
 	for _, f := range res.Files {
+		all = append(all, retainedDiffFile{entry: entryFromGitFile(f)})
+	}
+	sort.SliceStable(all, func(i, j int) bool {
+		return manifestOrderLess(all[i].entry, all[j].entry)
+	})
+	files := make([]retainedDiffFile, 0, len(all))
+	truncated := false
+	for _, f := range all {
 		if b := igl.BudgetFromContext(ctx); b != nil {
 			if err := b.AddItem(); err != nil {
 				truncated = true
@@ -146,7 +159,7 @@ func recoverCacheContent(ctx context.Context, d Deps, q diffQuery, sec readmeta.
 				break
 			}
 		}
-		files = append(files, retainedDiffFile{entry: entryFromGitFile(f)})
+		files = append(files, f)
 	}
 	patchLim := gitdiff.Limits{MaxBytes: patchByteCap(ctx, opts), Timeout: remainingOrDefault(ctx)}
 	text, partial, command, err := gitdiff.Patch(ctx, dir, from, to, opts.Paths, patchLim)
