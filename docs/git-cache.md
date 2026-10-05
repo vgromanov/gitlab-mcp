@@ -26,7 +26,9 @@ metadata only.
   fields cannot authorize. Fetch depth is only 1 or 2 (no full-history).
 - When the cache is enabled, `get_merge_request` is the MCP operation that
   runs that path for the requested merge request (HTTPS, depth 2, no
-  loopback). The tool result then includes a non-secret `git_cache` summary
+  loopback). Acquisition uses the same resolved project as the metadata
+  read, including `GITLAB_PROJECT_ID` / `--default-project` when `project_id`
+  is omitted. The tool result then includes a non-secret `git_cache` summary
   beside the merge request. Acquisition failure fails the call. With the
   cache disabled, `get_merge_request` stays the API merge-request read and
   does no cache work. No other metadata, approval, discussion, or raw-file

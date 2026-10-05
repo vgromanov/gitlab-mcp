@@ -163,3 +163,62 @@ func TestGetMergeRequestEnabledCacheAcquires(t *testing.T) {
 		t.Fatalf("acquisition was not inside Service.Acquire: %v", nested)
 	}
 }
+
+func TestGetMergeRequestCacheUsesDefaultProject(t *testing.T) {
+	var (
+		svc      *gitcache.Service
+		d        Deps
+		nested   error
+		once     sync.Once
+		userHits atomic.Int32
+		sawMR    atomic.Bool
+	)
+	ts, _ := gitcacheAuthzServer(t, func(path string, w http.ResponseWriter) bool {
+		if strings.Contains(path, "/projects/1/merge_requests/7") {
+			sawMR.Store(true)
+		}
+		if !strings.HasSuffix(path, "/user") {
+			return false
+		}
+		userHits.Add(1)
+		once.Do(func() {
+			_, nested = svc.Acquire(context.Background(), gitcache.AcquireIntent{
+				ProjectID: "1", MRIID: 7, Depth: 1, Token: "tok",
+			}, NewGitCacheAuthorizer(d))
+		})
+		return false
+	})
+	cli, err := gitlab.NewClient("tok",
+		gitlab.WithBaseURL(ts.URL+"/api/v4"),
+		gitlab.WithoutRetries(),
+		gitlab.WithInterceptor(igl.BudgetInterceptor()),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc = openAcquireTestService(t, "tok")
+	d = Deps{
+		Config: &config.Config{
+			Token:            "tok",
+			APIURL:           ts.URL + "/api/v4",
+			DefaultProjectID: "1",
+		},
+		Client:   cli,
+		GitCache: svc,
+	}
+	_, _, err = getMergeRequest(context.Background(), nil, getMergeRequestIn{
+		pidMR: pidMR{MergeRequestIID: 7},
+	}, d)
+	if !sawMR.Load() {
+		t.Fatal("metadata read did not use the default project")
+	}
+	if !errors.Is(err, gitcache.ErrAuthz) {
+		t.Fatalf("enabled get_merge_request with default project: %v", err)
+	}
+	if userHits.Load() == 0 {
+		t.Fatal("acquisition kept the omitted project_id")
+	}
+	if !errors.Is(nested, gitcache.ErrBusy) {
+		t.Fatalf("acquisition was not inside Service.Acquire: %v", nested)
+	}
+}

@@ -17,9 +17,11 @@ type mrCacheSummary struct {
 }
 
 // acquireMergeRequestObjects runs the production MR acquisition when the
-// cache service is enabled. A nil or disabled service returns no result and
-// does no cache filesystem or network work. The intent identifies the MR
-// only: depth is 2, transport is HTTPS, and AllowLoopback stays false.
+// cache service is enabled. projectID is the project already resolved for
+// the metadata read, including a configured default when the caller omits
+// project_id. A nil or disabled service returns no result and does no cache
+// filesystem or network work. The intent identifies the MR only: depth is 2,
+// transport is HTTPS, and AllowLoopback stays false.
 func acquireMergeRequestObjects(ctx context.Context, d Deps, projectID string, mrIID int64) (*gitcache.AcquireResult, error) {
 	if d.GitCache == nil || !d.GitCache.Enabled() {
 		return nil, nil

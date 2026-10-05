@@ -290,7 +290,7 @@ func getMergeRequest(ctx context.Context, _ *mcp.CallToolRequest, in getMergeReq
 	if err != nil {
 		return nil, nil, err
 	}
-	acquired, err := acquireMergeRequestObjects(ctx, d, in.ProjectID, in.MergeRequestIID)
+	acquired, err := acquireMergeRequestObjects(ctx, d, pid, in.MergeRequestIID)
 	if err != nil {
 		return nil, nil, err
 	}
