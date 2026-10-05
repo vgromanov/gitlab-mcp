@@ -1469,7 +1469,6 @@ func TestDiffContentRepair_F3_phaseReachabilityBudgets(t *testing.T) {
 	})
 	t.Run("straight_closing_elapsed", func(t *testing.T) {
 		closingStarted := make(chan struct{})
-		release := make(chan struct{})
 		var sawDone atomic.Bool
 		h, compares := mk(t, func(n int, w http.ResponseWriter, r *http.Request) bool {
 			if n == 2 {
@@ -1478,37 +1477,56 @@ func TestDiffContentRepair_F3_phaseReachabilityBudgets(t *testing.T) {
 				case <-r.Context().Done():
 					sawDone.Store(true)
 					return true
-				case <-release:
-					return true
-				case <-time.After(2 * time.Second):
-					t.Error("closing compare hung past elapsed window")
+				case <-time.After(5 * time.Second):
+					t.Error("closing compare was not stopped")
 					return true
 				}
 			}
 			return false
 		})
+		// An 80ms budget from call start expires on macOS before the closing
+		// compare is issued, so the handler never observes the stop. Keep the
+		// default elapsed window through the opening phase, then abort the
+		// budget deadline only after that request is in flight.
 		b := igl.DefaultBudget()
-		b.MaxElapsed = 80 * time.Millisecond
 		b.MaxRequests = 64
-		ctx := igl.WithBudget(context.Background(), b)
-		out, err := callDiffWindow(t, diffDeps(t, h), ctx, map[string]any{
-			"project_id": "42", "merge_request_iid": 1, "from_sha": from, "to_sha": to, "straight": true,
-			"mode": "content", "paths": []any{"a.go"},
-		})
-		close(release)
-		if atomic.LoadInt32(compares) < 1 {
-			t.Fatalf("opening missing compares=%d", atomic.LoadInt32(compares))
-		}
+		parent, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		ctx := igl.WithBudget(parent, b)
+		d := diffDeps(t, h)
+		var (
+			out map[string]any
+			err error
+			wg  sync.WaitGroup
+		)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			out, err = callDiffWindow(t, d, ctx, straightArgs)
+		}()
 		select {
 		case <-closingStarted:
-		default:
-			t.Fatal("closing phase not reached before elapsed stop")
+			cancel()
+			b.Cancel()
+		case <-time.After(10 * time.Second):
+			cancel()
+			t.Fatal("closing phase did not start")
+		}
+		wg.Wait()
+		deadline := time.Now().Add(2 * time.Second)
+		for !sawDone.Load() && time.Now().Before(deadline) {
+			time.Sleep(5 * time.Millisecond)
+		}
+		if atomic.LoadInt32(compares) != 2 {
+			t.Fatalf("expected opening+closing attempt compares=%d", atomic.LoadInt32(compares))
+		}
+		if !sawDone.Load() {
+			t.Fatalf("closing compare did not observe the stop err=%v", err)
 		}
 		if err == nil || !(strings.Contains(err.Error(), igl.ErrBudgetElapsed.Error()) || strings.Contains(err.Error(), context.DeadlineExceeded.Error()) || strings.Contains(err.Error(), "cancel")) {
 			t.Fatalf("want elapsed/deadline err=%v", err)
 		}
 		assertNoTrustedContent(t, out, err, "straight_closing_elapsed")
-		_ = sawDone.Load()
 	})
 	t.Run("straight_opening_request_budget", func(t *testing.T) {
 		// MaxRequests=6 stops before opening compare (diag: compare is request 7).
