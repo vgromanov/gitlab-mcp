@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -32,21 +31,7 @@ func establishPrivate(path string, dir bool) error {
 // the final component of that lookup and is not followed.
 func rejectSymlinkComponents(path string) error {
 	clean := filepath.Clean(path)
-	vol := filepath.VolumeName(clean)
-	rest := clean[len(vol):]
-	acc := vol
-	for _, part := range strings.Split(rest, string(filepath.Separator)) {
-		if part == "" {
-			if acc == "" && strings.HasPrefix(clean, string(filepath.Separator)) {
-				acc = string(filepath.Separator)
-			}
-			continue
-		}
-		if acc == "" || acc == string(filepath.Separator) {
-			acc = string(filepath.Separator) + part
-		} else {
-			acc = filepath.Join(acc, part)
-		}
+	for _, acc := range windowsPathPrefixes(clean) {
 		info, err := os.Lstat(acc)
 		if err != nil {
 			if os.IsNotExist(err) {

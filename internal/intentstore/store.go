@@ -41,6 +41,10 @@ type Store struct {
 	// commitBarrier runs after the statement work and before Commit.
 	// Tests use it to fail the commit once the new epoch is staged.
 	commitBarrier func() error
+	// lastAccepted is db+wal+shm after the last successful open or
+	// commit. Flushed frames from a rejected write are not counted
+	// against the cap until they become durable.
+	lastAccepted int64
 }
 
 // beforeCreate runs after a missing database file is observed and before the
@@ -357,6 +361,7 @@ func (s *Store) initialize(ctx context.Context, targetVersion int, migrate migra
 		return err
 	}
 	s.ready = true
+	s.noteAccepted()
 	return nil
 }
 
@@ -498,11 +503,12 @@ func (s *Store) commitWrite(ctx context.Context, requireDispatch bool, fn func(*
 		}
 		// Automatic checkpoints are off. Truncate here so WAL frames are
 		// copied into the main file only after the cap has been checked.
-		_, _ = s.db.ExecContext(context.Background(), `PRAGMA wal_checkpoint(TRUNCATE)`)
+		s.reclaimWAL()
+		s.noteAccepted()
 		return lockDownNewSidecars(s.path, before)
 	})
 	if errors.Is(err, ErrFull) {
-		_, _ = s.db.ExecContext(context.Background(), `PRAGMA wal_checkpoint(TRUNCATE)`)
+		s.reclaimWAL()
 	}
 	return err
 }
@@ -550,6 +556,21 @@ func (s *Store) guardBytes(ctx context.Context, tx *sql.Tx, changesBefore int64)
 }
 
 func (s *Store) enforceCap(ctx context.Context, tx *sql.Tx) error {
+	var pageSize int64
+	if err := tx.QueryRowContext(ctx, `PRAGMA page_size`).Scan(&pageSize); err != nil {
+		return mapDriver(err)
+	}
+	if pageSize <= 0 {
+		pageSize = 4096
+	}
+	before, err := bytesOnDisk(s.path)
+	if err != nil {
+		return err
+	}
+	// Do not flush when even one commit frame would exceed the cap.
+	if before+pageSize+24 > s.maxBytes {
+		return ErrFull
+	}
 	if err := flushPages(ctx, tx); err != nil {
 		return err
 	}
@@ -559,17 +580,42 @@ func (s *Store) enforceCap(ctx context.Context, tx *sql.Tx) error {
 	}
 	// cacheflush has already written the dirty pages. Commit appends one
 	// more WAL frame (page plus a 24-byte header) which is not in n yet.
-	var pageSize int64
-	if err := tx.QueryRowContext(ctx, `PRAGMA page_size`).Scan(&pageSize); err != nil {
-		return mapDriver(err)
-	}
-	if pageSize <= 0 {
-		pageSize = 4096
-	}
 	if n+pageSize+24 > s.maxBytes {
 		return ErrFull
 	}
 	return nil
+}
+
+func (s *Store) reclaimWAL() {
+	_, _ = s.db.ExecContext(context.Background(), `PRAGMA wal_checkpoint(TRUNCATE)`)
+}
+
+func (s *Store) noteAccepted() {
+	n, err := bytesOnDisk(s.path)
+	if err != nil {
+		return
+	}
+	s.lastAccepted = n
+}
+
+func (s *Store) accountedBytes() (int64, error) {
+	n, err := bytesOnDisk(s.path)
+	if err != nil {
+		return 0, err
+	}
+	if n >= s.maxBytes {
+		s.reclaimWAL()
+		n, err = bytesOnDisk(s.path)
+		if err != nil {
+			return 0, err
+		}
+	}
+	if n >= s.maxBytes && s.lastAccepted > 0 && s.lastAccepted < s.maxBytes {
+		// Leftover frames from a rejected flush are still on disk because
+		// a reader snapshot blocked TRUNCATE. They are not durable.
+		return s.lastAccepted, nil
+	}
+	return n, nil
 }
 
 func (s *Store) readyLocked() error {
@@ -606,11 +652,11 @@ func (s *Store) writableLocked(requireDispatch bool) error {
 	if _, err := existingSidecars(s.path); err != nil {
 		return err
 	}
-	n, err := bytesOnDisk(s.path)
+	n, err := s.accountedBytes()
 	if err != nil {
 		return err
 	}
-	// Current size only. guardBytes measures the flushed transaction before commit.
+	// Current durable size only. guardBytes measures the flushed transaction before commit.
 	if n >= s.maxBytes {
 		return ErrFull
 	}

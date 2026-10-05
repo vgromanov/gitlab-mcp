@@ -742,6 +742,60 @@ func TestIntermediateSymlinkRejected(t *testing.T) {
 	}
 }
 
+func TestWindowsDriveWalkKeepsAbsolute(t *testing.T) {
+	got := windowsPathPrefixes(`C:\private\link\intent.db`)
+	want := []string{`C:\private`, `C:\private\link`, `C:\private\link\intent.db`}
+	if len(got) != len(want) {
+		t.Fatalf("prefixes %v", got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("prefix %d = %q, want %q (filepath.Join(%q, %q) = %q)", i, got[i], want[i], "C:", "private", filepath.Join("C:", "private"))
+		}
+	}
+	slash := windowsPathPrefixes(`C:/private/link/intent.db`)
+	if len(slash) != 3 || slash[0] != `C:/private` || slash[1] != `C:/private/link` {
+		t.Fatalf("slash prefixes %v", slash)
+	}
+	unc := windowsPathPrefixes(`\\server\share\private\link\intent.db`)
+	if len(unc) < 2 || unc[0] != `\\server\share\private` || unc[1] != `\\server\share\private\link` {
+		t.Fatalf("unc prefixes %v", unc)
+	}
+}
+
+func TestRejectedFlushDoesNotStickCap(t *testing.T) {
+	cfg, _ := fixedNow(t)
+	s := openStore(t, cfg)
+	ctx := context.Background()
+	if _, err := s.db.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		t.Fatal(err)
+	}
+	reader := openStore(t, cfg)
+	rtx, err := reader.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var epoch string
+	if err := rtx.QueryRowContext(ctx, `SELECT value FROM meta WHERE key='epoch'`).Scan(&epoch); err != nil {
+		t.Fatal(err)
+	}
+	s.maxBytes = 60000
+	_, err = s.Begin(ctx, ident("k"), PayloadHash([]byte("a")), BeginOptions{})
+	if !errors.Is(err, ErrFull) {
+		t.Fatalf("begin: %v", err)
+	}
+	if err := rtx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Writable(); err != nil {
+		t.Fatalf("writable after rejected flush: %v", err)
+	}
+	s.maxBytes = DefaultMaxBytes
+	if _, err := s.Begin(ctx, ident("k"), PayloadHash([]byte("a")), BeginOptions{}); err != nil {
+		t.Fatalf("begin after reclaim: %v", err)
+	}
+}
+
 func TestUNCPathMatchesWindowsAbsolute(t *testing.T) {
 	path := `\\server\share\intent.db`
 	if !isAbs(path) {

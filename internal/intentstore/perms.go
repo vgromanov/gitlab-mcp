@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"strings"
 )
 
 func isSymlink(info os.FileInfo) bool {
@@ -91,6 +92,54 @@ type fileID struct {
 
 func sameFile(a, b fileID) bool {
 	return a.ok && b.ok && a.dev == b.dev && a.ino == b.ino
+}
+
+// windowsPathPrefixes walks a Windows path one component at a time.
+// Drive roots stay absolute: filepath.Join("C:", "private") is C:private,
+// which would skip C:\private\link and follow a junction there.
+func windowsPathPrefixes(clean string) []string {
+	vol := windowsVolume(clean)
+	rest := clean[len(vol):]
+	sep := `\`
+	if strings.Contains(clean, `/`) && !strings.Contains(clean, `\`) {
+		sep = `/`
+	}
+	acc := vol
+	var out []string
+	for _, part := range strings.Split(rest, sep) {
+		if part == "" {
+			if acc == "" {
+				acc = sep
+			}
+			continue
+		}
+		acc = joinWindowsAbs(acc, part, sep)
+		out = append(out, acc)
+	}
+	return out
+}
+
+func windowsVolume(clean string) string {
+	if share := uncShare(clean); share != "" {
+		return share
+	}
+	if len(clean) >= 2 && ((clean[0] >= 'A' && clean[0] <= 'Z') || (clean[0] >= 'a' && clean[0] <= 'z')) && clean[1] == ':' {
+		return clean[:2]
+	}
+	return ""
+}
+
+func joinWindowsAbs(acc, part, sep string) string {
+	switch {
+	case acc == "" || acc == sep:
+		return sep + part
+	case len(acc) == 2 && acc[1] == ':':
+		return acc + sep + part
+	case strings.HasSuffix(acc, sep):
+		return acc + part
+	default:
+		return acc + sep + part
+	}
 }
 
 func lstat(path string) (os.FileInfo, error) {
