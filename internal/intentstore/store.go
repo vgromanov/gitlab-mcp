@@ -24,6 +24,10 @@ import (
 // process to release the file lock.
 const lockTimeout = 5 * time.Second
 
+// lockSlice is how long one bbolt open waits for the lock before the context
+// is checked again.
+const lockSlice = 100 * time.Millisecond
+
 // Config selects the database file and local limits.
 type Config struct {
 	Path      string
@@ -216,7 +220,7 @@ func validateExistingFile(path string, info os.FileInfo) error {
 // verifies that the opened name is still the file those checks saw. It never
 // creates the file: creation goes through createExclusive, which keeps the
 // private mode and the no-follow walk.
-func openChecked(path string, write bool, maxBytes int64) (*bolt.DB, error) {
+func openChecked(ctx context.Context, path string, write bool, maxBytes int64) (*bolt.DB, error) {
 	before, err := identifyFile(path)
 	if err != nil {
 		return nil, err
@@ -225,7 +229,6 @@ func openChecked(path string, write bool, maxBytes int64) (*bolt.DB, error) {
 		beforeDBOpen(path)
 	}
 	opts := &bolt.Options{
-		Timeout:      lockTimeout,
 		ReadOnly:     !write,
 		PageSize:     pageSize,
 		NoStatistics: true,
@@ -236,8 +239,11 @@ func openChecked(path string, write bool, maxBytes int64) (*bolt.DB, error) {
 	if write && maxBytes > 0 {
 		opts.MaxSize = int(min(maxBytes, math.MaxInt))
 	}
-	db, err := bolt.Open(path, 0o600, opts)
+	db, err := openWithLock(ctx, path, opts)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
 		if symErr := rejectSymlinkComponents(path); symErr != nil {
 			return nil, symErr
 		}
@@ -258,6 +264,35 @@ func openChecked(path string, write bool, maxBytes int64) (*bolt.DB, error) {
 		return nil, err
 	}
 	return db, nil
+}
+
+// openWithLock opens the database and acquires its file lock in short
+// slices so the caller's context bounds the wait. bbolt can only wait for a
+// lock for a fixed time, so the wait is repeated until the context is done
+// (returning its error) or lockTimeout has passed (returning bbolt's timeout).
+func openWithLock(ctx context.Context, path string, opts *bolt.Options) (*bolt.DB, error) {
+	deadline := time.Now().Add(lockTimeout)
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		slice := min(lockSlice, time.Until(deadline))
+		if d, ok := ctx.Deadline(); ok {
+			slice = min(slice, time.Until(d))
+		}
+		if slice <= 0 {
+			slice = time.Millisecond
+		}
+		o := *opts
+		o.Timeout = slice
+		db, err := bolt.Open(path, 0o600, &o)
+		if !errors.Is(err, berrors.ErrTimeout) {
+			return db, err
+		}
+		if !time.Now().Before(deadline) {
+			return nil, err
+		}
+	}
 }
 
 // schemaState is what inspect found in an open database.
@@ -309,7 +344,7 @@ func (s *Store) initialize(ctx context.Context, targetVersion int, migrate migra
 		return err
 	}
 	if size > 0 {
-		done, err := s.adoptExisting(targetVersion)
+		done, err := s.adoptExisting(ctx, targetVersion)
 		if err != nil {
 			return err
 		}
@@ -323,8 +358,8 @@ func (s *Store) initialize(ctx context.Context, targetVersion int, migrate migra
 // adoptExisting classifies a non-empty file read-only. It reports done when
 // the file is this store at the target version, so a healthy store is opened
 // without writing. Foreign files are refused here and never opened for write.
-func (s *Store) adoptExisting(targetVersion int) (bool, error) {
-	db, err := openChecked(s.path, false, 0)
+func (s *Store) adoptExisting(ctx context.Context, targetVersion int) (bool, error) {
+	db, err := openChecked(ctx, s.path, false, 0)
 	if err != nil {
 		return false, err
 	}
@@ -366,7 +401,7 @@ func probeWritable(path string) error {
 }
 
 func (s *Store) initializeWrite(ctx context.Context, targetVersion int, migrate migrateFunc) error {
-	db, err := openChecked(s.path, true, s.maxBytes)
+	db, err := openChecked(ctx, s.path, true, s.maxBytes)
 	if err != nil {
 		return err
 	}
@@ -507,7 +542,7 @@ func (s *Store) commitWrite(ctx context.Context, requireDispatch bool, fn func(*
 	if err := s.writableLocked(requireDispatch); err != nil {
 		return err
 	}
-	db, err := openChecked(s.path, true, s.maxBytes)
+	db, err := openChecked(ctx, s.path, true, s.maxBytes)
 	if err != nil {
 		return err
 	}
@@ -553,7 +588,7 @@ func (s *Store) view(ctx context.Context, fn func(*bolt.Tx) error) error {
 	if err := s.guardPath(); err != nil {
 		return err
 	}
-	db, err := openChecked(s.path, false, 0)
+	db, err := openChecked(ctx, s.path, false, 0)
 	if err != nil {
 		return err
 	}

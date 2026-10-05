@@ -1288,6 +1288,70 @@ func TestPeerWithHigherCapGrowthIsHonored(t *testing.T) {
 	}
 }
 
+func TestLockWaitHonorsContext(t *testing.T) {
+	cfg, _ := fixedNow(t)
+	s := openStore(t, cfg)
+	bg := context.Background()
+	rec, err := s.Begin(bg, ident("held"), PayloadHash([]byte("h")), BeginOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	holder, err := bolt.Open(s.path, 0o600, &bolt.Options{Timeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	released := false
+	release := func() {
+		if !released {
+			released = true
+			_ = holder.Close()
+		}
+	}
+	t.Cleanup(release)
+
+	ops := map[string]func(ctx context.Context) error{
+		"get": func(ctx context.Context) error {
+			_, err := s.Get(ctx, rec.OperationID)
+			return err
+		},
+		"begin": func(ctx context.Context) error {
+			_, err := s.Begin(ctx, ident("blocked"), PayloadHash([]byte("b")), BeginOptions{})
+			return err
+		},
+	}
+	for name, op := range ops {
+		t.Run(name+"/deadline", func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(bg, 20*time.Millisecond)
+			defer cancel()
+			start := time.Now()
+			err := op(ctx)
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("err = %v, want DeadlineExceeded", err)
+			}
+			if d := time.Since(start); d > time.Second {
+				t.Fatalf("returned after %v, want well under the lock timeout", d)
+			}
+		})
+		t.Run(name+"/cancel", func(t *testing.T) {
+			ctx, cancel := context.WithCancel(bg)
+			time.AfterFunc(30*time.Millisecond, cancel)
+			start := time.Now()
+			err := op(ctx)
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("err = %v, want Canceled", err)
+			}
+			if d := time.Since(start); d > time.Second {
+				t.Fatalf("returned after %v, want well under the lock timeout", d)
+			}
+		})
+	}
+
+	release()
+	if _, err := s.Get(bg, rec.OperationID); err != nil {
+		t.Fatalf("get after release: %v", err)
+	}
+}
+
 func TestHandlesShareOneFileWithoutSidecars(t *testing.T) {
 	cfg, _ := fixedNow(t)
 	const handles = 6
