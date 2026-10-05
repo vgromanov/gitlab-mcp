@@ -316,6 +316,12 @@ func rejectReviewCursors(d Deps, items []reviewContextItemIn, now time.Time) err
 				if graphTok != "" {
 					return fmt.Errorf("%s: review context does not resume section cursors", cursor.ResyncRequired)
 				}
+				if decoded.Filters.Selection != "graph" {
+					return fmt.Errorf("%s: graph cursor selection", cursor.ResyncRequired)
+				}
+				if decoded.Filters.Since != strconv.FormatInt(item.MergeRequestIID, 10) {
+					return fmt.Errorf("%s: graph cursor binding", cursor.ResyncRequired)
+				}
 				graphTok = c.Cursor
 			default:
 				return fmt.Errorf("%s: review context does not resume section cursors", cursor.ResyncRequired)
@@ -1024,6 +1030,18 @@ func (rt *reviewRuntime) readPipelineGraph(item reviewContextItemIn, owner Canon
 		ExpectedSourceSHA: br.SourceSHA,
 		Cursor:            item.graphCursor,
 	}
+	if err := rt.bindReviewGraphCursor(item, owner, br, item.graphCursor); err != nil {
+		if strings.HasPrefix(err.Error(), cursor.ResyncRequired) {
+			out.Cause = cursor.ResyncRequired
+			return
+		}
+		code := reviewClassify(err)
+		sec.AddLimitation(code, "pipeline graph")
+		sec.ContentComplete = readmeta.ContentCompleteFalse
+		sec.Consistency = readmeta.ConsistencyUnknown
+		out.Sections["pipeline_graph"] = sec
+		return
+	}
 	var merged pipelineGraphOut
 	tok := item.graphCursor
 	for page := 0; page < cursor.MaxGraphVisited; page++ {
@@ -1082,6 +1100,54 @@ func (rt *reviewRuntime) readPipelineGraph(item reviewContextItemIn, owner Canon
 	}
 	out.PipelineGraph = &merged
 	out.Sections["pipeline_graph"] = merged.Section
+}
+
+func (rt *reviewRuntime) bindReviewGraphCursor(item reviewContextItemIn, owner CanonicalProject, br reviewBracket, tok string) error {
+	if strings.TrimSpace(tok) == "" {
+		return nil
+	}
+	decoded, err := cursor.Decode(rt.d.Config.CursorKey, tok, rt.now)
+	if err != nil {
+		return fmt.Errorf("%s: cursor validation failed", cursor.ResyncRequired)
+	}
+	if decoded.Tool != cursor.ToolPipelineGraph || decoded.Section != cursor.SectionPipelineGraph || decoded.GraphCont == nil {
+		return fmt.Errorf("%s: graph cursor binding", cursor.ResyncRequired)
+	}
+	if decoded.Filters.Selection != "graph" || decoded.Filters.Since != strconv.FormatInt(item.MergeRequestIID, 10) {
+		return fmt.Errorf("%s: graph cursor binding", cursor.ResyncRequired)
+	}
+	ownerID := strconv.FormatInt(owner.ID, 10)
+	if decoded.Filters.CallerUntil != ownerID {
+		return fmt.Errorf("%s: graph cursor binding", cursor.ResyncRequired)
+	}
+	if decoded.Filters.RefName != br.SourceSHA {
+		return fmt.Errorf("%s: graph cursor binding", cursor.ResyncRequired)
+	}
+	parent, _, _, err := resolveParentPipeline(rt.ctx, rt.d, ownerID, 0, graphSelection{ExpectedSHA: br.SourceSHA, MRIID: item.MergeRequestIID})
+	if err != nil {
+		return err
+	}
+	if parent == nil {
+		return fmt.Errorf("%s: graph cursor binding", cursor.ResyncRequired)
+	}
+	parentPID := parent.ScopeProject
+	if parentPID == "" {
+		parentPID = strconv.FormatInt(parent.ProjectID, 10)
+	}
+	gc := decoded.GraphCont
+	if gc.D == 0 {
+		if decoded.Scope.PipelineID == nil || *decoded.Scope.PipelineID != parent.ID || gc.NP != parentPID {
+			return fmt.Errorf("%s: graph cursor binding", cursor.ResyncRequired)
+		}
+		return nil
+	}
+	parentKey := graphNodeKey{Project: parentPID, Pipeline: parent.ID}.String()
+	for _, v := range gc.Vis {
+		if v == parentKey {
+			return nil
+		}
+	}
+	return fmt.Errorf("%s: graph cursor binding", cursor.ResyncRequired)
 }
 
 func sectionHasCode(sec readmeta.Section, code string) bool {

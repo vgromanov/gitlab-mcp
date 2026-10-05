@@ -1305,16 +1305,75 @@ func validGraphVisitKey(item string) bool {
 }
 
 func validGraphQueueKey(item string) bool {
-	// project:pipeline:depth
-	i := strings.LastIndexByte(item, ':')
-	if i <= 0 || i == len(item)-1 {
-		return false
+	_, _, _, _, _, ok := ParseGraphQueueItem(item)
+	return ok
+}
+
+// FormatGraphQueueItem encodes one signed walk-queue entry.
+// Shape: project:pipeline:depth:sha:ancestor,ancestor
+// sha is 40-hex or "-". The ancestor field is always present and may be empty.
+func FormatGraphQueueItem(project string, pipeline int64, depth int, sha string, ancestors []string) (string, error) {
+	if depth < 1 || pipeline < 1 || strings.TrimSpace(project) == "" || project != strings.TrimSpace(project) {
+		return "", ErrResyncRequired
 	}
-	depth, err := strconv.Atoi(item[i+1:])
+	if !validGraphVisitKey(project + ":" + strconv.FormatInt(pipeline, 10)) {
+		return "", ErrResyncRequired
+	}
+	if sha != "-" && !isGitSHA(sha) {
+		return "", ErrResyncRequired
+	}
+	seen := map[string]struct{}{}
+	for _, a := range ancestors {
+		if !validGraphVisitKey(a) {
+			return "", ErrResyncRequired
+		}
+		if _, dup := seen[a]; dup {
+			return "", ErrResyncRequired
+		}
+		seen[a] = struct{}{}
+	}
+	return project + ":" + strconv.FormatInt(pipeline, 10) + ":" + strconv.Itoa(depth) + ":" + sha + ":" + strings.Join(ancestors, ","), nil
+}
+
+// ParseGraphQueueItem decodes a signed walk-queue entry.
+func ParseGraphQueueItem(item string) (project string, pipeline int64, depth int, sha string, ancestors []string, ok bool) {
+	if item == "" || item != strings.TrimSpace(item) {
+		return "", 0, 0, "", nil, false
+	}
+	parts := strings.SplitN(item, ":", 5)
+	if len(parts) != 5 {
+		return "", 0, 0, "", nil, false
+	}
+	project = parts[0]
+	pipeline, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil || pipeline < 1 {
+		return "", 0, 0, "", nil, false
+	}
+	depth, err = strconv.Atoi(parts[2])
 	if err != nil || depth < 1 {
-		return false
+		return "", 0, 0, "", nil, false
 	}
-	return validGraphVisitKey(item[:i])
+	sha = parts[3]
+	if sha != "-" && !isGitSHA(sha) {
+		return "", 0, 0, "", nil, false
+	}
+	if !validGraphVisitKey(project + ":" + parts[1]) {
+		return "", 0, 0, "", nil, false
+	}
+	if parts[4] != "" {
+		seen := map[string]struct{}{}
+		for _, a := range strings.Split(parts[4], ",") {
+			if !validGraphVisitKey(a) {
+				return "", 0, 0, "", nil, false
+			}
+			if _, dup := seen[a]; dup {
+				return "", 0, 0, "", nil, false
+			}
+			seen[a] = struct{}{}
+			ancestors = append(ancestors, a)
+		}
+	}
+	return project, pipeline, depth, sha, ancestors, true
 }
 
 func splitGraphKey(item string) (string, int64, bool) {

@@ -209,19 +209,34 @@ func pidOf(pipe *pipelineView) string {
 }
 
 func parseQueuedNode(item string) (queuedGraphNode, bool) {
-	i := strings.LastIndexByte(item, ':')
-	if i <= 0 {
-		return queuedGraphNode{}, false
-	}
-	depth, err := strconv.Atoi(item[i+1:])
-	if err != nil || depth < 1 {
-		return queuedGraphNode{}, false
-	}
-	proj, id, ok := splitVisitKey(item[:i])
+	proj, pipe, depth, sha, ancs, ok := cursor.ParseGraphQueueItem(item)
 	if !ok {
 		return queuedGraphNode{}, false
 	}
-	return queuedGraphNode{Key: graphNodeKey{Project: proj, Pipeline: id}, Depth: depth}, true
+	n := queuedGraphNode{Key: graphNodeKey{Project: proj, Pipeline: pipe}, Depth: depth}
+	if sha != "-" {
+		n.ParentSHA = sha
+	}
+	for _, a := range ancs {
+		p, id, aok := splitVisitKey(a)
+		if !aok {
+			return queuedGraphNode{}, false
+		}
+		n.Ancestors = append(n.Ancestors, graphNodeKey{Project: p, Pipeline: id})
+	}
+	return n, true
+}
+
+func encodeQueuedNode(n queuedGraphNode) (string, error) {
+	sha := n.ParentSHA
+	if sha == "" {
+		sha = "-"
+	}
+	ancs := make([]string, 0, len(n.Ancestors))
+	for _, a := range n.Ancestors {
+		ancs = append(ancs, a.String())
+	}
+	return cursor.FormatGraphQueueItem(n.Key.Project, n.Key.Pipeline, n.Depth, sha, ancs)
 }
 
 func splitVisitKey(item string) (string, int64, bool) {
@@ -263,7 +278,11 @@ func (w *graphWalk) snapshotCont() *cursor.GraphCont {
 	sort.Strings(vis)
 	q := make([]string, 0, len(w.queue))
 	for _, n := range w.queue {
-		q = append(q, n.Key.String()+":"+strconv.Itoa(n.Depth))
+		item, err := encodeQueuedNode(n)
+		if err != nil {
+			item = ""
+		}
+		q = append(q, item)
 	}
 	cov := w.coverage
 	if cov == "" {
@@ -512,7 +531,7 @@ func (w *graphWalk) addBridgeEdge(parent graphNodeKey, parentSHA string, br grap
 		Key:       child,
 		Depth:     w.depth + 1,
 		ParentSHA: parentSHA,
-		Ancestors: append(append([]graphNodeKey{}, w.currentAncestors()...), parent),
+		Ancestors: append([]graphNodeKey{}, w.currentAncestors()...),
 	})
 }
 

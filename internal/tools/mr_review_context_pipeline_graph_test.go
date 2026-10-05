@@ -77,3 +77,56 @@ func TestReviewContext_pipelineGraphIndependentError(t *testing.T) {
 		t.Fatal("incomplete graph digest")
 	}
 }
+
+func TestReviewContext_graphCursorRequiresMRParent(t *testing.T) {
+	log := &pathLog{}
+	script := &reviewScript{log: log}
+	graph := &walkServer{
+		pipes: map[string]string{
+			"42/100": walkPipe(100, 42, shaN(1), "feature-1"),
+			"42/200": walkPipe(200, 42, shaN(1), "other"),
+		},
+		jobs: map[string]string{
+			"42/200/1": "[" + jobJSON(1, "x", "success", "false") + "]",
+			"42/200/2": "[" + jobJSON(2, "y", "success", "false") + "]",
+		},
+		mrPipes: `[{"id":100,"project_id":42,"sha":"` + shaN(1) + `","ref":"feature-1","status":"success"}]`,
+	}
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/pipelines") || strings.Contains(r.URL.Path, "/jobs") || strings.Contains(r.URL.Path, "/bridges") {
+			graph.ServeHTTP(w, r)
+			return
+		}
+		script.serve(w, r)
+	})
+	d := newReviewDeps(t, h)
+	_, raw, err := getMergeRequestPipelineGraph(context.Background(), nil, pipelineGraphIn{
+		ProjectID: "42", MergeRequestIID: 1, PipelineID: 200, PerPage: 1, ExpectedSourceSHA: shaN(1),
+	}, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tok, _ := graphSection(t, raw.(map[string]any))["next_cursor"].(string)
+	if tok == "" {
+		t.Fatal("need graph cursor")
+	}
+	out, err := callReviewDirect(t, d, context.Background(), []reviewContextItemIn{
+		{
+			ProjectID: "42", MergeRequestIID: 1, Sections: []string{"metadata", "pipeline_graph"},
+			Cursors: []reviewContextCursorIn{{Section: "pipeline_graph", Cursor: tok}},
+		},
+	})
+	if err != nil {
+		if !strings.Contains(err.Error(), cursor.ResyncRequired) {
+			t.Fatal(err)
+		}
+		return
+	}
+	item := out.Items[0]
+	if item.Cause != cursor.ResyncRequired {
+		t.Fatalf("foreign pipeline cursor cause=%s graph=%v", item.Cause, item.PipelineGraph)
+	}
+	if item.PipelineGraph != nil && item.PipelineGraph.Section.ContentComplete == readmeta.ContentCompleteTrue {
+		t.Fatal("must not complete a pinned non-parent pipeline")
+	}
+}

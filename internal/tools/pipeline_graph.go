@@ -257,7 +257,8 @@ func resumePipelineGraph(ctx context.Context, in pipelineGraphIn, sel graphSelec
 	if payload.Scope.PipelineID == nil || *payload.Scope.PipelineID < 1 || (in.PipelineID != 0 && in.PipelineID != *payload.Scope.PipelineID) {
 		return nil, nil, fmt.Errorf("%s: project scope mismatch", cursor.ResyncRequired)
 	}
-	if graphFilters(sel, payload.UpperBound, pid) != payload.Filters {
+	wantFilters := graphFilters(sel, payload.UpperBound, pid)
+	if wantFilters != payload.Filters {
 		return nil, nil, fmt.Errorf("%s: filter mismatch", cursor.ResyncRequired)
 	}
 	if err := reauthorizeCursorProject(ctx, d, canon); err != nil {
@@ -286,7 +287,7 @@ func resumePipelineGraph(ctx context.Context, in pipelineGraphIn, sel graphSelec
 		return nil, nil, fmt.Errorf("%s: pinned pipeline SHA mismatch", cursor.ResyncRequired)
 	}
 	scope := cursor.Scope{Kind: cursor.ScopePipeline, ProjectID: pipePID, PipelineID: payload.Scope.PipelineID}
-	if err := cursor.MatchBinding(payload, instance, actorID, d.Config.PolicyFingerprint(), toolPipelineGraph, sectionPipelineGraph, scope, payload.Filters, payload.ImmutableRefs, payload.UpperBound); err != nil {
+	if err := cursor.MatchBinding(payload, instance, actorID, d.Config.PolicyFingerprint(), toolPipelineGraph, sectionPipelineGraph, scope, wantFilters, payload.ImmutableRefs, payload.UpperBound); err != nil {
 		return nil, nil, fmt.Errorf("%s: binding mismatch", cursor.ResyncRequired)
 	}
 	section := newPipelineGraphSection(now)

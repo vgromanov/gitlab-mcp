@@ -409,6 +409,36 @@ func TestPipelineGraph_paginationCursorAndKey(t *testing.T) {
 	}
 }
 
+func TestPipelineGraph_resumeRejectsRaisedBounds(t *testing.T) {
+	jobs := map[string]string{
+		"1": "[" + jobJSON(1, "test", "success", "false") + "]",
+		"2": "[" + jobJSON(2, "test", "running", "false") + "]",
+	}
+	clk := &cursor.FakeClock{T: time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)}
+	h := graphHandler(nil, map[int]string{100: graphPipe("feature", "push")}, jobs, graphMR("feature"), graphPipes("feature"), false)
+	d := newCursorDeps(t, h, nil, clk)
+	in := pipelineGraphIn{ProjectID: "42", MergeRequestIID: 7, PerPage: 1, MaxNodes: 4}
+	_, out, err := getMergeRequestPipelineGraph(context.Background(), nil, in, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tok, _ := graphSection(t, out.(map[string]any))["next_cursor"].(string)
+	if tok == "" {
+		t.Fatal("missing cursor")
+	}
+	for _, mut := range []pipelineGraphIn{
+		{ProjectID: "42", MergeRequestIID: 7, PerPage: 1, MaxNodes: 4, MaxDepth: 32, Cursor: tok},
+		{ProjectID: "42", MergeRequestIID: 7, PerPage: 1, MaxNodes: 16, Cursor: tok},
+		{ProjectID: "42", MergeRequestIID: 7, PerPage: 20, MaxNodes: 4, Cursor: tok},
+		{ProjectID: "42", MergeRequestIID: 7, PerPage: 1, MaxNodes: 4, JobNames: []string{"test"}, Cursor: tok},
+	} {
+		_, _, err = getMergeRequestPipelineGraph(context.Background(), nil, mut, d)
+		if err == nil || !strings.Contains(err.Error(), "filter mismatch") {
+			t.Fatalf("raised bounds %v: %v", mut, err)
+		}
+	}
+}
+
 func TestPipelineGraph_forkHeadUsesSourceProject(t *testing.T) {
 	var hits []graphHit
 	jobs := map[string]string{

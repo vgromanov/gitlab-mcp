@@ -234,6 +234,17 @@ func TestPipelineGraph_twoPageBridgesAndJobs(t *testing.T) {
 		t.Fatalf("out %T", raw)
 	}
 	tok, _ := graphSection(t, last)["next_cursor"].(string)
+	if tok == "" {
+		t.Fatal("first page must continue")
+	}
+	payload, err := cursor.Decode(d.Config.CursorKey, tok, clk.Now())
+	if err != nil || payload.GraphCont == nil || len(payload.GraphCont.Q) == 0 {
+		t.Fatalf("graph cont %#v err %v", payload.GraphCont, err)
+	}
+	qn, qok := parseQueuedNode(payload.GraphCont.Q[0])
+	if !qok || qn.ParentSHA != graphPipeSHA || len(qn.Ancestors) != 1 || qn.Ancestors[0] != (graphNodeKey{Project: "42", Pipeline: 100}) {
+		t.Fatalf("queue ancestors %#v", qn)
+	}
 	for i := 0; i < 6 && tok != ""; i++ {
 		in.Cursor = tok
 		_, raw, err = getMergeRequestPipelineGraph(context.Background(), nil, in, d)
@@ -441,5 +452,25 @@ func TestPipelineGraph_bridges404UnknownCapability(t *testing.T) {
 	requireNotReady(t, out)
 	if out["downstream_coverage"] != downstreamCoverageUnknown || out["bridge_capability"] != bridgeCapabilityUnknown {
 		t.Fatalf("404 bridges %#v", out)
+	}
+}
+
+func TestParseQueuedNodeRestoresAncestors(t *testing.T) {
+	n := queuedGraphNode{
+		Key:       graphNodeKey{Project: "99", Pipeline: 200},
+		Depth:     1,
+		ParentSHA: graphPipeSHA,
+		Ancestors: []graphNodeKey{{Project: "42", Pipeline: 100}},
+	}
+	enc, err := encodeQueuedNode(n)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := parseQueuedNode(enc)
+	if !ok || got.Key != n.Key || got.Depth != 1 || got.ParentSHA != graphPipeSHA || len(got.Ancestors) != 1 || got.Ancestors[0] != n.Ancestors[0] {
+		t.Fatalf("roundtrip %#v from %q", got, enc)
+	}
+	if _, ok := parseQueuedNode("99:200:1"); ok {
+		t.Fatal("legacy queue key accepted")
 	}
 }
