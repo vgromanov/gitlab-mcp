@@ -776,6 +776,120 @@ func TestBeginStopsAtFlushedSize(t *testing.T) {
 	}
 }
 
+func TestInitCapBetweenFlushAndCommit(t *testing.T) {
+	// Schema flush is 57496 bytes and commit adds one 4120-byte frame (61616).
+	dir := privateDir(t)
+	path := filepath.Join(dir, "intent.db")
+	_, err := Open(Config{Path: path, MaxBytes: 60000})
+	if !errors.Is(err, ErrFull) {
+		t.Fatalf("open: %v", err)
+	}
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		if _, statErr := os.Lstat(path + suffix); !os.IsNotExist(statErr) {
+			t.Fatalf("left %s behind: %v", suffix, statErr)
+		}
+	}
+}
+
+func TestBeginCapBetweenFlushAndCommit(t *testing.T) {
+	// On a fresh store, Begin flushes to 73976 and commits at 78096.
+	cfg, _ := fixedNow(t)
+	cfg.MaxBytes = 75000
+	s := openStore(t, cfg)
+	ctx := context.Background()
+	before, err := bytesOnDisk(s.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before >= s.maxBytes {
+		t.Fatalf("open size %d already at cap", before)
+	}
+	_, err = s.Begin(ctx, ident("k"), PayloadHash([]byte("a")), BeginOptions{})
+	after, sizeErr := bytesOnDisk(s.path)
+	if sizeErr != nil {
+		t.Fatal(sizeErr)
+	}
+	if after > s.maxBytes {
+		t.Fatalf("begin grew to %d, cap %d, err %v", after, s.maxBytes, err)
+	}
+	if !errors.Is(err, ErrFull) {
+		t.Fatalf("begin %v (%d -> %d)", err, before, after)
+	}
+	if _, err := s.GetByIdentity(ctx, ident("k")); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("rolled-back insert visible: %v", err)
+	}
+}
+
+func TestClaimCapBetweenFlushAndCommit(t *testing.T) {
+	cfg, _ := fixedNow(t)
+	s := openStore(t, cfg)
+	ctx := context.Background()
+	rec, err := s.Begin(ctx, ident("k"), PayloadHash([]byte("a")), BeginOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		t.Fatal(err)
+	}
+	n, err := bytesOnDisk(s.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Flush of the claim is about 4152 bytes; commit adds another 4120-byte frame.
+	s.maxBytes = n + 5000
+	_, err = s.ClaimSending(ctx, rec.OperationID)
+	after, sizeErr := bytesOnDisk(s.path)
+	if sizeErr != nil {
+		t.Fatal(sizeErr)
+	}
+	if after > s.maxBytes {
+		t.Fatalf("claim grew to %d, cap %d, err %v", after, s.maxBytes, err)
+	}
+	if !errors.Is(err, ErrFull) {
+		t.Fatalf("claim %v (%d -> %d)", err, n, after)
+	}
+	got, err := s.Get(ctx, rec.OperationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != StatePrepared {
+		t.Fatalf("state %s", got.State)
+	}
+}
+
+func TestSqlitePrefixIsLiteral(t *testing.T) {
+	cfg, _ := fixedNow(t)
+	db, err := sql.Open("sqlite", cfg.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE sqlitex_controller(body TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	if err := db.QueryRow(userObjectCountSQL).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("user objects %d", n)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(cfg.Path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(cfg); !errors.Is(err, ErrUnrelatedDatabase) {
+		t.Fatalf("lookalike sqlite name: %v", err)
+	}
+	if rawHasTable(t, cfg.Path, "meta") || rawHasTable(t, cfg.Path, "intents") {
+		t.Fatal("unrelated database was rewritten")
+	}
+	if !rawHasTable(t, cfg.Path, "sqlitex_controller") {
+		t.Fatal("sqlitex_controller was dropped")
+	}
+}
+
 func TestWritableCountsRows(t *testing.T) {
 	cfg, _ := fixedNow(t)
 	cfg.MaxRows = 1

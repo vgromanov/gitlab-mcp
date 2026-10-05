@@ -489,9 +489,9 @@ func readEpoch(ctx context.Context, q rowQuery) (string, error) {
 	return epoch, nil
 }
 
-// guardBytes rejects a write whose flushed db+wal+shm exceeds the cap.
-// Dirty pages stay out of the WAL until they are flushed, so the size is
-// measured after sqlite3_db_cacheflush and before Commit.
+// guardBytes rejects a write whose committed db+wal+shm would exceed the cap.
+// Dirty pages stay out of the WAL until they are flushed. Commit then appends
+// one more frame, so the flushed size alone is not the committed size.
 func (s *Store) guardBytes(ctx context.Context, tx *sql.Tx, changesBefore int64) error {
 	var changes int64
 	if err := tx.QueryRowContext(ctx, `SELECT total_changes()`).Scan(&changes); err != nil {
@@ -511,7 +511,16 @@ func (s *Store) enforceCap(ctx context.Context, tx *sql.Tx) error {
 	if err != nil {
 		return err
 	}
-	if n > s.maxBytes {
+	// cacheflush has already written the dirty pages. Commit appends one
+	// more WAL frame (page plus a 24-byte header) which is not in n yet.
+	var pageSize int64
+	if err := tx.QueryRowContext(ctx, `PRAGMA page_size`).Scan(&pageSize); err != nil {
+		return mapDriver(err)
+	}
+	if pageSize <= 0 {
+		pageSize = 4096
+	}
+	if n+pageSize+24 > s.maxBytes {
 		return ErrFull
 	}
 	return nil
@@ -715,4 +724,6 @@ func sqliteFileURI(path, rawQuery string) string {
 	return (&url.URL{Scheme: "file", Path: p, RawQuery: rawQuery}).String()
 }
 
-const userObjectCountSQL = `SELECT COUNT(*) FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'`
+// Literal "sqlite_" prefix. LIKE would treat "_" as a single-character wildcard
+// and ignore names such as sqlitex_controller.
+const userObjectCountSQL = `SELECT COUNT(*) FROM sqlite_master WHERE substr(name, 1, 7) != 'sqlite_'`
