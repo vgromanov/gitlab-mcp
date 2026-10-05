@@ -680,20 +680,49 @@ func encodeGraphDigest(nodes []graphNodeView, edges []graphEdgeView, assessment,
 }
 
 func graphNodeDigest(n graphNodeView) string {
-	jobs := make([]string, 0, len(n.Jobs))
-	for _, j := range n.Jobs {
-		jobs = append(jobs, strings.Join([]string{
-			strconv.FormatInt(j.ID, 10),
-			deref(j.Name),
-			deref(j.Stage),
-			deref(j.Status),
-			j.AllowFailure,
-			j.Attempt,
-			j.Policy,
-		}, ","))
+	type jobRow struct {
+		ID           int64  `json:"id"`
+		Name         string `json:"name"`
+		Stage        string `json:"stage"`
+		Status       string `json:"status"`
+		AllowFailure string `json:"allow_failure"`
+		Attempt      string `json:"attempt"`
+		Policy       string `json:"policy"`
 	}
-	sort.Strings(jobs)
-	return strings.Join([]string{n.ProjectID, strconv.FormatInt(n.PipelineID, 10), n.Role, strings.Join(jobs, ";")}, ":")
+	jobs := make([]json.RawMessage, 0, len(n.Jobs))
+	for _, j := range n.Jobs {
+		raw, err := json.Marshal(jobRow{
+			ID:           j.ID,
+			Name:         deref(j.Name),
+			Stage:        deref(j.Stage),
+			Status:       deref(j.Status),
+			AllowFailure: j.AllowFailure,
+			Attempt:      j.Attempt,
+			Policy:       j.Policy,
+		})
+		if err != nil {
+			return ""
+		}
+		jobs = append(jobs, raw)
+	}
+	sort.Slice(jobs, func(i, j int) bool {
+		return bytes.Compare(jobs[i], jobs[j]) < 0
+	})
+	raw, err := json.Marshal(struct {
+		ProjectID  string            `json:"project_id"`
+		PipelineID int64             `json:"pipeline_id"`
+		Role       string            `json:"role"`
+		Jobs       []json.RawMessage `json:"jobs"`
+	}{
+		ProjectID:  n.ProjectID,
+		PipelineID: n.PipelineID,
+		Role:       n.Role,
+		Jobs:       jobs,
+	})
+	if err != nil {
+		return ""
+	}
+	return string(raw)
 }
 
 func graphEdgeDigest(e graphEdgeView) string {

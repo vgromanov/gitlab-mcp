@@ -515,6 +515,25 @@ func TestEncodeGraphDigestIncludesJobEvidence(t *testing.T) {
 	}
 }
 
+func TestEncodeGraphDigestDistinguishesJobFieldDelimiters(t *testing.T) {
+	status := "success"
+	nameComma := "a,b"
+	stageC := "c"
+	nameA := "a"
+	stageComma := "b,c"
+	left := graphNodeView{ProjectID: "42", PipelineID: 100, Role: nodeRoleParent, Jobs: []jobView{
+		{ID: 1, Name: &nameComma, Stage: &stageC, Status: &status, AllowFailure: "false", Attempt: attemptLatest, Policy: policyPass},
+	}}
+	right := graphNodeView{ProjectID: "42", PipelineID: 100, Role: nodeRoleParent, Jobs: []jobView{
+		{ID: 1, Name: &nameA, Stage: &stageComma, Status: &status, AllowFailure: "false", Attempt: attemptLatest, Policy: policyPass},
+	}}
+	a := encodeGraphDigest([]graphNodeView{left}, nil, assessReady, downstreamCoverageComplete)
+	b := encodeGraphDigest([]graphNodeView{right}, nil, assessReady, downstreamCoverageComplete)
+	if a == "" || a == b {
+		t.Fatalf("digest collided on unescaped job delimiters %s %s", a, b)
+	}
+}
+
 func TestPipelineGraph_resumeKeepsIncompleteEdge(t *testing.T) {
 	h := &walkServer{
 		pipes: map[string]string{
