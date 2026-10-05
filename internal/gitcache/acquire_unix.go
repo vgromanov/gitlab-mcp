@@ -117,6 +117,7 @@ func (m *Manager) Acquire(ctx context.Context, intent AcquireIntent, auth Author
 			Elapsed:      time.Since(start),
 			GenerationID: warm.ID,
 			Grant:        grant,
+			objects:      warm.Objects,
 		}, nil
 	} else if err != nil && !errors.Is(err, ErrUnavailable) {
 		return nil, preserveCtx(opCtx, err)
@@ -173,32 +174,28 @@ func (m *Manager) Acquire(ctx context.Context, intent AcquireIntent, auth Author
 		Elapsed:      time.Since(start),
 		GenerationID: gen.ID,
 		Grant:        grant,
+		objects:      fres.Objects,
 	}, nil
 }
 
-// Hold acquires (fresh authorization) then re-pins the generation objects.
+// Hold acquires (fresh authorization) and transfers the already decoded objects.
+// It pins the generation without decoding it a second time.
 func (m *Manager) Hold(ctx context.Context, intent AcquireIntent, auth Authorizer) (*ObjectHold, error) {
 	res, err := m.Acquire(ctx, intent, auth)
 	if err != nil {
 		return nil, err
 	}
-	if res == nil || res.GenerationID == "" {
+	if res == nil || res.GenerationID == "" || res.objects == nil {
 		return nil, ErrUnavailable
 	}
-	fp := GrantFingerprint(res.Grant)
-	ns := NamespaceID(res.Grant.AuthDomain, res.Grant.CanonicalInstance, res.Grant.ProjectID, res.Grant.SourceFork)
-	warm, err := m.lookupWarm(ctx, fp, ns)
+	gen, err := m.pinGeneration(ctx, res.GenerationID)
 	if err != nil {
 		return nil, err
 	}
-	if warm.ID != res.GenerationID {
-		_ = warm.Unpin()
-		return nil, ErrCorrupt
-	}
 	return &ObjectHold{
 		Result:  *res,
-		Objects: warm.Objects,
-		release: func() error { return warm.Unpin() },
+		Objects: res.objects,
+		release: func() error { return gen.Unpin() },
 	}, nil
 }
 

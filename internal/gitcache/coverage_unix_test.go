@@ -5,6 +5,8 @@ package gitcache
 import (
 	"context"
 	"errors"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/go-git/go-git/v5/plumbing"
@@ -164,11 +166,36 @@ func TestWarmAcquireProveGrant(t *testing.T) {
 	if hold == nil || len(hold.Objects) == 0 || hold.Result.GenerationID != res.GenerationID {
 		t.Fatalf("hold %#v", hold)
 	}
+	if err := mgr.Close(context.Background()); !errors.Is(err, ErrPinned) {
+		t.Fatalf("hold must pin: %v", err)
+	}
 	if err := hold.Release(); err != nil {
 		t.Fatal(err)
 	}
 	if err := hold.Release(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestOpenCompareDirUnderRoot(t *testing.T) {
+	root := regressionRoot(t)
+	mgr, err := OpenManager(root, bounds.BrootBytes+bounds.GenerationCharge())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Close(context.Background())
+	dir, cleanup, err := mgr.OpenCompareDir(context.Background(), 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(dir, filepath.Join(root, compareDirName)+string(filepath.Separator)) {
+		t.Fatalf("dir %s not under %s", dir, root)
+	}
+	if err := cleanup(); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := mgr.OpenCompareDir(context.Background(), bounds.MaxScratchBytes+1); !errors.Is(err, ErrLimit) {
+		t.Fatalf("oversize: %v", err)
 	}
 }
 

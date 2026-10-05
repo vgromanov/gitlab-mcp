@@ -15,11 +15,15 @@ type ObjectHold struct {
 }
 
 // Release drops the reader pin. It is safe to call more than once.
+// The callback is cleared only after a successful unpin so a failed persist
+// can be retried instead of leaking a live pin.
 func (h *ObjectHold) Release() error {
 	if h == nil || h.release == nil {
 		return nil
 	}
-	err := h.release()
+	if err := h.release(); err != nil {
+		return err
+	}
 	h.release = nil
-	return err
+	return nil
 }

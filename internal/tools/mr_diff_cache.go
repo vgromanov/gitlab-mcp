@@ -11,6 +11,7 @@ import (
 
 	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/gitcache"
 	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/gitcache/gitdiff"
+	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/gitcache/pack"
 	igl "gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/gitlab"
 	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/tools/readmeta"
 )
@@ -37,6 +38,7 @@ func (d Deps) cacheAvailable() bool {
 
 func (d Deps) holdCache(ctx context.Context, intent gitcache.AcquireIntent) (*gitcache.ObjectHold, error) {
 	auth := NewGitCacheAuthorizer(d)
+	ctx = cacheHoldCtx(ctx)
 	if d.cacheHold != nil {
 		return d.cacheHold.Hold(ctx, intent, auth)
 	}
@@ -46,18 +48,35 @@ func (d Deps) holdCache(ctx context.Context, intent gitcache.AcquireIntent) (*gi
 	return d.GitCache.Hold(ctx, intent, auth)
 }
 
+func cacheHoldCtx(ctx context.Context) context.Context {
+	b := igl.DefaultBudget()
+	b.MaxRequests = 64
+	if parent := igl.BudgetFromContext(ctx); parent != nil && parent.MaxElapsed > 0 {
+		left := parent.MaxElapsed
+		if !parent.ElapsedExceeded() {
+			if dl, ok := parent.OriginalDeadline(); ok {
+				if rem := time.Until(dl); rem > 0 && rem < left {
+					left = rem
+				}
+			}
+		}
+		b.MaxElapsed = left
+	}
+	return igl.WithBudget(ctx, b)
+}
+
 func recoverCacheManifest(ctx context.Context, d Deps, q diffQuery, sec readmeta.Section, proved provedManifest) (diffWindowOut, bool) {
 	hold, from, to, sem, prov, ok := prepareCacheCompare(ctx, d, q, proved)
 	if !ok {
 		return diffWindowOut{}, false
 	}
 	defer hold.Release()
-	dir, err := os.MkdirTemp("", "gitlab-mcp-gitdiff-")
+	dir, cleanup, err := d.openCompareDir(ctx, hold.Objects)
 	if err != nil {
 		return diffWindowOut{}, false
 	}
-	defer os.RemoveAll(dir)
-	if err := gitdiff.WriteBare(dir, hold.Objects); err != nil {
+	defer cleanup()
+	if err := gitdiff.WriteBare(ctx, dir, hold.Objects); err != nil {
 		return diffWindowOut{}, false
 	}
 	lim := gitdiff.Limits{MaxBytes: manifestByteCap(ctx), Timeout: remainingOrDefault(ctx)}
@@ -69,14 +88,25 @@ func recoverCacheManifest(ctx context.Context, d Deps, q diffQuery, sec readmeta
 		}
 		return diffWindowOut{}, false
 	}
+	sec.Limitations = []readmeta.Limitation{}
 	entries := make([]diffManifestEntry, 0, len(res.Files))
+	full := true
 	for _, f := range res.Files {
+		if b := igl.BudgetFromContext(ctx); b != nil {
+			if err := b.AddItem(); err != nil {
+				full = false
+				sec.AddLimitation(readmeta.CodePartial, "item budget")
+				break
+			}
+		}
 		entries = append(entries, entryFromGitFile(f))
 	}
 	proved = cacheProved(q, proved, from, to, len(entries))
+	if !full {
+		proved.Full = false
+	}
 	sec.Source = readmeta.SourceGitCache
 	sec.Provider = readmeta.ProviderGit
-	sec.Limitations = nil
 	out, err := finishManifestWindow(q, sec, proved, entries)
 	if err != nil {
 		return diffWindowOut{}, false
@@ -86,18 +116,18 @@ func recoverCacheManifest(ctx context.Context, d Deps, q diffQuery, sec readmeta
 	return out, true
 }
 
-func recoverCacheContent(ctx context.Context, d Deps, q diffQuery, sec readmeta.Section, proved provedManifest, opts diffContentOpts) (diffContentOut, bool) {
+func recoverCacheContent(ctx context.Context, d Deps, q diffQuery, sec readmeta.Section, proved provedManifest, opts diffContentOpts, versionID int64) (diffContentOut, bool) {
 	hold, from, to, sem, prov, ok := prepareCacheCompare(ctx, d, q, proved)
 	if !ok {
 		return diffContentOut{}, false
 	}
 	defer hold.Release()
-	dir, err := os.MkdirTemp("", "gitlab-mcp-gitdiff-")
+	dir, cleanup, err := d.openCompareDir(ctx, hold.Objects)
 	if err != nil {
 		return diffContentOut{}, false
 	}
-	defer os.RemoveAll(dir)
-	if err := gitdiff.WriteBare(dir, hold.Objects); err != nil {
+	defer cleanup()
+	if err := gitdiff.WriteBare(ctx, dir, hold.Objects); err != nil {
 		return diffContentOut{}, false
 	}
 	rawLim := gitdiff.Limits{MaxBytes: manifestByteCap(ctx), Timeout: remainingOrDefault(ctx)}
@@ -105,14 +135,27 @@ func recoverCacheContent(ctx context.Context, d Deps, q diffQuery, sec readmeta.
 	if err != nil {
 		return diffContentOut{}, false
 	}
+	sec.Limitations = []readmeta.Limitation{}
 	files := make([]retainedDiffFile, 0, len(res.Files))
 	for _, f := range res.Files {
+		if b := igl.BudgetFromContext(ctx); b != nil {
+			if err := b.AddItem(); err != nil {
+				sec.AddLimitation(readmeta.CodePartial, "item budget")
+				break
+			}
+		}
 		files = append(files, retainedDiffFile{entry: entryFromGitFile(f)})
 	}
-	patchLim := gitdiff.Limits{MaxBytes: patchByteCap(opts), Timeout: remainingOrDefault(ctx)}
+	patchLim := gitdiff.Limits{MaxBytes: patchByteCap(ctx, opts), Timeout: remainingOrDefault(ctx)}
 	text, partial, command, err := gitdiff.Patch(ctx, dir, from, to, opts.Paths, patchLim)
 	if err != nil && !partial {
 		return diffContentOut{}, false
+	}
+	if b := igl.BudgetFromContext(ctx); b != nil {
+		if err := b.ChargeBytes(int64(len(text))); err != nil {
+			partial = true
+			sec.AddLimitation(readmeta.CodePartial, "byte budget")
+		}
 	}
 	byPath := gitdiff.SplitPatches(text)
 	for i := range files {
@@ -131,7 +174,6 @@ func recoverCacheContent(ctx context.Context, d Deps, q diffQuery, sec readmeta.
 	built, retHash, cropped, knownOmit := buildDiffContentFiles(files, selected, opts)
 	sec.Source = readmeta.SourceGitCache
 	sec.Provider = readmeta.ProviderGit
-	sec.Limitations = nil
 	sec.CapabilityVersion = capabilityDiffContentV1
 	head := proved.Head
 	if head == "" {
@@ -149,12 +191,18 @@ func recoverCacheContent(ctx context.Context, d Deps, q diffQuery, sec readmeta.
 	} else {
 		sec.ContentComplete = readmeta.ContentCompleteUnknown
 	}
+	for _, o := range outcomes {
+		if o.Status == diffSelectorAbsent || o.Status == diffSelectorAmbiguous {
+			sec.ContentComplete = readmeta.ContentCompleteFalse
+			sec.AddLimitation(readmeta.CodePartial, "selector "+o.Status)
+		}
+	}
 	items := len(built)
 	sec.Counts.Items = &items
 	sec.Counts.Files = &items
 	prov.Command = command
 	return diffContentOut{
-		Section: sec, Selection: selectionOutFrom(q, proved, q.Selection.VersionID),
+		Section: sec, Selection: selectionOutFrom(q, proved, versionID),
 		Files: built, Selectors: outcomes, ReturnedContentHash: retHash, FullPatchHash: nil,
 		Provenance: &prov,
 	}, true
@@ -169,7 +217,7 @@ func prepareCacheCompare(ctx context.Context, d Deps, q diffQuery, proved proved
 		return nil, "", "", "", diffCacheProvenance{}, false
 	}
 	intent := gitcache.AcquireIntent{
-		ProjectID: q.Project,
+		ProjectID: cacheProjectID(q),
 		MRIID:     int(q.IID),
 		Depth:     2,
 		Transport: "https",
@@ -362,11 +410,59 @@ func manifestByteCap(ctx context.Context) int {
 	return 8 << 20
 }
 
-func patchByteCap(opts diffContentOpts) int {
-	if opts.MaxContentBytes > 0 {
-		return opts.MaxContentBytes
+func patchByteCap(ctx context.Context, opts diffContentOpts) int {
+	cap := 1 << 20
+	if opts.MaxContentBytes > 0 && opts.MaxContentBytes < cap {
+		cap = opts.MaxContentBytes
 	}
-	return 1 << 20
+	if b := igl.BudgetFromContext(ctx); b != nil {
+		if left := b.RemainingBytes(); left >= 0 && int(left) < cap {
+			if left == 0 {
+				return 1
+			}
+			return int(left)
+		}
+	}
+	return cap
+}
+
+func cacheProjectID(q diffQuery) string {
+	if p := strings.TrimSpace(q.Project); p != "" {
+		return p
+	}
+	if p := strings.TrimSpace(q.Selection.ProjectID); p != "" {
+		return p
+	}
+	if q.OwnerID > 0 {
+		return strconv.FormatInt(q.OwnerID, 10)
+	}
+	return ""
+}
+
+func (d Deps) openCompareDir(ctx context.Context, objs map[plumbing.Hash]pack.Object) (string, func(), error) {
+	size := objectBytes(objs)
+	if d.GitCache != nil {
+		if mgr := d.GitCache.Manager(); mgr != nil {
+			dir, cleanup, err := mgr.OpenCompareDir(ctx, size)
+			if err != nil {
+				return "", nil, err
+			}
+			return dir, func() { _ = cleanup() }, nil
+		}
+	}
+	dir, err := os.MkdirTemp("", "gitlab-mcp-gitdiff-")
+	if err != nil {
+		return "", nil, err
+	}
+	return dir, func() { _ = os.RemoveAll(dir) }, nil
+}
+
+func objectBytes(objs map[plumbing.Hash]pack.Object) int64 {
+	var n int64
+	for _, obj := range objs {
+		n += int64(len(obj.Data))
+	}
+	return n
 }
 
 func remainingOrDefault(ctx context.Context) time.Duration {

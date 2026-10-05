@@ -131,6 +131,10 @@ func TestDiffWindow_cacheRecoversContent(t *testing.T) {
 	if asMap(t, files[0])["status"] != diffFileStatusText {
 		t.Fatalf("file=%#v", files[0])
 	}
+	sel, _ := out["selection"].(map[string]any)
+	if sel["version_id"] != float64(1) {
+		t.Fatalf("selection=%#v", sel)
+	}
 }
 
 func TestDiffWindow_cacheMismatchNeverVerified(t *testing.T) {
@@ -310,7 +314,7 @@ func TestDiffWindow_apiAndGitAgreeOnFixture(t *testing.T) {
 	}
 	api := asMap(t, entries[0])
 	dir := t.TempDir()
-	if err := gitdiff.WriteBare(dir, objs); err != nil {
+	if err := gitdiff.WriteBare(context.Background(), dir, objs); err != nil {
 		t.Fatal(err)
 	}
 	res, err := gitdiff.Raw(context.Background(), dir, base, head, gitdiff.SemanticsFullMR, objs, gitdiff.Limits{})

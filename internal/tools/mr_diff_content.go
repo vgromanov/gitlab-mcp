@@ -1022,7 +1022,7 @@ func readVersionContent(ctx context.Context, d Deps, q diffQuery, sec readmeta.S
 	}
 	sel := selectionOutFrom(q, proved, versionID)
 	if status != "" || !proved.Full {
-		if out, ok := recoverCacheContent(ctx, d, q, sec, proved, opts); ok {
+		if out, ok := recoverCacheContent(ctx, d, q, sec, proved, opts, versionID); ok {
 			return out, nil
 		}
 		if status == "" {
@@ -1278,7 +1278,7 @@ func readIncrementalContent(ctx context.Context, d Deps, q diffQuery, sec readme
 	sec.Consistency = readmeta.ConsistencyConsistent
 	items := len(built)
 	sec.Counts.Items = &items
-	if out, ok := recoverCacheContent(ctx, d, q, sec, provedManifest{}, opts); ok {
+	if out, ok := recoverCacheContent(ctx, d, q, sec, provedManifest{}, opts, 0); ok {
 		return out, nil
 	}
 	return diffContentOut{

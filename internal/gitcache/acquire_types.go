@@ -7,6 +7,7 @@ import (
 	"github.com/go-git/go-git/v5/plumbing"
 
 	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/gitcache/listx"
+	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/gitcache/pack"
 	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/gitcache/sshtrust"
 )
 
@@ -56,4 +57,7 @@ type AcquireResult struct {
 	Elapsed      time.Duration
 	GenerationID string
 	Grant        Grant // authoritative binding used for this result
+	// objects is the already-decoded generation map. Hold consumes it so
+	// comparison does not decode the generation a second time.
+	objects map[plumbing.Hash]pack.Object
 }

@@ -1065,6 +1065,38 @@ func (g *Generation) Unpin() error {
 	return nil
 }
 
+// pinGeneration pins a committed generation by id without decoding objects.
+func (m *Manager) pinGeneration(ctx context.Context, id string) (*Generation, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if id == "" {
+		return nil, ErrUnavailable
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed || m.closing {
+		return nil, ErrClosed
+	}
+	if m.readers >= bounds.MaxReaders {
+		return nil, ErrBusy
+	}
+	for i, s := range m.slots {
+		if s.State != SlotCommitted {
+			continue
+		}
+		if hex.EncodeToString(s.ID[:]) != id {
+			continue
+		}
+		g := &Generation{ID: id, PackSize: int64(s.PackSize), IndexSize: int64(s.IndexSize), MetaSize: int64(s.MetaSize), mgr: m, slot: i}
+		if err := m.pinLocked(ctx, g); err != nil {
+			return nil, err
+		}
+		return g, nil
+	}
+	return nil, ErrUnavailable
+}
+
 // lookupWarm finds a committed generation matching grant fingerprint and namespace.
 // Content return is only via Acquire after a fresh ResolveGrant.
 func (m *Manager) lookupWarm(ctx context.Context, grantFP, ns string) (*Generation, error) {

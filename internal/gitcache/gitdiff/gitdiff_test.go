@@ -67,7 +67,7 @@ func TestRawSpecialPathsAndKinds(t *testing.T) {
 	gitDir := filepath.Join(repo, ".git")
 	objs := loadObjects(t, gitDir)
 	bare := t.TempDir()
-	if err := WriteBare(bare, objs); err != nil {
+	if err := WriteBare(context.Background(), bare, objs); err != nil {
 		t.Fatal(err)
 	}
 	plantHook(t, bare)
@@ -124,7 +124,7 @@ func TestRawOutputLimitIsPartial(t *testing.T) {
 	requireGit(t)
 	objs, base, head := manyFiles(t, 80)
 	bare := t.TempDir()
-	if err := WriteBare(bare, objs); err != nil {
+	if err := WriteBare(context.Background(), bare, objs); err != nil {
 		t.Fatal(err)
 	}
 	res, err := Raw(context.Background(), bare, base, head, SemanticsStraight, objs, Limits{MaxBytes: 64, Timeout: 5 * time.Second})
@@ -137,7 +137,7 @@ func TestRawTimeLimitIsPartial(t *testing.T) {
 	requireGit(t)
 	objs, base, head := manyFiles(t, 80)
 	bare := t.TempDir()
-	if err := WriteBare(bare, objs); err != nil {
+	if err := WriteBare(context.Background(), bare, objs); err != nil {
 		t.Fatal(err)
 	}
 	res, err := Raw(context.Background(), bare, base, head, SemanticsStraight, objs, Limits{MaxBytes: 8 << 20, Timeout: time.Nanosecond})
@@ -162,7 +162,7 @@ func TestNoExternalTextconvOrDiff(t *testing.T) {
 	head := strings.TrimSpace(string(gitCmd(t, repo, "rev-parse", "HEAD")))
 	objs := loadObjects(t, filepath.Join(repo, ".git"))
 	bare := t.TempDir()
-	if err := WriteBare(bare, objs); err != nil {
+	if err := WriteBare(context.Background(), bare, objs); err != nil {
 		t.Fatal(err)
 	}
 	script := filepath.Join(bare, "evil.sh")
@@ -187,7 +187,7 @@ func TestLargeManifestMetadata(t *testing.T) {
 	requireGit(t)
 	objs, base, head := manyFiles(t, 3500)
 	bare := t.TempDir()
-	if err := WriteBare(bare, objs); err != nil {
+	if err := WriteBare(context.Background(), bare, objs); err != nil {
 		t.Fatal(err)
 	}
 	res, err := Raw(context.Background(), bare, base, head, SemanticsFullMR, objs, Limits{MaxBytes: 16 << 20, Timeout: 30 * time.Second})
@@ -219,7 +219,7 @@ func TestPatchAgreesWithRaw(t *testing.T) {
 	head := strings.TrimSpace(string(gitCmd(t, repo, "rev-parse", "HEAD")))
 	objs := loadObjects(t, filepath.Join(repo, ".git"))
 	bare := t.TempDir()
-	if err := WriteBare(bare, objs); err != nil {
+	if err := WriteBare(context.Background(), bare, objs); err != nil {
 		t.Fatal(err)
 	}
 	res, err := Raw(context.Background(), bare, base, head, SemanticsStraight, objs, Limits{})
@@ -331,12 +331,12 @@ func errorsIs(err, target error) bool {
 }
 
 func TestWriteBareAndRequireCommits(t *testing.T) {
-	if err := WriteBare(t.TempDir(), nil); !errorsIs(err, ErrObject) {
+	if err := WriteBare(context.Background(), t.TempDir(), nil); !errorsIs(err, ErrObject) {
 		t.Fatalf("empty: %v", err)
 	}
 	h := plumbing.NewHash(strings.Repeat("a", 40))
 	bad := map[plumbing.Hash]pack.Object{h: {Type: "blob", Data: []byte("x"), Hash: plumbing.ZeroHash}}
-	if err := WriteBare(t.TempDir(), bad); !errorsIs(err, ErrObject) {
+	if err := WriteBare(context.Background(), t.TempDir(), bad); !errorsIs(err, ErrObject) {
 		t.Fatalf("mismatch: %v", err)
 	}
 	if err := RequireCommits(nil, ""); !errorsIs(err, ErrObject) {
@@ -358,5 +358,23 @@ func TestSplitPatchesKeys(t *testing.T) {
 	got := SplitPatches(text)
 	if got["old.txt"] == "" || got["new.txt"] == "" {
 		t.Fatalf("%#v", got)
+	}
+}
+
+func TestSplitPatchesQuotedPaths(t *testing.T) {
+	text := "diff --git \"a/file with spaces.txt\" \"b/file with spaces.txt\"\n--- \"a/file with spaces.txt\"\n+++ \"b/file with spaces.txt\"\n@@ -1 +1 @@\n-a\n+b\n"
+	got := SplitPatches(text)
+	if got["file with spaces.txt"] == "" {
+		t.Fatalf("%#v", got)
+	}
+}
+
+func TestWriteBareHonorsCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	blob := pack.Object{Type: "blob", Data: []byte("x")}
+	blob.Hash = pack.HashObject("blob", blob.Data)
+	if err := WriteBare(ctx, t.TempDir(), map[plumbing.Hash]pack.Object{blob.Hash: blob}); !errorsIs(err, context.Canceled) {
+		t.Fatalf("cancel: %v", err)
 	}
 }

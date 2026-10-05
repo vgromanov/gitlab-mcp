@@ -174,6 +174,24 @@ func (b *Budget) RemainingBytes() int64 {
 	return left
 }
 
+// ChargeBytes accounts retained output against MaxBytes.
+func (b *Budget) ChargeBytes(n int64) error {
+	if b == nil || n <= 0 {
+		return nil
+	}
+	if n > int64(^uint(0)>>1) {
+		n = int64(^uint(0) >> 1)
+	}
+	got, err := b.reserveBytes(int(n))
+	if err != nil {
+		return err
+	}
+	if int64(got) < n {
+		return ErrBudgetBytes
+	}
+	return nil
+}
+
 // AddItem increments retained item count; returns ErrBudgetItems if already at max.
 func (b *Budget) AddItem() error {
 	if b == nil {

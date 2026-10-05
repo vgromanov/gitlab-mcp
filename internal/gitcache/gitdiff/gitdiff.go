@@ -26,7 +26,7 @@ const (
 	SemanticsStraight    = "incremental_straight"
 	defaultTimeout       = 15 * time.Second
 	defaultMaxBytes      = 8 << 20
-	gitModeMissing       = "000000"
+	gitModeMissing       = "0"
 	gitModeGitlink       = "160000"
 	rawCommandTemplate   = "git --git-dir=<bare> -c core.hooksPath=<empty> -c diff.external= --no-pager diff --no-ext-diff --no-textconv --full-index --abbrev=40 --raw -z -M --no-color <from> <to>"
 	patchCommandTemplate = "git --git-dir=<bare> -c core.hooksPath=<empty> -c diff.external= --no-pager diff --no-ext-diff --no-textconv --ignore-submodules=all --full-index -p --binary --no-color <from> <to> -- <paths>"
@@ -81,8 +81,11 @@ func (l Limits) apply() Limits {
 }
 
 // WriteBare materializes loose objects into a bare repo with no worktree, hooks,
-// attributes, or textconv config.
-func WriteBare(dir string, objs map[plumbing.Hash]pack.Object) error {
+// attributes, or textconv config. ctx cancellation stops further writes.
+func WriteBare(ctx context.Context, dir string, objs map[plumbing.Hash]pack.Object) error {
+	if ctx != nil && ctx.Err() != nil {
+		return ctx.Err()
+	}
 	if dir == "" || len(objs) == 0 {
 		return ErrObject
 	}
@@ -103,6 +106,9 @@ func WriteBare(dir string, objs map[plumbing.Hash]pack.Object) error {
 		return err
 	}
 	for h, obj := range objs {
+		if ctx != nil && ctx.Err() != nil {
+			return ctx.Err()
+		}
 		if obj.Hash != h || pack.HashObject(obj.Type, obj.Data) != h {
 			return ErrObject
 		}
@@ -236,6 +242,7 @@ func runGit(ctx context.Context, gitDir string, lim Limits, args []string) ([]by
 		"GIT_DIR=" + gitDir,
 		"GIT_OPTIONAL_LOCKS=0",
 		"GIT_TERMINAL_PROMPT=0",
+		"GIT_LITERAL_PATHSPECS=1",
 		"LC_ALL=C",
 	}
 	var stdout capBuffer
@@ -439,26 +446,83 @@ func splitDiffGit(text string) []string {
 func patchPaths(part string) (oldPath, newPath string) {
 	for _, line := range strings.Split(part, "\n") {
 		if strings.HasPrefix(line, "--- ") {
-			oldPath = strings.TrimPrefix(strings.TrimPrefix(line[4:], "a/"), "b/")
-			if oldPath == "/dev/null" {
-				oldPath = ""
-			}
+			oldPath = headerPath(line[4:])
 		}
 		if strings.HasPrefix(line, "+++ ") {
-			newPath = strings.TrimPrefix(strings.TrimPrefix(line[4:], "b/"), "a/")
-			if newPath == "/dev/null" {
-				newPath = ""
-			}
+			newPath = headerPath(line[4:])
 		}
 		if strings.HasPrefix(line, "diff --git ") {
-			fields := strings.Fields(line)
-			if len(fields) >= 4 {
-				oldPath = strings.TrimPrefix(fields[2], "a/")
-				newPath = strings.TrimPrefix(fields[3], "b/")
+			a, b, ok := parseDiffGitPaths(line[len("diff --git "):])
+			if ok {
+				if oldPath == "" {
+					oldPath = a
+				}
+				if newPath == "" {
+					newPath = b
+				}
 			}
 		}
 	}
 	return oldPath, newPath
+}
+
+func headerPath(rest string) string {
+	rest = strings.TrimSuffix(rest, "\t")
+	rest = strings.TrimSpace(rest)
+	if rest == "" {
+		return ""
+	}
+	if rest[0] == '"' {
+		if u, err := strconv.Unquote(rest); err == nil {
+			rest = u
+		}
+	}
+	rest = strings.TrimPrefix(rest, "a/")
+	rest = strings.TrimPrefix(rest, "b/")
+	if rest == "/dev/null" {
+		return ""
+	}
+	return rest
+}
+
+func parseDiffGitPaths(rest string) (oldPath, newPath string, ok bool) {
+	oldPath, rest, ok = splitGitPathToken(rest)
+	if !ok {
+		return "", "", false
+	}
+	newPath, _, ok = splitGitPathToken(strings.TrimLeft(rest, " "))
+	if !ok {
+		return "", "", false
+	}
+	return strings.TrimPrefix(oldPath, "a/"), strings.TrimPrefix(newPath, "b/"), true
+}
+
+func splitGitPathToken(s string) (token, rest string, ok bool) {
+	s = strings.TrimLeft(s, " ")
+	if s == "" {
+		return "", s, false
+	}
+	if s[0] == '"' {
+		i := 1
+		for i < len(s) {
+			if s[i] == '\\' && i+1 < len(s) {
+				i += 2
+				continue
+			}
+			if s[i] == '"' {
+				raw := s[:i+1]
+				u, err := strconv.Unquote(raw)
+				if err != nil {
+					return "", s, false
+				}
+				return u, s[i+1:], true
+			}
+			i++
+		}
+		return "", s, false
+	}
+	tok, rest, _ := strings.Cut(s, " ")
+	return tok, rest, tok != ""
 }
 
 // LookPath reports whether a git binary exists. Tests skip when it does not.
