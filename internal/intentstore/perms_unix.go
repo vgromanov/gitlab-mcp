@@ -276,7 +276,15 @@ func checkOpenedDir(fd int) error {
 	if err := unix.Fstat(fd, &st); err != nil {
 		return err
 	}
-	return checkSharedDirMode(st)
+	if err := checkSharedDirMode(st); err != nil {
+		return err
+	}
+	// A sticky directory only lets an entry's owner rename it, so a write
+	// grant there does not endanger the validated path.
+	if st.Mode&unix.S_ISVTX == 0 {
+		return rejectAncestorACL(fd)
+	}
+	return nil
 }
 
 func splitPath(clean string) []string {

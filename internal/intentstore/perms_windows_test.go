@@ -8,6 +8,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"testing"
+
+	"golang.org/x/sys/windows"
 )
 
 func TestMakeParentsCreatesOwnerOnlyChain(t *testing.T) {
@@ -38,5 +40,30 @@ func TestMakeParentsRejectsJunctionAncestor(t *testing.T) {
 	}
 	if _, statErr := os.Stat(filepath.Join(target, "child")); statErr == nil {
 		t.Fatal("directory was created through the junction")
+	}
+}
+
+func TestUntrustedWritableAncestorRejected(t *testing.T) {
+	base := t.TempDir()
+	if err := rejectUntrustedAncestor(base); err != nil {
+		t.Fatalf("temp dir with default ACL: %v", err)
+	}
+	sd, err := windows.SecurityDescriptorFromString("D:(A;OICI;FA;;;WD)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dacl, _, err := sd.DACL()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := windows.SetNamedSecurityInfo(base, windows.SE_FILE_OBJECT,
+		windows.DACL_SECURITY_INFORMATION|windows.UNPROTECTED_DACL_SECURITY_INFORMATION, nil, nil, dacl, nil); err != nil {
+		t.Skipf("set everyone ACL: %v", err)
+	}
+	if err := rejectUntrustedAncestor(base); !errors.Is(err, ErrUnsafePermissions) {
+		t.Fatalf("everyone full control: %v", err)
+	}
+	if _, err := Open(Config{Path: filepath.Join(base, "store", "intent.db")}); !errors.Is(err, ErrUnsafePermissions) {
+		t.Fatalf("open under writable ancestor: %v", err)
 	}
 }

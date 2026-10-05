@@ -67,3 +67,41 @@ func TestPopulatedACLMalformedFailsClosed(t *testing.T) {
 		t.Fatal("truncated reply must fail closed")
 	}
 }
+
+func aclReplyWithACEs(rights ...[2]uint32) []byte {
+	reply := aclReply(uint32(len(rights)), len(rights))
+	base := attrRefOffset + 8 + kauthFilesecACLOffset + 8
+	for i, r := range rights {
+		binary.NativeEndian.PutUint32(reply[base+i*kauthACESize+16:], r[0])
+		binary.NativeEndian.PutUint32(reply[base+i*kauthACESize+20:], r[1])
+	}
+	return reply
+}
+
+func TestAncestorACLOnlyMutatingPermitsRejected(t *testing.T) {
+	denyDelete := [2]uint32{2, kauthDelete}
+	readOnly := [2]uint32{1, 1 << 1}
+	if aclGrantsMutation(aclReply(kauthFilesecNoACL, 0)) {
+		t.Fatal("no ACL must pass")
+	}
+	if aclGrantsMutation(aclReplyWithACEs(denyDelete)) {
+		t.Fatal("stock deny-delete ACL must pass")
+	}
+	if aclGrantsMutation(aclReplyWithACEs(denyDelete, readOnly)) {
+		t.Fatal("deny plus read-only permit must pass")
+	}
+	for name, rights := range map[string]uint32{
+		"add_file": kauthWriteData, "add_subdirectory": kauthAppendData,
+		"delete": kauthDelete, "delete_child": kauthDeleteChild,
+		"writesecurity": kauthWriteSecurity, "chown": kauthTakeOwnership,
+		"generic_write": kauthGenericWrite, "generic_all": kauthGenericAll,
+	} {
+		if !aclGrantsMutation(aclReplyWithACEs(denyDelete, [2]uint32{1, rights})) {
+			t.Fatalf("permit %s must be rejected", name)
+		}
+	}
+	truncated := aclReply(5, 1)
+	if !aclGrantsMutation(truncated) {
+		t.Fatal("entry count beyond the data must fail closed")
+	}
+}

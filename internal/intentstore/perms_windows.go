@@ -27,7 +27,8 @@ func establishPrivate(path string, dir bool) error {
 	return verifyOwnerOnly(path, dir)
 }
 
-// rejectSymlinkComponents refuses a symlink in any existing component.
+// rejectSymlinkComponents refuses a symlink in any existing component and a
+// directory component whose ACL lets an untrusted principal rename it.
 // Lstat is applied to each component, so an intermediate reparse point is
 // the final component of that lookup and is not followed.
 func rejectSymlinkComponents(path string) error {
@@ -42,6 +43,11 @@ func rejectSymlinkComponents(path string) error {
 		}
 		if isSymlink(info) {
 			return ErrSymlink
+		}
+		if info.IsDir() {
+			if err := rejectUntrustedAncestor(acc); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -125,6 +131,8 @@ func makeParents(path string) error {
 			if err := verifyOwnerOnly(acc, true); err != nil {
 				return err
 			}
+		} else if err := rejectUntrustedAncestor(acc); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -292,3 +300,72 @@ func verifyOwnerOnly(path string, dir bool) error {
 }
 
 const windowsWriteMask = windows.FILE_WRITE_DATA | windows.FILE_APPEND_DATA | windows.FILE_GENERIC_WRITE | windows.GENERIC_WRITE | windows.GENERIC_ALL
+
+const (
+	windowsDeleteChild = 0x40
+	// windowsMutateMask are the rights that let a principal remove or
+	// rename a directory entry, or rewrite who may.
+	windowsMutateMask = windowsDeleteChild | windows.DELETE | windows.WRITE_DAC | windows.WRITE_OWNER |
+		windows.GENERIC_ALL | windows.GENERIC_WRITE
+
+	windowsTrustedInstallerSID = "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"
+)
+
+// rejectUntrustedAncestor refuses a directory that a principal other than
+// this user, SYSTEM, Administrators, or TrustedInstaller can delete, rename,
+// or re-ACL. Such a principal can swap the validated private parent for a
+// junction between the path walk and sql.Open.
+func rejectUntrustedAncestor(path string) error {
+	sd, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION|windows.OWNER_SECURITY_INFORMATION)
+	if err != nil || sd == nil {
+		return ErrUnsafePermissions
+	}
+	user, err := currentUserSID()
+	if err != nil {
+		return ErrUnsafePermissions
+	}
+	trusted := func(sid *windows.SID) bool {
+		if sid == nil {
+			return false
+		}
+		if sid.Equals(user) {
+			return true
+		}
+		switch sid.String() {
+		case "S-1-5-18", "S-1-5-32-544", "S-1-3-0", windowsTrustedInstallerSID:
+			return true
+		}
+		return false
+	}
+	owner, _, err := sd.Owner()
+	if err != nil || !trusted(owner) {
+		return ErrUnsafePermissions
+	}
+	dacl, _, err := sd.DACL()
+	if err != nil || dacl == nil {
+		return ErrUnsafePermissions
+	}
+	for i := uint32(0); i < uint32(dacl.AceCount); i++ {
+		var ace *windows.ACCESS_ALLOWED_ACE
+		if err := windows.GetAce(dacl, i, &ace); err != nil {
+			return ErrUnsafePermissions
+		}
+		switch ace.Header.AceType {
+		case windows.ACCESS_DENIED_ACE_TYPE:
+			continue
+		case windows.ACCESS_ALLOWED_ACE_TYPE:
+		default:
+			return ErrUnsafePermissions
+		}
+		if ace.Header.AceFlags&windows.INHERIT_ONLY_ACE != 0 {
+			continue
+		}
+		if ace.Mask&windowsMutateMask == 0 {
+			continue
+		}
+		if !trusted((*windows.SID)(unsafe.Pointer(&ace.SidStart))) {
+			return ErrUnsafePermissions
+		}
+	}
+	return nil
+}

@@ -5,3 +5,6 @@ package intentstore
 // rejectAccessACL is a no-op on Unix flavors without a portable ACL API
 // in this build. Linux and Darwin inspect access ACLs.
 func rejectAccessACL(string) error { return nil }
+
+// rejectAncestorACL is a no-op for the same reason.
+func rejectAncestorACL(int) error { return nil }

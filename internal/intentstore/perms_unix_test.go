@@ -238,3 +238,68 @@ func TestAncestorOwnedByOtherUserRejected(t *testing.T) {
 	}
 	_ = s.Close()
 }
+
+func grantAncestorACL(t *testing.T, path string, write bool) {
+	t.Helper()
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin", "ios":
+		rule := "everyone allow list,search,readattr"
+		if write {
+			rule = "everyone allow list,search,add_file,add_subdirectory,delete_child"
+		}
+		cmd = exec.Command("chmod", "+a", rule, path)
+	case "linux":
+		if _, err := exec.LookPath("setfacl"); err != nil {
+			t.Skip("setfacl not installed")
+		}
+		perm := "rx"
+		if write {
+			perm = "rwx"
+		}
+		cmd = exec.Command("setfacl", "-m", "u:nobody:"+perm, path)
+	default:
+		t.Skip("no ACL grant helper")
+	}
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Skipf("grant ACL unsupported here: %v\n%s", err, out)
+	}
+}
+
+func TestAncestorWriteACLRejected(t *testing.T) {
+	base := privateDir(t)
+	grantAncestorACL(t, base, true)
+	path := filepath.Join(base, "store", "intent.db")
+	if _, err := Open(Config{Path: path}); !errors.Is(err, ErrUnsafePermissions) {
+		t.Fatalf("ancestor with write ACL: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(base, "store")); err == nil {
+		t.Fatal("parent was created beneath an ancestor with a write ACL")
+	}
+}
+
+func TestAncestorReadOnlyACLAccepted(t *testing.T) {
+	base := privateDir(t)
+	grantAncestorACL(t, base, false)
+	s, err := Open(Config{Path: filepath.Join(base, "store", "intent.db")})
+	if err != nil {
+		t.Fatalf("ancestor with read-only ACL: %v", err)
+	}
+	_ = s.Close()
+}
+
+func TestAncestorDenyDeleteACLAccepted(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("deny-delete is the stock macOS home directory ACL")
+	}
+	base := privateDir(t)
+	if out, err := exec.Command("chmod", "+a", "everyone deny delete", base).CombinedOutput(); err != nil {
+		t.Skipf("chmod +a: %v\n%s", err, out)
+	}
+	t.Cleanup(func() { _ = exec.Command("chmod", "-N", base).Run() })
+	s, err := Open(Config{Path: filepath.Join(base, "store", "intent.db")})
+	if err != nil {
+		t.Fatalf("ancestor with deny-delete ACL: %v", err)
+	}
+	_ = s.Close()
+}
