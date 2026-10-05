@@ -43,7 +43,9 @@ func callDiffWindow(t *testing.T, d Deps, srvCtx context.Context, args map[strin
 		t.Fatalf("client connect: %v", err)
 	}
 	t.Cleanup(func() { _ = cs.Close() })
-	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{Name: "get_merge_request_diff_window", Arguments: args})
+	// Use the same ctx as Connect so borrowed budgets/cancel/deadlines reach the tool
+	// and in-flight provider RoundTrips (matches callReviewContext).
+	res, err := cs.CallTool(srvCtx, &mcp.CallToolParams{Name: "get_merge_request_diff_window", Arguments: args})
 	if err != nil {
 		return nil, err
 	}

@@ -34,21 +34,26 @@ const (
 )
 
 type diffWindowIn struct {
-	ProjectID       string  `json:"project_id"`
-	MergeRequestIID int64   `json:"merge_request_iid"`
-	DiffVersionID   *int64  `json:"diff_version_id,omitempty"`
-	BaseSHA         *string `json:"base_sha,omitempty"`
-	StartSHA        *string `json:"start_sha,omitempty"`
-	HeadSHA         *string `json:"head_sha,omitempty"`
-	FromSHA         *string `json:"from_sha,omitempty"`
-	ToSHA           *string `json:"to_sha,omitempty"`
-	Straight        *bool   `json:"straight,omitempty"`
-	PerPage         *int    `json:"per_page,omitempty"`
-	Cursor          *string `json:"cursor,omitempty"`
-	MaxItems        *int    `json:"max_items,omitempty"`
-	MaxBytes        *int64  `json:"max_bytes,omitempty"`
-	MaxRequests     *int    `json:"max_requests,omitempty"`
-	MaxElapsedMS    *int64  `json:"max_elapsed_ms,omitempty"`
+	ProjectID       string   `json:"project_id"`
+	MergeRequestIID int64    `json:"merge_request_iid"`
+	DiffVersionID   *int64   `json:"diff_version_id,omitempty"`
+	BaseSHA         *string  `json:"base_sha,omitempty"`
+	StartSHA        *string  `json:"start_sha,omitempty"`
+	HeadSHA         *string  `json:"head_sha,omitempty"`
+	FromSHA         *string  `json:"from_sha,omitempty"`
+	ToSHA           *string  `json:"to_sha,omitempty"`
+	Straight        *bool    `json:"straight,omitempty"`
+	PerPage         *int     `json:"per_page,omitempty"`
+	Cursor          *string  `json:"cursor,omitempty"`
+	Mode            *string  `json:"mode,omitempty" jsonschema:"manifest (default) or content"`
+	Paths           []string `json:"paths,omitempty" jsonschema:"content mode: 1..per_page distinct repository-relative paths"`
+	ContextLines    *int     `json:"context_lines,omitempty" jsonschema:"content mode: 0..20, default 3"`
+	MaxLines        *int     `json:"max_lines,omitempty" jsonschema:"content mode: 1..10000, default 1000"`
+	MaxContentBytes *int     `json:"max_content_bytes,omitempty" jsonschema:"content mode: 1..1048576, default 262144"`
+	MaxItems        *int     `json:"max_items,omitempty"`
+	MaxBytes        *int64   `json:"max_bytes,omitempty"`
+	MaxRequests     *int     `json:"max_requests,omitempty"`
+	MaxElapsedMS    *int64   `json:"max_elapsed_ms,omitempty"`
 }
 
 type diffManifestEntry struct {
@@ -114,12 +119,19 @@ func getMergeRequestDiffWindow(ctx context.Context, _ *mcp.CallToolRequest, in d
 	if d.Config == nil || len(d.Config.CursorKey) < cursor.MinKeyBytes {
 		return nil, nil, fmt.Errorf("%s", errCursorKeyMissingDiffWindow)
 	}
+	mode, contentOpts, err := normalizeDiffWindowMode(in)
+	if err != nil {
+		return nil, nil, err
+	}
 	sel, err := normalizeDiffSelection(in)
 	if err != nil {
 		return nil, nil, err
 	}
 	var resume *cursor.Payload
 	if in.Cursor != nil && strings.TrimSpace(*in.Cursor) != "" {
+		if mode == diffModeContent {
+			return nil, nil, fmt.Errorf("content mode does not support cursor")
+		}
 		decoded, decErr := cursor.Decode(d.Config.CursorKey, *in.Cursor, d.now())
 		if decErr != nil {
 			return nil, nil, fmt.Errorf("%s", cursor.ResyncRequired)
@@ -171,13 +183,21 @@ func getMergeRequestDiffWindow(ctx context.Context, _ *mcp.CallToolRequest, in d
 	if resume != nil {
 		offset = resume.DiffWindow.Offset
 	}
-	out, err := readBoundedDiffManifest(ctx, d, diffQuery{
+	q := diffQuery{
 		OwnerID: owner.ID, IID: sel.IID, MRID: mr.ID,
 		SourceProjectID: mr.SourceProjectID, TargetProjectID: mr.ProjectID,
 		Selection: sel, Offset: offset, Now: d.now(), Resume: resume,
 		ActorID: actor, Instance: instance, PolicyFP: d.Config.PolicyFingerprint(),
 		Key: d.Config.CursorKey, Project: strconv.FormatInt(owner.ID, 10),
-	})
+	}
+	if mode == diffModeContent {
+		out, err := readBoundedDiffContent(ctx, d, q, contentOpts)
+		if err != nil {
+			return nil, nil, err
+		}
+		return nil, out, nil
+	}
+	out, err := readBoundedDiffManifest(ctx, d, q)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -583,7 +603,7 @@ func getVersionBody(ctx context.Context, d Deps, projectID, iid, versionID int64
 			return nil
 		}
 		return igl.BudgetFromContext(ctx).AddItem()
-	})
+	}, nil)
 	if err != nil {
 		if passthroughTypedProviderErr(err) {
 			return objectStream{}, err
@@ -995,7 +1015,7 @@ func readIncrementalManifest(ctx context.Context, d Deps, q diffQuery, sec readm
 			return b.AddItem()
 		}
 		return nil
-	})
+	}, nil)
 	if err != nil {
 		if passthroughTypedProviderErr(err) {
 			return diffWindowOut{}, err
@@ -1081,7 +1101,7 @@ func proveCommitProject(ctx context.Context, d Deps, q diffQuery) (int64, error)
 
 func proveCommit(ctx context.Context, d Deps, projectID int64, sha string) error {
 	path := fmt.Sprintf("projects/%s/repository/commits/%s", gitlab.PathEscape(strconv.FormatInt(projectID, 10)), gitlab.PathEscape(sha))
-	st, resp, err := streamDiffObject(ctx, d.Client, path, nil, nil)
+	st, resp, err := streamDiffObject(ctx, d.Client, path, nil, nil, nil)
 	if err != nil {
 		if passthroughTypedProviderErr(err) {
 			return err
@@ -1111,15 +1131,54 @@ func proveCommit(ctx context.Context, d Deps, projectID int64, sha string) error
 type objectStream struct {
 	fields  map[string]json.RawMessage
 	entries []diffManifestEntry
+	patches []streamedPatch
 	diffsOK bool
 	pathBad bool
+}
+
+type streamedPatch struct {
+	text      string
+	retained  bool
+	overCap   bool
+	dupKey    bool
+	wrongType bool
+	absent    bool
+}
+
+type patchCollect struct {
+	want         map[string]struct{}
+	maxCandidate int
+	maxSelected  int
+	selectedUsed int
+}
+
+func newPatchCollect(paths []string) *patchCollect {
+	want := make(map[string]struct{}, len(paths))
+	for _, p := range paths {
+		want[p] = struct{}{}
+	}
+	return &patchCollect{
+		want:         want,
+		maxCandidate: diffContentMaxCandidateBytes,
+		maxSelected:  diffContentMaxSelectedBytes,
+	}
+}
+
+func (c *patchCollect) wanted(entry diffManifestEntry) bool {
+	if c == nil || len(c.want) == 0 {
+		return false
+	}
+	_, okOld := c.want[pathStr(entry.OldPath)]
+	_, okNew := c.want[pathStr(entry.NewPath)]
+	return okOld || okNew
 }
 
 // streamDiffObject reads one JSON object with StreamJSONArrayQueue ownership:
 // a derived child context and pipe are closed on every exit, including a
 // callback stop, and the shared budget is never cancelled. Patch strings are
-// discarded while scanning and are not retained. Bool flags stay raw JSON.
-func streamDiffObject(ctx context.Context, client *gitlab.Client, path string, opt any, onEntry func(diffManifestEntry) error) (objectStream, *gitlab.Response, error) {
+// discarded while scanning unless collect is non-nil and selects the entry.
+// Bool flags stay raw JSON.
+func streamDiffObject(ctx context.Context, client *gitlab.Client, path string, opt any, onEntry func(diffManifestEntry) error, collect *patchCollect) (objectStream, *gitlab.Response, error) {
 	var zero objectStream
 	if client == nil {
 		return zero, nil, io.ErrUnexpectedEOF
@@ -1150,7 +1209,7 @@ func streamDiffObject(ctx context.Context, client *gitlab.Client, path string, o
 		defer func() { _ = pr.Close() }()
 		dec := json.NewDecoder(pr)
 		dec.UseNumber()
-		parsed, err := decodeProviderObject(dec, onEntry)
+		parsed, err := decodeProviderObject(dec, onEntry, collect)
 		if err != nil {
 			stop(err)
 			return
@@ -1187,7 +1246,7 @@ func streamDiffObject(ctx context.Context, client *gitlab.Client, path string, o
 	return result, resp, doErr
 }
 
-func decodeProviderObject(dec *json.Decoder, onEntry func(diffManifestEntry) error) (objectStream, error) {
+func decodeProviderObject(dec *json.Decoder, onEntry func(diffManifestEntry) error, collect *patchCollect) (objectStream, error) {
 	tok, err := dec.Token()
 	if err != nil {
 		return objectStream{}, err
@@ -1196,6 +1255,7 @@ func decodeProviderObject(dec *json.Decoder, onEntry func(diffManifestEntry) err
 		return objectStream{}, fmt.Errorf("stream object: expected '{'")
 	}
 	st := objectStream{fields: map[string]json.RawMessage{}}
+	seen := map[string]struct{}{}
 	for dec.More() {
 		keyTok, err := dec.Token()
 		if err != nil {
@@ -1205,12 +1265,17 @@ func decodeProviderObject(dec *json.Decoder, onEntry func(diffManifestEntry) err
 		if !ok {
 			return objectStream{}, fmt.Errorf("stream object: key")
 		}
+		if _, dup := seen[key]; dup {
+			return objectStream{}, fmt.Errorf("stream object: duplicate key %q", key)
+		}
+		seen[key] = struct{}{}
 		if key == "diffs" {
-			entries, okDiff, bad, err := decodeDiffArrayDroppingPatch(dec, onEntry)
+			entries, patches, okDiff, bad, err := decodeDiffArray(dec, onEntry, collect)
 			if err != nil {
 				return objectStream{}, err
 			}
 			st.entries = entries
+			st.patches = patches
 			st.diffsOK = okDiff
 			st.pathBad = bad
 			continue
@@ -1231,28 +1296,29 @@ func decodeProviderObject(dec *json.Decoder, onEntry func(diffManifestEntry) err
 	return st, nil
 }
 
-func decodeDiffArrayDroppingPatch(dec *json.Decoder, onEntry func(diffManifestEntry) error) ([]diffManifestEntry, bool, bool, error) {
+func decodeDiffArray(dec *json.Decoder, onEntry func(diffManifestEntry) error, collect *patchCollect) ([]diffManifestEntry, []streamedPatch, bool, bool, error) {
 	tok, err := dec.Token()
 	if err != nil {
-		return nil, false, false, err
+		return nil, nil, false, false, err
 	}
 	if tok == nil {
-		return nil, false, false, nil
+		return nil, nil, false, false, nil
 	}
 	d, ok := tok.(json.Delim)
 	if !ok || d != '[' {
 		if err := discardJSONValueAfterToken(dec, tok); err != nil {
-			return nil, false, false, err
+			return nil, nil, false, false, err
 		}
-		return nil, false, false, nil
+		return nil, nil, false, false, nil
 	}
 	var entries []diffManifestEntry
+	var patches []streamedPatch
 	pathBad := false
 	seen := map[string]struct{}{}
 	for dec.More() {
-		entry, bad, err := decodeEntryDroppingPatch(dec)
+		entry, patch, bad, err := decodeEntry(dec, collect)
 		if err != nil {
-			return nil, false, false, err
+			return nil, nil, false, false, err
 		}
 		if bad || (pathStr(entry.OldPath) == "" && pathStr(entry.NewPath) == "") {
 			pathBad = true
@@ -1264,69 +1330,137 @@ func decodeDiffArrayDroppingPatch(dec *json.Decoder, onEntry func(diffManifestEn
 		seen[key] = struct{}{}
 		if onEntry != nil {
 			if err := onEntry(entry); err != nil {
-				return nil, false, false, err
+				return nil, nil, false, false, err
 			}
 		}
 		entries = append(entries, entry)
+		patches = append(patches, patch)
 	}
 	end, err := dec.Token()
 	if err != nil {
-		return nil, false, false, err
+		return nil, nil, false, false, err
 	}
 	if d, ok := end.(json.Delim); !ok || d != ']' {
-		return nil, false, false, fmt.Errorf("stream object: expected ']'")
+		return nil, nil, false, false, fmt.Errorf("stream object: expected ']'")
 	}
-	sort.Slice(entries, func(i, j int) bool {
-		if pathStr(entries[i].OldPath) != pathStr(entries[j].OldPath) {
-			return pathStr(entries[i].OldPath) < pathStr(entries[j].OldPath)
+	order := make([]int, len(entries))
+	for i := range order {
+		order[i] = i
+	}
+	sort.Slice(order, func(i, j int) bool {
+		a, b := entries[order[i]], entries[order[j]]
+		if pathStr(a.OldPath) != pathStr(b.OldPath) {
+			return pathStr(a.OldPath) < pathStr(b.OldPath)
 		}
-		if pathStr(entries[i].NewPath) != pathStr(entries[j].NewPath) {
-			return pathStr(entries[i].NewPath) < pathStr(entries[j].NewPath)
+		if pathStr(a.NewPath) != pathStr(b.NewPath) {
+			return pathStr(a.NewPath) < pathStr(b.NewPath)
 		}
-		return flagKey(entries[i]) < flagKey(entries[j])
+		return flagKey(a) < flagKey(b)
 	})
-	return entries, true, pathBad, nil
+	sortedEntries := make([]diffManifestEntry, len(entries))
+	sortedPatches := make([]streamedPatch, len(patches))
+	for i, idx := range order {
+		sortedEntries[i] = entries[idx]
+		sortedPatches[i] = patches[idx]
+	}
+	return sortedEntries, sortedPatches, true, pathBad, nil
 }
 
-func decodeEntryDroppingPatch(dec *json.Decoder) (diffManifestEntry, bool, error) {
+func decodeEntry(dec *json.Decoder, collect *patchCollect) (diffManifestEntry, streamedPatch, bool, error) {
 	tok, err := dec.Token()
 	if err != nil {
-		return diffManifestEntry{}, false, err
+		return diffManifestEntry{}, streamedPatch{}, false, err
 	}
 	if d, ok := tok.(json.Delim); !ok || d != '{' {
-		return diffManifestEntry{}, false, fmt.Errorf("stream object: diff entry")
+		return diffManifestEntry{}, streamedPatch{}, false, fmt.Errorf("stream object: diff entry")
 	}
 	env := map[string]json.RawMessage{}
+	var patch streamedPatch
+	patch.absent = true
+	sawDiff, sawPatch := false, false
 	for dec.More() {
 		keyTok, err := dec.Token()
 		if err != nil {
-			return diffManifestEntry{}, false, err
+			return diffManifestEntry{}, streamedPatch{}, false, err
 		}
 		key, ok := keyTok.(string)
 		if !ok {
-			return diffManifestEntry{}, false, fmt.Errorf("stream object: entry key")
+			return diffManifestEntry{}, streamedPatch{}, false, fmt.Errorf("stream object: entry key")
 		}
 		if key == "diff" || key == "patch" {
-			if err := discardJSONValue(dec); err != nil {
-				return diffManifestEntry{}, false, err
+			if key == "diff" {
+				if sawDiff || sawPatch {
+					patch.dupKey = true
+				}
+				sawDiff = true
+			} else {
+				if sawPatch || sawDiff {
+					patch.dupKey = true
+				}
+				sawPatch = true
+			}
+			if collect == nil || patch.dupKey {
+				if err := discardJSONValue(dec); err != nil {
+					return diffManifestEntry{}, streamedPatch{}, false, err
+				}
+				continue
+			}
+			var raw json.RawMessage
+			if err := dec.Decode(&raw); err != nil {
+				return diffManifestEntry{}, streamedPatch{}, false, err
+			}
+			trimmed := bytes.TrimSpace(raw)
+			if len(trimmed) == 0 || string(trimmed) == "null" {
+				patch.absent = true
+				continue
+			}
+			var s string
+			if json.Unmarshal(trimmed, &s) != nil {
+				patch.wrongType = true
+				patch.absent = false
+				continue
+			}
+			patch.absent = false
+			if len(s) > collect.maxCandidate {
+				patch.overCap = true
+			} else {
+				patch.text = s
 			}
 			continue
 		}
 		var raw json.RawMessage
 		if err := dec.Decode(&raw); err != nil {
-			return diffManifestEntry{}, false, err
+			return diffManifestEntry{}, streamedPatch{}, false, err
+		}
+		if _, exists := env[key]; exists {
+			patch.dupKey = true
 		}
 		env[key] = raw
 	}
 	end, err := dec.Token()
 	if err != nil {
-		return diffManifestEntry{}, false, err
+		return diffManifestEntry{}, streamedPatch{}, false, err
 	}
 	if d, ok := end.(json.Delim); !ok || d != '}' {
-		return diffManifestEntry{}, false, fmt.Errorf("stream object: entry end")
+		return diffManifestEntry{}, streamedPatch{}, false, fmt.Errorf("stream object: entry end")
+	}
+	if sawDiff && sawPatch {
+		patch.dupKey = true
+		patch.text = ""
 	}
 	entry, bad := entryFromRaw(env)
-	return entry, bad, nil
+	if collect != nil && !patch.dupKey && !patch.wrongType && !patch.absent && !patch.overCap && collect.wanted(entry) {
+		if collect.selectedUsed+len(patch.text) > collect.maxSelected {
+			patch.overCap = true
+			patch.text = ""
+		} else {
+			collect.selectedUsed += len(patch.text)
+			patch.retained = true
+		}
+	} else if !patch.retained {
+		patch.text = ""
+	}
+	return entry, patch, bad, nil
 }
 
 func discardJSONValue(dec *json.Decoder) error {
