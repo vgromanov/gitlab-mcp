@@ -121,6 +121,33 @@ func TestSelectPrefix_scanCutWithholdsShortCredential(t *testing.T) {
 	}
 }
 
+func TestRedact_quotedAuthorizationAndBearer(t *testing.T) {
+	cases := []string{
+		`Authorization: Bearer "secret" next`,
+		`Authorization: Basic "dXNlcjpwYXNz" next`,
+		"Authorization: Bearer 'secret'\nnext",
+		`Proxy-Authorization: Bearer "secret"`,
+		`pre Bearer "secret" post`,
+		"Authorization: Bearer \"unclosed\nnext",
+	}
+	for _, src := range cases {
+		out, n := redactBytes([]byte(src), nil)
+		s := string(out)
+		for _, leak := range []string{"secret", "dXNlcjpwYXNz", "unclosed"} {
+			if strings.Contains(s, leak) {
+				t.Fatalf("leaked %q in %q -> %q n=%d", leak, src, s, n)
+			}
+		}
+		if n < 1 {
+			t.Fatalf("n %d src %q out %q", n, src, s)
+		}
+	}
+	unquoted, n := redactBytes([]byte("Authorization: Bearer supersecret\n"), nil)
+	if n < 1 || strings.Contains(string(unquoted), "supersecret") {
+		t.Fatalf("unquoted n %d out %q", n, unquoted)
+	}
+}
+
 func TestRedact_shortCompleteBearer(t *testing.T) {
 	body := []byte("pre\nBearer abc\npost\n")
 	out, n := redactBytes(body, nil)

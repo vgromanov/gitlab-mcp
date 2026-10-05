@@ -347,6 +347,106 @@ func (shortContentLengthRT) RoundTrip(req *http.Request) (*http.Response, error)
 	}, nil
 }
 
+func TestGetPipelineJobOutput_newlineTerminatedLineCount(t *testing.T) {
+	d := authzDeps(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/trace") {
+			_, _ = io.WriteString(w, "one\n")
+			return
+		}
+		_, _ = io.WriteString(w, `{"id":42}`)
+	}))
+	_, raw, err := getPipelineJobOutput(context.Background(), nil, getPipelineJobOutputIn{
+		ProjectID: "42", JobID: 9,
+	}, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := decodeTrace(t, raw)
+	if m["trace"] != "one\n" {
+		t.Fatalf("trace %q", m["trace"])
+	}
+	counts, _ := traceSection(t, raw)["counts"].(map[string]any)
+	if counts == nil || int(counts["items"].(float64)) != 1 {
+		t.Fatalf("items %#v", counts)
+	}
+
+	d2 := authzDeps(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/trace") {
+			_, _ = io.WriteString(w, "one\ntwo")
+			return
+		}
+		_, _ = io.WriteString(w, `{"id":42}`)
+	}))
+	_, raw, err = getPipelineJobOutput(context.Background(), nil, getPipelineJobOutputIn{
+		ProjectID: "42", JobID: 9,
+	}, d2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	counts, _ = traceSection(t, raw)["counts"].(map[string]any)
+	if counts == nil || int(counts["items"].(float64)) != 2 {
+		t.Fatalf("unterminated items %#v", counts)
+	}
+}
+
+type overlongContentLengthRT struct{}
+
+func (overlongContentLengthRT) RoundTrip(req *http.Request) (*http.Response, error) {
+	if strings.Contains(req.URL.Path, "/trace") {
+		h := make(http.Header)
+		h.Set("Content-Type", "text/plain")
+		h.Set("Content-Length", "2")
+		return &http.Response{
+			StatusCode:    http.StatusOK,
+			Header:        h,
+			Body:          io.NopCloser(bytes.NewReader([]byte("abcd"))),
+			ContentLength: -1,
+			Request:       req,
+		}, nil
+	}
+	body := []byte(`{"id":42}`)
+	return &http.Response{
+		StatusCode:    http.StatusOK,
+		Header:        http.Header{"Content-Type": []string{"application/json"}},
+		Body:          io.NopCloser(bytes.NewReader(body)),
+		ContentLength: int64(len(body)),
+		Request:       req,
+	}, nil
+}
+
+func TestGetPipelineJobOutput_overlongContentLengthIsNotComplete(t *testing.T) {
+	cli, err := gitlab.NewClient("t",
+		gitlab.WithBaseURL("https://example.test/api/v4"),
+		gitlab.WithoutRetries(),
+		gitlab.WithHTTPClient(&http.Client{Transport: igl.BudgetInterceptor()(overlongContentLengthRT{})}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := Deps{Config: &config.Config{Token: "t"}, Client: cli}
+	_, raw, err := getPipelineJobOutput(context.Background(), nil, getPipelineJobOutputIn{
+		ProjectID: "42", JobID: 9,
+	}, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := decodeTrace(t, raw)
+	if m["trace"] != "abcd" {
+		t.Fatalf("trace %q", m["trace"])
+	}
+	w := traceWindow(t, raw)
+	if w["total_known"] != false || w["total_bytes"] != nil {
+		t.Fatalf("window %#v", w)
+	}
+	if w["source_end_exclusive"] != float64(4) {
+		t.Fatalf("source end %#v", w)
+	}
+	sec := traceSection(t, raw)
+	if sec["content_complete"] == readmeta.ContentCompleteTrue {
+		t.Fatalf("complete %#v", sec)
+	}
+}
+
 func TestGetPipelineJobOutput_shortContentLengthIsNotComplete(t *testing.T) {
 	cli, err := gitlab.NewClient("t",
 		gitlab.WithBaseURL("https://example.test/api/v4"),

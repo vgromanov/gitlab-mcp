@@ -327,10 +327,13 @@ func finalizeJobTrace(out *JobTraceResult, req JobTraceRequest, hdr http.Header,
 		out.ObservedEndExcl = &end
 		out.RangeHonored = false
 		cl, hasCL := parseContentLength(hdr)
-		// A clean EOF with fewer bytes than Content-Length is not the declared
-		// object. Keeping that size, or leaving EOF set, lets a prefix look like
-		// a finished trace (content_complete, or an error search with no match).
-		if hasCL && out.EOF && end < cl {
+		// A clean EOF with fewer bytes than Content-Length, or a body that ran
+		// past Content-Length, is not the declared object. Keeping that size,
+		// or leaving EOF set, lets a prefix look like a finished trace
+		// (content_complete, or an error search with no match). A scan-capped
+		// prefix (end < cl and not EOF) is still a legitimate truncated read
+		// of a larger object and may attest Size from Content-Length.
+		if hasCL && ((out.EOF && end < cl) || end > cl) {
 			out.SizeKnown = false
 			out.Size = 0
 			out.EOF = false

@@ -440,7 +440,10 @@ func sectionForTrace(now time.Time, win jobTraceWindow, piece tracePiece, meta t
 	sec := newJobTraceSection(now)
 	items := 0
 	if piece.text != "" {
-		items = strings.Count(piece.text, "\n") + 1
+		items = strings.Count(piece.text, "\n")
+		if !strings.HasSuffix(piece.text, "\n") {
+			items++
+		}
 	}
 	bytesN := int64(win.OutputBytes)
 	sec.Counts.Items = &items

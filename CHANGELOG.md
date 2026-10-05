@@ -14,8 +14,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `output_bytes`, and `redaction_count`. Legacy `truncate_lines` still selects
   a prefix. Ignored `Range` responses are not scanned without a bound, and a
   scan that cannot prove the tail does not invent one. A 200 body that ends
-  before `Content-Length` is incomplete: the declared size is dropped, and the
-  error selector does not treat that prefix as a finished search. Tail and
+  before `Content-Length`, or that is longer than `Content-Length`, is
+  incomplete: the declared size is dropped, and the error selector does not
+  treat that prefix as a finished search. Quoted `Authorization` Bearer/Basic
+  credentials are redacted through the closing delimiter. `counts.items` is the
+  number of output lines and does not add a synthetic line when the text
+  already ends in a newline. Tail and
   range windows keep redaction context outside the returned bytes, a partial
   206 is not a complete trace, redaction is linear in the trace size, and
   `output_bytes` / `redaction_count` follow the UTF-8 text actually returned.

@@ -120,6 +120,52 @@ func TestStreamJobTrace_shortContentLengthIsIncomplete(t *testing.T) {
 	}
 }
 
+func TestStreamJobTrace_overlongContentLengthIsIncomplete(t *testing.T) {
+	var n atomic.Int64
+	var closes atomic.Int64
+	body := &countingReadCloser{r: bytes.NewReader([]byte("abcd")), n: &n, closes: &closes}
+	rt := &scriptedRT{
+		status:  http.StatusOK,
+		headers: http.Header{"Content-Length": []string{"2"}},
+		body:    body,
+	}
+	res := StreamJobTrace(context.Background(), clientWithRT(t, rt), JobTraceRequest{
+		ProjectID: "42", JobID: 1, MaxScanBytes: 4096,
+	})
+	if res.Err != nil {
+		t.Fatal(res.Err)
+	}
+	if string(res.Data) != "abcd" {
+		t.Fatalf("data %q", res.Data)
+	}
+	if res.SizeKnown || res.Size != 0 || res.EOF || res.SuffixAnchored || !res.Truncated {
+		t.Fatalf("overlong body attested as complete: %+v", res)
+	}
+	if res.ObservedEndExcl == nil || *res.ObservedEndExcl != 4 {
+		t.Fatalf("observed end %+v", res.ObservedEndExcl)
+	}
+	if closes.Load() == 0 {
+		t.Fatal("body not closed")
+	}
+
+	// A scan-capped prefix of a larger object still attests Content-Length.
+	payload := bytes.Repeat([]byte("a"), 200)
+	rt2 := &scriptedRT{
+		status:  http.StatusOK,
+		headers: http.Header{"Content-Length": []string{"1000"}},
+		body:    io.NopCloser(bytes.NewReader(payload)),
+	}
+	res = StreamJobTrace(context.Background(), clientWithRT(t, rt2), JobTraceRequest{
+		ProjectID: "42", JobID: 1, MaxScanBytes: 50,
+	})
+	if res.Err != nil {
+		t.Fatal(res.Err)
+	}
+	if !res.Truncated || !res.SizeKnown || res.Size != 1000 || res.EOF || len(res.Data) != 50 {
+		t.Fatalf("scan-capped prefix %+v len=%d", res, len(res.Data))
+	}
+}
+
 func TestStreamJobTrace_cancelClosesReader(t *testing.T) {
 	body := &gateBody{started: make(chan struct{}), unblock: make(chan struct{})}
 	rt := &scriptedRT{status: http.StatusOK, body: body}

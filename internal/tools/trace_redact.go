@@ -687,9 +687,7 @@ func parseAuthHeader(src []byte, i int) (int, int, bool) {
 	}
 	j = skipSpace(src, j)
 	start := j
-	for j < len(src) && src[j] > ' ' && src[j] != '"' {
-		j++
-	}
+	j = consumeAuthCredential(src, j, false)
 	if j == start {
 		return 0, 0, false
 	}
@@ -709,9 +707,7 @@ func parseBearer(src []byte, i int, atEOF bool) (int, int, bool) {
 	}
 	j = skipSpace(src, j)
 	start := j
-	for j < len(src) && isTokenChar(src[j]) {
-		j++
-	}
+	j = consumeAuthCredential(src, j, true)
 	if j == start {
 		return 0, 0, false
 	}
@@ -825,6 +821,38 @@ func hasFoldPrefix(b []byte, prefix string) bool {
 
 func skipSpace(src []byte, j int) int {
 	for j < len(src) && isSpaceByte(src[j]) {
+		j++
+	}
+	return j
+}
+
+// consumeAuthCredential reads one Authorization/Bearer value. A quoted value
+// runs through its closing delimiter (the quotes stay in the span). An
+// unclosed quote runs to the newline or the end of src. Unquoted Authorization
+// values still stop at whitespace or a quote; standalone Bearer tokens keep
+// the token-character set.
+func consumeAuthCredential(src []byte, j int, tokenChars bool) int {
+	if j >= len(src) {
+		return j
+	}
+	if src[j] == '"' || src[j] == '\'' {
+		quote := src[j]
+		j++
+		for j < len(src) && src[j] != quote && src[j] != '\n' && src[j] != '\r' {
+			j++
+		}
+		if j < len(src) && src[j] == quote {
+			j++
+		}
+		return j
+	}
+	if tokenChars {
+		for j < len(src) && isTokenChar(src[j]) {
+			j++
+		}
+		return j
+	}
+	for j < len(src) && src[j] > ' ' && src[j] != '"' && src[j] != '\'' {
 		j++
 	}
 	return j
