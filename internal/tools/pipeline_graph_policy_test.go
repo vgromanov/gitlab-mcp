@@ -161,9 +161,10 @@ func TestClassifyRelationEvidence(t *testing.T) {
 }
 
 func TestLineageKeepsHistory(t *testing.T) {
+	// No retried field: the greater id is the latest attempt.
 	jobs := []graphJob{
-		{ID: 1, Name: "test", NameKnown: true, Status: "failed", StatusKnown: true, Allow: readmeta.PresenceFalse, AllowValid: true, Retried: readmeta.PresenceTrue, RetriedValid: true},
-		{ID: 2, Name: "test", NameKnown: true, Status: "success", StatusKnown: true, Allow: readmeta.PresenceFalse, AllowValid: true, Retried: readmeta.PresenceFalse, RetriedValid: true},
+		{ID: 2, Name: "test", NameKnown: true, Status: "success", StatusKnown: true, Allow: readmeta.PresenceFalse, AllowValid: true},
+		{ID: 1, Name: "test", NameKnown: true, Status: "failed", StatusKnown: true, Allow: readmeta.PresenceFalse, AllowValid: true},
 	}
 	groups := buildLineage(jobs)
 	if len(groups) != 1 || !groups[0].LatestKnown || groups[0].LatestIDs[0] != 2 || len(groups[0].HistoryIDs) != 1 || groups[0].HistoryIDs[0] != 1 {
@@ -174,23 +175,17 @@ func TestLineageKeepsHistory(t *testing.T) {
 	}
 	assessment, _ := assessParent(assessInput{RelationProven: true, Outcomes: groups[0].Outcomes})
 	if assessment == assessBlocked || assessment == "ready" {
-		t.Fatalf("historical failure blocked the latest success: %s", assessment)
+		t.Fatalf("older failure blocked the latest success: %s", assessment)
 	}
 
-	unknown := []graphJob{
-		{ID: 3, Name: "test", NameKnown: true, Status: "failed", StatusKnown: true, Allow: readmeta.PresenceFalse, AllowValid: true},
-		{ID: 4, Name: "test", NameKnown: true, Status: "success", StatusKnown: true, Allow: readmeta.PresenceFalse, AllowValid: true, Retried: readmeta.PresenceFalse, RetriedValid: true},
+	failedLatest := []graphJob{
+		{ID: 3, Name: "test", NameKnown: true, Status: "success", StatusKnown: true, Allow: readmeta.PresenceFalse, AllowValid: true},
+		{ID: 4, Name: "test", NameKnown: true, Status: "failed", StatusKnown: true, Allow: readmeta.PresenceFalse, AllowValid: true},
 	}
-	groups = buildLineage(unknown)
-	if groups[0].LatestKnown {
-		t.Fatal("missing retried must not invent a latest attempt")
-	}
+	groups = buildLineage(failedLatest)
 	assessment, _ = assessParent(assessInput{RelationProven: true, Outcomes: groups[0].Outcomes})
-	if assessment != assessBlocked && assessment != assessUnknown {
-		t.Fatalf("assessment %s", assessment)
-	}
-	if assessment == "ready" {
-		t.Fatal("ready")
+	if assessment != assessBlocked {
+		t.Fatalf("latest failure must block: %s", assessment)
 	}
 }
 

@@ -43,12 +43,14 @@ type pipelineGraphIn struct {
 }
 
 type pipelineView struct {
-	ID          int64   `json:"id"`
-	Status      *string `json:"status"`
-	Source      *string `json:"source"`
-	Ref         *string `json:"ref"`
-	SHA         *string `json:"sha"`
-	StatusKnown bool    `json:"status_known"`
+	ID           int64   `json:"id"`
+	Status       *string `json:"status"`
+	Source       *string `json:"source"`
+	Ref          *string `json:"ref"`
+	SHA          *string `json:"sha"`
+	StatusKnown  bool    `json:"status_known"`
+	ProjectID    int64   `json:"-"`
+	ScopeProject string  `json:"-"`
 }
 
 type relationView struct {
@@ -194,13 +196,17 @@ func initialPipelineGraph(ctx context.Context, in pipelineGraphIn, sel graphSele
 	for _, lim := range limits {
 		section.AddLimitation(lim.Code, lim.Message)
 	}
-	page, err := collectJobPage(ctx, d, budget, pid, chosen.ID, 1, sel.PerPage, nil)
+	pipePID := chosen.ScopeProject
+	if pipePID == "" {
+		pipePID = pid
+	}
+	page, err := collectJobPage(ctx, d, budget, pipePID, chosen.ID, 1, sel.PerPage, nil)
 	if err != nil {
 		return nil, nil, err
 	}
 	upper := now.UTC().Format(time.RFC3339Nano)
 	expires := now.UTC().Add(d.Config.CursorTTL()).Format(time.RFC3339Nano)
-	return nil, Out(finishGraph(section, pid, mrIID, chosen, rel, page, sel, d, actorID, upper, expires, 1, true)), nil
+	return nil, Out(finishGraph(section, pid, pipePID, mrIID, chosen, rel, page, sel, d, actorID, upper, expires, 1, true)), nil
 }
 
 func resumePipelineGraph(ctx context.Context, in pipelineGraphIn, sel graphSelection, d Deps, budget *igl.Budget, now time.Time, tok string) (*mcp.CallToolResult, any, error) {
@@ -230,27 +236,44 @@ func resumePipelineGraph(ctx context.Context, in pipelineGraphIn, sel graphSelec
 		return nil, nil, err
 	}
 	pid := strconv.FormatInt(canon.ID, 10)
-	if payload.Scope.ProjectID != pid || payload.Scope.PipelineID == nil || in.PipelineID != *payload.Scope.PipelineID {
+	// pipeline_id may be omitted. The first call can select the pipeline from
+	// the merge request, and the signed cursor already binds that id.
+	if payload.Scope.PipelineID == nil || *payload.Scope.PipelineID < 1 || (in.PipelineID != 0 && in.PipelineID != *payload.Scope.PipelineID) {
 		return nil, nil, fmt.Errorf("%s: project scope mismatch", cursor.ResyncRequired)
 	}
-	if graphFilters(sel, payload.UpperBound) != payload.Filters {
+	if graphFilters(sel, payload.UpperBound, pid) != payload.Filters {
 		return nil, nil, fmt.Errorf("%s: filter mismatch", cursor.ResyncRequired)
 	}
 	if err := reauthorizeCursorProject(ctx, d, canon); err != nil {
 		return nil, nil, err
 	}
-	pipe, err := loadPipeline(ctx, d, pid, *payload.Scope.PipelineID)
+	pipeCanon := canon
+	pipePID := pid
+	if payload.Scope.ProjectID != pid {
+		pipeCanon, err = resolveCursorProjectIdentity(ctx, d, payload.Scope.ProjectID)
+		if err != nil {
+			return nil, nil, err
+		}
+		pipePID = strconv.FormatInt(pipeCanon.ID, 10)
+		if pipePID != payload.Scope.ProjectID {
+			return nil, nil, fmt.Errorf("%s: project scope mismatch", cursor.ResyncRequired)
+		}
+		if err := reauthorizeCursorProject(ctx, d, pipeCanon); err != nil {
+			return nil, nil, err
+		}
+	}
+	pipe, err := loadPipeline(ctx, d, pipePID, *payload.Scope.PipelineID)
 	if err != nil {
 		return nil, nil, err
 	}
 	if pipe == nil || pipe.SHA == nil || len(payload.ImmutableRefs) != 1 || *pipe.SHA != payload.ImmutableRefs[0] {
 		return nil, nil, fmt.Errorf("%s: pinned pipeline SHA mismatch", cursor.ResyncRequired)
 	}
-	scope := cursor.Scope{Kind: cursor.ScopePipeline, ProjectID: pid, PipelineID: payload.Scope.PipelineID}
+	scope := cursor.Scope{Kind: cursor.ScopePipeline, ProjectID: pipePID, PipelineID: payload.Scope.PipelineID}
 	if err := cursor.MatchBinding(payload, instance, actorID, d.Config.PolicyFingerprint(), toolPipelineGraph, sectionPipelineGraph, scope, payload.Filters, payload.ImmutableRefs, payload.UpperBound); err != nil {
 		return nil, nil, fmt.Errorf("%s: binding mismatch", cursor.ResyncRequired)
 	}
-	guard, err := collectJobPage(ctx, d, budget, pid, pipe.ID, payload.PageState.Page, sel.PerPage, nil)
+	guard, err := collectJobPage(ctx, d, budget, pipePID, pipe.ID, payload.PageState.Page, sel.PerPage, nil)
 	if err != nil || guard.Partial {
 		return nil, nil, fmt.Errorf("%s: previous-page guard failed", cursor.ResyncRequired)
 	}
@@ -266,7 +289,7 @@ func resumePipelineGraph(ctx context.Context, in pipelineGraphIn, sel graphSelec
 		return nil, nil, fmt.Errorf("%s: previous-page boundary drift", cursor.ResyncRequired)
 	}
 	nextPage := int(payload.PageState.ProviderNextPage)
-	page, err := collectJobPage(ctx, d, budget, pid, pipe.ID, nextPage, sel.PerPage, idSet(ids))
+	page, err := collectJobPage(ctx, d, budget, pipePID, pipe.ID, nextPage, sel.PerPage, idSet(ids))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -304,12 +327,18 @@ func resumePipelineGraph(ctx context.Context, in pipelineGraphIn, sel graphSelec
 	if sel.MRIID > 0 {
 		mrIID = &sel.MRIID
 	}
-	return nil, Out(finishGraph(section, pid, mrIID, pipe, rel, page, sel, d, actorID, payload.UpperBound, payload.ExpiresAt, nextPage, false)), nil
+	return nil, Out(finishGraph(section, pid, pipePID, mrIID, pipe, rel, page, sel, d, actorID, payload.UpperBound, payload.ExpiresAt, nextPage, false)), nil
 }
 
 type mrFacts struct {
 	SourceBranch string
 	HeadID       int64
+	HeadProject  int64
+}
+
+type pipelineRef struct {
+	ID        int64
+	ProjectID int64
 }
 
 func resolveParentPipeline(ctx context.Context, d Deps, pid string, pipelineID int64, sel graphSelection) (*pipelineView, relationResult, []readmeta.Limitation, error) {
@@ -323,6 +352,11 @@ func resolveParentPipeline(ctx context.Context, d Deps, pid string, pipelineID i
 			rel.SHAComparison = compareSHA("", sel.ExpectedSHA)
 			return nil, rel, []readmeta.Limitation{{Code: readmeta.CodeInaccessible, Message: "pipeline not found"}}, nil
 		}
+		scope, err := bindPipelineProject(ctx, d, pid, pipe.ProjectID)
+		if err != nil {
+			return nil, rel, nil, err
+		}
+		pipe.ScopeProject = scope
 		rel = relationResult{Kind: relUnproven, Evidence: []string{}, SHAComparison: compareSHA(deref(pipe.SHA), sel.ExpectedSHA)}
 		if sel.MRIID > 0 {
 			linked, exhausted, err := pipelineListed(ctx, d, pid, sel.MRIID, pipelineID)
@@ -357,10 +391,11 @@ func resolveParentPipeline(ctx context.Context, d Deps, pid string, pipelineID i
 	if mr == nil {
 		return nil, rel, []readmeta.Limitation{{Code: readmeta.CodeInaccessible, Message: "merge request not found"}}, nil
 	}
-	ids, exhausted, err := listMRPipelineIDs(ctx, d, pid, sel.MRIID)
+	refs, exhausted, err := listMRPipelineRefs(ctx, d, pid, sel.MRIID)
 	if err != nil {
 		return nil, rel, nil, err
 	}
+	ids := pipelineRefIDs(refs)
 	chosenID, ambiguous, missing := selectParentID(mr.HeadID, ids, exhausted)
 	if missing || ambiguous {
 		lim := readmeta.Limitation{Code: readmeta.CodeUnknownCount, Message: "parent pipeline is ambiguous"}
@@ -369,13 +404,24 @@ func resolveParentPipeline(ctx context.Context, d Deps, pid string, pipelineID i
 		}
 		return nil, relationResult{Kind: relUnproven, Evidence: []string{}, SHAComparison: compareSHA("", sel.ExpectedSHA)}, []readmeta.Limitation{lim}, nil
 	}
-	pipe, err := loadPipeline(ctx, d, pid, chosenID)
+	scope, err := bindPipelineProject(ctx, d, pid, projectForChosen(chosenID, mr, refs))
+	if err != nil {
+		return nil, rel, nil, err
+	}
+	pipe, err := loadPipeline(ctx, d, scope, chosenID)
 	if err != nil {
 		return nil, rel, nil, err
 	}
 	if pipe == nil {
 		return nil, rel, []readmeta.Limitation{{Code: readmeta.CodeInaccessible, Message: "pipeline not found"}}, nil
 	}
+	if pipe.ProjectID > 0 {
+		scope, err = bindPipelineProject(ctx, d, scope, pipe.ProjectID)
+		if err != nil {
+			return nil, rel, nil, err
+		}
+	}
+	pipe.ScopeProject = scope
 	rel = classifyRelation(relationInput{
 		MRIID:         sel.MRIID,
 		SourceBranch:  mr.SourceBranch,
@@ -457,7 +503,7 @@ func unresolvedGraph(section readmeta.Section, pid string, mrIID *int64, rel rel
 	}
 }
 
-func finishGraph(section readmeta.Section, pid string, mrIID *int64, pipe *pipelineView, rel relationResult, page graphPage, sel graphSelection, d Deps, actorID int64, upper, expires string, pageNum int, fromStart bool) pipelineGraphOut {
+func finishGraph(section readmeta.Section, pid, pipePID string, mrIID *int64, pipe *pipelineView, rel relationResult, page graphPage, sel graphSelection, d Deps, actorID int64, upper, expires string, pageNum int, fromStart bool) pipelineGraphOut {
 	section.AddLimitation(readmeta.CodeUnsupported, "downstream coverage is unknown")
 	if !rel.Proven {
 		section.AddLimitation(readmeta.CodeUnknownCount, "pipeline relation is unproven")
@@ -489,6 +535,9 @@ func finishGraph(section readmeta.Section, pid string, mrIID *int64, pipe *pipel
 	for _, g := range groups {
 		for id, attempt := range g.Attempts {
 			attemptOf[id] = attempt
+		}
+		if sel.Filter.active() && !lineageGroupVisible(g, page.Jobs, sel.Filter) {
+			continue
 		}
 		latest := g.LatestIDs
 		if latest == nil {
@@ -531,7 +580,7 @@ func finishGraph(section readmeta.Section, pid string, mrIID *int64, pipe *pipel
 		section.Consistency = readmeta.ConsistencyUnknown
 	}
 	if !page.Partial && page.Paging.PagingKnown && !page.Paging.ExhaustedObserved && page.Paging.SDKNextPage == int64(pageNum)+1 && ok && len(page.Jobs) > 0 {
-		if tok, err := mintGraphCursor(d, actorID, pid, pipe.ID, sha, sel, upper, expires, pageNum, page); err == nil {
+		if tok, err := mintGraphCursor(d, actorID, pipePID, pipe.ID, sha, sel, upper, expires, pageNum, page, pid); err == nil {
 			section.NextCursor = &tok
 		} else {
 			section.AddLimitation(readmeta.CodePartial, "continuation cursor was not issued")
@@ -568,7 +617,7 @@ func finishGraph(section readmeta.Section, pid string, mrIID *int64, pipe *pipel
 	}
 }
 
-func mintGraphCursor(d Deps, actorID int64, pid string, pipelineID int64, sha string, sel graphSelection, upper, expires string, pageNum int, page graphPage) (string, error) {
+func mintGraphCursor(d Deps, actorID int64, pid string, pipelineID int64, sha string, sel graphSelection, upper, expires string, pageNum int, page graphPage, mrProject string) (string, error) {
 	instance, err := cursorInstance(d.Config)
 	if err != nil {
 		return "", err
@@ -584,7 +633,7 @@ func mintGraphCursor(d Deps, actorID int64, pid string, pipelineID int64, sha st
 		Tool:          toolPipelineGraph,
 		Section:       sectionPipelineGraph,
 		Scope:         cursor.Scope{Kind: cursor.ScopePipeline, ProjectID: pid, PipelineID: &id},
-		Filters:       graphFilters(sel, upper),
+		Filters:       graphFilters(sel, upper, mrProject),
 		ImmutableRefs: []string{sha},
 		UpperBound:    upper,
 		ExpiresAt:     expires,
@@ -600,20 +649,32 @@ func mintGraphCursor(d Deps, actorID int64, pid string, pipelineID int64, sha st
 	return cursor.Encode(d.Config.CursorKey, payload)
 }
 
-func graphFilters(sel graphSelection, upper string) cursor.Filters {
+func graphFilters(sel graphSelection, upper, mrProject string) cursor.Filters {
 	mr := ""
 	if sel.MRIID > 0 {
 		mr = strconv.FormatInt(sel.MRIID, 10)
 	}
 	return cursor.Filters{
-		RefName:   sel.ExpectedSHA,
-		Path:      filterCanonical(sel.Filter),
-		Since:     mr,
-		Until:     upper,
-		Order:     "provider",
-		Selection: "parent_jobs",
-		PerPage:   sel.PerPage,
+		RefName:     sel.ExpectedSHA,
+		Path:        filterCanonical(sel.Filter),
+		Since:       mr,
+		CallerUntil: mrProject,
+		Until:       upper,
+		Order:       "provider",
+		Selection:   "parent_jobs",
+		PerPage:     sel.PerPage,
 	}
+}
+
+// lineageGroupVisible reports whether a full-page lineage group has at least
+// one job the caller will see. Assessment still uses every group.
+func lineageGroupVisible(g lineageGroup, jobs []graphJob, f jobFilter) bool {
+	for _, job := range jobs {
+		if _, ok := g.Attempts[job.ID]; ok && f.match(job) {
+			return true
+		}
+	}
+	return false
 }
 
 func jobToView(job graphJob, attempt string) jobView {
@@ -685,7 +746,7 @@ func loadPipeline(ctx context.Context, d Deps, pid string, id int64) (*pipelineV
 	if p == nil || p.ID < 1 {
 		return nil, fmt.Errorf("%s: pipeline identity", readmeta.CodeIdentityUnresolved)
 	}
-	view := &pipelineView{ID: p.ID}
+	view := &pipelineView{ID: p.ID, ProjectID: p.ProjectID, ScopeProject: pid}
 	if s := strings.TrimSpace(p.Status); s != "" {
 		view.Status = &s
 		view.StatusKnown = true
@@ -716,25 +777,62 @@ func loadMergeRequest(ctx context.Context, d Deps, pid string, iid int64) (*mrFa
 	facts := &mrFacts{SourceBranch: strings.TrimSpace(mr.SourceBranch)}
 	if mr.HeadPipeline != nil && mr.HeadPipeline.ID > 0 {
 		facts.HeadID = mr.HeadPipeline.ID
+		if mr.HeadPipeline.ProjectID > 0 {
+			facts.HeadProject = mr.HeadPipeline.ProjectID
+		}
 	}
 	return facts, nil
 }
 
+// bindPipelineProject authorizes the pipeline's own project. A fork head
+// pipeline lives in the source project, not the merge request target.
+// reported <= 0 keeps the already authorized project.
+func bindPipelineProject(ctx context.Context, d Deps, authorized string, reported int64) (string, error) {
+	if reported < 1 {
+		return authorized, nil
+	}
+	want := strconv.FormatInt(reported, 10)
+	if want == authorized {
+		return authorized, nil
+	}
+	return resolveCursorProjectCanonical(ctx, d, want)
+}
+
+func projectForChosen(chosen int64, mr *mrFacts, refs []pipelineRef) int64 {
+	if mr != nil && chosen == mr.HeadID && mr.HeadProject > 0 {
+		return mr.HeadProject
+	}
+	for _, ref := range refs {
+		if ref.ID == chosen && ref.ProjectID > 0 {
+			return ref.ProjectID
+		}
+	}
+	return 0
+}
+
+func pipelineRefIDs(refs []pipelineRef) []int64 {
+	ids := make([]int64, 0, len(refs))
+	for _, ref := range refs {
+		ids = append(ids, ref.ID)
+	}
+	return ids
+}
+
 func pipelineListed(ctx context.Context, d Deps, pid string, iid, pipelineID int64) (bool, bool, error) {
-	ids, exhausted, err := listMRPipelineIDs(ctx, d, pid, iid)
+	refs, exhausted, err := listMRPipelineRefs(ctx, d, pid, iid)
 	if err != nil {
 		return false, false, err
 	}
-	for _, id := range ids {
-		if id == pipelineID {
+	for _, ref := range refs {
+		if ref.ID == pipelineID {
 			return true, exhausted, nil
 		}
 	}
 	return false, exhausted, nil
 }
 
-func listMRPipelineIDs(ctx context.Context, d Deps, pid string, iid int64) ([]int64, bool, error) {
-	var ids []int64
+func listMRPipelineRefs(ctx context.Context, d Deps, pid string, iid int64) ([]pipelineRef, bool, error) {
+	var ids []pipelineRef
 	page := 1
 	for {
 		if err := ctx.Err(); err != nil {
@@ -742,15 +840,15 @@ func listMRPipelineIDs(ctx context.Context, d Deps, pid string, iid int64) ([]in
 		}
 		path := fmt.Sprintf("projects/%s/merge_requests/%d/pipelines", gitlab.PathEscape(pid), iid)
 		opt := &gitlab.ListOptions{Page: int64(page), PerPage: graphDefaultPerPage}
-		var batch []int64
+		var batch []pipelineRef
 		broken := false
 		resp, err := igl.StreamJSONArray(ctx, d.Client, http.MethodGet, path, opt, func(raw json.RawMessage) error {
-			id, ok := parseObjectID(raw)
+			ref, ok := parsePipelineRef(raw)
 			if !ok {
 				broken = true
 				return fmt.Errorf("%s: malformed pipeline list", readmeta.CodePartial)
 			}
-			batch = append(batch, id)
+			batch = append(batch, ref)
 			return nil
 		})
 		if broken {
@@ -844,12 +942,17 @@ func observeResp(resp *gitlab.Response) readmeta.PagingObservation {
 	return readmeta.ObservePaging(resp.Response.Header, resp.NextPage)
 }
 
-func parseObjectID(raw json.RawMessage) (int64, bool) {
+func parsePipelineRef(raw json.RawMessage) (pipelineRef, bool) {
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(bytes.TrimSpace(raw), &fields); err != nil {
-		return 0, false
+		return pipelineRef{}, false
 	}
-	return positiveJSONID(fields["id"])
+	id, ok := positiveJSONID(fields["id"])
+	if !ok {
+		return pipelineRef{}, false
+	}
+	projectID, _ := positiveJSONID(fields["project_id"])
+	return pipelineRef{ID: id, ProjectID: projectID}, true
 }
 
 func jobIDStrings(jobs []graphJob) []string {

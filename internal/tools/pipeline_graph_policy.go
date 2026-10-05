@@ -84,7 +84,9 @@ type assessInput struct {
 }
 
 // parseGraphJob decodes one raw job object. Malformed identity is an error.
-// A present non-bool allow_failure or retried stays unknown rather than false.
+// A present non-bool allow_failure stays unknown rather than false.
+// GitLab pipeline jobs have no retried field; a decoded value is recorded and
+// is not used to choose the latest attempt.
 func parseGraphJob(raw json.RawMessage) (graphJob, error) {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
@@ -208,7 +210,10 @@ func allowTerminal(job graphJob, allowKnown bool, blockReason string) policyOutc
 }
 
 // buildLineage groups jobs by name, keeps every attempt, and emits policy
-// outcomes for effective latest attempts only. History is never dropped.
+// outcomes for the latest attempt only. History is never dropped.
+// The latest attempt is the greatest job id in the group. GitLab's jobs API
+// does not send retried; include_retried only adds older attempts, and a
+// retry is a new job with a higher id.
 func buildLineage(jobs []graphJob) []lineageGroup {
 	order := []string{}
 	byKey := map[string][]graphJob{}
@@ -231,52 +236,29 @@ func buildLineage(jobs []graphJob) []lineageGroup {
 
 func lineageOne(jobs []graphJob) lineageGroup {
 	g := lineageGroup{Attempts: map[int64]string{}, LatestIDs: []int64{}, HistoryIDs: []int64{}}
-	if len(jobs) > 0 && jobs[0].NameKnown {
+	if len(jobs) == 0 {
+		return g
+	}
+	if jobs[0].NameKnown {
 		name := jobs[0].Name
 		g.Name = &name
 	}
-	explicit := true
-	var current []graphJob
+	latest := jobs[0]
+	for _, job := range jobs[1:] {
+		if job.ID > latest.ID {
+			latest = job
+		}
+	}
+	g.LatestKnown = true
+	g.LatestIDs = []int64{latest.ID}
+	g.Attempts[latest.ID] = attemptLatest
+	g.Outcomes = append(g.Outcomes, jobPolicy(latest))
 	for _, job := range jobs {
-		if !job.RetriedValid || (job.Retried != readmeta.PresenceTrue && job.Retried != readmeta.PresenceFalse) {
-			explicit = false
+		if job.ID == latest.ID {
 			continue
 		}
-		if job.Retried == readmeta.PresenceTrue {
-			g.HistoryIDs = append(g.HistoryIDs, job.ID)
-			g.Attempts[job.ID] = attemptHistory
-			continue
-		}
-		current = append(current, job)
-	}
-	if !explicit {
-		for _, job := range jobs {
-			g.Attempts[job.ID] = attemptUnknown
-		}
-		g.Outcomes = append(g.Outcomes, policyOutcome{Outcome: policyUnknown, Reason: "unknown_policy"})
-		for _, job := range jobs {
-			if p := jobPolicy(job); p.Outcome == policyBlock {
-				g.Outcomes = append(g.Outcomes, p)
-			}
-		}
-		return g
-	}
-	sort.Slice(current, func(i, j int) bool { return current[i].ID > current[j].ID })
-	switch len(current) {
-	case 0:
-		g.Outcomes = append(g.Outcomes, policyOutcome{Outcome: policyUnknown, Reason: "unknown_policy"})
-	case 1:
-		g.LatestKnown = true
-		g.LatestIDs = []int64{current[0].ID}
-		g.Attempts[current[0].ID] = attemptLatest
-		g.Outcomes = append(g.Outcomes, jobPolicy(current[0]))
-	default:
-		for _, job := range current {
-			g.LatestIDs = append(g.LatestIDs, job.ID)
-			g.Attempts[job.ID] = attemptUnknown
-			g.Outcomes = append(g.Outcomes, jobPolicy(job))
-		}
-		g.Outcomes = append(g.Outcomes, policyOutcome{Outcome: policyUnknown, Reason: "unknown_policy"})
+		g.HistoryIDs = append(g.HistoryIDs, job.ID)
+		g.Attempts[job.ID] = attemptHistory
 	}
 	sort.Slice(g.HistoryIDs, func(i, j int) bool { return g.HistoryIDs[i] < g.HistoryIDs[j] })
 	return g
