@@ -11,6 +11,7 @@ import (
 	"syscall"
 
 	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/config"
+	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/gitcache"
 	glclient "gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/gitlab"
 	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/intentstore"
 	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/mcpsrv"
@@ -64,7 +65,31 @@ func runWithConfig(parent context.Context, cfg *config.Config) int {
 		return 1
 	}
 
-	srv := mcpsrv.NewServer(cfg, client, log, mcpsrv.WithGuardedClient(guarded))
+	var cacheSvc *gitcache.Service
+	if cfg.GitCacheEnabled {
+		cacheSvc, err = gitcache.OpenService(gitcache.ServiceConfig{
+			Enabled:             true,
+			Token:               cfg.Token,
+			Root:                cfg.GitCacheRoot,
+			QuotaBytes:          cfg.GitCacheQuotaBytes,
+			CAPath:              cfg.GitCacheCACertPath,
+			Insecure:            cfg.GitCacheInsecure,
+			AllowedInsecureHost: cfg.GitCacheAllowedInsecureHost,
+		})
+		if err != nil {
+			slog.Error("git cache", "err", err)
+			return 1
+		}
+		defer func() {
+			_ = cacheSvc.Close(context.Background())
+		}()
+	}
+
+	opts := []mcpsrv.ServerOption{mcpsrv.WithGuardedClient(guarded)}
+	if cacheSvc != nil {
+		opts = append(opts, mcpsrv.WithGitCache(cacheSvc))
+	}
+	srv := mcpsrv.NewServer(cfg, client, log, opts...)
 	ctx, stop := signal.NotifyContext(parent, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 

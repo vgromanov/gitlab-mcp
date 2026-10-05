@@ -19,7 +19,7 @@ import (
 func RegisterMergeRequests(s *mcp.Server, d Deps) {
 	AddTool(s, d, true, "", &mcp.Tool{Name: "merge_merge_request", Description: "Accept / merge a merge request"}, mergeMergeRequest)
 	AddTool(s, d, true, "", &mcp.Tool{Name: "create_merge_request", Description: "Create a merge request"}, createMergeRequest)
-	AddTool(s, d, false, "", &mcp.Tool{Name: "get_merge_request", Description: "Get merge request details"}, getMergeRequest)
+	AddTool(s, d, false, "", &mcp.Tool{Name: "get_merge_request", Description: "Get merge request details. When the native object cache is enabled, also acquires that merge request's authorized objects."}, getMergeRequest)
 	AddTool(s, d, false, "", &mcp.Tool{Name: "get_merge_request_diffs", Description: "Get MR diffs (structured list, first page)"}, getMergeRequestDiffs)
 	AddTool(s, d, false, "", &mcp.Tool{Name: "list_merge_request_diffs", Description: "List MR diffs with pagination"}, listMergeRequestDiffs)
 	AddTool(s, d, false, "", &mcp.Tool{Name: "get_merge_request_conflicts", Description: "Summarize MR conflicts from diffs and MR flags"}, getMergeRequestConflicts)
@@ -290,7 +290,11 @@ func getMergeRequest(ctx context.Context, _ *mcp.CallToolRequest, in getMergeReq
 	if err != nil {
 		return nil, nil, err
 	}
-	return nil, Out(mr), nil
+	acquired, err := acquireMergeRequestObjects(ctx, d, pid, in.MergeRequestIID)
+	if err != nil {
+		return nil, nil, err
+	}
+	return nil, Out(mergeRequestCacheResult(mr, acquired)), nil
 }
 
 type getMergeRequestDiffsIn struct {

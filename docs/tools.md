@@ -215,6 +215,7 @@ This document describes the tool surface currently registered by
 - `list_pipeline_trigger_jobs`
 - `get_pipeline_job`
 - `get_pipeline_job_output`
+- `get_merge_request_pipeline_graph` — parent pipeline plus one page of jobs (`include_retried=true`). The latest attempt of a name is the greatest job id. The jobs API has no per-job `retried` field, and an older attempt already seen on an earlier page stays history so it does not block. Continuation stores a capped fingerprint of each seen name so a later page can still be fetched. A job filter still assesses the full page, omits lineage groups with no returned job, and omits ids that were filtered out of that group. An empty filter and a filter whose only token is `-` stay distinct in the continuation binding. A truncated jobs page keeps jobs decoded before the break and does not continue from that response. A fork head pipeline is read from `head_pipeline.project_id` after that project is authorized. The pipeline list is scanned only until that head id is found. A single listed pipeline is selected only when the merge request has no head pipeline id. Classifies required/optional/unknown manual jobs, and never reports overall ready while downstream bridges are unvisited. Resume accepts the signed pipeline id when `pipeline_id` is omitted. Requires `GITLAB_MCP_CURSOR_KEY`. Does not play, retry, or cancel jobs.
 - `create_pipeline`
 - `retry_pipeline`
 - `cancel_pipeline`

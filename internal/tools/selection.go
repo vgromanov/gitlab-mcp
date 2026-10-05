@@ -63,7 +63,7 @@ var dailyTools = []string{
 }
 
 // reviewReadTools is the GITLAB_TOOL_PROFILE=review_read|review_write
-// ceiling (exact 29 safe reads). review_write adds no guarded writes here.
+// ceiling (exact 30 safe reads). review_write adds no guarded writes here.
 var reviewReadTools = []string{
 	"get_project",
 	"get_merge_request",
@@ -92,6 +92,7 @@ var reviewReadTools = []string{
 	"list_pipeline_trigger_jobs",
 	"get_pipeline_job",
 	"get_pipeline_job_output",
+	"get_merge_request_pipeline_graph",
 	"get_merge_request_review_queue",
 	"get_merge_request_review_context",
 }
@@ -124,7 +125,7 @@ var familyTools = map[string][]string{
 	},
 	"pipeline": {
 		"list_pipelines", "get_pipeline", "list_pipeline_jobs", "list_pipeline_trigger_jobs",
-		"get_pipeline_job", "get_pipeline_job_output", "create_pipeline", "retry_pipeline",
+		"get_pipeline_job", "get_pipeline_job_output", "get_merge_request_pipeline_graph", "create_pipeline", "retry_pipeline",
 		"cancel_pipeline", "play_pipeline_job", "retry_pipeline_job", "cancel_pipeline_job",
 		"list_job_artifacts", "download_job_artifacts", "get_job_artifact_file",
 		"list_deployments", "get_deployment", "list_environments", "get_environment",
