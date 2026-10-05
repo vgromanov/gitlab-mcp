@@ -1096,6 +1096,7 @@ func (rt *reviewRuntime) readPipelineGraph(item reviewContextItemIn, owner Canon
 		if merged.Digest != nil {
 			merged.Section.ContentComplete = readmeta.ContentCompleteTrue
 			merged.Section.PaginationExhausted = true
+			merged.Section.ManifestCoverage = readmeta.CoverageFull
 			if merged.Section.Consistency == "" {
 				merged.Section.Consistency = readmeta.ConsistencyConsistent
 			}
@@ -1205,8 +1206,10 @@ func mergePipelineGraph(dst *pipelineGraphOut, src pipelineGraphOut) {
 	dst.BridgesVisited = dst.BridgesVisited || src.BridgesVisited
 	dst.BridgeCapability = src.BridgeCapability
 	dst.Reasons = appendUniqueReasons(dst.Reasons, src.Reasons)
-	dst.Jobs = append(dst.Jobs, src.Jobs...)
-	dst.Lineage = append(dst.Lineage, src.Lineage...)
+	if sameRootPipeline(*dst, src) {
+		dst.Jobs = append(dst.Jobs, src.Jobs...)
+		dst.Lineage = append(dst.Lineage, src.Lineage...)
+	}
 	for _, n := range src.Nodes {
 		dst.Nodes = mergeGraphNode(dst.Nodes, n)
 	}
@@ -1216,6 +1219,13 @@ func mergePipelineGraph(dst *pipelineGraphOut, src pipelineGraphOut) {
 		}
 	}
 	dst.Digest = src.Digest
+}
+
+func sameRootPipeline(dst, src pipelineGraphOut) bool {
+	if dst.PipelineID == nil || src.PipelineID == nil {
+		return false
+	}
+	return *dst.PipelineID == *src.PipelineID
 }
 
 func mergeGraphNode(nodes []graphNodeView, n graphNodeView) []graphNodeView {

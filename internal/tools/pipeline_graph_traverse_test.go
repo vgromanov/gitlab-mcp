@@ -534,6 +534,45 @@ func TestEncodeGraphDigestDistinguishesJobFieldDelimiters(t *testing.T) {
 	}
 }
 
+func TestEncodeGraphDigestIncludesPipelineMetadata(t *testing.T) {
+	ok := "success"
+	failed := "failed"
+	ref := "feature"
+	src := "push"
+	shaA := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	shaB := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	name := "test"
+	stage := "test"
+	base := graphNodeView{
+		ProjectID: "42", PipelineID: 100, Depth: 0, Role: nodeRoleParent,
+		Pipeline: &pipelineView{ID: 100, Status: &ok, Source: &src, Ref: &ref, SHA: &shaA, StatusKnown: true},
+		Jobs:     []jobView{{ID: 1, Name: &name, Stage: &stage, Status: &ok, AllowFailure: "false", Attempt: attemptLatest, Policy: policyPass}},
+	}
+	altSHA := base
+	altPipe := *base.Pipeline
+	altPipe.SHA = &shaB
+	altSHA.Pipeline = &altPipe
+	altStatus := base
+	stPipe := *base.Pipeline
+	stPipe.Status = &failed
+	altStatus.Pipeline = &stPipe
+	altDepth := base
+	altDepth.Depth = 1
+	got := encodeGraphDigest([]graphNodeView{base}, nil, assessReady, downstreamCoverageComplete)
+	if got == "" {
+		t.Fatal("empty digest")
+	}
+	if got == encodeGraphDigest([]graphNodeView{altSHA}, nil, assessReady, downstreamCoverageComplete) {
+		t.Fatal("digest ignored pipeline SHA")
+	}
+	if got == encodeGraphDigest([]graphNodeView{altStatus}, nil, assessReady, downstreamCoverageComplete) {
+		t.Fatal("digest ignored pipeline status")
+	}
+	if got == encodeGraphDigest([]graphNodeView{altDepth}, nil, assessReady, downstreamCoverageComplete) {
+		t.Fatal("digest ignored node depth")
+	}
+}
+
 func TestPipelineGraph_resumeKeepsIncompleteEdge(t *testing.T) {
 	h := &walkServer{
 		pipes: map[string]string{

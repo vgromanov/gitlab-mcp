@@ -708,15 +708,41 @@ func graphNodeDigest(n graphNodeView) string {
 	sort.Slice(jobs, func(i, j int) bool {
 		return bytes.Compare(jobs[i], jobs[j]) < 0
 	})
+	var pipe json.RawMessage
+	if n.Pipeline != nil {
+		raw, err := json.Marshal(struct {
+			ID          int64  `json:"id"`
+			Status      string `json:"status"`
+			Source      string `json:"source"`
+			Ref         string `json:"ref"`
+			SHA         string `json:"sha"`
+			StatusKnown bool   `json:"status_known"`
+		}{
+			ID:          n.Pipeline.ID,
+			Status:      deref(n.Pipeline.Status),
+			Source:      deref(n.Pipeline.Source),
+			Ref:         deref(n.Pipeline.Ref),
+			SHA:         deref(n.Pipeline.SHA),
+			StatusKnown: n.Pipeline.StatusKnown,
+		})
+		if err != nil {
+			return ""
+		}
+		pipe = raw
+	}
 	raw, err := json.Marshal(struct {
 		ProjectID  string            `json:"project_id"`
 		PipelineID int64             `json:"pipeline_id"`
+		Depth      int               `json:"depth"`
 		Role       string            `json:"role"`
+		Pipeline   json.RawMessage   `json:"pipeline"`
 		Jobs       []json.RawMessage `json:"jobs"`
 	}{
 		ProjectID:  n.ProjectID,
 		PipelineID: n.PipelineID,
+		Depth:      n.Depth,
 		Role:       n.Role,
+		Pipeline:   pipe,
 		Jobs:       jobs,
 	})
 	if err != nil {

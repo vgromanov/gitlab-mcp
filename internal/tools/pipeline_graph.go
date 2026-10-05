@@ -351,12 +351,13 @@ func resumePipelineGraph(ctx context.Context, in pipelineGraphIn, sel graphSelec
 	if err != nil || guard.Partial {
 		return nil, nil, fmt.Errorf("%s: previous-page guard failed", cursor.ResyncRequired)
 	}
+	tokens := jobGuardTokens(guard.Jobs)
 	ids := jobIDStrings(guard.Jobs)
 	last := ""
-	if len(ids) > 0 {
-		last = ids[len(ids)-1]
+	if len(tokens) > 0 {
+		last = tokens[len(tokens)-1]
 	}
-	if cursor.SequenceDigest(ids) != payload.PageState.SequenceDigest || last != payload.PageState.LastSHA || len(ids) != payload.PageState.ItemsOnPage {
+	if cursor.SequenceDigest(tokens) != payload.PageState.SequenceDigest || last != payload.PageState.LastSHA || len(tokens) != payload.PageState.ItemsOnPage {
 		return nil, nil, fmt.Errorf("%s: previous-page boundary drift", cursor.ResyncRequired)
 	}
 	if !guard.Paging.PagingKnown || observedNextPage(guard.Paging) != payload.PageState.ProviderNextPage || payload.PageState.ProviderNextPage != int64(payload.PageState.Page)+1 {
@@ -685,7 +686,7 @@ func finishGraph(ctx context.Context, section readmeta.Section, pid, pipePID str
 		walk.coverage = downstreamCoverageUnknown
 		walk.unseen = true
 		nextLineage := encodeLineageCarry(mergeLineageCarry(prior, page.Jobs))
-		if tok, err := mintGraphCursor(d, actorID, pipePID, pipe.ID, sha, sel, upper, expires, pageNum, jobIDStrings(page.Jobs), next, len(page.Jobs), pid, nextLineage, walk.snapshotCont()); err == nil {
+		if tok, err := mintGraphCursor(d, actorID, pipePID, pipe.ID, sha, sel, upper, expires, pageNum, jobGuardTokens(page.Jobs), next, len(page.Jobs), pid, nextLineage, walk.snapshotCont()); err == nil {
 			section.NextCursor = &tok
 		} else {
 			section.AddLimitation(readmeta.CodePartial, "continuation cursor was not issued")
@@ -1042,7 +1043,7 @@ func walkQueuedChildren(ctx context.Context, section *readmeta.Section, rootPID 
 			walk.coverage = downstreamCoveragePartial
 			if moreJobs && childSHA != "" && len(page.Jobs) > 0 {
 				nextLineage := encodeLineageCarry(mergeLineageCarry(lineageCarry{}, page.Jobs))
-				if tok, err := mintGraphCursor(d, actorID, scope, child.ID, childSHA, sel, upper, expires, 1, jobIDStrings(page.Jobs), nextJobs, len(page.Jobs), rootPID, nextLineage, walk.snapshotCont()); err == nil {
+				if tok, err := mintGraphCursor(d, actorID, scope, child.ID, childSHA, sel, upper, expires, 1, jobGuardTokens(page.Jobs), nextJobs, len(page.Jobs), rootPID, nextLineage, walk.snapshotCont()); err == nil {
 					section.NextCursor = &tok
 				}
 			}
@@ -1575,6 +1576,34 @@ func jobIDStrings(jobs []graphJob) []string {
 	out := make([]string, 0, len(jobs))
 	for _, job := range jobs {
 		out = append(out, strconv.FormatInt(job.ID, 10))
+	}
+	return out
+}
+
+func jobGuardToken(job graphJob) string {
+	raw, err := json.Marshal(struct {
+		ID     int64  `json:"id"`
+		Name   string `json:"name"`
+		Stage  string `json:"stage"`
+		Status string `json:"status"`
+		Allow  string `json:"allow_failure"`
+	}{
+		ID:     job.ID,
+		Name:   job.Name,
+		Stage:  job.Stage,
+		Status: job.Status,
+		Allow:  allowPresenceLabel(job.Allow, job.AllowValid),
+	})
+	if err != nil {
+		return ""
+	}
+	return string(raw)
+}
+
+func jobGuardTokens(jobs []graphJob) []string {
+	out := make([]string, 0, len(jobs))
+	for _, job := range jobs {
+		out = append(out, jobGuardToken(job))
 	}
 	return out
 }

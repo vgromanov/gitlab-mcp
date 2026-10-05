@@ -261,3 +261,93 @@ func TestReviewContext_graphFollowsMorePagesThanVisitedCap(t *testing.T) {
 		t.Fatalf("cursor retained without a budget stop: %#v", item.PipelineGraph.Section)
 	}
 }
+
+func TestReviewContext_internalGraphPagesMarkCoverageFull(t *testing.T) {
+	log := &pathLog{}
+	script := &reviewScript{log: log}
+	graph := &walkServer{
+		pipes: map[string]string{"42/100": walkPipe(100, 42, shaN(1), "feature-1")},
+		jobs: map[string]string{
+			"42/100/1": jobPageJSON(1, 20),
+			"42/100/2": jobPageJSON(21, 1),
+		},
+		mrPipes: `[{"id":100,"project_id":42,"sha":"` + shaN(1) + `","ref":"feature-1","status":"success"}]`,
+	}
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/pipelines") || strings.Contains(r.URL.Path, "/jobs") || strings.Contains(r.URL.Path, "/bridges") {
+			graph.ServeHTTP(w, r)
+			return
+		}
+		script.serve(w, r)
+	})
+	d := newReviewDeps(t, h)
+	out, err := callReviewDirect(t, d, context.Background(), []reviewContextItemIn{
+		{ProjectID: "42", MergeRequestIID: 1, Sections: []string{"metadata", "pipeline_graph"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item := out.Items[0]
+	sec := item.Sections["pipeline_graph"]
+	if item.Cause != "" || item.pipelineGraphDigest == "" || sec.ContentComplete != readmeta.ContentCompleteTrue {
+		t.Fatalf("incomplete multi-page graph cause=%s sec=%#v", item.Cause, sec)
+	}
+	if sec.ManifestCoverage != readmeta.CoverageFull {
+		t.Fatalf("merged graph coverage %q", sec.ManifestCoverage)
+	}
+}
+
+func TestReviewContext_childJobPagesStayOffRootJobs(t *testing.T) {
+	log := &pathLog{}
+	script := &reviewScript{log: log}
+	graph := &walkServer{
+		pipes: map[string]string{
+			"42/100": walkPipe(100, 42, shaN(1), "feature-1"),
+			"99/200": walkPipe(200, 99, shaN(2), "child"),
+		},
+		jobs: map[string]string{
+			"42/100/1": "[" + jobJSON(1, "parent", "success", "false") + "]",
+			"99/200/1": jobPageJSON(10, 20),
+			"99/200/2": jobPageJSON(30, 1),
+		},
+		bridges: map[string]string{
+			"42/100/1": "[" + bridgeJSON(50, "one", 99, 200, shaN(2)) + "]",
+		},
+		mrPipes: `[{"id":100,"project_id":42,"sha":"` + shaN(1) + `","ref":"feature-1","status":"success"}]`,
+	}
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/pipelines") || strings.Contains(r.URL.Path, "/jobs") || strings.Contains(r.URL.Path, "/bridges") {
+			graph.ServeHTTP(w, r)
+			return
+		}
+		script.serve(w, r)
+	})
+	d := newReviewDeps(t, h)
+	out, err := callReviewDirect(t, d, context.Background(), []reviewContextItemIn{
+		{ProjectID: "42", MergeRequestIID: 1, Sections: []string{"metadata", "pipeline_graph"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item := out.Items[0]
+	if item.PipelineGraph == nil {
+		t.Fatalf("missing graph cause=%s", item.Cause)
+	}
+	for _, job := range item.PipelineGraph.Jobs {
+		if job.ID != 1 {
+			t.Fatalf("root jobs leaked child id %d: %#v", job.ID, item.PipelineGraph.Jobs)
+		}
+	}
+	if len(item.PipelineGraph.Jobs) != 1 {
+		t.Fatalf("root jobs %#v", item.PipelineGraph.Jobs)
+	}
+	var childJobs int
+	for _, n := range item.PipelineGraph.Nodes {
+		if n.PipelineID == 200 {
+			childJobs += len(n.Jobs)
+		}
+	}
+	if childJobs < 21 {
+		t.Fatalf("child jobs stayed off nodes: %#v", item.PipelineGraph.Nodes)
+	}
+}
