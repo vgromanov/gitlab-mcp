@@ -165,6 +165,19 @@ func StreamJobTrace(ctx context.Context, client *gitlab.Client, req JobTraceRequ
 		out.Err = copyErr
 		return out
 	}
+	if status == http.StatusRequestedRangeNotSatisfiable && emptyTraceRangeRejected(req, headers) {
+		zero := int64(0)
+		out.Data = []byte{}
+		out.EOF = true
+		out.Truncated = false
+		out.SizeKnown = true
+		out.Size = 0
+		out.ObservedStart = &zero
+		out.ObservedEndExcl = &zero
+		out.RangeHonored = true
+		out.SuffixAnchored = req.SuffixBytes > 0
+		return out
+	}
 	if doErr != nil && status != http.StatusPartialContent && status != http.StatusOK {
 		out.Data = []byte{}
 		out.Err = mapBudgetContextErr(ctx, doErr)
@@ -177,6 +190,16 @@ func StreamJobTrace(ctx context.Context, client *gitlab.Client, req JobTraceRequ
 
 	finalizeJobTrace(&out, req, headers, maxScan)
 	return out
+}
+
+// emptyTraceRangeRejected recognizes the standard answer to a tail or
+// from-the-start Range on a zero-byte trace: 416 with Content-Range
+// "bytes */0". The object is empty and complete, not an HTTP failure.
+func emptyTraceRangeRejected(req JobTraceRequest, hdr http.Header) bool {
+	if req.SuffixBytes <= 0 && (req.RangeStart != nil && *req.RangeStart != 0) {
+		return false
+	}
+	return strings.TrimSpace(headerGet(hdr, "Content-Range")) == "bytes */0"
 }
 
 func traceRangeHeader(req JobTraceRequest) (string, bool) {
@@ -282,6 +305,18 @@ func finalizeJobTrace(out *JobTraceResult, req JobTraceRequest, hdr http.Header,
 			if crStart != wantStart {
 				out.Data = []byte{}
 				out.Err = fmt.Errorf("Content-Range start mismatch")
+				out.RangeHonored = false
+				return
+			}
+		}
+		if req.SuffixBytes > 0 && out.SizeKnown {
+			wantStart := out.Size - req.SuffixBytes
+			if wantStart < 0 {
+				wantStart = 0
+			}
+			if crStart > wantStart {
+				out.Data = []byte{}
+				out.Err = fmt.Errorf("Content-Range shorter than requested suffix")
 				out.RangeHonored = false
 				return
 			}

@@ -63,7 +63,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   spaced value with no quote or newline in the fetched buffer is withheld
   instead of exposing a quoted Authorization continuation, a configured-token
   fragment of any length at a non-EOF scan cut is withheld, and a request-cap
-  failure reports `budget_requests` instead of `budget_bytes` (RVG-136).
+  failure reports `budget_requests` instead of `budget_bytes`. A suffix-range
+  206 that starts after `size - suffix` (for example `bytes 990-999/1000` for
+  `bytes=-512`) is rejected instead of reporting `tail_proven`, and a `416`
+  with `Content-Range: bytes */0` on a tail or from-start read is an empty
+  completed trace instead of an `http_error` (RVG-136).
 - Legacy MR diff getters (`get_merge_request_diffs`, `get_merge_request_file_diff`,
   `get_merge_request_conflicts`) now include honest `pagination` / `section`
   completeness metadata on their existing object responses (RVG-127 /

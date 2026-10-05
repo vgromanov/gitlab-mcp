@@ -774,7 +774,7 @@ func TestGetPipelineJobOutput_tailBeyondScanUsesMargin(t *testing.T) {
 	}
 }
 
-func TestGetPipelineJobOutput_tailBoundaryWithheldWithoutLead(t *testing.T) {
+func TestGetPipelineJobOutput_tailBoundaryStraddlingSecretRedacted(t *testing.T) {
 	scan := 64
 	raw := bytes.Repeat([]byte("x"), 8000)
 	secret := []byte("glpat-" + strings.Repeat("a", 20))
@@ -785,7 +785,11 @@ func TestGetPipelineJobOutput_tailBoundaryWithheldWithoutLead(t *testing.T) {
 			_, _ = io.WriteString(w, `{"id":42}`)
 			return
 		}
-		start := len(raw) - scan
+		var suffix int
+		if _, err := fmt.Sscanf(r.Header.Get("Range"), "bytes=-%d", &suffix); err != nil {
+			t.Fatalf("range %q", r.Header.Get("Range"))
+		}
+		start := len(raw) - suffix
 		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, len(raw)-1, len(raw)))
 		w.WriteHeader(http.StatusPartialContent)
 		_, _ = w.Write(raw[start:])
@@ -1660,5 +1664,52 @@ func TestSafeTraceErr_budgetCodesAreDistinct(t *testing.T) {
 	by := safeTraceErr(fmt.Errorf("wrap: %w", igl.ErrBudgetBytes))
 	if by == nil || !strings.Contains(by.Error(), readmeta.CodeBudgetBytes) || strings.Contains(by.Error(), readmeta.CodeBudgetRequests) {
 		t.Fatalf("bytes %v", by)
+	}
+}
+
+func TestGetPipelineJobOutput_tailEmptyTrace416(t *testing.T) {
+	d := authzDeps(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, "/trace") {
+			_, _ = io.WriteString(w, `{"id":42}`)
+			return
+		}
+		if r.Header.Get("Range") == "" {
+			return
+		}
+		w.Header().Set("Content-Range", "bytes */0")
+		w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+	}))
+	_, out, err := getPipelineJobOutput(context.Background(), nil, getPipelineJobOutputIn{
+		ProjectID: "42", JobID: 8, Selector: "tail", MaxLines: 5,
+	}, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text := decodeTrace(t, out)["trace"].(string); text != "" {
+		t.Fatalf("trace %q", text)
+	}
+	if w := traceWindow(t, out); w["tail_proven"] != true {
+		t.Fatalf("window %#v", w)
+	}
+}
+
+func TestGetPipelineJobOutput_tailUndersizedSuffixIsRejected(t *testing.T) {
+	raw := bytes.Repeat([]byte("x"), 1000)
+	d := authzDeps(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, "/trace") {
+			_, _ = io.WriteString(w, `{"id":42}`)
+			return
+		}
+		w.Header().Set("Content-Range", "bytes 990-999/1000")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(raw[990:])
+	}))
+	_, out, err := getPipelineJobOutput(context.Background(), nil, getPipelineJobOutputIn{
+		ProjectID: "42", JobID: 8, Selector: "tail", MaxLines: 5, MaxScanBytes: 512,
+	}, d)
+	if err == nil {
+		if w := traceWindow(t, out); w["tail_proven"] == true {
+			t.Fatalf("undersized suffix reported tail_proven: %#v", w)
+		}
 	}
 }

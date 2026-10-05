@@ -37,6 +37,62 @@ func TestStreamJobTrace_suffix206(t *testing.T) {
 	}
 }
 
+func TestStreamJobTrace_suffixUndersized206Rejected(t *testing.T) {
+	run := func(cr string, n int, suffix int64) JobTraceResult {
+		rt := &scriptedRT{
+			status:  http.StatusPartialContent,
+			headers: http.Header{"Content-Range": []string{cr}},
+			body:    io.NopCloser(bytes.NewReader(bytes.Repeat([]byte("a"), n))),
+		}
+		return StreamJobTrace(context.Background(), clientWithRT(t, rt), JobTraceRequest{
+			ProjectID: "42", JobID: 1, SuffixBytes: suffix, MaxScanBytes: 4096,
+		})
+	}
+	short := run("bytes 990-999/1000", 10, 512)
+	if short.Err == nil || len(short.Data) != 0 || short.RangeHonored || short.SuffixAnchored {
+		t.Fatalf("undersized suffix honored: %+v %q", short, short.Data)
+	}
+	full := run("bytes 488-999/1000", 512, 512)
+	if full.Err != nil || !full.SuffixAnchored || len(full.Data) != 512 {
+		t.Fatalf("exact suffix %+v", full)
+	}
+	small := run("bytes 0-9/10", 10, 512)
+	if small.Err != nil || !small.SuffixAnchored || len(small.Data) != 10 {
+		t.Fatalf("whole-object suffix %+v", small)
+	}
+}
+
+func TestStreamJobTrace_emptyTraceSuffix416(t *testing.T) {
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Range", "bytes */0")
+		w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+		_, _ = w.Write([]byte("range not satisfiable"))
+	})
+	res := StreamJobTrace(context.Background(), clientWithServer(t, h), JobTraceRequest{
+		ProjectID: "42", JobID: 7, SuffixBytes: 64, MaxScanBytes: 64,
+	})
+	if res.Err != nil || len(res.Data) != 0 || !res.EOF || !res.SizeKnown || res.Size != 0 || !res.SuffixAnchored {
+		t.Fatalf("%+v %q", res, res.Data)
+	}
+	h2 := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Range", "bytes */500")
+		w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+	})
+	res = StreamJobTrace(context.Background(), clientWithServer(t, h2), JobTraceRequest{
+		ProjectID: "42", JobID: 7, SuffixBytes: 64, MaxScanBytes: 64,
+	})
+	if res.Err == nil {
+		t.Fatalf("non-empty 416 accepted: %+v", res)
+	}
+	start := int64(10)
+	res = StreamJobTrace(context.Background(), clientWithServer(t, h), JobTraceRequest{
+		ProjectID: "42", JobID: 7, RangeStart: &start, MaxScanBytes: 64,
+	})
+	if res.Err == nil {
+		t.Fatalf("offset range on empty trace accepted: %+v", res)
+	}
+}
+
 func TestStreamJobTrace_ignoredRangeDoesNotRead(t *testing.T) {
 	var n atomic.Int64
 	var closes atomic.Int64
