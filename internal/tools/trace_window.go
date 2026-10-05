@@ -229,7 +229,11 @@ func selectRange(data []byte, observedStart, wantStart int64, wantEnd *int64, ma
 		if rel < end {
 			end = rel
 		}
-	} else if scan > 0 {
+	}
+	// Cap the returned span at max_scan_bytes for both open-ended and bounded
+	// ranges. Lookbehind and trailing margin stay in data for redaction but
+	// are not copied into the window.
+	if scan > 0 {
 		capAt := start + scan
 		if capAt < end {
 			end = capAt

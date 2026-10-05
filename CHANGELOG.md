@@ -23,7 +23,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   newline, so a one-line `"one\n"` prefix is complete. An un-ranged prefix or
   error GET that is answered with a nonzero 206 is rejected. A nonempty
   configured token is always scanned, including values shorter than eight
-  bytes. Tail and range windows keep redaction context outside the returned
+  bytes. A bounded range whose span exceeds `max_scan_bytes` still fetches
+  lookbehind and lookahead for redaction, then crops the returned window to
+  the scan cap. The 30s timeout and default body budget start before project
+  authorization so a stuck identity lookup cannot overrun the deadline.
+  Tail and range windows keep redaction context outside the returned
   bytes, a partial
   206 is not a complete trace, redaction is linear in the trace size, and
   `output_bytes` / `redaction_count` follow the UTF-8 text actually returned.

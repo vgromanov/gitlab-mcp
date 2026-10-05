@@ -1102,6 +1102,104 @@ func TestGetPipelineJobOutput_openRangeIncludesLookbehind(t *testing.T) {
 	}
 }
 
+func TestGetPipelineJobOutput_boundedRangeCapsReturnedSpan(t *testing.T) {
+	raw := bytes.Repeat([]byte(" "), 4000)
+	copy(raw[1000:], []byte("MARKER"))
+	start := int64(1000)
+	end := int64(3000)
+	d := authzDeps(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, "/trace") {
+			_, _ = io.WriteString(w, `{"id":42}`)
+			return
+		}
+		var from, to int
+		if _, err := fmt.Sscanf(r.Header.Get("Range"), "bytes=%d-%d", &from, &to); err != nil {
+			t.Fatalf("range %q", r.Header.Get("Range"))
+		}
+		if from >= int(start) {
+			t.Errorf("bounded range omitted lookbehind: %q", r.Header.Get("Range"))
+		}
+		if to < int(end)-1 {
+			t.Errorf("bounded range omitted lookahead: %q", r.Header.Get("Range"))
+		}
+		if from < 0 {
+			from = 0
+		}
+		if to >= len(raw) {
+			to = len(raw) - 1
+		}
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", from, to, len(raw)))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(raw[from : to+1])
+	}))
+	_, out, err := getPipelineJobOutput(context.Background(), nil, getPipelineJobOutputIn{
+		ProjectID: "42", JobID: 8, Selector: "range", StartByte: &start, EndByte: &end, MaxScanBytes: 100, MaxBytes: 1 << 20,
+	}, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := decodeTrace(t, out)["trace"].(string)
+	w := traceWindow(t, out)
+	span := w["source_end_exclusive"].(float64) - w["source_start"].(float64)
+	if !strings.Contains(text, "MARKER") || w["source_start"].(float64) != float64(start) || span != 100 {
+		t.Fatalf("trace %q window %#v", text, w)
+	}
+}
+
+func TestGetPipelineJobOutput_authzUsesBoundedContext(t *testing.T) {
+	var sawDeadline atomic.Bool
+	var authzBeforeTrace atomic.Bool
+	var sawAuthz atomic.Bool
+	rt := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if _, ok := req.Context().Deadline(); ok {
+			sawDeadline.Store(true)
+		}
+		if strings.Contains(req.URL.Path, "/trace") {
+			if sawAuthz.Load() {
+				authzBeforeTrace.Store(true)
+			}
+			body := []byte("ok\n")
+			return &http.Response{
+				StatusCode:    http.StatusOK,
+				Header:        http.Header{"Content-Type": []string{"text/plain"}},
+				Body:          io.NopCloser(bytes.NewReader(body)),
+				ContentLength: int64(len(body)),
+				Request:       req,
+			}, nil
+		}
+		sawAuthz.Store(true)
+		body := []byte(`{"id":42,"path_with_namespace":"g/p","namespace":{"id":7,"kind":"group","full_path":"g","parent_id":0}}`)
+		return &http.Response{
+			StatusCode:    http.StatusOK,
+			Header:        http.Header{"Content-Type": []string{"application/json"}},
+			Body:          io.NopCloser(bytes.NewReader(body)),
+			ContentLength: int64(len(body)),
+			Request:       req,
+		}, nil
+	})
+	cli, err := gitlab.NewClient("t",
+		gitlab.WithBaseURL("https://example.test/api/v4"),
+		gitlab.WithoutRetries(),
+		gitlab.WithHTTPClient(&http.Client{Transport: igl.BudgetInterceptor()(rt)}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := Deps{Config: &config.Config{Token: "fixture-pat", AllowedProjectIDs: []string{"42"}}, Client: cli}
+	_, raw, err := getPipelineJobOutput(context.Background(), nil, getPipelineJobOutputIn{
+		ProjectID: "42", JobID: 8,
+	}, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decodeTrace(t, raw)["trace"] != "ok\n" {
+		t.Fatalf("trace %#v", raw)
+	}
+	if !sawDeadline.Load() || !authzBeforeTrace.Load() || !sawAuthz.Load() {
+		t.Fatalf("deadline=%v authzBeforeTrace=%v authz=%v", sawDeadline.Load(), authzBeforeTrace.Load(), sawAuthz.Load())
+	}
+}
+
 func TestGetPipelineJobOutput_rangeEndNearMaxIntDoesNotCollapse(t *testing.T) {
 	start := int64(0)
 	end := int64(math.MaxInt64 - 10)

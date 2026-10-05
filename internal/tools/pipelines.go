@@ -205,14 +205,13 @@ type getPipelineJobOutputIn struct {
 }
 
 func getPipelineJobOutput(ctx context.Context, _ *mcp.CallToolRequest, in getPipelineJobOutputIn, d Deps) (*mcp.CallToolResult, any, error) {
-	pid, err := resolvePipelineProject(ctx, in.ProjectID, d)
-	if err != nil {
-		return nil, nil, err
-	}
 	q, err := normalizeTraceQuery(in)
 	if err != nil {
 		return nil, nil, err
 	}
+	// Bound the call before identity lookup. The production client has no
+	// client-wide timeout, so a stuck project/group resolve would otherwise
+	// run past this 30s deadline. Authorization still happens before the trace GET.
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	token := ""
@@ -232,6 +231,10 @@ func getPipelineJobOutput(ctx context.Context, _ *mcp.CallToolRequest, in getPip
 		ctx = igl.WithBudget(ctx, b)
 	} else {
 		b.EnsureMinBytes(need)
+	}
+	pid, err := resolvePipelineProject(ctx, in.ProjectID, d)
+	if err != nil {
+		return nil, nil, err
 	}
 	res, meta, err := readJobTrace(ctx, d, pid, in.JobID, q)
 	if err != nil {

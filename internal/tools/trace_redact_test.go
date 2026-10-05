@@ -121,6 +121,20 @@ func TestSelectPrefix_scanCutWithholdsShortCredential(t *testing.T) {
 	}
 }
 
+func TestSelectRange_boundedSpanCapsAtScan(t *testing.T) {
+	// 512 lookbehind + 100 scan + 512 lookahead, as readJobTrace fetches.
+	data := bytes.Repeat([]byte(" "), 1124)
+	copy(data[512:], []byte("MARKER"))
+	end := int64(3000)
+	p := selectRange(data, 488, 1000, &end, 1<<20, jobTraceHardLine, "", true, 10000, 100)
+	if p.start == nil || p.end == nil || *p.start != 1000 || *p.end-*p.start != 100 {
+		t.Fatalf("span start=%v end=%v text=%q", p.start, p.end, p.text)
+	}
+	if !strings.Contains(p.text, "MARKER") || p.full {
+		t.Fatalf("text %q full %v", p.text, p.full)
+	}
+}
+
 func TestSelectPrefix_newlineTerminatedMaxLines(t *testing.T) {
 	p := selectPrefix([]byte("one\n"), 0, 1, 1<<20, jobTraceHardLine, "", true)
 	if p.text != "one\n" || !p.full || p.end == nil || *p.end != 4 {
