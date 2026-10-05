@@ -27,6 +27,7 @@ const (
 // LookupEnv is injected to avoid reading unrelated process environment.
 type Input struct {
 	Host, LocalUser, Home    string
+	RemoteUser               string // URL user; used when config has no User, including %r
 	UserConfig, SystemConfig string
 	LookupEnv                func(string) (string, bool)
 }
@@ -292,7 +293,7 @@ func (r *resolver) match(args []string, src string, line int) (bool, error) {
 		case "originalhost":
 			subject = r.in.Host
 		case "user":
-			subject = r.in.LocalUser
+			subject = r.remoteUser()
 			if v, ok := r.values["user"]; ok {
 				subject = v.args[0]
 			}
@@ -370,6 +371,13 @@ func matches(s string, patterns []string, caseSensitive bool) bool {
 	return positive
 }
 
+func (r *resolver) remoteUser() string {
+	if r.in.RemoteUser != "" {
+		return r.in.RemoteUser
+	}
+	return r.in.LocalUser
+}
+
 func (r *resolver) scalar(key, def string) string {
 	if v, ok := r.values[key]; ok {
 		return v.args[0]
@@ -381,7 +389,7 @@ func (r *resolver) bad(key, reason string) error {
 	return problem(v.source, v.line, key, reason)
 }
 func (r *resolver) finish() (Config, error) {
-	c := Config{HostName: r.in.Host, User: r.scalar("user", r.in.LocalUser), Port: 22, StrictHostKeyChecking: r.scalar("stricthostkeychecking", "ask"), UpdateHostKeys: r.scalar("updatehostkeys", "yes"), PublicKeyAuthentication: true}
+	c := Config{HostName: r.in.Host, User: r.scalar("user", r.remoteUser()), Port: 22, StrictHostKeyChecking: r.scalar("stricthostkeychecking", "ask"), UpdateHostKeys: r.scalar("updatehostkeys", "yes"), PublicKeyAuthentication: true}
 	if r.scalar("canonicalizehostname", "no") != "no" {
 		return Config{}, r.bad("canonicalizehostname", "canonicalization is unsupported")
 	}

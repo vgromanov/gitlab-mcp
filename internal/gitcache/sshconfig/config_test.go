@@ -178,6 +178,29 @@ func TestTokenExpansionAndQuoting(t *testing.T) {
 		}
 	}
 }
+func TestRemoteUserUsedWhenConfigUserUnset(t *testing.T) {
+	in := fixture(t, "IdentityFile %d/.ssh/%r_key\n", "")
+	in.RemoteUser = "git"
+	c := resolve(t, in)
+	if c.User != "git" {
+		t.Fatalf("user %q", c.User)
+	}
+	want := filepath.Join(in.Home, ".ssh/git_key")
+	if !reflect.DeepEqual(c.IdentityFiles, []string{want}) {
+		t.Fatalf("%%r expanded from local user: %v", c.IdentityFiles)
+	}
+	in = fixture(t, "User configured\nIdentityFile %d/.ssh/%r_key\n", "")
+	in.RemoteUser = "git"
+	c = resolve(t, in)
+	if c.User != "configured" {
+		t.Fatalf("configured User lost: %q", c.User)
+	}
+	want = filepath.Join(in.Home, ".ssh/configured_key")
+	if !reflect.DeepEqual(c.IdentityFiles, []string{want}) {
+		t.Fatalf("%%r did not follow configured User: %v", c.IdentityFiles)
+	}
+}
+
 func TestMissingOptionalConfigAndBounds(t *testing.T) {
 	in := fixture(t, "", "")
 	os.Remove(in.UserConfig)

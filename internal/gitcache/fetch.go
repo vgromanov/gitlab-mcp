@@ -350,17 +350,28 @@ type limitedBody struct {
 }
 
 func (b *limitedBody) Read(p []byte) (int, error) {
-	if b.n >= b.max {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if b.n > b.max {
 		return 0, ErrLimit
+	}
+	// A body of exactly max bytes ends with EOF. Probe one extra byte before
+	// treating the ceiling as overflow, matching listx.limitedReader.
+	if b.n == b.max {
+		var one [1]byte
+		n, err := b.ReadCloser.Read(one[:])
+		if n > 0 {
+			b.n += int64(n)
+			return 0, ErrLimit
+		}
+		return 0, err
 	}
 	if int64(len(p)) > b.max-b.n {
 		p = p[:b.max-b.n]
 	}
 	n, err := b.ReadCloser.Read(p)
 	b.n += int64(n)
-	if b.n > b.max {
-		return n, ErrLimit
-	}
 	return n, err
 }
 

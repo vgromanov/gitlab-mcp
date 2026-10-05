@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/gitcache/origin"
 	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/gitcache/sshconfig"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
@@ -45,6 +46,55 @@ func TestPrepareTrustProvenanceChangesWithKnownHosts(t *testing.T) {
 	}
 	if fp1 == fp2 {
 		t.Fatal("known_hosts change did not alter PrepareTrust provenance")
+	}
+}
+
+func TestPrepareSSHUsesURLUser(t *testing.T) {
+	host := mustPrepareKey(t)
+	home := t.TempDir()
+	known := filepath.Join(home, "known_hosts")
+	if err := os.WriteFile(known, []byte(knownhosts.Line([]string{"127.0.0.1:22"}, host.PublicKey())+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := filepath.Join(home, "config")
+	body := fmt.Sprintf("Host 127.0.0.1\n Port 22\n IdentityAgent none\n IdentityFile %%d/.ssh/%%r_key\n UserKnownHostsFile %s\n GlobalKnownHostsFile none\n StrictHostKeyChecking yes\n UpdateHostKeys no\n", known)
+	if err := os.WriteFile(cfg, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	in := sshconfig.Input{Home: home, LocalUser: "local", RemoteUser: "local", UserConfig: cfg, SystemConfig: filepath.Join(home, "missing")}
+	target, err := origin.Parse("ssh://git@127.0.0.1:22/repo.git", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := prepareSSH(context.Background(), target, Options{SSHConfig: &in}.WithLoopback())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.cfg.User != "git" {
+		t.Fatalf("authenticated as %q", p.cfg.User)
+	}
+	want := filepath.Join(home, ".ssh/git_key")
+	if len(p.cfg.IdentityFiles) != 1 || p.cfg.IdentityFiles[0] != want {
+		t.Fatalf("%%r identity %v", p.cfg.IdentityFiles)
+	}
+
+	scp, err := origin.Parse("git@127.0.0.1:repo.git", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cfg, []byte(fmt.Sprintf("Host 127.0.0.1\n User configured\n Port 22\n IdentityAgent none\n IdentityFile %%d/.ssh/%%r_key\n UserKnownHostsFile %s\n GlobalKnownHostsFile none\n StrictHostKeyChecking yes\n UpdateHostKeys no\n", known)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p, err = prepareSSH(context.Background(), scp, Options{SSHConfig: &in}.WithLoopback())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.cfg.User != "configured" {
+		t.Fatalf("configured User lost: %q", p.cfg.User)
+	}
+	want = filepath.Join(home, ".ssh/configured_key")
+	if len(p.cfg.IdentityFiles) != 1 || p.cfg.IdentityFiles[0] != want {
+		t.Fatalf("configured %%r identity %v", p.cfg.IdentityFiles)
 	}
 }
 

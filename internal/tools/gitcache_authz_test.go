@@ -98,6 +98,42 @@ func gitcacheAuthzDeps(t *testing.T, ts *httptest.Server) Deps {
 	return Deps{Config: cfg, Client: cli}
 }
 
+func TestGitCacheAuthorizer_scpSSHURL(t *testing.T) {
+	ts, _ := gitcacheAuthzServer(t, func(path string, w http.ResponseWriter) bool {
+		switch {
+		case strings.HasSuffix(path, "/projects/1") || strings.HasSuffix(path, "/projects/g%2Fp"):
+			_, _ = io.WriteString(w, `{
+				"id":1,"path_with_namespace":"g/p",
+				"http_url_to_repo":"https://gitlab.example/g/p.git",
+				"ssh_url_to_repo":"git@gitlab.example:g/p.git",
+				"namespace":{"id":10,"kind":"group","full_path":"g","parent_id":0}
+			}`)
+			return true
+		case strings.HasSuffix(path, "/projects/2"):
+			_, _ = io.WriteString(w, `{
+				"id":2,"path_with_namespace":"u/fork",
+				"http_url_to_repo":"https://gitlab.example/u/fork.git",
+				"ssh_url_to_repo":"git@gitlab.example:u/fork.git",
+				"namespace":{"id":11,"kind":"group","full_path":"u","parent_id":10}
+			}`)
+			return true
+		default:
+			return false
+		}
+	})
+	auth := NewGitCacheAuthorizer(gitcacheAuthzDeps(t, ts))
+	g, err := auth.ResolveGrant(context.Background(), gitcache.AcquireIntent{AllowLoopback: true, ProjectID: "1", MRIID: 7, Depth: 1, Token: "tok"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g.SourceSSHURL != "git@gitlab.example:u/fork.git" || g.TargetSSHURL != "git@gitlab.example:g/p.git" {
+		t.Fatalf("scp urls src=%q tgt=%q", g.SourceSSHURL, g.TargetSSHURL)
+	}
+	if g.SourceHTTPSURL != "https://gitlab.example/u/fork.git" || g.TargetHTTPSURL != "https://gitlab.example/g/p.git" {
+		t.Fatalf("https urls src=%q tgt=%q", g.SourceHTTPSURL, g.TargetHTTPSURL)
+	}
+}
+
 func TestGitCacheAuthorizer_freshCanonicalBinding(t *testing.T) {
 	ts, _ := gitcacheAuthzServer(t, nil)
 	d := gitcacheAuthzDeps(t, ts)

@@ -33,6 +33,35 @@ func TestAcceptsHTTPSAndSSH(t *testing.T) {
 	}
 }
 
+func TestAcceptsGitLabSCP(t *testing.T) {
+	got, err := origin.Parse("git@example.com:group/proj.git", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Scheme != "ssh" || got.User != "git" || got.Host != "example.com" || got.Port != "22" || got.Path != "/group/proj.git" {
+		t.Fatalf("%#v", got)
+	}
+	got, err = origin.Parse("git@[2001:db8::1]:group/proj.git", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Host != "2001:db8::1" || got.Path != "/group/proj.git" || got.User != "git" || got.Port != "22" {
+		t.Fatalf("%#v", got)
+	}
+	for _, raw := range []string{
+		"git@example.com:group/../proj.git",
+		"git@example.com:group/./proj.git",
+		"git@example.com:group//proj.git",
+		"git:token@example.com:group/proj.git",
+		"git@[::1]:group/proj.git",
+		"user:secret@example.com:group/proj.git",
+	} {
+		if _, err := origin.Parse(raw, false); err == nil {
+			t.Fatalf("accepted %q", raw)
+		}
+	}
+}
+
 func TestInsecureAllowedExactHost(t *testing.T) {
 	if !origin.InsecureAllowed("gitlabci.raiffeisen.ru", origin.DefaultInsecureHost) {
 		t.Fatal("expected allow")

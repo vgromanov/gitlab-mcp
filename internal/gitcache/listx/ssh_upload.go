@@ -404,13 +404,23 @@ func admitPreparedAuth(ctx context.Context, p *preparedSSH) (string, error) {
 	}
 	return authSelectionFingerprint(p.cfg, signers), nil
 }
-func prepareSSH(ctx context.Context, target origin.Target, opt Options) (*preparedSSH, error) {
-	var err error
-	input := sshconfig.Input{Host: target.Host}
+
+// sshInputForTarget copies optional SSH config and always binds the authorized
+// URL user. Configured User still wins inside Resolve; an absent User, including
+// %r, must not fall back to the local OS account.
+func sshInputForTarget(target origin.Target, opt Options) sshconfig.Input {
+	input := sshconfig.Input{Host: target.Host, RemoteUser: target.User}
 	if opt.SSHConfig != nil {
 		input = *opt.SSHConfig
 		input.Host = target.Host
+		input.RemoteUser = target.User
 	}
+	return input
+}
+
+func prepareSSH(ctx context.Context, target origin.Target, opt Options) (*preparedSSH, error) {
+	var err error
+	input := sshInputForTarget(target, opt)
 	if input.Home == "" {
 		input.Home, err = os.UserHomeDir()
 		if err != nil {

@@ -314,9 +314,16 @@ func ValidateCloneURL(raw, instance, projectPath string, allowLoopback bool) err
 	if err != nil || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
 		return ErrAuthz
 	}
-	ru, err := url.Parse(raw)
-	if err != nil || ru.RawQuery != "" || ru.Fragment != "" || ru.RawPath != "" {
+	// SCP-style git@host:path is not a hierarchical URL. Reject query and
+	// fragment characters, and apply the raw-path check only to ssh:// and https.
+	if strings.ContainsAny(raw, "?#") {
 		return ErrAuthz
+	}
+	if strings.Contains(raw, "://") {
+		ru, err := url.Parse(raw)
+		if err != nil || ru.RawQuery != "" || ru.Fragment != "" || ru.RawPath != "" {
+			return ErrAuthz
+		}
 	}
 	if !strings.EqualFold(t.Host, u.Hostname()) || projectPath == "" || strings.HasPrefix(projectPath, "/") {
 		return ErrAuthz

@@ -22,11 +22,7 @@ var ErrSSHConfig = errors.New("ssh configuration could not be resolved")
 var ErrSSHOverrides = errors.New("SSH reads existing configuration; separate identity, agent, or known_hosts overrides are not accepted")
 
 func listConfiguredSSH(ctx context.Context, target origin.Target, opt Options, timeout time.Duration, maxBytes int64) ([]Ref, error) {
-	input := sshconfig.Input{Host: target.Host}
-	if opt.SSHConfig != nil {
-		input = *opt.SSHConfig
-		input.Host = target.Host
-	}
+	input := sshInputForTarget(target, opt)
 	if input.Home == "" {
 		var err error
 		input.Home, err = os.UserHomeDir()

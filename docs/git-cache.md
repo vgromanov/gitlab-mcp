@@ -39,7 +39,7 @@ metadata only.
 |---|---|---|---|
 | `GITLAB_MCP_GIT_CACHE` | `--git-cache` | `false` | Master enable. |
 | `GITLAB_MCP_GIT_CACHE_ROOT` | `--git-cache-root` | empty | Required when enabled. Dedicated operator-selected directory. |
-| `GITLAB_MCP_GIT_CACHE_QUOTA_BYTES` | `--git-cache-quota-bytes` | derived default | Logical regular-file budget for the whole root. |
+| `GITLAB_MCP_GIT_CACHE_QUOTA_BYTES` | `--git-cache-quota-bytes` | derived default | Logical regular-file budget for the whole root. Unset or `0` uses the derived default. A malformed or negative explicit value is rejected. |
 | `GITLAB_MCP_GIT_CACHE_CA_CERT_PATH` | `--git-cache-ca-cert` | empty | PEM CA file **augments** system roots; malformed/unreadable fails closed. |
 | `GITLAB_MCP_GIT_CACHE_INSECURE` | `--git-cache-insecure` | `false` | Explicit opt-in; does not follow API insecure. |
 | `GITLAB_MCP_GIT_CACHE_INSECURE_HOST` | `--git-cache-insecure-host` | `gitlabci.raiffeisen.ru` | Exact hostname allowed for cache insecure TLS. |

@@ -54,6 +54,54 @@ func TestReadLimited(t *testing.T) {
 	}
 }
 
+// eofLater returns payload without EOF, then EOF on the next read.
+type eofLater struct {
+	b []byte
+	i int
+}
+
+func (r *eofLater) Read(p []byte) (int, error) {
+	if r.i >= len(r.b) {
+		return 0, io.EOF
+	}
+	n := copy(p, r.b[r.i:])
+	r.i += n
+	return n, nil
+}
+
+func TestLimitedBodyAcceptsExactMax(t *testing.T) {
+	const max = 8
+	exact := &limitedBody{ReadCloser: io.NopCloser(&eofLater{b: bytes.Repeat([]byte("a"), max)}), max: max}
+	got, err := io.ReadAll(exact)
+	if err != nil || len(got) != max || string(got) != strings.Repeat("a", max) {
+		t.Fatalf("exact max: %q %v", got, err)
+	}
+	over := &limitedBody{ReadCloser: io.NopCloser(&eofLater{b: bytes.Repeat([]byte("a"), max+1)}), max: max}
+	got, err = io.ReadAll(over)
+	if !errors.Is(err, ErrLimit) || len(got) != max {
+		t.Fatalf("overflow: n=%d err=%v", len(got), err)
+	}
+	got, err = readLimited(context.Background(), &eofLater{b: bytes.Repeat([]byte("b"), 32)}, 32)
+	if err != nil || string(got) != strings.Repeat("b", 32) {
+		t.Fatalf("readLimited exact: %q %v", got, err)
+	}
+}
+
+func TestValidateCloneURLAcceptsGitLabSCP(t *testing.T) {
+	if err := ValidateCloneURL("git@gitlab.example:group/proj.git", "https://gitlab.example/api/v4", "group/proj", false); err != nil {
+		t.Fatal(err)
+	}
+	for _, raw := range []string{
+		"git@gitlab.example:group/../proj.git",
+		"git@evil.example:group/proj.git",
+		"git@gitlab.example:group/proj.git?x=1",
+	} {
+		if err := ValidateCloneURL(raw, "https://gitlab.example/api/v4", "group/proj", false); !errors.Is(err, ErrAuthz) {
+			t.Fatalf("%q: %v", raw, err)
+		}
+	}
+}
+
 func TestLimitedBodyAndTransport(t *testing.T) {
 	body := &limitedBody{ReadCloser: io.NopCloser(strings.NewReader(strings.Repeat("z", 20))), max: 5}
 	buf := make([]byte, 16)

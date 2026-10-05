@@ -54,6 +54,10 @@ type Config struct {
 	GitCacheCACertPath          string
 	GitCacheInsecure            bool
 	GitCacheAllowedInsecureHost string
+
+	// gitCacheQuotaErr is set when an explicit quota is malformed or negative.
+	// Unset quota stays zero and later selects the derived default.
+	gitCacheQuotaErr error
 }
 
 func envBool(key string, def bool) bool {
@@ -85,6 +89,20 @@ func envInt64(key string, def int64) int64 {
 		return def
 	}
 	return n
+}
+
+// parseExplicitQuota accepts an empty value as unset (zero). A present value
+// must be a non-negative integer; malformed and negative values are errors.
+func parseExplicitQuota(raw string) (int64, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0, nil
+	}
+	n, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("GITLAB_MCP_GIT_CACHE_QUOTA_BYTES must be a non-negative integer")
+	}
+	return n, nil
 }
 
 func parseCSV(raw string) []string {
@@ -130,7 +148,7 @@ func Load() *Config {
 		HTTPSProxy:                  envString("HTTPS_PROXY", ""),
 		GitCacheEnabled:             envBool("GITLAB_MCP_GIT_CACHE", false),
 		GitCacheRoot:                envString("GITLAB_MCP_GIT_CACHE_ROOT", ""),
-		GitCacheQuotaBytes:          envInt64("GITLAB_MCP_GIT_CACHE_QUOTA_BYTES", 0),
+		GitCacheQuotaBytes:          0,
 		GitCacheCACertPath:          envString("GITLAB_MCP_GIT_CACHE_CA_CERT_PATH", ""),
 		GitCacheInsecure:            envBool("GITLAB_MCP_GIT_CACHE_INSECURE", false),
 		GitCacheAllowedInsecureHost: envString("GITLAB_MCP_GIT_CACHE_INSECURE_HOST", "gitlabci.raiffeisen.ru"),
@@ -145,6 +163,9 @@ func Load() *Config {
 	if v, ok := os.LookupEnv("GITLAB_MCP_CURSOR_KEY"); ok {
 		c.CursorKey = []byte(v)
 	}
+	quota, quotaErr := parseExplicitQuota(os.Getenv("GITLAB_MCP_GIT_CACHE_QUOTA_BYTES"))
+	c.GitCacheQuotaBytes = quota
+	c.gitCacheQuotaErr = quotaErr
 
 	var (
 		flagToken                = flag.String("token", "", "GitLab PAT (overrides GITLAB_PERSONAL_ACCESS_TOKEN)")
@@ -252,7 +273,12 @@ func Load() *Config {
 		c.GitCacheRoot = *flagGitCacheRoot
 	}
 	if flagVisited("git-cache-quota-bytes") {
-		c.GitCacheQuotaBytes = *flagGitCacheQuota
+		if *flagGitCacheQuota < 0 {
+			c.gitCacheQuotaErr = fmt.Errorf("--git-cache-quota-bytes must be a non-negative integer")
+		} else {
+			c.GitCacheQuotaBytes = *flagGitCacheQuota
+			c.gitCacheQuotaErr = nil
+		}
 	}
 	if *flagGitCacheCA != "" {
 		c.GitCacheCACertPath = *flagGitCacheCA
@@ -354,6 +380,9 @@ func (c *Config) Validate() error {
 	}
 	if err := cursor.ValidateKey(c.CursorKey); err != nil {
 		return err
+	}
+	if c.gitCacheQuotaErr != nil {
+		return c.gitCacheQuotaErr
 	}
 	if c.GitCacheEnabled {
 		if strings.TrimSpace(c.GitCacheRoot) == "" {

@@ -35,14 +35,16 @@ type Target struct {
 	User   string
 }
 
-// Parse accepts only https and ssh. Loopback is accepted solely when
-// allowLoopback is set by tests. Credential userinfo is rejected. The ssh
-// user "git" is routing, not a credential secret.
+// Parse accepts https, ssh://, and GitLab SCP-style git@host:path. Loopback
+// is accepted solely when allowLoopback is set by tests. Credential userinfo
+// is rejected. The ssh user "git" is routing, not a credential secret.
 func Parse(raw string, allowLoopback bool) (Target, error) {
 	raw = strings.TrimSpace(raw)
-	if raw == "" || strings.HasPrefix(raw, "ext::") || strings.HasPrefix(raw, "file:") ||
-		strings.HasPrefix(raw, "git:") || strings.HasPrefix(raw, "git@") {
+	if raw == "" || strings.HasPrefix(raw, "ext::") || strings.HasPrefix(raw, "file:") || strings.HasPrefix(raw, "git:") {
 		return Target{}, ErrScheme
+	}
+	if user, host, path, ok := splitSCP(raw); ok {
+		return finishSCP(raw, user, host, path, allowLoopback)
 	}
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -99,6 +101,81 @@ func Parse(raw string, allowLoopback bool) (Target, error) {
 		Path:   path,
 		User:   user,
 	}, nil
+}
+
+// splitSCP reports a GitLab scp-style user@host:path. ssh:// URLs are not this form.
+func splitSCP(raw string) (user, host, path string, ok bool) {
+	if strings.Contains(raw, "://") || strings.ContainsAny(raw, " \t?#") {
+		return "", "", "", false
+	}
+	at := strings.IndexByte(raw, '@')
+	if at <= 0 || strings.Contains(raw[at+1:], "@") {
+		return "", "", "", false
+	}
+	user = raw[:at]
+	rest := raw[at+1:]
+	if strings.ContainsAny(user, ":/") {
+		return user, "", "", true
+	}
+	if strings.HasPrefix(rest, "[") {
+		end := strings.IndexByte(rest, ']')
+		if end < 2 || end+1 >= len(rest) || rest[end+1] != ':' {
+			return "", "", "", false
+		}
+		return user, rest[1:end], rest[end+2:], true
+	}
+	colon := strings.IndexByte(rest, ':')
+	if colon <= 0 {
+		return "", "", "", false
+	}
+	return user, rest[:colon], rest[colon+1:], true
+}
+
+func finishSCP(raw, user, host, path string, allowLoopback bool) (Target, error) {
+	if user == "" || strings.ContainsAny(user, ":/") {
+		return Target{}, ErrUserinfo
+	}
+	if err := checkHost(host, allowLoopback); err != nil {
+		return Target{}, err
+	}
+	path, err := repoPath(path)
+	if err != nil {
+		return Target{}, err
+	}
+	return Target{Raw: raw, Scheme: "ssh", Host: host, Port: "22", Path: path, User: user}, nil
+}
+
+func checkHost(host string, allowLoopback bool) error {
+	if host == "" {
+		return ErrHost
+	}
+	if !allowLoopback {
+		if ip := net.ParseIP(host); ip != nil && (ip.IsLoopback() || ip.IsUnspecified()) {
+			return ErrHost
+		}
+		if strings.EqualFold(host, "localhost") {
+			return ErrHost
+		}
+	}
+	return nil
+}
+
+func repoPath(path string) (string, error) {
+	if path == "" || strings.ContainsAny(path, "\\?#\r\n\x00") {
+		return "", ErrHost
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	if strings.Contains(path, "//") {
+		return "", ErrHost
+	}
+	for _, seg := range strings.Split(strings.Trim(path, "/"), "/") {
+		if seg == "" || seg == "." || seg == ".." {
+			return "", ErrHost
+		}
+	}
+	return path, nil
 }
 
 // InsecureAllowed reports whether cache-only insecure TLS may apply for host
