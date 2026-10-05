@@ -469,20 +469,28 @@ func checkedAdd(a, b int) (int, bool) {
 	return a + b, true
 }
 
-func advanceHunkBoundary(start, count int, haveEnd bool, lastEnd int) (int, bool, bool) {
-	// Zero-count start denotes the boundary after that start (exclusive cursor = start).
-	// Positive counts cover [start, start+count). Next hunk must not start before lastEnd.
+func advanceHunkBoundary(start, count int, haveEnd bool, lastNext int) (int, bool, bool) {
+	// Normalize both positive and zero-count hunks to a next-line coordinate:
+	//   positive [start, start+count) → next = start+count; require start >= lastNext
+	//   zero-count boundary-after start → next = start+1; require next >= lastNext
+	// Zero at MaxInt fails closed (no wrap). Equal next is allowed (same insertion point).
+	var next int
 	if count == 0 {
-		if haveEnd && start < lastEnd {
+		n, ok := checkedAdd(start, 1)
+		if !ok {
 			return 0, false, false
 		}
-		return start, true, true
+		next = n
+		if haveEnd && next < lastNext {
+			return 0, false, false
+		}
+		return next, true, true
 	}
 	end, ok := checkedAdd(start, count)
 	if !ok {
 		return 0, false, false
 	}
-	if haveEnd && start < lastEnd {
+	if haveEnd && start < lastNext {
 		return 0, false, false
 	}
 	return end, true, true

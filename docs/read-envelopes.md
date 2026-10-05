@@ -209,7 +209,7 @@ Content mode (`mode=content`, capability `readmeta.diff_content.v1`) selects exa
 
 ### Content mode examples
 
-Examples below are tool-tagged for documentation validation. List-diff examples earlier in this file remain `list_merge_request_diffs` OutputSchema fixtures. Content examples are **not** validated against that list schema; they mirror registered `get_merge_request_diff_window` (`mode=content`) CallTool projections. Window/line detail and some section keys may be **illustrative abridgements** (marked `…`); mandatory documented enums (`selection.kind`, coverage/`content_complete`/`consistency`, limitation `code`/`message`, selector statuses, hash nullability) must match the live CallTool oracle.
+Examples below are tool-tagged for documentation validation. List-diff examples earlier in this file remain `list_merge_request_diffs` OutputSchema fixtures. Content examples are **not** validated against that list schema; they mirror registered `get_merge_request_diff_window` (`mode=content`) CallTool projections. Window/line detail and some section keys may be **illustrative abridgements** (marked `…`); **requested `selectors` path/status sets are complete and authoritative** (not abridged). Mandatory documented enums (`selection.kind`, coverage/`content_complete`/`consistency`, limitation `code`/`message`, selector statuses, hash nullability) must match the live CallTool oracle.
 
 **Success (version, selected text)** — `tool: get_merge_request_diff_window` / content. Actual version-content coverage is `manifest_coverage=unknown`, `patch_coverage=partial`, `selection.kind=full_version`; `content_complete` stays `unknown` when the selected source is syntactically valid but not newly proved complete:
 
@@ -253,7 +253,7 @@ Examples below are tool-tagged for documentation validation. List-diff examples 
   },
   "selection": {"kind": "incremental", "from_sha": "…", "to_sha": "…", "straight": true},
   "files": [{"status": "text", "windows": [{"text": "@@ -1 +1 @@\n-a\n+b\n", "window_hash": {"scope": "diff_content.window_text.v1", "value": "…"}}]}],
-  "selectors": [{"path": "missing.go", "status": "unobserved"}],
+  "selectors": [{"path": "a.go", "status": "matched"}, {"path": "missing.go", "status": "unobserved"}],
   "returned_content_hash": {"scope": "diff_content.returned_windows_concat.v1", "value": "…"},
   "full_patch_hash": null
 }

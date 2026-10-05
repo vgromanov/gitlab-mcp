@@ -418,7 +418,7 @@ func TestDocsReadEnvelopesExamplesValidateRegisteredOutputSchema(t *testing.T) {
 		}
 		assertDocsContentMatchesCallToolOracle(t, i, label, fixture, oracle)
 	}
-	// Negative controls: mutate documented fields; oracle comparison must fail.
+	// Negative controls: mutate documented fields; same predicates as docs↔CallTool must fail.
 	t.Run("negative_mutate_selection_kind", func(t *testing.T) {
 		bad := cloneMap(oracles["version"])
 		sel := asMap(t, bad["selection"])
@@ -439,12 +439,58 @@ func TestDocsReadEnvelopesExamplesValidateRegisteredOutputSchema(t *testing.T) {
 			t.Fatal("mutated limitation detail must fail oracle")
 		}
 	})
-	t.Run("negative_mutate_drift_selectors_empty", func(t *testing.T) {
+	// Selector negatives exercise the SAME validateDocsContentSelectors used by docs↔CallTool.
+	wantStraight, _ := oracles["straight"]["selectors"].([]any)
+	wantDrift, _ := oracles["drift"]["selectors"].([]any)
+	wantVersion, _ := oracles["version"]["selectors"].([]any)
+	t.Run("negative_remove_only_matched_keep_unobserved", func(t *testing.T) {
+		got := []any{map[string]any{"path": "missing.go", "status": "unobserved"}}
+		if err := validateDocsContentSelectors(wantStraight, got); err == nil {
+			t.Fatal("dropping matched a.go while keeping unobserved must fail shared selector predicate")
+		}
+		bad := cloneMap(oracles["straight"])
+		bad["selectors"] = got
+		if err := docsContentOracleMismatch(oracles["straight"], bad); err == nil {
+			t.Fatal("docsContentOracleMismatch must also reject dropped matched selector")
+		}
+	})
+	t.Run("negative_replace_with_unrequested_path", func(t *testing.T) {
+		got := []any{map[string]any{"path": "unrequested.go", "status": "unobserved"}}
+		if err := validateDocsContentSelectors(wantStraight, got); err == nil {
+			t.Fatal("unknown path must fail shared selector predicate")
+		}
+		bad := cloneMap(oracles["straight"])
+		bad["selectors"] = got
+		if err := docsContentOracleMismatch(oracles["straight"], bad); err == nil {
+			t.Fatal("docsContentOracleMismatch must also reject unknown path")
+		}
+	})
+	t.Run("negative_duplicate_path", func(t *testing.T) {
+		got := []any{
+			map[string]any{"path": "a.go", "status": "matched"},
+			map[string]any{"path": "a.go", "status": "matched"},
+		}
+		if err := validateDocsContentSelectors(wantVersion, got); err == nil {
+			t.Fatal("duplicate path must fail shared selector predicate")
+		}
+	})
+	t.Run("negative_wrong_status", func(t *testing.T) {
+		got := []any{
+			map[string]any{"path": "a.go", "status": "unobserved"},
+			map[string]any{"path": "missing.go", "status": "unobserved"},
+		}
+		if err := validateDocsContentSelectors(wantStraight, got); err == nil {
+			t.Fatal("wrong status must fail shared selector predicate")
+		}
+	})
+	t.Run("negative_erase_all_selectors", func(t *testing.T) {
+		if err := validateDocsContentSelectors(wantDrift, nil); err == nil {
+			t.Fatal("erased selectors must fail shared selector predicate")
+		}
 		bad := cloneMap(oracles["drift"])
 		bad["selectors"] = []any{}
-		err := docsContentOracleMismatch(oracles["drift"], bad)
-		if err == nil {
-			t.Fatal("erased drift selectors must fail oracle")
+		if err := docsContentOracleMismatch(oracles["drift"], bad); err == nil {
+			t.Fatal("docsContentOracleMismatch must also reject erased selectors")
 		}
 	})
 }
@@ -575,26 +621,11 @@ func assertDocsContentMatchesCallToolOracle(t *testing.T, docIdx int, label stri
 			t.Fatalf("docs %d/%s limitation uses detail", docIdx, label)
 		}
 	}
-	// Selectors: docs must retain requested path outcomes matching oracle statuses.
-	oSels := asSlice(t, oracle["selectors"])
+	// Selectors: docs must retain the complete requested path/status set (shared predicate).
+	oSels, _ := oracle["selectors"].([]any)
 	dSels, _ := doc["selectors"].([]any)
-	if len(dSels) == 0 && len(oSels) > 0 {
-		t.Fatalf("docs %d/%s erased selectors; oracle keeps %#v", docIdx, label, oSels)
-	}
-	byPath := map[string]string{}
-	for _, raw := range oSels {
-		m := asMap(t, raw)
-		byPath[asString(m["path"])] = asString(m["status"])
-	}
-	for _, raw := range dSels {
-		m, _ := raw.(map[string]any)
-		if m == nil {
-			continue
-		}
-		p := asString(m["path"])
-		if want, ok := byPath[p]; ok && asString(m["status"]) != want {
-			t.Fatalf("docs %d/%s selector %s status=%v want %s", docIdx, label, p, m["status"], want)
-		}
+	if err := validateDocsContentSelectors(oSels, dSels); err != nil {
+		t.Fatalf("docs %d/%s selectors: %v (doc=%#v oracle=%#v)", docIdx, label, err, dSels, oSels)
 	}
 	// Hash nullability
 	if label == "drift" {
@@ -612,8 +643,62 @@ func assertDocsContentMatchesCallToolOracle(t *testing.T, docIdx int, label stri
 	}
 }
 
+// validateDocsContentSelectors enforces the complete requested path/status set
+// (equal cardinality, all required paths, no unknown/duplicate paths, exact statuses).
+// Shared by docs↔CallTool assertions and negative controls.
+func validateDocsContentSelectors(want, got []any) error {
+	if len(want) != len(got) {
+		return fmt.Errorf("selector cardinality want %d got %d", len(want), len(got))
+	}
+	wantByPath := map[string]string{}
+	for _, raw := range want {
+		m, ok := raw.(map[string]any)
+		if !ok {
+			return fmt.Errorf("want selector not object")
+		}
+		p, _ := m["path"].(string)
+		if p == "" {
+			return fmt.Errorf("want empty path")
+		}
+		if _, dup := wantByPath[p]; dup {
+			return fmt.Errorf("want duplicate path %s", p)
+		}
+		st, _ := m["status"].(string)
+		wantByPath[p] = st
+	}
+	seen := map[string]struct{}{}
+	for _, raw := range got {
+		m, ok := raw.(map[string]any)
+		if !ok {
+			return fmt.Errorf("got selector not object")
+		}
+		p, _ := m["path"].(string)
+		if p == "" {
+			return fmt.Errorf("got empty path")
+		}
+		if _, dup := seen[p]; dup {
+			return fmt.Errorf("duplicate path %s", p)
+		}
+		seen[p] = struct{}{}
+		wantStatus, ok := wantByPath[p]
+		if !ok {
+			return fmt.Errorf("unknown path %s", p)
+		}
+		st, _ := m["status"].(string)
+		if st != wantStatus {
+			return fmt.Errorf("path %s status=%q want %q", p, st, wantStatus)
+		}
+	}
+	for p := range wantByPath {
+		if _, ok := seen[p]; !ok {
+			return fmt.Errorf("missing path %s", p)
+		}
+	}
+	return nil
+}
+
 func docsContentOracleMismatch(oracle, candidate map[string]any) error {
-	// Minimal oracle equality for negative controls on documented fields.
+	// Oracle equality for negative controls; selectors use the shared predicate.
 	oSec, _ := oracle["section"].(map[string]any)
 	cSec, _ := candidate["section"].(map[string]any)
 	if cSec == nil {
@@ -643,8 +728,8 @@ func docsContentOracleMismatch(oracle, candidate map[string]any) error {
 	}
 	oSels, _ := oracle["selectors"].([]any)
 	cSels, _ := candidate["selectors"].([]any)
-	if len(oSels) > 0 && len(cSels) == 0 {
-		return fmt.Errorf("selectors")
+	if err := validateDocsContentSelectors(oSels, cSels); err != nil {
+		return fmt.Errorf("selectors: %w", err)
 	}
 	return nil
 }

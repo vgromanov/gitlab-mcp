@@ -2638,51 +2638,180 @@ func TestDiffContentRepair_F11_partialAndDriftMatrix(t *testing.T) {
 	})
 }
 
-// ---- RVG-143 R1/R3/R4/R5 repair controls (old-source reds first) ----
+// ---- RVG-143 R1/N1/R3/R4/R5 repair controls (old-source reds first) ----
 
 func TestDiffContentRepair_R1_zeroCountOrdering(t *testing.T) {
+	// N1 concrete cases from independent source review on b3b70aed.
+	validImmediateOld := "@@ -1 +1 @@\n-a\n+b\n@@ -1,0 +2 @@\n+c\n"
+	invalidZeroThenPositiveOld := "@@ -1,0 +2 @@\n+x\n@@ -1 +3 @@\n-a\n+b\n"
+	validImmediateNew := "@@ -1 +1 @@\n-a\n+b\n@@ -2 +1,0 @@\n-c\n"
+	invalidZeroThenPositiveNew := "@@ -2 +1,0 @@\n-x\n@@ -3 +1 @@\n-a\n+b\n"
 	malformedInsert := "@@ -1 +1 @@\n-a\n+b\n@@ -0,0 +2 @@\n+c\n"
 	malformedDelete := "@@ -1 +1 @@\n-a\n+b\n@@ -2 +0,0 @@\n-c\n"
-	t.Run("helper_malformed_zero_old_after_positive", func(t *testing.T) {
-		parsed := parseUnifiedDiff(malformedInsert)
-		if parsed.ok {
-			t.Fatal("helper: zero-old boundary before prior old line must reject")
+
+	t.Run("helper_valid_immediate_zero_after_positive_old", func(t *testing.T) {
+		if !parseUnifiedDiff(validImmediateOld).ok {
+			t.Fatal("helper: positive ending at N then zero boundary N must accept")
 		}
 	})
-	t.Run("helper_malformed_zero_new_after_positive", func(t *testing.T) {
-		parsed := parseUnifiedDiff(malformedDelete)
-		if parsed.ok {
-			t.Fatal("helper: zero-new boundary before prior new line must reject")
+	t.Run("helper_invalid_zero_then_positive_same_boundary_old", func(t *testing.T) {
+		if parseUnifiedDiff(invalidZeroThenPositiveOld).ok {
+			t.Fatal("helper: zero N then positive start N must reject")
 		}
 	})
-	t.Run("helper_backward_zero_after_zero", func(t *testing.T) {
-		// Second zero-old boundary retreats before the first zero boundary.
+	t.Run("helper_valid_immediate_zero_after_positive_new", func(t *testing.T) {
+		if !parseUnifiedDiff(validImmediateNew).ok {
+			t.Fatal("helper: new-side positive end N then zero N must accept")
+		}
+	})
+	t.Run("helper_invalid_zero_then_positive_same_boundary_new", func(t *testing.T) {
+		if parseUnifiedDiff(invalidZeroThenPositiveNew).ok {
+			t.Fatal("helper: new-side zero N then positive start N must reject")
+		}
+	})
+	t.Run("helper_zero_at_0_then_consume_1", func(t *testing.T) {
+		patch := "@@ -0,0 +1 @@\n+a\n@@ -1 +2 @@\n-b\n+c\n"
+		if !parseUnifiedDiff(patch).ok {
+			t.Fatal("helper: zero at 0 maps next-line 1; consuming line 1 must accept")
+		}
+	})
+	t.Run("helper_zero_N_then_positive_N_plus_1", func(t *testing.T) {
+		patch := "@@ -1,0 +1 @@\n+a\n@@ -2 +2 @@\n-b\n+c\n"
+		if !parseUnifiedDiff(patch).ok {
+			t.Fatal("helper: zero N then positive N+1 must accept")
+		}
+	})
+	t.Run("helper_consecutive_zero_forward", func(t *testing.T) {
+		patch := "@@ -1,0 +1 @@\n+a\n@@ -2,0 +2 @@\n+b\n"
+		if !parseUnifiedDiff(patch).ok {
+			t.Fatal("helper: consecutive forward zeros must accept")
+		}
+	})
+	t.Run("helper_consecutive_zero_equal", func(t *testing.T) {
+		// Equal next-line after zero is allowed (same insertion point).
+		patch := "@@ -1,0 +1 @@\n+a\n@@ -1,0 +2 @@\n+b\n"
+		if !parseUnifiedDiff(patch).ok {
+			t.Fatal("helper: equal consecutive zeros must accept")
+		}
+	})
+	t.Run("helper_consecutive_zero_backward", func(t *testing.T) {
 		patch := "@@ -2,0 +1 @@\n+a\n@@ -0,0 +2 @@\n+b\n"
 		if parseUnifiedDiff(patch).ok {
 			t.Fatal("helper: backward zero after zero must reject")
 		}
 	})
-	t.Run("helper_integer_limit_zero_boundary", func(t *testing.T) {
-		// Positive hunk ending at MaxInt then zero at 0 must reject; overflow on positive end also rejects.
-		hdr := "@@ -" + strconv.Itoa(math.MaxInt) + " +1 @@\n"
-		// header parse may fail for MaxInt alone; use MaxInt-1 count 1 then zero retreat
+	t.Run("helper_malformed_zero_old_after_positive", func(t *testing.T) {
+		if parseUnifiedDiff(malformedInsert).ok {
+			t.Fatal("helper: zero-old boundary before prior old line must reject")
+		}
+	})
+	t.Run("helper_malformed_zero_new_after_positive", func(t *testing.T) {
+		if parseUnifiedDiff(malformedDelete).ok {
+			t.Fatal("helper: zero-new boundary before prior new line must reject")
+		}
+	})
+	t.Run("helper_integer_limit_zero_at_maxint", func(t *testing.T) {
+		// Zero boundary at MaxInt: start+1 overflows → fail closed.
+		patch := "@@ -" + strconv.Itoa(math.MaxInt) + ",0 +1 @@\n+c\n"
+		if parseUnifiedDiff(patch).ok {
+			t.Fatal("helper: zero at MaxInt must reject (overflow fail-closed)")
+		}
+	})
+	t.Run("helper_integer_limit_zero_before_maxint_end", func(t *testing.T) {
 		patch := "@@ -" + strconv.Itoa(math.MaxInt-1) + ",1 +1,1 @@\n-a\n+b\n@@ -0,0 +2 @@\n+c\n"
 		if parseUnifiedDiff(patch).ok {
 			t.Fatal("helper: zero boundary before MaxInt-adjacent end must reject")
 		}
-		_ = hdr
+	})
+	t.Run("helper_integer_limit_positive_overflow", func(t *testing.T) {
+		patch := "@@ -" + strconv.Itoa(math.MaxInt) + ",1 +1,1 @@\n-a\n+b\n"
+		if parseUnifiedDiff(patch).ok {
+			t.Fatal("helper: positive start+count overflow must reject")
+		}
 	})
 	t.Run("helper_positive_legitimate_adjacency", func(t *testing.T) {
+		// Includes immediate zero-after-consumed-1 (boundary 1), not only later boundary 2.
+		// The prior "@@ -1,1 +1,0 @@ ... @@ -2,0 +1,1 @@" case was falsely green under mixed
+		// units (zero stored boundary-after=1, positive start 1 passed); next-line units
+		// correctly reject consuming new line 1 after zero-at-1. Use +2,1 instead.
 		cases := []string{
 			"@@ -0,0 +1 @@\n+a\n",
 			"@@ -0,0 +1 @@\n+a\n@@ -1 +2 @@\n-b\n+c\n",
+			validImmediateOld,
 			"@@ -1 +1 @@\n-a\n+b\n@@ -2,0 +3 @@\n+c\n",
-			"@@ -1,1 +1,0 @@\n-a\n@@ -2,0 +1,1 @@\n+b\n",
+			"@@ -1,1 +1,0 @@\n-a\n@@ -2,0 +2,1 @@\n+b\n",
+			validImmediateNew,
 		}
 		for _, p := range cases {
 			if !parseUnifiedDiff(p).ok {
 				t.Fatalf("helper: legitimate adjacency rejected: %q", p)
 			}
+		}
+	})
+	t.Run("helper_false_legitimate_mixed_units_now_rejects", func(t *testing.T) {
+		// Previously accepted under mixed coordinate units; must reject after normalization.
+		patch := "@@ -1,1 +1,0 @@\n-a\n@@ -2,0 +1,1 @@\n+b\n"
+		if parseUnifiedDiff(patch).ok {
+			t.Fatal("helper: zero-at-1 then positive new start 1 must reject under next-line units")
+		}
+	})
+	t.Run("mcp_invalid_zero_then_positive_selected_good_sibling", func(t *testing.T) {
+		head, base, start := shaN(1), shaN(2), shaN(3)
+		good := "@@ -1 +1 @@\n-a\n+b\n"
+		bad := invalidZeroThenPositiveOld
+		diffs := fmt.Sprintf(`[{"old_path":"bad.go","new_path":"bad.go","a_mode":"100644","b_mode":"100644","diff":%q},{"old_path":"keep.go","new_path":"keep.go","a_mode":"100644","b_mode":"100644","diff":%q}]`, bad, good)
+		body := versionObject(1, 5001, head, base, start, "collected", "2", diffs)
+		h := serveDiffBase(&pathLog{}, func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case strings.Contains(r.URL.Path, "/versions/1"):
+				_, _ = io.WriteString(w, body)
+			case strings.Contains(r.URL.Path, "/merge_requests/"):
+				_, _ = io.WriteString(w, `{"id":5001,"iid":1,"project_id":42,"source_project_id":42}`)
+			default:
+				http.NotFound(w, r)
+			}
+		})
+		out, err := callDiffWindow(t, diffDeps(t, h), nil, map[string]any{
+			"project_id": "42", "merge_request_iid": 1, "diff_version_id": 1,
+			"mode": "content", "paths": []any{"bad.go", "keep.go"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		files := asSlice(t, out["files"])
+		if len(files) != 2 {
+			t.Fatalf("files=%#v", files)
+		}
+		byPath := map[string]map[string]any{}
+		for _, raw := range files {
+			m := asMap(t, raw)
+			byPath[asString(m["new_path"])] = m
+		}
+		badF, keepF := byPath["bad.go"], byPath["keep.go"]
+		if badF == nil || keepF == nil {
+			t.Fatalf("missing paths %#v", byPath)
+		}
+		if asString(badF["status"]) != diffFileStatusMalformed {
+			t.Fatalf("bad status=%v", badF["status"])
+		}
+		if wins, _ := badF["windows"].([]any); len(wins) != 0 {
+			t.Fatalf("bad windows %#v", wins)
+		}
+		if asString(keepF["status"]) != diffFileStatusText {
+			t.Fatalf("keep status=%v", keepF["status"])
+		}
+		wins := asSlice(t, keepF["windows"])
+		if len(wins) != 1 {
+			t.Fatalf("keep windows %#v", wins)
+		}
+		wantSum := sha256.Sum256([]byte(good))
+		wh := asMap(t, asMap(t, wins[0])["window_hash"])
+		if asString(wh["value"]) != hex.EncodeToString(wantSum[:]) {
+			t.Fatalf("keep hash=%v want %s", wh, hex.EncodeToString(wantSum[:]))
+		}
+		// No usable anchors from malformed selected; good sibling keeps exact hash only.
+		if rc := out["returned_content_hash"]; rc == nil {
+			t.Fatal("returned_content_hash missing for good sibling")
 		}
 	})
 	t.Run("mcp_malformed_selected_good_sibling", func(t *testing.T) {
@@ -2738,6 +2867,94 @@ func TestDiffContentRepair_R1_zeroCountOrdering(t *testing.T) {
 		wh := asMap(t, asMap(t, wins[0])["window_hash"])
 		if asString(wh["value"]) != hex.EncodeToString(wantSum[:]) {
 			t.Fatalf("keep hash=%v want %s", wh, hex.EncodeToString(wantSum[:]))
+		}
+	})
+	t.Run("mcp_valid_immediate_adjacency_exact_text_hash_anchors", func(t *testing.T) {
+		head, base, start := shaN(1), shaN(2), shaN(3)
+		valid := validImmediateOld
+		diffs := fmt.Sprintf(`[{"old_path":"adj.go","new_path":"adj.go","a_mode":"100644","b_mode":"100644","diff":%q}]`, valid)
+		body := versionObject(1, 5001, head, base, start, "collected", "1", diffs)
+		h := serveDiffBase(&pathLog{}, func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case strings.Contains(r.URL.Path, "/versions/1"):
+				_, _ = io.WriteString(w, body)
+			case strings.Contains(r.URL.Path, "/merge_requests/"):
+				_, _ = io.WriteString(w, `{"id":5001,"iid":1,"project_id":42,"source_project_id":42}`)
+			default:
+				http.NotFound(w, r)
+			}
+		})
+		out, err := callDiffWindow(t, diffDeps(t, h), nil, map[string]any{
+			"project_id": "42", "merge_request_iid": 1, "diff_version_id": 1,
+			"mode": "content", "paths": []any{"adj.go"}, "context_lines": 0,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		files := asSlice(t, out["files"])
+		if len(files) != 1 {
+			t.Fatalf("files=%#v", files)
+		}
+		f := asMap(t, files[0])
+		if asString(f["status"]) != diffFileStatusText {
+			t.Fatalf("status=%v", f["status"])
+		}
+		mcpWins := asSlice(t, f["windows"])
+		if len(mcpWins) == 0 {
+			t.Fatal("expected nonempty windows for valid adjacency")
+		}
+		// Rebuild private parserCoords from the exact same patch bytes (JSON drops them).
+		parsed := parseUnifiedDiff(valid)
+		if !parsed.ok {
+			t.Fatal("setup: valid patch must parse")
+		}
+		budget := &contentEmitBudget{maxLines: 1000, maxBytes: 262144}
+		proofWins, ok, _, _ := selectDiffWindows(parsed, 0, budget)
+		if !ok || len(proofWins) == 0 {
+			t.Fatalf("setup selectDiffWindows ok=%v wins=%d", ok, len(proofWins))
+		}
+		if len(proofWins) != len(mcpWins) {
+			t.Fatalf("window count mcp=%d proof=%d", len(mcpWins), len(proofWins))
+		}
+		for i := range proofWins {
+			mw := asMap(t, mcpWins[i])
+			if asString(mw["text"]) != proofWins[i].Text {
+				t.Fatalf("window[%d] text mcp=%q proof=%q", i, mw["text"], proofWins[i].Text)
+			}
+			wantHash := hex.EncodeToString(func() []byte { s := sha256.Sum256([]byte(proofWins[i].Text)); return s[:] }())
+			wh := asMap(t, mw["window_hash"])
+			if asString(wh["value"]) != wantHash || asString(wh["value"]) != proofWins[i].WindowHash.Value {
+				t.Fatalf("window[%d] hash mcp=%v proof=%s", i, wh, proofWins[i].WindowHash.Value)
+			}
+		}
+		vid := int64(1)
+		sel := diffContentSelectionOut{
+			ProjectID: "42", MergeRequestIID: 1, Kind: diffModeVersion, VersionID: &vid,
+			HeadSHA: strPtr(head), BaseSHA: strPtr(base), StartSHA: strPtr(start),
+		}
+		file := diffContentFile{
+			Status: diffFileStatusText, OldPath: strPtr("adj.go"), NewPath: strPtr("adj.go"),
+			Windows: proofWins,
+		}
+		proof := proofFromContentFile(sel, file, true)
+		if !proof.Available {
+			t.Fatalf("proof unavailable: %#v", proof)
+		}
+		// Anchors on both sides of the immediate-adjacency patch.
+		for _, a := range []diffAnchor{
+			{ProjectID: "42", MergeRequestIID: 1, Kind: diffModeVersion, VersionID: 1,
+				HeadSHA: head, BaseSHA: base, StartSHA: start,
+				OldPath: "adj.go", NewPath: "adj.go", Side: "old", Line: 1},
+			{ProjectID: "42", MergeRequestIID: 1, Kind: diffModeVersion, VersionID: 1,
+				HeadSHA: head, BaseSHA: base, StartSHA: start,
+				OldPath: "adj.go", NewPath: "adj.go", Side: "new", Line: 1},
+			{ProjectID: "42", MergeRequestIID: 1, Kind: diffModeVersion, VersionID: 1,
+				HeadSHA: head, BaseSHA: base, StartSHA: start,
+				OldPath: "adj.go", NewPath: "adj.go", Side: "new", Line: 2},
+		} {
+			if _, err := validateDiffAnchor(proof, a); err != nil {
+				t.Fatalf("anchor %#v: %v", a, err)
+			}
 		}
 	})
 }
