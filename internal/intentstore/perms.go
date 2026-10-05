@@ -142,6 +142,20 @@ func lockDownNewSidecars(path string, before map[string]struct{}) error {
 	return checkFileMode(info)
 }
 
+func fileSize(path string) (int64, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	if isSymlink(info) {
+		return 0, ErrSymlink
+	}
+	return info.Size(), nil
+}
+
 func bytesOnDisk(path string) (int64, error) {
 	var total int64
 	for _, p := range sidecarPaths(path) {

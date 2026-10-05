@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -468,6 +469,168 @@ func TestEpochResetKeepsTombstones(t *testing.T) {
 	}
 }
 
+func TestResetEpochCommitFailureKeepsEpoch(t *testing.T) {
+	cfg, _ := fixedNow(t)
+	s := openStore(t, cfg)
+	ctx := context.Background()
+	s.DisableDispatch()
+	before := s.epoch
+	s.commitBarrier = func() error {
+		return errors.New("forced commit failure")
+	}
+	err := s.ResetEpoch(ctx, EpochResetConfirmation)
+	s.commitBarrier = nil
+	if err == nil {
+		t.Fatal("expected commit failure")
+	}
+	if s.epoch != before {
+		t.Fatalf("memory epoch changed to %s", s.epoch)
+	}
+	if got := rawMeta(t, cfg.Path, "epoch"); got != before {
+		t.Fatalf("persisted epoch %s, want %s", got, before)
+	}
+	if err := s.ResetEpoch(ctx, EpochResetConfirmation); err != nil {
+		t.Fatal(err)
+	}
+	if s.epoch == before {
+		t.Fatal("epoch did not advance after a successful reset")
+	}
+	if got := rawMeta(t, cfg.Path, "epoch"); got != s.epoch {
+		t.Fatalf("persisted %s memory %s", got, s.epoch)
+	}
+}
+
+func TestForeignEpochBlocksOldWrite(t *testing.T) {
+	cfg, _ := fixedNow(t)
+	a := openStore(t, cfg)
+	b := openStore(t, cfg)
+	ctx := context.Background()
+	rec, err := b.Begin(ctx, ident("k"), PayloadHash([]byte("a")), BeginOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldEpoch := rec.Epoch
+	a.DisableDispatch()
+	if err := a.ResetEpoch(ctx, EpochResetConfirmation); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.ClaimSending(ctx, rec.OperationID); !errors.Is(err, ErrStaleEpoch) {
+		t.Fatalf("claim after foreign reset: %v", err)
+	}
+	got, err := b.Get(ctx, rec.OperationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != StatePrepared || got.Epoch != oldEpoch || got.EpochCurrent {
+		t.Fatalf("old row still claimable: %+v", got)
+	}
+	if _, err := b.ClaimSending(ctx, rec.OperationID); !errors.Is(err, ErrStaleEpoch) {
+		t.Fatalf("second claim: %v", err)
+	}
+	fresh, err := b.Begin(ctx, ident("new"), PayloadHash([]byte("b")), BeginOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh.Epoch != a.epoch || fresh.Epoch == oldEpoch || !fresh.EpochCurrent {
+		t.Fatalf("new row epoch %+v store %s old %s", fresh, a.epoch, oldEpoch)
+	}
+}
+
+func TestByteCapCountsPendingGrowth(t *testing.T) {
+	cfg, _ := fixedNow(t)
+	s := openStore(t, cfg)
+	ctx := context.Background()
+	n, err := bytesOnDisk(s.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.maxBytes = n + 64
+	if _, err := s.Begin(ctx, ident("k"), PayloadHash([]byte("a")), BeginOptions{}); !errors.Is(err, ErrFull) {
+		t.Fatalf("pending growth: %v", err)
+	}
+	if _, err := s.GetByIdentity(ctx, ident("k")); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("rolled-back insert visible: %v", err)
+	}
+	s.maxBytes = DefaultMaxBytes
+	if _, err := s.Begin(ctx, ident("k"), PayloadHash([]byte("a")), BeginOptions{}); err != nil {
+		t.Fatalf("write under cap: %v", err)
+	}
+}
+
+func TestEncodedIntentPath(t *testing.T) {
+	ctx := context.Background()
+	for _, name := range []string{"intent#1.db", "intent%231.db"} {
+		t.Run(name, func(t *testing.T) {
+			dir := privateDir(t)
+			path := filepath.Join(dir, name)
+			s, err := Open(Config{Path: path})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = s.Close() })
+			if _, err := s.Begin(ctx, ident("k"), PayloadHash([]byte("a")), BeginOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			info, err := os.Lstat(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if info.Size() == 0 || !rawHasTable(t, path, "meta") {
+				t.Fatal("sqlite opened a different file than the configured path")
+			}
+			if name == "intent%231.db" {
+				if _, err := os.Lstat(filepath.Join(dir, "intent#1.db")); !os.IsNotExist(err) {
+					t.Fatalf("percent-escape opened %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestRejectViewOnlyDatabase(t *testing.T) {
+	cfg, _ := fixedNow(t)
+	db, err := sql.Open("sqlite", cfg.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE VIEW only_view AS SELECT 1 AS n`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(cfg.Path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(cfg); !errors.Is(err, ErrUnrelatedDatabase) {
+		t.Fatalf("view-only: %v", err)
+	}
+	if rawHasTable(t, cfg.Path, "meta") {
+		t.Fatal("view-only database was rewritten")
+	}
+	if !rawHasObject(t, cfg.Path, "view", "only_view") {
+		t.Fatal("view was dropped")
+	}
+}
+
+func TestParentDirIsFilesystemRoot(t *testing.T) {
+	root := string(filepath.Separator)
+	got := parentDir(root + "intent.db")
+	if got != root {
+		t.Fatalf("parent of root file = %q, want %q", got, root)
+	}
+	if runtime.GOOS == "windows" && parentDir(`C:\intent.db`) != `C:\` {
+		t.Fatalf("parent of C:\\intent.db = %q", parentDir(`C:\intent.db`))
+	}
+}
+
+func TestSQLiteFileURIEncodesReservedBytes(t *testing.T) {
+	got := sqliteFileURI("/tmp/a#b%23.db", "mode=ro")
+	if strings.Contains(got, "#") || !strings.Contains(got, "a%23b%2523.db") || !strings.Contains(got, "mode=ro") {
+		t.Fatal(got)
+	}
+}
+
 func createUnrelated(t *testing.T, path string) {
 	t.Helper()
 	db, err := sql.Open("sqlite", "file:"+path)
@@ -491,16 +654,35 @@ func createUnrelated(t *testing.T, path string) {
 
 func rawHasTable(t *testing.T, path, name string) bool {
 	t.Helper()
-	db, err := sql.Open("sqlite", "file:"+path+"?mode=ro")
+	return rawHasObject(t, path, "table", name)
+}
+
+func rawHasObject(t *testing.T, path, kind, name string) bool {
+	t.Helper()
+	db, err := sql.Open("sqlite", sqliteFileURI(path, "mode=ro&_query_only=1"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
 	var n int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, name).Scan(&n); err != nil {
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type=? AND name=?`, kind, name).Scan(&n); err != nil {
 		t.Fatal(err)
 	}
 	return n == 1
+}
+
+func rawMeta(t *testing.T, path, key string) string {
+	t.Helper()
+	db, err := sql.Open("sqlite", sqliteFileURI(path, "mode=ro&_query_only=1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var v string
+	if err := db.QueryRow(`SELECT value FROM meta WHERE key=?`, key).Scan(&v); err != nil {
+		t.Fatal(err)
+	}
+	return v
 }
 
 func rawColumn(t *testing.T, path, name string) bool {

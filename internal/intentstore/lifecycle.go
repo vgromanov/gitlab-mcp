@@ -188,6 +188,9 @@ func (s *Store) Get(ctx context.Context, operationID string) (Receipt, error) {
 	if err := s.readyLocked(); err != nil {
 		return Receipt{}, err
 	}
+	if err := s.reloadEpoch(ctx, s.db); err != nil {
+		return Receipt{}, err
+	}
 	return getByIDTx(ctx, s.db, operationID, s.epoch)
 }
 
@@ -199,6 +202,9 @@ func (s *Store) GetByIdentity(ctx context.Context, id Identity) (Receipt, error)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.readyLocked(); err != nil {
+		return Receipt{}, err
+	}
+	if err := s.reloadEpoch(ctx, s.db); err != nil {
 		return Receipt{}, err
 	}
 	return getByIdentityTx(ctx, s.db, id, s.epoch)
@@ -232,12 +238,14 @@ func (s *Store) Compact(ctx context.Context) (int, error) {
 }
 
 // ResetEpoch records a new epoch. Dispatch must already be disabled.
-// Existing rows, including tombstones, are not deleted.
+// Existing rows, including tombstones, are not deleted. The cached epoch
+// changes only after the meta update commits.
 func (s *Store) ResetEpoch(ctx context.Context, confirmation string) error {
 	if confirmation != EpochResetConfirmation {
 		return ErrConfirmation
 	}
-	return s.writeTx(ctx, false, func(tx *sql.Tx) error {
+	var next string
+	return s.commitWrite(ctx, false, func(tx *sql.Tx) error {
 		if s.dispatch {
 			return ErrDispatchEnabled
 		}
@@ -256,8 +264,10 @@ func (s *Store) ResetEpoch(ctx context.Context, confirmation string) error {
 		if affected != 1 {
 			return ErrUnrelatedDatabase
 		}
-		s.epoch = epoch
+		next = epoch
 		return nil
+	}, func() {
+		s.epoch = next
 	})
 }
 

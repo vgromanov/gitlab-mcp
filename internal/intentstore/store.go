@@ -7,7 +7,9 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -36,6 +38,9 @@ type Store struct {
 	maxBytes  int64
 	retention time.Duration
 	clock     func() time.Time
+	// commitBarrier runs after the statement work and before Commit.
+	// Tests use it to fail the commit once the new epoch is staged.
+	commitBarrier func() error
 }
 
 type migrateFunc func(tx *sql.Tx, from, to int) error
@@ -134,7 +139,7 @@ func prepare(cfg Config) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	dsn := "file:" + path + "?_txlock=immediate&_busy_timeout=5000&_journal_mode=WAL&_synchronous=FULL&_foreign_keys=on"
+	dsn := sqliteFileURI(path, "_txlock=immediate&_busy_timeout=5000&_journal_mode=WAL&_synchronous=FULL&_foreign_keys=on")
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, mapDriver(err)
@@ -202,7 +207,7 @@ func (s *Store) initialize(ctx context.Context, targetVersion int, migrate migra
 	switch {
 	case appID == 0 && userVersion == 0:
 		var n int
-		q := `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'`
+		q := userObjectCountSQL
 		if err := tx.QueryRowContext(ctx, q).Scan(&n); err != nil {
 			return mapDriver(err)
 		}
@@ -276,7 +281,7 @@ func (s *Store) initialize(ctx context.Context, targetVersion int, migrate migra
 
 // refuseUnrelated inspects an existing SQLite file without converting it to WAL.
 func refuseUnrelated(path string) error {
-	dsn := "file:" + path + "?mode=ro&_query_only=1"
+	dsn := sqliteFileURI(path, "mode=ro&_query_only=1")
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return mapDriver(err)
@@ -291,7 +296,7 @@ func refuseUnrelated(path string) error {
 		return mapDriver(err)
 	}
 	var n int
-	q := `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'`
+	q := userObjectCountSQL
 	if err := db.QueryRow(q).Scan(&n); err != nil {
 		return mapDriver(err)
 	}
@@ -342,6 +347,10 @@ func (s *Store) DisableDispatch() {
 }
 
 func (s *Store) writeTx(ctx context.Context, requireDispatch bool, fn func(*sql.Tx) error) error {
+	return s.commitWrite(ctx, requireDispatch, fn, nil)
+}
+
+func (s *Store) commitWrite(ctx context.Context, requireDispatch bool, fn func(*sql.Tx) error, afterCommit func()) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.writableLocked(requireDispatch); err != nil {
@@ -362,15 +371,98 @@ func (s *Store) writeTx(ctx context.Context, requireDispatch bool, fn func(*sql.
 				_ = tx.Rollback()
 			}
 		}()
+		prior := s.epoch
+		if err := s.reloadEpoch(ctx, tx); err != nil {
+			return err
+		}
+		if s.epoch != prior {
+			return ErrStaleEpoch
+		}
+		var changesBefore int64
+		if err := tx.QueryRowContext(ctx, `SELECT total_changes()`).Scan(&changesBefore); err != nil {
+			return mapDriver(err)
+		}
 		if err := fn(tx); err != nil {
 			return err
+		}
+		if err := s.guardBytes(ctx, tx, changesBefore); err != nil {
+			return err
+		}
+		if s.commitBarrier != nil {
+			if err := s.commitBarrier(); err != nil {
+				return err
+			}
 		}
 		if err := tx.Commit(); err != nil {
 			return mapDriver(err)
 		}
 		committed = true
+		if afterCommit != nil {
+			afterCommit()
+		}
 		return lockDownNewSidecars(s.path, before)
 	})
+}
+
+// reloadEpoch replaces the cached epoch with the committed meta value.
+func (s *Store) reloadEpoch(ctx context.Context, q rowQuery) error {
+	epoch, err := readEpoch(ctx, q)
+	if err != nil {
+		return err
+	}
+	s.epoch = epoch
+	return nil
+}
+
+func readEpoch(ctx context.Context, q rowQuery) (string, error) {
+	var epoch string
+	err := q.QueryRowContext(ctx, `SELECT value FROM meta WHERE key='epoch'`).Scan(&epoch)
+	if err != nil || epoch == "" {
+		return "", ErrUnrelatedDatabase
+	}
+	return epoch, nil
+}
+
+// guardBytes rejects a write whose commit would grow db+wal+shm past the cap.
+// WAL frames are not on disk until commit, so the check uses the transaction's
+// page count plus one frame when an in-place update does not add a page.
+func (s *Store) guardBytes(ctx context.Context, tx *sql.Tx, changesBefore int64) error {
+	var pages, pageSize, changes int64
+	q := `SELECT pc.page_count, ps.page_size, total_changes() FROM pragma_page_count() pc, pragma_page_size() ps`
+	if err := tx.QueryRowContext(ctx, q).Scan(&pages, &pageSize, &changes); err != nil {
+		return mapDriver(err)
+	}
+	if changes == changesBefore || pageSize <= 0 {
+		return nil
+	}
+	logical := pages * pageSize
+	dbSize, err := fileSize(s.path)
+	if err != nil {
+		return err
+	}
+	walSize, err := fileSize(s.path + "-wal")
+	if err != nil {
+		return err
+	}
+	shmSize, err := fileSize(s.path + "-shm")
+	if err != nil {
+		return err
+	}
+	newPages := int64(1)
+	if logical > dbSize {
+		grew := (logical - dbSize + pageSize - 1) / pageSize
+		if grew > newPages {
+			newPages = grew
+		}
+	}
+	extra := newPages * (pageSize + 24)
+	if walSize == 0 {
+		extra += 32
+	}
+	if dbSize+walSize+shmSize+extra > s.maxBytes {
+		return ErrFull
+	}
+	return nil
 }
 
 func (s *Store) readyLocked() error {
@@ -499,9 +591,17 @@ func isAbs(path string) bool {
 }
 
 func parentDir(path string) string {
-	i := strings.LastIndexAny(path, `/\`)
-	if i <= 0 {
-		return path
-	}
-	return path[:i]
+	return filepath.Dir(path)
 }
+
+// sqliteFileURI encodes path so `#` and `%` stay inside the file name.
+// A raw file: concatenation lets SQLite treat those bytes as URI syntax.
+func sqliteFileURI(path, rawQuery string) string {
+	p := filepath.ToSlash(path)
+	if !strings.HasPrefix(p, "/") {
+		p = "/" + p
+	}
+	return (&url.URL{Scheme: "file", Path: p, RawQuery: rawQuery}).String()
+}
+
+const userObjectCountSQL = `SELECT COUNT(*) FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'`
