@@ -121,3 +121,35 @@ func TestMkdirRaceDoesNotChmodSymlinkTarget(t *testing.T) {
 		t.Fatalf("target mode %o, chmod followed the symlink", info.Mode().Perm())
 	}
 }
+
+func TestOpenRejectsDotDotPastSymlink(t *testing.T) {
+	base := privateDir(t)
+	safe := filepath.Join(base, "safe")
+	dbdir := filepath.Join(safe, "db")
+	evil := filepath.Join(base, "evil")
+	for _, dir := range []string{safe, dbdir, evil} {
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	link := filepath.Join(safe, "link")
+	if err := os.Symlink(evil, link); err != nil {
+		t.Fatal(err)
+	}
+	// Clean would walk /safe/db while SQLite would open under the link.
+	attack := link + "/../db/intent.db"
+	if _, err := Open(Config{Path: attack}); err == nil {
+		t.Fatal("accepted .. after symlink")
+	}
+	if _, err := os.Lstat(filepath.Join(evil, "intent.db")); err == nil {
+		t.Fatal("opened through the symlink")
+	}
+	s, err := Open(Config{Path: filepath.Join(dbdir, "intent.db")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+}

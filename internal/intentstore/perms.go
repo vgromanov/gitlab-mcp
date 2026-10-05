@@ -11,6 +11,20 @@ func isSymlink(info os.FileInfo) bool {
 	return info.Mode()&os.ModeSymlink != 0
 }
 
+// rejectDotDot refuses a path that still contains `..`. filepath.Clean
+// would collapse /safe/link/../db before the descriptor walk, while
+// sql.Open still receives the original name and can land under the link.
+func rejectDotDot(path string) error {
+	for _, part := range strings.FieldsFunc(path, func(r rune) bool {
+		return r == '/' || r == '\\'
+	}) {
+		if part == ".." {
+			return errors.New("intent store: path must not contain ..")
+		}
+	}
+	return nil
+}
+
 func checkDir(path string, info os.FileInfo) error {
 	if isSymlink(info) {
 		return ErrSymlink

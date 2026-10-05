@@ -787,10 +787,12 @@ func TestRejectedFlushDoesNotStickCap(t *testing.T) {
 	if err := rtx.Rollback(); err != nil {
 		t.Fatal(err)
 	}
+	// 60000 still cannot fit a commit frame. Leftover rejected WAL
+	// must not keep Writable/Begin stuck after the cap is raised.
+	s.maxBytes = DefaultMaxBytes
 	if err := s.Writable(); err != nil {
 		t.Fatalf("writable after rejected flush: %v", err)
 	}
-	s.maxBytes = DefaultMaxBytes
 	if _, err := s.Begin(ctx, ident("k"), PayloadHash([]byte("a")), BeginOptions{}); err != nil {
 		t.Fatalf("begin after reclaim: %v", err)
 	}
@@ -895,6 +897,22 @@ func TestParentDirIsFilesystemRoot(t *testing.T) {
 	if runtime.GOOS == "windows" && parentDir(`C:\intent.db`) != `C:\` {
 		t.Fatalf("parent of C:\\intent.db = %q", parentDir(`C:\intent.db`))
 	}
+}
+
+func TestOpenRejectsDotDot(t *testing.T) {
+	dir := privateDir(t)
+	sep := string(filepath.Separator)
+	// filepath.Join would Clean this to dir/intent.db. Keep the `..`
+	// so validation and sql.Open cannot diverge across a symlink.
+	path := dir + sep + "nested" + sep + ".." + sep + "intent.db"
+	if _, err := Open(Config{Path: path}); err == nil {
+		t.Fatal("accepted path with ..")
+	}
+	s, err := Open(Config{Path: filepath.Join(dir, "intent.db")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
 }
 
 func TestNewStoreHonorsByteCap(t *testing.T) {
@@ -1073,6 +1091,23 @@ func TestWritableCountsRows(t *testing.T) {
 	}
 	if _, err := s.Begin(ctx, ident("other"), PayloadHash([]byte("b")), BeginOptions{}); !errors.Is(err, ErrFull) {
 		t.Fatalf("new key while full: %v", err)
+	}
+}
+
+func TestWritableReservesCommitFrame(t *testing.T) {
+	cfg, _ := fixedNow(t)
+	s := openStore(t, cfg)
+	n, err := bytesOnDisk(s.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Cap sits between the current size and one extra WAL frame.
+	s.maxBytes = n + 1000
+	if err := s.Writable(); !errors.Is(err, ErrFull) {
+		t.Fatalf("writable: %v", err)
+	}
+	if _, err := s.Begin(context.Background(), ident("k"), PayloadHash([]byte("a")), BeginOptions{}); !errors.Is(err, ErrFull) {
+		t.Fatalf("begin: %v", err)
 	}
 }
 

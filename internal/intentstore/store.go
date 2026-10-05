@@ -125,6 +125,9 @@ func prepare(cfg Config) (store *Store, created bool, err error) {
 	if !isAbs(path) || strings.ContainsAny(path, "?\x00") {
 		return nil, false, errors.New("intent store: path must be absolute")
 	}
+	if err := rejectDotDot(path); err != nil {
+		return nil, false, err
+	}
 	if err := rejectSymlinkComponents(path); err != nil {
 		return nil, false, err
 	}
@@ -551,15 +554,13 @@ func (s *Store) enforceCap(ctx context.Context, tx *sql.Tx) error {
 	if err := tx.QueryRowContext(ctx, `PRAGMA page_size`).Scan(&pageSize); err != nil {
 		return mapDriver(err)
 	}
-	if pageSize <= 0 {
-		pageSize = 4096
-	}
 	before, err := bytesOnDisk(s.path)
 	if err != nil {
 		return err
 	}
 	// Do not flush when even one commit frame would exceed the cap.
-	if before+pageSize+24 > s.maxBytes {
+	reserve := walCommitReserve(pageSize)
+	if before+reserve > s.maxBytes {
 		return ErrFull
 	}
 	if err := flushPages(ctx, tx); err != nil {
@@ -571,10 +572,18 @@ func (s *Store) enforceCap(ctx context.Context, tx *sql.Tx) error {
 	}
 	// cacheflush has already written the dirty pages. Commit appends one
 	// more WAL frame (page plus a 24-byte header) which is not in n yet.
-	if n+pageSize+24 > s.maxBytes {
+	if n+reserve > s.maxBytes {
 		return ErrFull
 	}
 	return nil
+}
+
+// walCommitReserve is the page plus 24-byte header Commit appends after flush.
+func walCommitReserve(pageSize int64) int64 {
+	if pageSize <= 0 {
+		pageSize = 4096
+	}
+	return pageSize + 24
 }
 
 func (s *Store) reclaimWAL() {
@@ -647,8 +656,13 @@ func (s *Store) writableLocked(requireDispatch bool) error {
 	if err != nil {
 		return err
 	}
-	// Current durable size only. guardBytes measures the flushed transaction before commit.
-	if n >= s.maxBytes {
+	var pageSize int64
+	if err := s.db.QueryRow(`PRAGMA page_size`).Scan(&pageSize); err != nil {
+		return mapDriver(err)
+	}
+	// Same one-frame reserve as enforceCap: Check/Writable must not
+	// pass a store whose next Begin cannot persist a commit frame.
+	if n+walCommitReserve(pageSize) > s.maxBytes {
 		return ErrFull
 	}
 	return nil
