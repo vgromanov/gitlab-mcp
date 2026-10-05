@@ -376,3 +376,28 @@ func TestTrimOutputBytes_runeBoundary(t *testing.T) {
 		t.Fatalf("split rune kept %q", cut)
 	}
 }
+
+func TestRedactRangeEdges_spacedWordsWithoutQuotesAreWithheld(t *testing.T) {
+	src := []byte(strings.Repeat("AA BB ", 40) + "SECRET " + strings.Repeat("CC ", 40))
+	from := bytes.Index(src, []byte("SECRET"))
+	out, _ := redactRangeEdges(src, from, from+6, "", true, false, false)
+	if strings.Contains(out, "SECRET") {
+		t.Fatalf("mid-value window leaked %q", out)
+	}
+}
+
+func TestSelectPrefix_shortConfiguredTokenFragmentAtCut(t *testing.T) {
+	data := []byte("hello secre")
+	p := selectPrefix(data, 0, 10, 1<<20, jobTraceHardLine, "secret-token", false)
+	if strings.Contains(p.text, "secre") {
+		t.Fatalf("non-EOF cut leaked %q", p.text)
+	}
+	done := selectPrefix(data, 0, 10, 1<<20, jobTraceHardLine, "secret-token", true)
+	if !strings.Contains(done.text, "secre") {
+		t.Fatalf("EOF fragment over-redacted %q", done.text)
+	}
+	e := selectError([]byte("fatal: oops secre"), 0, "oops", 1<<20, jobTraceHardLine, "secret-token", false)
+	if strings.Contains(e.text, "secre") {
+		t.Fatalf("error select leaked %q", e.text)
+	}
+}

@@ -382,17 +382,23 @@ func finalizeJobTrace(out *JobTraceResult, req JobTraceRequest, hdr http.Header,
 	}
 }
 
-// boundedRangeProviderShort is true when a bounded Range GET is answered with
-// a 206 that ends before both the requested (context-expanded) end and the
-// known object total. bytes 0-49/1000 for a request of 0-611 is not honored.
+// boundedRangeProviderShort is true when a Range GET is answered with a 206
+// that ends before the requested end and before the known object total.
+// bytes 0-49/1000 for a request of 0-611 is not honored. An open-ended
+// request (bytes=100-) has no requested end, so its end is the known total:
+// bytes 100-199/1000 stops short and is not honored, while an unknown total
+// ("*") cannot prove a shortfall.
 func boundedRangeProviderShort(req JobTraceRequest, endExcl int64, sizeKnown bool, size int64) bool {
-	if req.SuffixBytes > 0 || req.RangeEndExcl == nil {
+	if req.SuffixBytes > 0 {
 		return false
 	}
 	if sizeKnown && endExcl == size {
 		return false
 	}
-	return endExcl < *req.RangeEndExcl
+	if req.RangeEndExcl != nil {
+		return endExcl < *req.RangeEndExcl
+	}
+	return req.RangeStart != nil && sizeKnown && endExcl < size
 }
 
 // applyJobTraceObjectEOF clears EOF when a 206 does not cover the whole

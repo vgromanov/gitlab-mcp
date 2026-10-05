@@ -348,7 +348,7 @@ func TestStreamJobTrace_capped206WithinSpanKeepsPrefix(t *testing.T) {
 	start := int64(100)
 	rt := &scriptedRT{
 		status:  http.StatusPartialContent,
-		headers: http.Header{"Content-Range": []string{"bytes 100-199/999"}},
+		headers: http.Header{"Content-Range": []string{"bytes 100-998/999"}},
 		body:    io.NopCloser(bytes.NewReader(bytes.Repeat([]byte("a"), 50))),
 	}
 	res := StreamJobTrace(context.Background(), clientWithRT(t, rt), JobTraceRequest{
@@ -359,6 +359,32 @@ func TestStreamJobTrace_capped206WithinSpanKeepsPrefix(t *testing.T) {
 	}
 	if !res.Truncated || !res.RangeHonored || len(res.Data) != 8 || res.ObservedEndExcl == nil || *res.ObservedEndExcl != 108 {
 		t.Fatalf("%+v %q", res, res.Data)
+	}
+}
+
+func TestStreamJobTrace_openEndedRangeShortProviderSpanRejected(t *testing.T) {
+	start := int64(100)
+	run := func(cr string, n int) JobTraceResult {
+		rt := &scriptedRT{
+			status:  http.StatusPartialContent,
+			headers: http.Header{"Content-Range": []string{cr}},
+			body:    io.NopCloser(bytes.NewReader(bytes.Repeat([]byte("a"), n))),
+		}
+		return StreamJobTrace(context.Background(), clientWithRT(t, rt), JobTraceRequest{
+			ProjectID: "42", JobID: 1, RangeStart: &start, MaxScanBytes: 4096,
+		})
+	}
+	short := run("bytes 100-199/1000", 100)
+	if short.Err == nil || len(short.Data) != 0 || short.RangeHonored {
+		t.Fatalf("short open-ended 206 honored: %+v %q", short, short.Data)
+	}
+	whole := run("bytes 100-999/1000", 900)
+	if whole.Err != nil || !whole.RangeHonored || len(whole.Data) != 900 || !whole.SizeKnown {
+		t.Fatalf("object-end open-ended 206 %+v", whole)
+	}
+	unknown := run("bytes 100-199/*", 100)
+	if unknown.Err != nil || !unknown.RangeHonored || unknown.EOF {
+		t.Fatalf("unknown-total open-ended 206 %+v", unknown)
 	}
 }
 

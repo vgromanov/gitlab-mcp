@@ -58,7 +58,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   that ends at `@` without a password is redacted, a tail line cap keeps the
   end of the last line, and an open-ended range still fetches the redaction
   margin. A bounded-range 206 that ends before both the requested range and
-  the known object total is rejected (RVG-136).
+  the known object total is rejected, and so is an open-ended `start_byte`
+  206 that stops before the known total. A bounded range inside a long
+  spaced value with no quote or newline in the fetched buffer is withheld
+  instead of exposing a quoted Authorization continuation, a configured-token
+  fragment of any length at a non-EOF scan cut is withheld, and a request-cap
+  failure reports `budget_requests` instead of `budget_bytes` (RVG-136).
 - Legacy MR diff getters (`get_merge_request_diffs`, `get_merge_request_file_diff`,
   `get_merge_request_conflicts`) now include honest `pagination` / `section`
   completeness metadata on their existing object responses (RVG-127 /

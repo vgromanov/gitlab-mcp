@@ -1588,3 +1588,77 @@ func TestGetPipelineJobOutput_outputBytesMatchJSONReplacement(t *testing.T) {
 		t.Fatalf("capped %q window %#v", ctext, cw)
 	}
 }
+
+func TestGetPipelineJobOutput_quotedAuthCloserBeyondLookahead(t *testing.T) {
+	prefix := `Authorization: Bearer "`
+	payload := strings.Repeat("A ", 700) + "SECRET-MARKER " + strings.Repeat("B ", 600)
+	raw := []byte(prefix + payload + "\"\n")
+	start := int64(len(prefix) + 1400)
+	end := start + int64(len("SECRET-MARKER"))
+	d := authzDeps(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, "/trace") {
+			_, _ = io.WriteString(w, `{"id":42}`)
+			return
+		}
+		var from, to int
+		if _, err := fmt.Sscanf(r.Header.Get("Range"), "bytes=%d-%d", &from, &to); err != nil {
+			t.Fatalf("range %q", r.Header.Get("Range"))
+		}
+		if from < 0 {
+			from = 0
+		}
+		if to >= len(raw) {
+			to = len(raw) - 1
+		}
+		if bytes.ContainsAny(raw[from:to+1], `"`) {
+			t.Fatalf("fixture buffer %d-%d contains a quote", from, to)
+		}
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", from, to, len(raw)))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(raw[from : to+1])
+	}))
+	_, out, err := getPipelineJobOutput(context.Background(), nil, getPipelineJobOutputIn{
+		ProjectID: "42", JobID: 8, Selector: "range", StartByte: &start, EndByte: &end, MaxScanBytes: 256, MaxBytes: 1 << 20,
+	}, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := decodeTrace(t, out)["trace"].(string)
+	if strings.Contains(text, "SECRET") {
+		t.Fatalf("quoted value beyond lookahead leaked %q", text)
+	}
+}
+
+func TestGetPipelineJobOutput_cappedPrefixWithholdsShortTokenFragment(t *testing.T) {
+	raw := []byte("hello secret-token and more\n")
+	capAt := len("hello secre")
+	d := authzDeps(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, "/trace") {
+			_, _ = io.WriteString(w, `{"id":42}`)
+			return
+		}
+		_, _ = w.Write(raw)
+	}))
+	d.Config.Token = "secret-token"
+	_, out, err := getPipelineJobOutput(context.Background(), nil, getPipelineJobOutputIn{
+		ProjectID: "42", JobID: 8, Selector: "prefix", MaxScanBytes: capAt, MaxBytes: 1 << 20,
+	}, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := decodeTrace(t, out)["trace"].(string)
+	if strings.Contains(text, "secre") || !strings.Contains(text, "hello") {
+		t.Fatalf("token fragment at scan cut %q", text)
+	}
+}
+
+func TestSafeTraceErr_budgetCodesAreDistinct(t *testing.T) {
+	req := safeTraceErr(fmt.Errorf("wrap: %w", igl.ErrBudgetRequests))
+	if req == nil || !strings.Contains(req.Error(), readmeta.CodeBudgetRequests) || strings.Contains(req.Error(), readmeta.CodeBudgetBytes) {
+		t.Fatalf("requests %v", req)
+	}
+	by := safeTraceErr(fmt.Errorf("wrap: %w", igl.ErrBudgetBytes))
+	if by == nil || !strings.Contains(by.Error(), readmeta.CodeBudgetBytes) || strings.Contains(by.Error(), readmeta.CodeBudgetRequests) {
+		t.Fatalf("bytes %v", by)
+	}
+}

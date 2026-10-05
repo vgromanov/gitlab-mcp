@@ -264,6 +264,16 @@ func isTraceDelim(c byte) bool {
 	return c <= ' ' || c == '"' || c == '\''
 }
 
+func multiWordPrefix(b []byte) bool {
+	b = bytes.TrimSpace(b)
+	for _, c := range b {
+		if c == ' ' || c == '\t' {
+			return true
+		}
+	}
+	return false
+}
+
 // quotedHeadContinuation withholds a quoted Authorization/Bearer value that
 // began before the returned window. Spaces inside the quotes are not
 // delimiters. When the opening quote is in lookbehind, quote state is
@@ -325,8 +335,6 @@ func quotedHeadContinuation(src []byte, from, to int) (int, int, bool) {
 		}
 		// Opening quote sits before src. A closer only in lookahead still
 		// proves this window is a quoted continuation; withhold through to.
-		// An unclosed quote-free buffer cannot be distinguished from an
-		// unquoted line, so do not suppress it.
 		for i := to; i < len(src); i++ {
 			if src[i] == '\n' || src[i] == '\r' {
 				return 0, 0, false
@@ -341,6 +349,14 @@ func quotedHeadContinuation(src []byte, from, to int) (int, int, bool) {
 				}
 				return 0, 0, false
 			}
+		}
+		// No quote and no newline anywhere in the fetched buffer. A bounded
+		// range deep inside a long quoted value looks exactly like this. A
+		// single unbroken token is handled by leadingUnanchoredToken; spaced
+		// words mid-line are withheld because the closer, and so the opener,
+		// lie beyond the lookbehind and lookahead.
+		if multiWordPrefix(src[:from]) {
+			return from, to, true
 		}
 		return 0, 0, false
 	}
@@ -563,15 +579,15 @@ func danglingWord(src []byte, to int, keyword string, min int) int {
 	return -1
 }
 
+// tokenPrefixEnd finds a proper prefix of the configured token at the cut.
+// A non-EOF scan can end inside the token, so any length counts; leaving a
+// short fragment in the output would disclose part of the secret.
 func tokenPrefixEnd(src []byte, to int, token []byte) int {
-	if len(token) < 8 {
-		return -1
-	}
 	max := len(token) - 1
 	if max > to {
 		max = to
 	}
-	for n := max; n >= 8; n-- {
+	for n := max; n >= 1; n-- {
 		if bytes.Equal(src[to-n:to], token[:n]) {
 			return to - n
 		}

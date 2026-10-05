@@ -580,8 +580,11 @@ func safeTraceErr(err error) error {
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, igl.ErrBudgetElapsed) {
 		return fmt.Errorf("%s: job trace budget elapsed", readmeta.CodeBudgetElapsed)
 	}
-	if errors.Is(err, igl.ErrBudgetBytes) || errors.Is(err, igl.ErrBudgetRequests) {
-		return fmt.Errorf("%s: job trace budget exhausted", readmeta.CodeBudgetBytes)
+	if errors.Is(err, igl.ErrBudgetRequests) {
+		return fmt.Errorf("%s: job trace request budget exhausted", readmeta.CodeBudgetRequests)
+	}
+	if errors.Is(err, igl.ErrBudgetBytes) {
+		return fmt.Errorf("%s: job trace byte budget exhausted", readmeta.CodeBudgetBytes)
 	}
 	if errors.Is(err, gitlab.ErrNotFound) {
 		return fmt.Errorf("%s: job trace not found", readmeta.CodeInaccessible)
