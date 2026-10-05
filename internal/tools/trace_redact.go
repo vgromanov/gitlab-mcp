@@ -269,8 +269,8 @@ func isTraceDelim(c byte) bool {
 // delimiters. When the opening quote is in lookbehind, quote state is
 // tracked from the current line. When the opening quote sits before src,
 // the first quote in the window that is followed by a delimiter or the
-// window end is treated as the closer. If that closer is only in lookahead
-// or is missing, the whole window is withheld.
+// window end is treated as the closer. If that closer is only in lookahead,
+// the whole window is withheld.
 func quotedHeadContinuation(src []byte, from, to int) (int, int, bool) {
 	if from < 0 {
 		from = 0
@@ -323,7 +323,26 @@ func quotedHeadContinuation(src []byte, from, to int) (int, int, bool) {
 				return 0, 0, false
 			}
 		}
-		return from, to, true
+		// Opening quote sits before src. A closer only in lookahead still
+		// proves this window is a quoted continuation; withhold through to.
+		// An unclosed quote-free buffer cannot be distinguished from an
+		// unquoted line, so do not suppress it.
+		for i := to; i < len(src); i++ {
+			if src[i] == '\n' || src[i] == '\r' {
+				return 0, 0, false
+			}
+			if src[i] == '\\' && i+1 < len(src) && src[i+1] != '\n' && src[i+1] != '\r' {
+				i++
+				continue
+			}
+			if src[i] == '"' || src[i] == '\'' {
+				if i+1 >= len(src) || src[i+1] <= ' ' {
+					return from, to, true
+				}
+				return 0, 0, false
+			}
+		}
+		return 0, 0, false
 	}
 	end := from
 	for end < to {

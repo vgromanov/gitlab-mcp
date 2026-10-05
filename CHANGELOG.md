@@ -38,7 +38,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Authorization credentials honor escaped quotes (`\"`, `\'`) as part of
   the value, not as the closer. Quoted Authorization values that continue
   across a range cut are withheld even when the lookbehind contains spaces
-  and the closing quote is only in lookahead or is missing.
+  and the closing quote is only in lookahead.
   Tail and range windows keep redaction context outside the returned
   bytes, a partial
   206 is not a complete trace, redaction is linear in the trace size, and
