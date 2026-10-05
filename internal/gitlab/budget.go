@@ -219,6 +219,30 @@ func (b *Budget) CapLimits(maxItems int, maxBytes int64, maxRequests int) {
 	}
 }
 
+// ElapsedExceeded reports that the budget clock, not a parent deadline, has passed.
+func (b *Budget) ElapsedExceeded() bool {
+	if b == nil {
+		return false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.MaxElapsed > 0 && !b.start.IsZero() && time.Since(b.start) > b.MaxElapsed
+}
+
+// OriginalDeadline is the deadline WithBudget derived from the clock start.
+// It does not change the budget. A parent deadline can still be earlier.
+func (b *Budget) OriginalDeadline() (time.Time, bool) {
+	if b == nil {
+		return time.Time{}, false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.start.IsZero() || b.MaxElapsed <= 0 {
+		return time.Time{}, false
+	}
+	return b.start.Add(b.MaxElapsed), true
+}
+
 // LimitsSnapshot returns current Max* caps under lock (for tests/diagnostics).
 func (b *Budget) LimitsSnapshot() (maxItems int, maxBytes int64, maxRequests int, maxElapsed time.Duration) {
 	if b == nil {

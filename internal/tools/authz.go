@@ -2,12 +2,14 @@ package tools
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"strconv"
 	"strings"
 
 	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/config"
+	igl "gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/gitlab"
 	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/tools/readmeta"
 
 	gitlab "gitlab.com/gitlab-org/api/client-go/v2"
@@ -35,6 +37,17 @@ func policyActive(cfg *config.Config) bool {
 
 func identityErr(detail string) error {
 	return fmt.Errorf("%s: %s", readmeta.CodeIdentityUnresolved, detail)
+}
+
+// passthroughTypedProviderErr keeps budget, cancel, and deadline errors intact.
+// Other failures stay on their existing identity or HTTP mapping.
+func passthroughTypedProviderErr(err error) bool {
+	return errors.Is(err, igl.ErrBudgetRequests) ||
+		errors.Is(err, igl.ErrBudgetBytes) ||
+		errors.Is(err, igl.ErrBudgetItems) ||
+		errors.Is(err, igl.ErrBudgetElapsed) ||
+		errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded)
 }
 
 func authzDenied(detail string) error {
@@ -75,6 +88,12 @@ func getProjectSafe(ctx context.Context, d Deps, pid string) (*gitlab.Project, e
 	wantNumeric, isNumeric := parseStrictPositiveID(tok)
 	p, _, err := d.Client.Projects.GetProject(tok, nil, gitlab.WithContext(ctx))
 	if err != nil {
+		if cause, ok := providerTimeoutCause(ctx, err); ok {
+			return nil, cause
+		}
+		if passthroughTypedProviderErr(err) {
+			return nil, err
+		}
 		return nil, identityErr("resolve project identity")
 	}
 	if p == nil || p.ID <= 0 {
@@ -87,14 +106,94 @@ func getProjectSafe(ctx context.Context, d Deps, pid string) (*gitlab.Project, e
 	return p, nil
 }
 
+func groupBudgetPreflight(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return groupContextCause(ctx, err)
+	}
+	b := igl.BudgetFromContext(ctx)
+	if b == nil {
+		return nil
+	}
+	if b.ElapsedExceeded() {
+		return igl.ErrBudgetElapsed
+	}
+	_, _, items := b.Stats()
+	if b.MaxItems > 0 && items >= b.MaxItems {
+		return igl.ErrBudgetItems
+	}
+	return nil
+}
+
+// providerTimeoutCause classifies only an incoming deadline or budget-elapsed
+// error. context.Canceled and every other typed or ordinary provider error stay
+// as they arrived, even when the parent context has since expired.
+func providerTimeoutCause(ctx context.Context, err error) (error, bool) {
+	if errors.Is(err, context.Canceled) {
+		return err, true
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, igl.ErrBudgetElapsed) {
+		return groupContextCause(ctx, err), true
+	}
+	return nil, false
+}
+
+// groupContextCause keeps parent cancellation and an earlier parent deadline
+// distinct from the budget clock. ErrBudgetElapsed is only the MaxElapsed expiry.
+// An earlier parent deadline stays DeadlineExceeded even when the budget clock
+// has also expired by the time the error is classified.
+func groupContextCause(ctx context.Context, err error) error {
+	if errors.Is(ctx.Err(), context.Canceled) || errors.Is(err, context.Canceled) {
+		return context.Canceled
+	}
+	deadline := errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, igl.ErrBudgetElapsed)
+	if !deadline {
+		return err
+	}
+	if parentDeadlineEarlier(ctx) {
+		return context.DeadlineExceeded
+	}
+	if b := igl.BudgetFromContext(ctx); b != nil && b.ElapsedExceeded() {
+		return igl.ErrBudgetElapsed
+	}
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.Is(err, context.DeadlineExceeded) {
+		return context.DeadlineExceeded
+	}
+	return err
+}
+
+func parentDeadlineEarlier(ctx context.Context) bool {
+	effective, ok := ctx.Deadline()
+	if !ok {
+		return false
+	}
+	b := igl.BudgetFromContext(ctx)
+	if b == nil {
+		return true
+	}
+	original, has := b.OriginalDeadline()
+	if !has {
+		return true
+	}
+	return effective.Before(original)
+}
+
 func getGroupSafe(ctx context.Context, d Deps, gid string) (*gitlab.Group, error) {
 	tok := normalizeIdentityToken(gid)
 	if tok == "" {
 		return nil, identityErr("resolve group identity")
 	}
 	wantNumeric, isNumeric := parseStrictPositiveID(tok)
+	if err := groupBudgetPreflight(ctx); err != nil {
+		return nil, err
+	}
 	g, _, err := d.Client.Groups.GetGroup(tok, nil, gitlab.WithContext(ctx))
 	if err != nil {
+		if cause := groupContextCause(ctx, err); errors.Is(cause, context.Canceled) || errors.Is(cause, context.DeadlineExceeded) || errors.Is(cause, igl.ErrBudgetElapsed) {
+			return nil, cause
+		}
+		if passthroughTypedProviderErr(err) {
+			return nil, err
+		}
 		return nil, identityErr("resolve group identity")
 	}
 	if g == nil || g.ID <= 0 {
@@ -172,6 +271,9 @@ func groupAncestryContains(ctx context.Context, d Deps, startNamespaceID int64, 
 		seen[cur] = struct{}{}
 		g, err := getGroupSafe(ctx, d, strconv.FormatInt(cur, 10))
 		if err != nil {
+			if passthroughTypedProviderErr(err) {
+				return false, err
+			}
 			// Namespace may be a user namespace (Groups.GetGroup fails) — not a group member.
 			return false, nil
 		}

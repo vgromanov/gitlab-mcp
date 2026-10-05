@@ -63,7 +63,7 @@ var dailyTools = []string{
 }
 
 // reviewReadTools is the GITLAB_TOOL_PROFILE=review_read|review_write
-// ceiling (exact 28 safe reads). review_write adds no guarded writes here.
+// ceiling (exact 29 safe reads). review_write adds no guarded writes here.
 var reviewReadTools = []string{
 	"get_project",
 	"get_merge_request",
@@ -75,6 +75,7 @@ var reviewReadTools = []string{
 	"list_merge_request_changed_files",
 	"list_merge_request_versions",
 	"get_merge_request_version",
+	"get_merge_request_diff_window",
 	"list_merge_request_diffs",
 	"mr_discussions",
 	"get_merge_request_notes",

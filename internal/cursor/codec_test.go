@@ -60,6 +60,41 @@ func errorsIsResync(err error) bool {
 	return err != nil && (err == ErrResyncRequired || err.Error() == ResyncRequired)
 }
 
+func TestEncodeDecode_fractionalExpires(t *testing.T) {
+	key := testKey(t)
+	t.Run("fractional", func(t *testing.T) {
+		p := basePayload()
+		p.UpperBound = "2026-10-03T12:00:00.7Z"
+		p.Filters.Until = p.UpperBound
+		p.ExpiresAt = "2026-10-03T14:00:00.5Z"
+		tok, err := Encode(key, p)
+		if err != nil {
+			t.Fatalf("encode fractional: %v", err)
+		}
+		got, err := Decode(key, tok, time.Date(2026, 10, 3, 13, 0, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatalf("decode fractional: %v", err)
+		}
+		if got.ExpiresAt != p.ExpiresAt || got.UpperBound != p.UpperBound || got.Filters.Until != p.Filters.Until {
+			t.Fatalf("roundtrip upper=%s until=%s exp=%s", got.UpperBound, got.Filters.Until, got.ExpiresAt)
+		}
+	})
+	t.Run("integer-second", func(t *testing.T) {
+		p := basePayload()
+		tok, err := Encode(key, p)
+		if err != nil {
+			t.Fatalf("encode integer: %v", err)
+		}
+		got, err := Decode(key, tok, time.Date(2026, 10, 3, 13, 0, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatalf("decode integer: %v", err)
+		}
+		if got.ExpiresAt != p.ExpiresAt || got.UpperBound != p.UpperBound {
+			t.Fatalf("integer changed upper=%s exp=%s", got.UpperBound, got.ExpiresAt)
+		}
+	})
+}
+
 func TestEncodeDecode_roundTrip(t *testing.T) {
 	key := testKey(t)
 	p := basePayload()
@@ -814,4 +849,252 @@ func TestReviewContextToken(t *testing.T) {
 	if _, err := Decode(key, qtok, legacyNow); err != nil {
 		t.Fatalf("rq2 round trip: %v", err)
 	}
+}
+
+func TestDiscussionsEvidenceAndDC1(t *testing.T) {
+	key := []byte("0123456789abcdef0123456789abcdef")
+	now := time.Date(2026, 10, 4, 12, 0, 0, 0, time.UTC)
+	sem := strings.Repeat("ab", 32)
+	pos := strings.Repeat("cd", 32)
+	full := strings.Repeat("ef", 32)
+	bundle := []byte(`{"schema":"discussions.evidence.v1","capability":"readmeta.review_context.discussions.v1","selection":"all","semantic_feedback_digest":"` + sem + `","position_digest":"` + pos + `","full_revision_digest":"` + full + `"}`)
+	sum := sha256.Sum256(bundle)
+	dig := fmtSHA(sum[:])
+	p := reviewContextPayload(now)
+	p.ContextRef.Requested = []string{"discussions", "metadata"}
+	p.ContextRef.Complete = []string{"discussions", "metadata"}
+	p.ContextRef.Excluded = []string{}
+	p.ContextRef.Digests = map[string]string{"discussions": dig, "metadata": strings.Repeat("12", 32)}
+	p.Filters.Selection = "discussions,metadata"
+	tok, err := Encode(key, p)
+	if err != nil {
+		t.Fatalf("discussions evidence encode: %v", err)
+	}
+	if _, err := Decode(key, tok, now); err != nil {
+		t.Fatalf("discussions evidence decode: %v", err)
+	}
+	p.ContextRef.Digests["pipeline_graph"] = strings.Repeat("34", 32)
+	if _, err := Encode(key, p); err == nil {
+		t.Fatal("extra digest key")
+	}
+	pipe := reviewContextPayload(now)
+	pipe.ContextRef.Requested = []string{"pipeline_graph"}
+	pipe.ContextRef.Complete = []string{"pipeline_graph"}
+	pipe.ContextRef.Excluded = []string{}
+	pipe.ContextRef.Digests = map[string]string{"pipeline_graph": strings.Repeat("ab", 32)}
+	pipe.Filters.Selection = "pipeline_graph"
+	if _, err := Encode(key, pipe); err == nil {
+		t.Fatal("pipeline_graph complete")
+	}
+	meta := reviewContextPayload(now)
+	if _, err := Encode(key, meta); err != nil {
+		t.Fatalf("metadata token: %v", err)
+	}
+	dc := discussionsCursorPayload(now)
+	dtok, err := Encode(key, dc)
+	if err != nil {
+		t.Fatalf("dc1 encode: %v", err)
+	}
+	if _, err := Decode(key, dtok, now); err != nil {
+		t.Fatalf("dc1 decode: %v", err)
+	}
+	qp := queuePayloadOK()
+	qp.DiscussionsCont = dc.DiscussionsCont
+	if _, err := Encode(key, qp); err == nil {
+		t.Fatal("dc1 on queue token")
+	}
+	lc := basePayload()
+	lc.DiscussionsCont = dc.DiscussionsCont
+	if _, err := Encode(key, lc); err == nil {
+		t.Fatal("dc1 on list_commits token")
+	}
+}
+
+func discussionsCursorPayload(now time.Time) Payload {
+	iid := int64(7)
+	head := strings.Repeat("a", 40)
+	target := strings.Repeat("d", 40)
+	base := strings.Repeat("b", 40)
+	start := strings.Repeat("c", 40)
+	bound := now.UTC().Format(time.RFC3339)
+	return Payload{
+		SchemaVersion:   SchemaV1,
+		Instance:        "https://gitlab.example/api/v4",
+		ActorID:         7,
+		PolicyFP:        "policyfp",
+		Tool:            ToolReviewContext,
+		Section:         SectionReviewDiscussions,
+		Scope:           Scope{Kind: ScopeProject, ProjectID: "42", MergeRequestIID: &iid},
+		Filters:         Filters{Until: bound, Order: "provider", Selection: "all", PerPage: 20},
+		ImmutableRefs:   []string{head, target, head, base, start},
+		UpperBound:      bound,
+		ExpiresAt:       now.UTC().Add(DefaultTTL).Format(time.RFC3339),
+		DiscussionsCont: &DiscussionsCont{V: DiscussionsContSchemaDC1, P: 1},
+	}
+}
+
+func fmtSHA(b []byte) string {
+	const hexdigits = "0123456789abcdef"
+	out := make([]byte, len(b)*2)
+	for i, c := range b {
+		out[i*2] = hexdigits[c>>4]
+		out[i*2+1] = hexdigits[c&0x0f]
+	}
+	return string(out)
+}
+
+func TestDiffManifestEvidenceKeyset(t *testing.T) {
+	key := []byte("0123456789abcdef0123456789abcdef")
+	now := time.Date(2026, 10, 4, 12, 0, 0, 0, time.UTC)
+	p := reviewContextPayload(now)
+	p.ContextRef.Requested = []string{"diff_manifest", "metadata"}
+	p.ContextRef.Complete = []string{"diff_manifest", "metadata"}
+	p.ContextRef.Excluded = []string{}
+	p.ContextRef.Digests = map[string]string{"diff_manifest": strings.Repeat("ab", 32), "metadata": strings.Repeat("cd", 32)}
+	p.ContextRef.Evidence = map[string]string{"diff_manifest": DiffManifestEvidenceV1}
+	p.Filters.Selection = "diff_manifest,metadata"
+	tok, err := Encode(key, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := Decode(key, tok, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.ContextRef.Evidence) != 1 || got.ContextRef.Evidence["diff_manifest"] != DiffManifestEvidenceV1 {
+		t.Fatalf("evidence=%v", got.ContextRef.Evidence)
+	}
+	p.ContextRef.Evidence = map[string]string{"diff_manifest": "diff_manifest.v2"}
+	if _, err := Encode(key, p); err == nil {
+		t.Fatal("unknown evidence version accepted")
+	}
+	p.ContextRef.Evidence = map[string]string{"diff_manifest": DiffManifestEvidenceV1, "metadata": "extra"}
+	if _, err := Encode(key, p); err == nil {
+		t.Fatal("extra evidence key accepted")
+	}
+	p.ContextRef.Evidence = nil
+	if _, err := Encode(key, p); err == nil {
+		t.Fatal("complete diff_manifest without evidence accepted")
+	}
+	excluded := reviewContextPayload(now)
+	excluded.ContextRef.Requested = []string{"diff_manifest", "metadata"}
+	excluded.ContextRef.Complete = []string{"metadata"}
+	excluded.ContextRef.Excluded = []string{"diff_manifest"}
+	excluded.ContextRef.Digests = map[string]string{"metadata": strings.Repeat("cd", 32)}
+	excluded.ContextRef.Evidence = map[string]string{"diff_manifest": DiffManifestEvidenceV1}
+	excluded.Filters.Selection = "diff_manifest,metadata"
+	if _, err := Encode(key, excluded); err == nil {
+		t.Fatal("evidence on excluded diff_manifest accepted")
+	}
+	metaTok, err := Encode(key, reviewContextPayload(now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Decode(key, metaTok, now); err != nil {
+		t.Fatal(err)
+	}
+	approvals := reviewContextPayload(now)
+	approvals.ContextRef.Requested = []string{"approvals"}
+	approvals.ContextRef.Complete = []string{"approvals"}
+	approvals.ContextRef.Excluded = []string{}
+	approvals.ContextRef.Digests = map[string]string{"approvals": strings.Repeat("ab", 32)}
+	approvals.Filters.Selection = "approvals"
+	apTok, err := Encode(key, approvals)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Decode(key, apTok, now); err != nil {
+		t.Fatal(err)
+	}
+	discTok, err := Encode(key, discussionsCursorPayload(now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Decode(key, discTok, now); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDiffWindowCursorModes(t *testing.T) {
+	key := []byte("0123456789abcdef0123456789abcdef")
+	now := time.Date(2026, 10, 4, 12, 0, 0, 0, time.UTC)
+	iid := int64(1)
+	sum := strings.Repeat("ab", 32)
+	upper := now.Format(time.RFC3339)
+	newPayload := func() Payload {
+		return Payload{
+			SchemaVersion: SchemaV1,
+			Instance:      "https://gitlab.example/api/v4",
+			ActorID:       7,
+			PolicyFP:      "policyfp",
+			Tool:          ToolDiffWindow,
+			Section:       SectionDiffManifest,
+			Scope:         Scope{Kind: ScopeProject, ProjectID: "42", MergeRequestIID: &iid},
+			Filters:       Filters{PerPage: 1, Until: upper},
+			UpperBound:    upper,
+			ExpiresAt:     now.Add(DefaultTTL).Format(time.RFC3339),
+			PageState:     PageState{Page: 1, PerPage: 1, ItemsOnPage: 1, LastSHA: sum, SequenceDigest: sum, ProviderNextPage: 2},
+		}
+	}
+	version := newPayload()
+	version.ImmutableRefs = []string{strings.Repeat("a", 40)}
+	version.Filters.Selection = "version:1"
+	version.DiffWindow = &DiffWindowCont{V: DiffWindowSchemaDM1, Mode: "full_version", VersionID: 1, Total: 2, Offset: 1, FullDigest: sum, PerPage: 1}
+	tok, err := Encode(key, version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Decode(key, tok, now); err != nil {
+		t.Fatal(err)
+	}
+	tuple := newPayload()
+	base, start, head := strings.Repeat("b", 40), strings.Repeat("c", 40), strings.Repeat("d", 40)
+	tuple.ImmutableRefs = []string{base, start, head}
+	tuple.Filters.Selection = "tuple:" + base + ":" + start + ":" + head
+	tuple.DiffWindow = &DiffWindowCont{V: DiffWindowSchemaDM1, Mode: "full_tuple", BaseSHA: base, StartSHA: start, HeadSHA: head, Total: 2, Offset: 1, FullDigest: sum, PerPage: 1}
+	tupleTok, err := Encode(key, tuple)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Decode(key, tupleTok, now); err != nil {
+		t.Fatal(err)
+	}
+	inc := newPayload()
+	from, to := strings.Repeat("e", 40), strings.Repeat("f", 40)
+	inc.ImmutableRefs = []string{from, to}
+	inc.Filters.Selection = "inc:" + from + ":" + to
+	inc.DiffWindow = &DiffWindowCont{V: DiffWindowSchemaDM1, Mode: "incremental", FromSHA: from, ToSHA: to, Straight: true, Total: 2, Offset: 1, FullDigest: sum, PerPage: 1}
+	incTok, err := Encode(key, inc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Decode(key, incTok, now); err != nil {
+		t.Fatal(err)
+	}
+	bad := newPayload()
+	bad.ImmutableRefs = version.ImmutableRefs
+	bad.Filters.Selection = "version:1"
+	bad.DiffWindow = &DiffWindowCont{V: DiffWindowSchemaDM1, Mode: "nope", VersionID: 1, Total: 2, Offset: 1, FullDigest: sum, PerPage: 1}
+	if _, err := Encode(key, bad); err == nil {
+		t.Fatal("unknown diff window mode accepted")
+	}
+	reject := func(name string, mut func(*Payload)) {
+		t.Helper()
+		p := version
+		w := *version.DiffWindow
+		p.DiffWindow = &w
+		p.ImmutableRefs = append([]string(nil), version.ImmutableRefs...)
+		mut(&p)
+		if _, err := Encode(key, p); err == nil {
+			t.Fatalf("%s accepted", name)
+		}
+	}
+	reject("selection", func(p *Payload) { p.Filters.Selection = "version:2" })
+	reject("bind", func(p *Payload) { p.DiffWindow.HeadSHA = strings.Repeat("b", 40) })
+	reject("absolute ttl", func(p *Payload) { p.ExpiresAt = now.Add(time.Hour).Format(time.RFC3339) })
+	reject("ref", func(p *Payload) { p.ImmutableRefs = []string{strings.Repeat("a", 40), strings.Repeat("a", 40)} })
+	reject("window", func(p *Payload) {
+		p.DiffWindow.Offset = 2
+		p.DiffWindow.Total = 4
+	})
 }
