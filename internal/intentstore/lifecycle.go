@@ -124,7 +124,7 @@ func (s *Store) RecordOutcome(ctx context.Context, operationID string, outcome O
 		return Receipt{}, ErrInvalidOutcome
 	}
 	var out Receipt
-	err := s.writeTx(ctx, true, func(tx *sql.Tx) error {
+	err := s.writeTx(ctx, false, func(tx *sql.Tx) error {
 		rec, err := getByIDTx(ctx, tx, operationID, s.epoch)
 		if err != nil {
 			return err
@@ -188,10 +188,11 @@ func (s *Store) Get(ctx context.Context, operationID string) (Receipt, error) {
 	if err := s.readyLocked(); err != nil {
 		return Receipt{}, err
 	}
-	if err := s.reloadEpoch(ctx, s.db); err != nil {
+	epoch, err := readEpoch(ctx, s.db)
+	if err != nil {
 		return Receipt{}, err
 	}
-	return getByIDTx(ctx, s.db, operationID, s.epoch)
+	return getByIDTx(ctx, s.db, operationID, epoch)
 }
 
 // GetByIdentity loads the receipt for an idempotency key.
@@ -204,10 +205,11 @@ func (s *Store) GetByIdentity(ctx context.Context, id Identity) (Receipt, error)
 	if err := s.readyLocked(); err != nil {
 		return Receipt{}, err
 	}
-	if err := s.reloadEpoch(ctx, s.db); err != nil {
+	epoch, err := readEpoch(ctx, s.db)
+	if err != nil {
 		return Receipt{}, err
 	}
-	return getByIdentityTx(ctx, s.db, id, s.epoch)
+	return getByIdentityTx(ctx, s.db, id, epoch)
 }
 
 // Compact drops finalized receipt details older than the retention window.

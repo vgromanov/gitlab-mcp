@@ -97,6 +97,9 @@ func prepare(cfg Config) (*Store, error) {
 	if !isAbs(path) || strings.ContainsAny(path, "?\x00") {
 		return nil, errors.New("intent store: path must be absolute")
 	}
+	if err := rejectSymlinkComponents(path); err != nil {
+		return nil, err
+	}
 	parent := parentDir(path)
 	info, err := os.Lstat(parent)
 	if err != nil {
@@ -339,7 +342,8 @@ func (s *Store) Writable() error {
 	return s.writableLocked(true)
 }
 
-// DisableDispatch stops new intents and claims. Reads and epoch reset remain.
+// DisableDispatch stops new intents and claims. Reads, outcome recording,
+// compaction, and epoch reset remain.
 func (s *Store) DisableDispatch() {
 	s.mu.Lock()
 	s.dispatch = false
@@ -360,7 +364,7 @@ func (s *Store) commitWrite(ctx context.Context, requireDispatch bool, fn func(*
 	if err != nil {
 		return err
 	}
-	return callBusy(func() error {
+	err = callBusy(func() error {
 		tx, err := s.db.BeginTx(ctx, nil)
 		if err != nil {
 			return mapDriver(err)
@@ -371,12 +375,22 @@ func (s *Store) commitWrite(ctx context.Context, requireDispatch bool, fn func(*
 				_ = tx.Rollback()
 			}
 		}()
-		prior := s.epoch
-		if err := s.reloadEpoch(ctx, tx); err != nil {
-			return err
+		var prevCache int64
+		if err := tx.QueryRowContext(ctx, `PRAGMA cache_size`).Scan(&prevCache); err != nil {
+			return mapDriver(err)
 		}
-		if s.epoch != prior {
-			return ErrStaleEpoch
+		// One cached page forces the other dirty pages into the WAL before
+		// commit, so the byte cap sees every frame except the last.
+		if _, err := tx.ExecContext(ctx, `PRAGMA cache_size = 1`); err != nil {
+			return mapDriver(err)
+		}
+		defer func() {
+			_, _ = tx.ExecContext(context.Background(), fmt.Sprintf("PRAGMA cache_size = %d", prevCache))
+		}()
+		if requireDispatch {
+			if err := s.requireCurrentEpoch(ctx, tx); err != nil {
+				return err
+			}
 		}
 		var changesBefore int64
 		if err := tx.QueryRowContext(ctx, `SELECT total_changes()`).Scan(&changesBefore); err != nil {
@@ -384,6 +398,11 @@ func (s *Store) commitWrite(ctx context.Context, requireDispatch bool, fn func(*
 		}
 		if err := fn(tx); err != nil {
 			return err
+		}
+		if requireDispatch {
+			if err := s.requireCurrentEpoch(ctx, tx); err != nil {
+				return err
+			}
 		}
 		if err := s.guardBytes(ctx, tx, changesBefore); err != nil {
 			return err
@@ -393,6 +412,7 @@ func (s *Store) commitWrite(ctx context.Context, requireDispatch bool, fn func(*
 				return err
 			}
 		}
+		_, _ = tx.ExecContext(ctx, fmt.Sprintf("PRAGMA cache_size = %d", prevCache))
 		if err := tx.Commit(); err != nil {
 			return mapDriver(err)
 		}
@@ -402,15 +422,23 @@ func (s *Store) commitWrite(ctx context.Context, requireDispatch bool, fn func(*
 		}
 		return lockDownNewSidecars(s.path, before)
 	})
+	if errors.Is(err, ErrFull) {
+		_, _ = s.db.ExecContext(context.Background(), `PRAGMA wal_checkpoint(TRUNCATE)`)
+	}
+	return err
 }
 
-// reloadEpoch replaces the cached epoch with the committed meta value.
-func (s *Store) reloadEpoch(ctx context.Context, q rowQuery) error {
+// requireCurrentEpoch refuses a dispatch write when meta.epoch is not the
+// epoch this store opened or last committed. The cache is not replaced, so a
+// later Begin or ClaimSending on the same handle fails the same way.
+func (s *Store) requireCurrentEpoch(ctx context.Context, q rowQuery) error {
 	epoch, err := readEpoch(ctx, q)
 	if err != nil {
 		return err
 	}
-	s.epoch = epoch
+	if epoch != s.epoch {
+		return ErrStaleEpoch
+	}
 	return nil
 }
 
@@ -423,43 +451,26 @@ func readEpoch(ctx context.Context, q rowQuery) (string, error) {
 	return epoch, nil
 }
 
-// guardBytes rejects a write whose commit would grow db+wal+shm past the cap.
-// WAL frames are not on disk until commit, so the check uses the transaction's
-// page count plus one frame when an in-place update does not add a page.
+// guardBytes rejects a write whose spilled WAL already passes the cap.
+// cache_size=1 leaves at most one dirty page unspilled, and commit adds a
+// 24-byte frame, so both are reserved here.
 func (s *Store) guardBytes(ctx context.Context, tx *sql.Tx, changesBefore int64) error {
-	var pages, pageSize, changes int64
-	q := `SELECT pc.page_count, ps.page_size, total_changes() FROM pragma_page_count() pc, pragma_page_size() ps`
-	if err := tx.QueryRowContext(ctx, q).Scan(&pages, &pageSize, &changes); err != nil {
+	var changes, pageSize int64
+	q := `SELECT total_changes(), page_size FROM pragma_page_size()`
+	if err := tx.QueryRowContext(ctx, q).Scan(&changes, &pageSize); err != nil {
 		return mapDriver(err)
 	}
-	if changes == changesBefore || pageSize <= 0 {
+	if changes == changesBefore {
 		return nil
 	}
-	logical := pages * pageSize
-	dbSize, err := fileSize(s.path)
+	if pageSize <= 0 {
+		pageSize = 4096
+	}
+	n, err := bytesOnDisk(s.path)
 	if err != nil {
 		return err
 	}
-	walSize, err := fileSize(s.path + "-wal")
-	if err != nil {
-		return err
-	}
-	shmSize, err := fileSize(s.path + "-shm")
-	if err != nil {
-		return err
-	}
-	newPages := int64(1)
-	if logical > dbSize {
-		grew := (logical - dbSize + pageSize - 1) / pageSize
-		if grew > newPages {
-			newPages = grew
-		}
-	}
-	extra := newPages * (pageSize + 24)
-	if walSize == 0 {
-		extra += 32
-	}
-	if dbSize+walSize+shmSize+extra > s.maxBytes {
+	if n+pageSize+24+24 > s.maxBytes {
 		return ErrFull
 	}
 	return nil
@@ -478,6 +489,9 @@ func (s *Store) writableLocked(requireDispatch bool) error {
 	}
 	if requireDispatch && !s.dispatch {
 		return ErrWritesDisabled
+	}
+	if err := rejectSymlinkComponents(s.path); err != nil {
+		return err
 	}
 	info, err := os.Lstat(parentDir(s.path))
 	if err != nil {
@@ -500,6 +514,8 @@ func (s *Store) writableLocked(requireDispatch bool) error {
 	if err != nil {
 		return err
 	}
+	// Already over the cap. Growth still inside this transaction is checked
+	// again in guardBytes, after dirty pages have spilled to the WAL.
 	if n >= s.maxBytes {
 		return ErrFull
 	}
@@ -587,11 +603,64 @@ func callBusy(fn func() error) error {
 }
 
 func isAbs(path string) bool {
-	return strings.HasPrefix(path, "/") || (len(path) >= 3 && path[1] == ':' && (path[2] == '\\' || path[2] == '/'))
+	if filepath.IsAbs(path) {
+		return true
+	}
+	if len(path) >= 3 && path[1] == ':' && (path[2] == '\\' || path[2] == '/') {
+		return true
+	}
+	return uncShare(path) != ""
 }
 
 func parentDir(path string) string {
+	if share := uncShare(path); share != "" {
+		rest := path[len(share):]
+		if rest == "" || rest == `\` || rest == `/` {
+			return share
+		}
+		sep := `\`
+		if strings.Contains(rest, `/`) && !strings.Contains(rest, `\`) {
+			sep = `/`
+		}
+		i := strings.LastIndex(rest, sep)
+		if i <= 0 {
+			return share
+		}
+		return share + rest[:i]
+	}
 	return filepath.Dir(path)
+}
+
+// uncShare returns `\\server\share` or `//server/share` when path is a UNC
+// path. filepath.IsAbs accepts these on Windows and rejects the backslash
+// form on other GOOS, so the check is explicit.
+func uncShare(path string) string {
+	switch {
+	case strings.HasPrefix(path, `\\`):
+		rest := strings.TrimPrefix(path, `\\`)
+		server, rest, ok := strings.Cut(rest, `\`)
+		if !ok || server == "" {
+			return ""
+		}
+		share, _, _ := strings.Cut(rest, `\`)
+		if share == "" {
+			return ""
+		}
+		return `\\` + server + `\` + share
+	case strings.HasPrefix(path, `//`):
+		rest := strings.TrimPrefix(path, `//`)
+		server, rest, ok := strings.Cut(rest, `/`)
+		if !ok || server == "" {
+			return ""
+		}
+		share, _, _ := strings.Cut(rest, `/`)
+		if share == "" {
+			return ""
+		}
+		return `//` + server + `/` + share
+	default:
+		return ""
+	}
 }
 
 // sqliteFileURI encodes path so `#` and `%` stay inside the file name.

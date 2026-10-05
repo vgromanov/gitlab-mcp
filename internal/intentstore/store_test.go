@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -517,22 +518,131 @@ func TestForeignEpochBlocksOldWrite(t *testing.T) {
 	if _, err := b.ClaimSending(ctx, rec.OperationID); !errors.Is(err, ErrStaleEpoch) {
 		t.Fatalf("claim after foreign reset: %v", err)
 	}
+	if b.epoch != oldEpoch {
+		t.Fatalf("foreign store adopted epoch %s", b.epoch)
+	}
+	if _, err := b.Begin(ctx, ident("new"), PayloadHash([]byte("b")), BeginOptions{}); !errors.Is(err, ErrStaleEpoch) {
+		t.Fatalf("begin after foreign reset: %v", err)
+	}
+	if _, err := b.ClaimSending(ctx, rec.OperationID); !errors.Is(err, ErrStaleEpoch) {
+		t.Fatalf("second claim: %v", err)
+	}
+	if _, err := b.GetByIdentity(ctx, ident("new")); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("old-epoch insert: %v", err)
+	}
 	got, err := b.Get(ctx, rec.OperationID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got.State != StatePrepared || got.Epoch != oldEpoch || got.EpochCurrent {
-		t.Fatalf("old row still claimable: %+v", got)
+		t.Fatalf("old row changed: %+v", got)
 	}
-	if _, err := b.ClaimSending(ctx, rec.OperationID); !errors.Is(err, ErrStaleEpoch) {
-		t.Fatalf("second claim: %v", err)
+	if b.epoch != oldEpoch || !b.dispatch {
+		t.Fatalf("cache epoch %s dispatch %v", b.epoch, b.dispatch)
 	}
-	fresh, err := b.Begin(ctx, ident("new"), PayloadHash([]byte("b")), BeginOptions{})
+}
+
+func TestRecordOutcomeAfterDisableDispatch(t *testing.T) {
+	cfg, _ := fixedNow(t)
+	s := openStore(t, cfg)
+	ctx := context.Background()
+	rec, err := s.Begin(ctx, ident("k"), PayloadHash([]byte("a")), BeginOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fresh.Epoch != a.epoch || fresh.Epoch == oldEpoch || !fresh.EpochCurrent {
-		t.Fatalf("new row epoch %+v store %s old %s", fresh, a.epoch, oldEpoch)
+	if _, err := s.ClaimSending(ctx, rec.OperationID); err != nil {
+		t.Fatal(err)
+	}
+	s.DisableDispatch()
+	if _, err := s.Begin(ctx, ident("new"), PayloadHash([]byte("b")), BeginOptions{}); !errors.Is(err, ErrWritesDisabled) {
+		t.Fatalf("begin: %v", err)
+	}
+	if _, err := s.ClaimSending(ctx, rec.OperationID); !errors.Is(err, ErrWritesDisabled) {
+		t.Fatalf("claim: %v", err)
+	}
+	got, err := s.RecordOutcome(ctx, rec.OperationID, Outcome{State: StatePublished, ObservedHead: "head"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != StatePublished {
+		t.Fatalf("outcome %+v", got)
+	}
+}
+
+func TestCompactRespectsDirtyPages(t *testing.T) {
+	cfg, now := fixedNow(t)
+	s := openStore(t, cfg)
+	ctx := context.Background()
+	for i := 0; i < 100; i++ {
+		key := fmt.Sprintf("k%03d", i)
+		rec, err := s.Begin(ctx, ident(key), PayloadHash([]byte(key)), BeginOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.ClaimSending(ctx, rec.OperationID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.RecordOutcome(ctx, rec.OperationID, Outcome{State: StatePublished, ObservedHead: "head"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	*now = now.Add(31 * 24 * time.Hour)
+	if _, err := s.db.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		t.Fatal(err)
+	}
+	n, err := bytesOnDisk(s.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.maxBytes = n + 5000
+	_, err = s.Compact(ctx)
+	after, sizeErr := bytesOnDisk(s.path)
+	if sizeErr != nil {
+		t.Fatal(sizeErr)
+	}
+	if after > s.maxBytes {
+		t.Fatalf("compact grew to %d, cap %d, err %v", after, s.maxBytes, err)
+	}
+	if err == nil {
+		t.Fatalf("compact of 100 rows fit in 5000 bytes (%d -> %d)", n, after)
+	}
+	if !errors.Is(err, ErrFull) {
+		t.Fatalf("compact: %v", err)
+	}
+}
+
+func TestIntermediateSymlinkRejected(t *testing.T) {
+	base := privateDir(t)
+	real := filepath.Join(base, "real")
+	if err := os.Mkdir(real, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(base, "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(real, "subdir"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(link, "subdir", "intent.db")
+	if _, err := Open(Config{Path: path}); !errors.Is(err, ErrSymlink) {
+		t.Fatalf("intermediate symlink: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(real, "subdir", "intent.db")); !os.IsNotExist(err) {
+		t.Fatal("database was created through the symlink")
+	}
+}
+
+func TestUNCPathMatchesWindowsAbsolute(t *testing.T) {
+	path := `\\server\share\intent.db`
+	if !isAbs(path) {
+		t.Fatal("UNC path rejected")
+	}
+	if parentDir(path) != `\\server\share` {
+		t.Fatalf("parent %q", parentDir(path))
+	}
+	if isAbs(`\\server`) || isAbs(`relative\intent.db`) {
+		t.Fatal("incomplete UNC or relative path accepted")
 	}
 }
 

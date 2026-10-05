@@ -4,7 +4,9 @@ import (
 	"errors"
 	"io"
 	"os"
+	"path/filepath"
 	"runtime"
+	"strings"
 )
 
 func isSymlink(info os.FileInfo) bool {
@@ -45,6 +47,52 @@ func checkFileMode(info os.FileInfo) error {
 		return ErrUnsafePermissions
 	}
 	return nil
+}
+
+// rejectSymlinkComponents refuses a symlink in any existing component of path.
+// macOS uses /var, /tmp, and /etc as symlinks to /private; those ancestors are
+// the only exception, so a symlink created under them is still rejected.
+func rejectSymlinkComponents(path string) error {
+	clean := filepath.Clean(path)
+	vol := filepath.VolumeName(clean)
+	rest := clean[len(vol):]
+	acc := vol
+	for _, part := range strings.Split(rest, string(filepath.Separator)) {
+		if part == "" {
+			if acc == "" && strings.HasPrefix(clean, string(filepath.Separator)) {
+				acc = string(filepath.Separator)
+			}
+			continue
+		}
+		if acc == "" || acc == string(filepath.Separator) {
+			acc = string(filepath.Separator) + part
+		} else {
+			acc = filepath.Join(acc, part)
+		}
+		info, err := os.Lstat(acc)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		if isSymlink(info) && !macosSystemSymlink(acc) {
+			return ErrSymlink
+		}
+	}
+	return nil
+}
+
+func macosSystemSymlink(path string) bool {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "ios" {
+		return false
+	}
+	switch filepath.Clean(path) {
+	case "/var", "/tmp", "/etc":
+		return true
+	default:
+		return false
+	}
 }
 
 func lstat(path string) (os.FileInfo, error) {
