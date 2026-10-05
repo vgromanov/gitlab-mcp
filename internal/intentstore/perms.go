@@ -1,7 +1,6 @@
 package intentstore
 
 import (
-	"database/sql"
 	"errors"
 	"io"
 	"os"
@@ -30,58 +29,6 @@ func checkFileMode(path string, info os.FileInfo) error {
 		return ErrUnsafePermissions
 	}
 	return checkFileAccess(path, info)
-}
-
-func removeStoreFiles(path string) {
-	for _, p := range sidecarPaths(path) {
-		_ = os.Remove(p)
-	}
-}
-
-// removeCreatedStore deletes a file this process created only when it has
-// not become an initialized intent store. Another process can open the
-// empty file and finish initialization while this creator is still failing.
-// When the state cannot be read, the files are left in place.
-func removeCreatedStore(path string) {
-	if storeInitialized(path, nil) {
-		return
-	}
-	removeStoreFiles(path)
-}
-
-func storeInitialized(path string, db *sql.DB) bool {
-	if id, ok := readAppID(db); ok {
-		return id == ApplicationID
-	}
-	if path == "" {
-		return true
-	}
-	dsn := sqliteFileURI(path, "mode=ro&_query_only=1")
-	probe, err := sql.Open("sqlite", dsn)
-	if err != nil {
-		return true
-	}
-	defer probe.Close()
-	probe.SetMaxOpenConns(1)
-	if err := probe.Ping(); err != nil {
-		return true
-	}
-	id, ok := readAppID(probe)
-	if !ok {
-		return true
-	}
-	return id == ApplicationID
-}
-
-func readAppID(db *sql.DB) (uint32, bool) {
-	if db == nil {
-		return 0, false
-	}
-	var appID int64
-	if err := db.QueryRow("PRAGMA application_id").Scan(&appID); err != nil {
-		return 0, false
-	}
-	return uint32(appID), true
 }
 
 type fileID struct {

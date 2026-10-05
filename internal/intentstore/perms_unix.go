@@ -133,10 +133,10 @@ func makeParents(path string) error {
 		var st unix.Stat_t
 		err := unix.Fstatat(fd, part, &st, unix.AT_SYMLINK_NOFOLLOW)
 		if os.IsNotExist(err) {
-			if err := unix.Mkdirat(fd, part, 0o700); err != nil && !os.IsExist(err) {
-				return err
+			if afterParentMissing != nil {
+				afterParentMissing(built, part)
 			}
-			if err := unix.Fchmodat(fd, part, 0o700, 0); err != nil {
+			if err := mkdirPrivate(fd, part); err != nil {
 				return err
 			}
 		} else if err != nil {
@@ -151,6 +151,31 @@ func makeParents(path string) error {
 		built = full
 	}
 	return nil
+}
+
+// afterParentMissing runs after a path component is observed missing and
+// before Mkdirat. Tests use it to plant a symlink in that gap.
+var afterParentMissing func(parent, part string)
+
+// mkdirPrivate creates part and chmods the opened directory, not the path
+// name. Fchmodat after Mkdirat EEXIST would follow a symlink an attacker
+// planted in a sticky directory such as /tmp.
+func mkdirPrivate(dirfd int, part string) error {
+	err := unix.Mkdirat(dirfd, part, 0o700)
+	if err != nil && !os.IsExist(err) {
+		return err
+	}
+	if err != nil {
+		// Lost the create. Do not chmod the name; openComponent will
+		// refuse a symlink and accept a directory that already exists.
+		return nil
+	}
+	nfd, err := unix.Openat(dirfd, part, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(nfd)
+	return unix.Fchmod(nfd, 0o700)
 }
 
 // openParent opens the parent directory of path without following a symlink

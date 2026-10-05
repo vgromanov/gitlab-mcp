@@ -904,11 +904,11 @@ func TestNewStoreHonorsByteCap(t *testing.T) {
 	if !errors.Is(err, ErrFull) {
 		t.Fatalf("open: %v", err)
 	}
-	for _, suffix := range []string{"", "-wal", "-shm"} {
-		if _, statErr := os.Lstat(path + suffix); !os.IsNotExist(statErr) {
-			t.Fatalf("left %s behind: %v", suffix, statErr)
-		}
+	s, err := Open(Config{Path: path})
+	if err != nil {
+		t.Fatalf("reopen after failed init: %v", err)
 	}
+	t.Cleanup(func() { _ = s.Close() })
 }
 
 func TestBeginStopsAtFlushedSize(t *testing.T) {
@@ -947,11 +947,11 @@ func TestInitCapBetweenFlushAndCommit(t *testing.T) {
 	if !errors.Is(err, ErrFull) {
 		t.Fatalf("open: %v", err)
 	}
-	for _, suffix := range []string{"", "-wal", "-shm"} {
-		if _, statErr := os.Lstat(path + suffix); !os.IsNotExist(statErr) {
-			t.Fatalf("left %s behind: %v", suffix, statErr)
-		}
+	s, err := Open(Config{Path: path})
+	if err != nil {
+		t.Fatalf("reopen after failed init: %v", err)
 	}
+	t.Cleanup(func() { _ = s.Close() })
 }
 
 func TestBeginCapBetweenFlushAndCommit(t *testing.T) {
@@ -1076,6 +1076,49 @@ func TestWritableCountsRows(t *testing.T) {
 	}
 }
 
+func TestFailedInitLeavesFileForBlockedPeer(t *testing.T) {
+	cfg, _ := fixedNow(t)
+	ctx := context.Background()
+	done := make(chan error, 1)
+	afterPrepare = func(s *Store) error {
+		afterPrepare = nil
+		go func() {
+			peer, err := Open(Config{Path: s.path})
+			if err != nil {
+				done <- err
+				return
+			}
+			t.Cleanup(func() { _ = peer.Close() })
+			_, err = peer.Begin(ctx, ident("k"), PayloadHash([]byte("a")), BeginOptions{})
+			done <- err
+		}()
+		// Hold the write lock so the peer is blocked at BeginTx before
+		// it can commit application_id. Rolling back here is the
+		// smaller-MaxBytes abort; deleting the file would leave the
+		// peer on unlinked DB/WAL inodes.
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		time.Sleep(50 * time.Millisecond)
+		if err := tx.Rollback(); err != nil {
+			return err
+		}
+		return ErrFull
+	}
+	t.Cleanup(func() { afterPrepare = nil })
+	_, err := Open(cfg)
+	if !errors.Is(err, ErrFull) {
+		t.Fatalf("creator: %v", err)
+	}
+	if _, err := os.Lstat(cfg.Path); err != nil {
+		t.Fatalf("file removed while peer was opening: %v", err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("peer: %v", err)
+	}
+}
+
 func TestFailedInitDoesNotDeletePeerStore(t *testing.T) {
 	cfg, _ := fixedNow(t)
 	ctx := context.Background()
@@ -1137,8 +1180,14 @@ func TestOpenRejectsAncestorSwap(t *testing.T) {
 	if !errors.Is(err, ErrSymlink) {
 		t.Fatalf("ancestor swap: %v", err)
 	}
-	if _, err := os.Lstat(filepath.Join(evil, "intent.db")); err == nil {
-		t.Fatal("opened through the swapped symlink")
+	// sql.Open may create an empty file after the ancestor is swapped.
+	// Abort before initialize, and do not follow the symlink to unlink
+	// it: that is the same delete a blocked peer can lose receipts on.
+	evilDB := filepath.Join(evil, "intent.db")
+	if _, err := os.Lstat(evilDB); err == nil {
+		if rawHasTable(t, evilDB, "meta") || rawHasTable(t, evilDB, "intents") {
+			t.Fatal("initialized through the swapped symlink")
+		}
 	}
 }
 

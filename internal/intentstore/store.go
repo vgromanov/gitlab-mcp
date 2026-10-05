@@ -112,12 +112,11 @@ func open(ctx context.Context, cfg Config, targetVersion int, migrate migrateFun
 	return s, nil
 }
 
-func abandonCreated(s *Store, created bool, err error) (*Store, error) {
-	keep := created && storeInitialized(s.path, s.db)
+func abandonCreated(s *Store, _ bool, err error) (*Store, error) {
 	_ = s.db.Close()
-	if created && !keep {
-		removeCreatedStore(s.path)
-	}
+	// Leave a published file in place. application_id is not a safe
+	// keep-signal: a peer can be blocked on BeginTx before it commits
+	// the schema, and deleting here would make its receipts vanish.
 	return nil, err
 }
 
@@ -170,19 +169,11 @@ func prepare(cfg Config) (store *Store, created bool, err error) {
 		} else {
 			created = true
 			if err := establishPrivate(path, false); err != nil {
-				removeCreatedStore(path)
 				return nil, false, err
 			}
 		}
 	default:
 		return nil, false, err
-	}
-	if created {
-		defer func() {
-			if store == nil {
-				removeCreatedStore(path)
-			}
-		}()
 	}
 	before, err := existingSidecars(path)
 	if err != nil {

@@ -85,3 +85,39 @@ func TestWritableAncestorRejected(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = s.Close() })
 }
+
+func TestMkdirRaceDoesNotChmodSymlinkTarget(t *testing.T) {
+	base := privateDir(t)
+	sticky := filepath.Join(base, "tmp")
+	if err := os.Mkdir(sticky, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(sticky, 0o777|os.ModeSticky); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(base, "target")
+	if err := os.Mkdir(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	afterParentMissing = func(parent, part string) {
+		afterParentMissing = nil
+		if err := os.Symlink(target, filepath.Join(parent, part)); err != nil {
+			t.Errorf("plant symlink: %v", err)
+		}
+	}
+	t.Cleanup(func() { afterParentMissing = nil })
+	_, err := Open(Config{Path: filepath.Join(sticky, "missing", "intent.db")})
+	if !errors.Is(err, ErrSymlink) {
+		t.Fatalf("mkdir race: %v", err)
+	}
+	info, err := os.Lstat(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o755 {
+		t.Fatalf("target mode %o, chmod followed the symlink", info.Mode().Perm())
+	}
+}
