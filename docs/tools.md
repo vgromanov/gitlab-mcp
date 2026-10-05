@@ -215,6 +215,7 @@ This document describes the tool surface currently registered by
 - `list_pipeline_trigger_jobs`
 - `get_pipeline_job`
 - `get_pipeline_job_output`
+- `get_merge_request_pipeline_graph` — parent pipeline plus one page of jobs (`include_retried=true`). Keeps retry history, classifies required/optional/unknown manual jobs, and never reports overall ready while downstream bridges are unvisited. Requires `GITLAB_MCP_CURSOR_KEY`. Does not play, retry, or cancel jobs.
 - `create_pipeline`
 - `retry_pipeline`
 - `cancel_pipeline`
