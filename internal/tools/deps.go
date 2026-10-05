@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"context"
 	"time"
 
 	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/config"
@@ -25,6 +26,13 @@ type Deps struct {
 	// registered from this dependency. An enabled service is used by
 	// get_merge_request to acquire that merge request's authorized objects.
 	GitCache *gitcache.Service
+	// cacheHold, when set, replaces GitCache.Hold for hermetic recovery tests.
+	cacheHold cacheObjectHolder
+}
+
+type cacheObjectHolder interface {
+	Enabled() bool
+	Hold(context.Context, gitcache.AcquireIntent, gitcache.Authorizer) (*gitcache.ObjectHold, error)
 }
 
 func (d Deps) now() time.Time {

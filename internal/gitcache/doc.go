@@ -13,7 +13,8 @@
 //
 // Ordinary API metadata, approval, discussion, and raw-file tools do not
 // require this package. When a service is enabled, get_merge_request acquires
-// that merge request through GitCacheAuthorizer and Service.Acquire. Exact-diff
-// / rename / hunk / GitLab anchor parity is owned by RVG-145 and is not
-// implemented here.
+// that merge request through GitCacheAuthorizer and Service.Acquire.
+// get_merge_request_diff_window (RVG-145) may compare those authorized
+// objects with a locked-down no-checkout git subprocess; this package still
+// does not invoke installed Git for acquisition.
 package gitcache

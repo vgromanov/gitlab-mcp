@@ -8,3 +8,8 @@ import "context"
 func (m *Manager) Acquire(context.Context, AcquireIntent, Authorizer) (*AcquireResult, error) {
 	return nil, ErrPlatform
 }
+
+// Hold is unsupported on this platform.
+func (m *Manager) Hold(context.Context, AcquireIntent, Authorizer) (*ObjectHold, error) {
+	return nil, ErrPlatform
+}

@@ -99,6 +99,9 @@ func TestServiceDisabledAndDomain(t *testing.T) {
 	if _, err := svc.Acquire(context.Background(), AcquireIntent{ProjectID: "1", MRIID: 1, Depth: 1}, StaticAuthorizer{}); !errors.Is(err, ErrDisabled) {
 		t.Fatalf("disabled acquire: %v", err)
 	}
+	if _, err := svc.Hold(context.Background(), AcquireIntent{ProjectID: "1", MRIID: 1, Depth: 2}, StaticAuthorizer{}); !errors.Is(err, ErrDisabled) {
+		t.Fatalf("disabled hold: %v", err)
+	}
 	_ = svc.Close(context.Background())
 }
 
@@ -153,6 +156,19 @@ func TestWarmAcquireProveGrant(t *testing.T) {
 	}
 	if !res.Warm || res.Objects == 0 {
 		t.Fatalf("warm result %#v", res)
+	}
+	hold, err := mgr.Hold(context.Background(), intent, auth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hold == nil || len(hold.Objects) == 0 || hold.Result.GenerationID != res.GenerationID {
+		t.Fatalf("hold %#v", hold)
+	}
+	if err := hold.Release(); err != nil {
+		t.Fatal(err)
+	}
+	if err := hold.Release(); err != nil {
+		t.Fatal(err)
 	}
 }
 

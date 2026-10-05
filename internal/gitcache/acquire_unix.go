@@ -176,6 +176,32 @@ func (m *Manager) Acquire(ctx context.Context, intent AcquireIntent, auth Author
 	}, nil
 }
 
+// Hold acquires (fresh authorization) then re-pins the generation objects.
+func (m *Manager) Hold(ctx context.Context, intent AcquireIntent, auth Authorizer) (*ObjectHold, error) {
+	res, err := m.Acquire(ctx, intent, auth)
+	if err != nil {
+		return nil, err
+	}
+	if res == nil || res.GenerationID == "" {
+		return nil, ErrUnavailable
+	}
+	fp := GrantFingerprint(res.Grant)
+	ns := NamespaceID(res.Grant.AuthDomain, res.Grant.CanonicalInstance, res.Grant.ProjectID, res.Grant.SourceFork)
+	warm, err := m.lookupWarm(ctx, fp, ns)
+	if err != nil {
+		return nil, err
+	}
+	if warm.ID != res.GenerationID {
+		_ = warm.Unpin()
+		return nil, ErrCorrupt
+	}
+	return &ObjectHold{
+		Result:  *res,
+		Objects: warm.Objects,
+		release: func() error { return warm.Unpin() },
+	}, nil
+}
+
 func preserveCtx(ctx context.Context, err error) error {
 	if err == nil {
 		return nil

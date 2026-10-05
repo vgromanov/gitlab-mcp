@@ -72,9 +72,10 @@ type diffManifestEntry struct {
 }
 
 type diffWindowOut struct {
-	Section readmeta.Section    `json:"section"`
-	Entries []diffManifestEntry `json:"entries"`
-	Digest  *string             `json:"digest"`
+	Section    readmeta.Section     `json:"section"`
+	Entries    []diffManifestEntry  `json:"entries"`
+	Digest     *string              `json:"digest"`
+	Provenance *diffCacheProvenance `json:"provenance,omitempty"`
 }
 
 type diffSelection struct {
@@ -523,6 +524,9 @@ func readVersionManifest(ctx context.Context, d Deps, q diffQuery, sec readmeta.
 		return diffWindowOut{}, err
 	}
 	if !proved.Full {
+		if out, ok := recoverCacheManifest(ctx, d, q, sec, proved); ok {
+			return out, nil
+		}
 		return incompleteManifestWindow(q, sec, proved.Head, status, entries), nil
 	}
 	return finishManifestWindow(q, sec, proved, entries)
@@ -1058,6 +1062,9 @@ func readIncrementalManifest(ctx context.Context, d Deps, q diffQuery, sec readm
 	end := q.Selection.PerPage
 	if end > len(entries) {
 		end = len(entries)
+	}
+	if out, ok := recoverCacheManifest(ctx, d, q, sec, provedManifest{}); ok {
+		return out, nil
 	}
 	return diffWindowOut{Section: sec, Entries: windowEntries(entries, q.Offset, end)}, nil
 }

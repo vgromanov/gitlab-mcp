@@ -107,6 +107,33 @@ func (s *Service) Acquire(ctx context.Context, intent AcquireIntent, auth Author
 	return mgr.Acquire(ctx, intent, auth)
 }
 
+// Hold re-authorizes and returns pinned generation objects for comparison.
+// A warm generation still goes through ResolveGrant. The caller must Release.
+func (s *Service) Hold(ctx context.Context, intent AcquireIntent, auth Authorizer) (*ObjectHold, error) {
+	if s == nil {
+		return nil, ErrDisabled
+	}
+	s.mu.Lock()
+	if !s.enabled || s.mgr == nil {
+		s.mu.Unlock()
+		return nil, ErrDisabled
+	}
+	mgr := s.mgr
+	cfg := s.cfg
+	s.mu.Unlock()
+	if auth == nil {
+		return nil, ErrAuthz
+	}
+	if cfg.Token != "" {
+		if intent.Token != "" && intent.Token != cfg.Token {
+			return nil, ErrAuthz
+		}
+		intent.Token = cfg.Token
+	}
+	intent = applyServiceTLS(intent, cfg)
+	return mgr.Hold(ctx, intent, auth)
+}
+
 func applyServiceTLS(intent AcquireIntent, cfg ServiceConfig) AcquireIntent {
 	// Startup configuration is authoritative for the service. Direct Manager
 	// acquisition has its own explicit per-operation trust input for hermetic use.

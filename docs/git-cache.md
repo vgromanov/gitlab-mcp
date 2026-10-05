@@ -5,9 +5,10 @@ by default. When disabled, ordinary API metadata, approval, discussion, and
 raw-file tools keep their existing behavior and perform no cache filesystem or
 network work.
 
-This is **not** GitLab exact-diff / rename / hunk / discussion-anchor parity.
-That work belongs to RVG-145. Tree path/hash/mode comparison is available as
-metadata only.
+Acquisition still does **not** invoke installed Git. RVG-145 comparison recovery
+(`get_merge_request_diff_window`) may run a locked-down no-checkout `git diff`
+against already authorized objects when the API cannot supply an exact
+comparison. Disable `GITLAB_MCP_GIT_CACHE` to keep honest API-partial results.
 
 ## What it does
 

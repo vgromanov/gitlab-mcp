@@ -21,6 +21,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `get_merge_request_diff_window` can recover an exact manifest or bounded
+  content window from the authorized git object cache when the GitLab API
+  comparison is incomplete (RVG-145). Recovery re-authorizes warm objects,
+  compares the selected SHAs without recomputing a merge-base, and stamps
+  git-cache provenance. Disable `GITLAB_MCP_GIT_CACHE` to keep honest API
+  partials.
 - Corp GitLab home `skunk-works/tools/gitlab-mcp` with shared
   `ci-pipelines` `/pipelines/golang.yml`, committed `vendor/`, and
   `.golangci.yml` vendor mode (SW-148).

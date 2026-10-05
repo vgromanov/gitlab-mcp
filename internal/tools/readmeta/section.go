@@ -11,6 +11,8 @@ import (
 const (
 	SourceGitLabREST        = "gitlab_rest"
 	ProviderGitLab          = "gitlab"
+	SourceGitCache          = "git_cache"
+	ProviderGit             = "git"
 	CapabilityMRDiffsV1     = "readmeta.mr_diffs.v1"
 	ContentCompleteTrue     = "true"
 	ContentCompleteFalse    = "false"

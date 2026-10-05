@@ -144,6 +144,7 @@ type diffContentOut struct {
 	Selectors           []diffSelectorOutcome   `json:"selectors"`
 	ReturnedContentHash *diffContentHash        `json:"returned_content_hash"`
 	FullPatchHash       *diffContentHash        `json:"full_patch_hash"`
+	Provenance          *diffCacheProvenance    `json:"provenance,omitempty"`
 }
 
 type retainedDiffFile struct {
@@ -1021,6 +1022,9 @@ func readVersionContent(ctx context.Context, d Deps, q diffQuery, sec readmeta.S
 	}
 	sel := selectionOutFrom(q, proved, versionID)
 	if status != "" || !proved.Full {
+		if out, ok := recoverCacheContent(ctx, d, q, sec, proved, opts); ok {
+			return out, nil
+		}
 		if status == "" {
 			status = readmeta.CodePartial
 		}
@@ -1274,6 +1278,9 @@ func readIncrementalContent(ctx context.Context, d Deps, q diffQuery, sec readme
 	sec.Consistency = readmeta.ConsistencyConsistent
 	items := len(built)
 	sec.Counts.Items = &items
+	if out, ok := recoverCacheContent(ctx, d, q, sec, provedManifest{}, opts); ok {
+		return out, nil
+	}
 	return diffContentOut{
 		Section: sec, Selection: selectionOutFrom(q, provedManifest{}, 0),
 		Files: built, Selectors: outcomes, ReturnedContentHash: retHash, FullPatchHash: nil,
