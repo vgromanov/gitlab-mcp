@@ -782,3 +782,106 @@ func TestPipelineGraph_pausedChildKeepsAncestryForCycle(t *testing.T) {
 		t.Fatalf("back-edge from resumed child misclassified: %#v", kinds)
 	}
 }
+
+func TestPipelineGraph_cycleEdgeNeverReady(t *testing.T) {
+	h := &walkServer{
+		pipes: map[string]string{
+			"42/100": walkPipe(100, 42, graphPipeSHA, "feature"),
+			"99/200": walkPipe(200, 99, graphChildSHA, "child"),
+		},
+		jobs: map[string]string{
+			"42/100/1": "[" + jobJSON(1, "parent", "success", "false") + "]",
+			"99/200/1": "[" + jobJSON(10, "child", "success", "false") + "]",
+		},
+		bridges: map[string]string{
+			"42/100/1": "[" + bridgeJSON(50, "to-child", 99, 200, graphChildSHA) + "]",
+			"99/200/1": "[" + bridgeJSON(60, "to-root", 42, 100, graphPipeSHA) + "]",
+		},
+		mr:      graphMR("feature"),
+		mrPipes: graphPipes("feature"),
+	}
+	out, _, err := callWalk(t, h, pipelineGraphIn{ProjectID: "42", MergeRequestIID: 7, MaxRequests: 64}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasKind(edgeKinds(t, out), edgeKindCycle) {
+		t.Fatalf("expected cycle edge %#v", out["edges"])
+	}
+	if out["assessment"] == assessReady || out["downstream_coverage"] == downstreamCoverageComplete {
+		t.Fatalf("cycle graph certified: assessment=%v coverage=%v", out["assessment"], out["downstream_coverage"])
+	}
+	if sec := graphSection(t, out); sec["content_complete"] == true {
+		t.Fatalf("cycle graph content_complete %#v", sec)
+	}
+}
+
+func ancestorDriftServer() *walkServer {
+	return &walkServer{
+		pipes: map[string]string{
+			"42/100": walkPipe(100, 42, graphPipeSHA, "feature"),
+			"99/200": walkPipe(200, 99, graphChildSHA, "child"),
+		},
+		jobs: map[string]string{
+			"42/100/1": "[" + jobJSON(1, "parent", "failed", "true") + "]",
+			"99/200/1": "[" + jobJSON(10, "child-a", "success", "false") + "]",
+			"99/200/2": "[" + jobJSON(11, "child-b", "success", "false") + "]",
+		},
+		bridges: map[string]string{
+			"42/100/1": "[" + bridgeJSON(50, "to-child", 99, 200, graphChildSHA) + "]",
+		},
+		mr:      graphMR("feature"),
+		mrPipes: graphPipes("feature"),
+	}
+}
+
+func childContinuation(t *testing.T, h *walkServer) (Deps, pipelineGraphIn, string) {
+	t.Helper()
+	in := pipelineGraphIn{ProjectID: "42", MergeRequestIID: 7, PerPage: 1}
+	clk := &cursor.FakeClock{T: time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)}
+	d := newCursorDeps(t, h, nil, clk)
+	_, raw, err := getMergeRequestPipelineGraph(context.Background(), nil, in, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tok, _ := graphSection(t, raw.(map[string]any))["next_cursor"].(string)
+	payload, err := cursor.Decode(d.Config.CursorKey, tok, clk.Now())
+	if err != nil || payload.GraphCont == nil || payload.GraphCont.NI != 200 || len(payload.GraphCont.Anc) != 1 {
+		t.Fatalf("expected child continuation, got %#v err %v", payload.GraphCont, err)
+	}
+	return d, in, tok
+}
+
+func TestPipelineGraph_childCursorDetectsRootJobDrift(t *testing.T) {
+	h := ancestorDriftServer()
+	d, in, tok := childContinuation(t, h)
+	h.jobs["42/100/1"] = "[" + jobJSON(1, "parent", "success", "true") + "]"
+	in.Cursor = tok
+	_, _, err := getMergeRequestPipelineGraph(context.Background(), nil, in, d)
+	if err == nil || !strings.Contains(err.Error(), cursor.ResyncRequired) {
+		t.Fatalf("root job drift not detected: %v", err)
+	}
+}
+
+func TestPipelineGraph_childCursorDetectsRootBridgeDrift(t *testing.T) {
+	h := ancestorDriftServer()
+	d, in, tok := childContinuation(t, h)
+	h.bridges["42/100/1"] = "[" + bridgeJSON(50, "to-child", 99, 200, graphChildSHA) + "," + bridgeJSON(51, "late", 98, 300, graphChildSHA) + "]"
+	in.Cursor = tok
+	_, _, err := getMergeRequestPipelineGraph(context.Background(), nil, in, d)
+	if err == nil || !strings.Contains(err.Error(), cursor.ResyncRequired) {
+		t.Fatalf("root bridge drift not detected: %v", err)
+	}
+}
+
+func TestPipelineGraph_childCursorStableAncestorsResume(t *testing.T) {
+	h := ancestorDriftServer()
+	d, in, tok := childContinuation(t, h)
+	in.Cursor = tok
+	_, raw, err := getMergeRequestPipelineGraph(context.Background(), nil, in, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if raw.(map[string]any)["downstream_coverage"] != downstreamCoverageComplete {
+		t.Fatalf("stable ancestors should resume to completion: %#v", raw)
+	}
+}

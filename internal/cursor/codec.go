@@ -197,6 +197,9 @@ type GraphCont struct {
 	Vis   []string `json:"vis,omitempty"`
 	Q     []string `json:"q,omitempty"`
 	Anc   []string `json:"anc,omitempty"`
+	Ev    []string `json:"ev,omitempty"`
+	JD    string   `json:"jd,omitempty"`
+	BD    string   `json:"bd,omitempty"`
 	N     int      `json:"n"`
 	Block bool     `json:"block,omitempty"`
 	Part  bool     `json:"part,omitempty"`
@@ -1274,6 +1277,9 @@ func validateGraphCont(c *GraphCont) error {
 	if err := validateGraphAncestry(c.Anc, c.D); err != nil {
 		return err
 	}
+	if err := validateGraphEvidence(c); err != nil {
+		return err
+	}
 	if c.RI < 0 || (c.RI == 0 && c.RP != "") {
 		return ErrResyncRequired
 	}
@@ -1294,6 +1300,67 @@ func validateGraphCont(c *GraphCont) error {
 		return ErrResyncRequired
 	}
 	return validateGraphReasons(c.Rsn)
+}
+
+func validGraphDigest(s string) bool {
+	if s == "" {
+		return true
+	}
+	if len(s) != 32 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// FormatGraphEvidence encodes the jobs and bridges digests of one completed node.
+func FormatGraphEvidence(key, jobs, bridges string) (string, error) {
+	if !validGraphVisitKey(key) || !validGraphDigest(jobs) || !validGraphDigest(bridges) {
+		return "", ErrResyncRequired
+	}
+	return key + "=" + jobs + "=" + bridges, nil
+}
+
+// ParseGraphEvidence decodes a FormatGraphEvidence item.
+func ParseGraphEvidence(item string) (key, jobs, bridges string, ok bool) {
+	i := strings.LastIndexByte(item, '=')
+	if i < 0 {
+		return "", "", "", false
+	}
+	bridges = item[i+1:]
+	rest := item[:i]
+	j := strings.LastIndexByte(rest, '=')
+	if j < 0 {
+		return "", "", "", false
+	}
+	jobs, key = rest[j+1:], rest[:j]
+	if !validGraphVisitKey(key) || !validGraphDigest(jobs) || !validGraphDigest(bridges) {
+		return "", "", "", false
+	}
+	return key, jobs, bridges, true
+}
+
+func validateGraphEvidence(c *GraphCont) error {
+	if !validGraphDigest(c.JD) || !validGraphDigest(c.BD) || len(c.Ev) > MaxGraphVisited {
+		return ErrResyncRequired
+	}
+	seen := map[string]struct{}{}
+	for _, item := range c.Ev {
+		key, _, _, ok := ParseGraphEvidence(item)
+		if !ok {
+			return ErrResyncRequired
+		}
+		if _, dup := seen[key]; dup {
+			return ErrResyncRequired
+		}
+		seen[key] = struct{}{}
+	}
+	return nil
 }
 
 // validateGraphAncestry checks the active node's root-to-parent path.

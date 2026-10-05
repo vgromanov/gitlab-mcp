@@ -344,6 +344,9 @@ func resumePipelineGraph(ctx context.Context, in pipelineGraphIn, sel graphSelec
 		return nil, nil, werr
 	}
 	walk.bindRelation(rel)
+	if err := walk.revalidateAncestors(ctx, d, budget, sel.PerPage); err != nil {
+		return nil, nil, err
+	}
 	if payload.GraphCont != nil && payload.GraphCont.Phase == cursor.GraphPhaseBridges {
 		return resumeGraphBridges(ctx, &section, pid, pipePID, mrIID, pipe, rel, sel, d, actorID, &payload, walk, budget)
 	}
@@ -423,7 +426,7 @@ func resumeGraphBridges(ctx context.Context, section *readmeta.Section, pid, pip
 		if !bridgePagingExhausted(page) {
 			markIncompleteBridgePaging(section, walk, page)
 		}
-		walk.visited[graphNodeKey{Project: pipePID, Pipeline: pipe.ID}.String()] = struct{}{}
+		walk.completeNode(graphNodeKey{Project: pipePID, Pipeline: pipe.ID})
 		if err := walkQueuedChildren(ctx, section, pid, sel, d, actorID, payload.UpperBound, payload.ExpiresAt, walk, budget); err != nil {
 			return nil, nil, err
 		}
@@ -626,6 +629,7 @@ func finishGraph(ctx context.Context, section readmeta.Section, pid, pipePID str
 	groups := buildLineage(page.Jobs, prior)
 	if walk != nil {
 		walk.recordOutcomes(groups)
+		walk.jobsEv = chainEvidence(walk.jobsEv, jobGuardTokens(page.Jobs)...)
 	}
 	attemptOf := map[int64]string{}
 	for _, g := range groups {
@@ -885,7 +889,7 @@ func walkBridgesAndChildren(ctx context.Context, section *readmeta.Section, root
 	if !bridgePagingExhausted(bpage) {
 		markIncompleteBridgePaging(section, walk, bpage)
 	}
-	walk.visited[graphNodeKey{Project: pipePID, Pipeline: pipe.ID}.String()] = struct{}{}
+	walk.completeNode(graphNodeKey{Project: pipePID, Pipeline: pipe.ID})
 	if err := walkQueuedChildren(ctx, section, rootPID, sel, d, actorID, upper, expires, walk, budget); err != nil {
 		return err
 	}
@@ -960,6 +964,7 @@ func walkQueuedChildren(ctx context.Context, section *readmeta.Section, rootPID 
 		walk.current = next.Key
 		walk.depth = next.Depth
 		walk.ancestors = next.Ancestors
+		walk.jobsEv, walk.bridgesEv = "", ""
 		kind, err := walk.authorize(ctx, d, next.Key.Project)
 		if err != nil {
 			return err
@@ -1001,6 +1006,7 @@ func walkQueuedChildren(ctx context.Context, section *readmeta.Section, rootPID 
 		walk.pipe = child
 		walk.depth = next.Depth
 		walk.phase = cursor.GraphPhaseJobs
+		walk.jobsEv = chainEvidence("", jobGuardTokens(page.Jobs)...)
 		groups := buildLineage(page.Jobs, lineageCarry{})
 		walk.recordOutcomes(groups)
 		attemptOf := map[int64]string{}

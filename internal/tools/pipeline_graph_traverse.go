@@ -121,6 +121,9 @@ type graphWalk struct {
 	relProven        bool
 	relSHA           string
 	stickyIncomplete bool
+	jobsEv           string
+	bridgesEv        string
+	evidence         map[string][2]string
 }
 
 var errPipelineForbidden = errors.New("pipeline forbidden")
@@ -190,6 +193,16 @@ func restoreGraphWalk(pipe *pipelineView, gc *cursor.GraphCont, depth, nodes int
 		relProven:        gc.Prv,
 		relSHA:           gc.RS,
 		stickyIncomplete: gc.Inc,
+		jobsEv:           gc.JD,
+		bridgesEv:        gc.BD,
+		evidence:         map[string][2]string{},
+	}
+	for _, item := range gc.Ev {
+		key, jd, bd, ok := cursor.ParseGraphEvidence(item)
+		if !ok {
+			return nil, fmt.Errorf("%s: graph continuation missing", cursor.ResyncRequired)
+		}
+		w.evidence[key] = [2]string{jd, bd}
 	}
 	for _, a := range gc.Anc {
 		p, id, ok := splitVisitKey(a)
@@ -341,6 +354,13 @@ func (w *graphWalk) snapshotCont() *cursor.GraphCont {
 		}
 	}
 	rsn := uniqueGraphReasons(w.reasons)
+	ev := make([]string, 0, len(w.evidence))
+	for key, pair := range w.evidence {
+		if item, err := cursor.FormatGraphEvidence(key, pair[0], pair[1]); err == nil {
+			ev = append(ev, item)
+		}
+	}
+	sort.Strings(ev)
 	var anc []string
 	for _, a := range w.ancestors {
 		anc = append(anc, a.String())
@@ -354,6 +374,9 @@ func (w *graphWalk) snapshotCont() *cursor.GraphCont {
 		Vis:   vis,
 		Q:     q,
 		Anc:   anc,
+		Ev:    ev,
+		JD:    w.jobsEv,
+		BD:    w.bridgesEv,
 		N:     w.nodeCount,
 		Block: w.block,
 		Part:  w.partial,
@@ -495,6 +518,7 @@ func parseGraphBridge(raw json.RawMessage) (graphBridge, error) {
 
 func (w *graphWalk) ingestBridges(parent graphNodeKey, parentSHA string, page bridgePage) {
 	w.bridgesOn = true
+	w.bridgesEv = chainEvidence(w.bridgesEv, bridgePageTokens(page)...)
 	if page.Unsupported {
 		w.cap = bridgeCapabilityUnknown
 		w.unseen = true
@@ -540,7 +564,7 @@ func (w *graphWalk) hasIncompleteEdges() bool {
 	}
 	for _, e := range w.edges {
 		switch e.Kind {
-		case edgeKindMissing, edgeKindDenied, edgeKindIdentity, edgeKindDepthStop, edgeKindNodeStop, edgeKindUnsupported, edgeKindInaccessible:
+		case edgeKindMissing, edgeKindDenied, edgeKindIdentity, edgeKindDepthStop, edgeKindNodeStop, edgeKindUnsupported, edgeKindInaccessible, edgeKindCycle:
 			return true
 		}
 	}
@@ -601,6 +625,9 @@ func (w *graphWalk) addBridgeEdge(parent graphNodeKey, parentSHA string, br grap
 	if _, seen := w.visited[child.String()]; seen || w.queued(child) || w.isAncestor(child) {
 		if w.isAncestor(child) || child == w.current {
 			base.Kind = edgeKindCycle
+			w.unseen = true
+			w.stickyIncomplete = true
+			w.coverage = downstreamCoveragePartial
 		} else {
 			base.Kind = edgeKindShared
 		}
