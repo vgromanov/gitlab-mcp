@@ -126,13 +126,17 @@ type Filters struct {
 }
 
 // PageState is signed pagination/guard state for the last returned page.
+// LineageMax is used only by the parent pipeline graph. Each entry is
+// "<job id> <job name>" for the greatest id of that name seen so far.
+// Other tools leave it empty, and omitempty keeps their tokens unchanged.
 type PageState struct {
-	Page             int    `json:"page"`
-	PerPage          int    `json:"per_page"`
-	SequenceDigest   string `json:"sequence_digest"`
-	LastSHA          string `json:"last_sha"`
-	ItemsOnPage      int    `json:"items_on_page"`
-	ProviderNextPage int64  `json:"provider_next_page"`
+	Page             int      `json:"page"`
+	PerPage          int      `json:"per_page"`
+	SequenceDigest   string   `json:"sequence_digest"`
+	LastSHA          string   `json:"last_sha"`
+	ItemsOnPage      int      `json:"items_on_page"`
+	ProviderNextPage int64    `json:"provider_next_page"`
+	LineageMax       []string `json:"lineage_max,omitempty"`
 }
 
 // Scope binds project/optional MR, group queue, or project/pipeline.

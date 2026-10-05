@@ -66,7 +66,6 @@ type jobView struct {
 	Stage        *string `json:"stage"`
 	Status       *string `json:"status"`
 	AllowFailure string  `json:"allow_failure"`
-	Retried      string  `json:"retried"`
 	Attempt      string  `json:"attempt"`
 	Policy       string  `json:"policy"`
 }
@@ -206,7 +205,7 @@ func initialPipelineGraph(ctx context.Context, in pipelineGraphIn, sel graphSele
 	}
 	upper := now.UTC().Format(time.RFC3339Nano)
 	expires := now.UTC().Add(d.Config.CursorTTL()).Format(time.RFC3339Nano)
-	return nil, Out(finishGraph(section, pid, pipePID, mrIID, chosen, rel, page, sel, d, actorID, upper, expires, 1, true)), nil
+	return nil, Out(finishGraph(section, pid, pipePID, mrIID, chosen, rel, page, sel, d, actorID, upper, expires, 1, true, nil)), nil
 }
 
 func resumePipelineGraph(ctx context.Context, in pipelineGraphIn, sel graphSelection, d Deps, budget *igl.Budget, now time.Time, tok string) (*mcp.CallToolResult, any, error) {
@@ -288,6 +287,13 @@ func resumePipelineGraph(ctx context.Context, in pipelineGraphIn, sel graphSelec
 	if !guard.Paging.PagingKnown || guard.Paging.SDKNextPage != payload.PageState.ProviderNextPage || payload.PageState.ProviderNextPage != int64(payload.PageState.Page)+1 {
 		return nil, nil, fmt.Errorf("%s: previous-page boundary drift", cursor.ResyncRequired)
 	}
+	prior, err := decodeLineageMax(payload.PageState.LineageMax)
+	if err != nil {
+		return nil, nil, fmt.Errorf("%s: previous-page boundary drift", cursor.ResyncRequired)
+	}
+	if !lineageMaxCovers(prior, guard.Jobs) {
+		return nil, nil, fmt.Errorf("%s: previous-page boundary drift", cursor.ResyncRequired)
+	}
 	nextPage := int(payload.PageState.ProviderNextPage)
 	page, err := collectJobPage(ctx, d, budget, pipePID, pipe.ID, nextPage, sel.PerPage, idSet(ids))
 	if err != nil {
@@ -327,7 +333,7 @@ func resumePipelineGraph(ctx context.Context, in pipelineGraphIn, sel graphSelec
 	if sel.MRIID > 0 {
 		mrIID = &sel.MRIID
 	}
-	return nil, Out(finishGraph(section, pid, pipePID, mrIID, pipe, rel, page, sel, d, actorID, payload.UpperBound, payload.ExpiresAt, nextPage, false)), nil
+	return nil, Out(finishGraph(section, pid, pipePID, mrIID, pipe, rel, page, sel, d, actorID, payload.UpperBound, payload.ExpiresAt, nextPage, false, prior)), nil
 }
 
 type mrFacts struct {
@@ -391,7 +397,7 @@ func resolveParentPipeline(ctx context.Context, d Deps, pid string, pipelineID i
 	if mr == nil {
 		return nil, rel, []readmeta.Limitation{{Code: readmeta.CodeInaccessible, Message: "merge request not found"}}, nil
 	}
-	refs, exhausted, err := listMRPipelineRefs(ctx, d, pid, sel.MRIID)
+	refs, exhausted, err := listMRPipelineRefs(ctx, d, pid, sel.MRIID, mr.HeadID)
 	if err != nil {
 		return nil, rel, nil, err
 	}
@@ -444,17 +450,13 @@ func selectParentID(head int64, ids []int64, exhausted bool) (int64, bool, bool)
 		if _, ok := seen[head]; ok {
 			return head, false, false
 		}
+		// A listed pipeline that is not the head is a different pipeline.
+		// Do not substitute it. A single listed id is only a fallback when
+		// the merge request did not provide a head pipeline id.
+		return 0, true, false
 	}
 	if !exhausted {
 		return 0, true, false
-	}
-	if head > 0 {
-		if _, ok := seen[head]; !ok && len(ids) == 1 {
-			return ids[0], false, false
-		}
-		if _, ok := seen[head]; ok {
-			return head, false, false
-		}
 	}
 	switch len(ids) {
 	case 0:
@@ -503,7 +505,7 @@ func unresolvedGraph(section readmeta.Section, pid string, mrIID *int64, rel rel
 	}
 }
 
-func finishGraph(section readmeta.Section, pid, pipePID string, mrIID *int64, pipe *pipelineView, rel relationResult, page graphPage, sel graphSelection, d Deps, actorID int64, upper, expires string, pageNum int, fromStart bool) pipelineGraphOut {
+func finishGraph(section readmeta.Section, pid, pipePID string, mrIID *int64, pipe *pipelineView, rel relationResult, page graphPage, sel graphSelection, d Deps, actorID int64, upper, expires string, pageNum int, fromStart bool, prior map[string]int64) pipelineGraphOut {
 	section.AddLimitation(readmeta.CodeUnsupported, "downstream coverage is unknown")
 	if !rel.Proven {
 		section.AddLimitation(readmeta.CodeUnknownCount, "pipeline relation is unproven")
@@ -518,7 +520,7 @@ func finishGraph(section readmeta.Section, pid, pipePID string, mrIID *int64, pi
 	if ok {
 		section.HeadSHA = &sha
 	}
-	groups := buildLineage(page.Jobs)
+	groups := buildLineage(page.Jobs, prior)
 	var outcomes []policyOutcome
 	for _, g := range groups {
 		outcomes = append(outcomes, g.Outcomes...)
@@ -529,14 +531,24 @@ func finishGraph(section readmeta.Section, pid, pipePID string, mrIID *int64, pi
 		RelationProven: rel.Proven,
 		Outcomes:       outcomes,
 	})
-	views := make([]jobView, 0, len(page.Jobs))
-	lineage := make([]lineageView, 0, len(groups))
 	attemptOf := map[int64]string{}
 	for _, g := range groups {
 		for id, attempt := range g.Attempts {
 			attemptOf[id] = attempt
 		}
-		if sel.Filter.active() && !lineageGroupVisible(g, page.Jobs, sel.Filter) {
+	}
+	views := make([]jobView, 0, len(page.Jobs))
+	returned := map[int64]struct{}{}
+	for _, job := range page.Jobs {
+		if sel.Filter.active() && !sel.Filter.match(job) {
+			continue
+		}
+		returned[job.ID] = struct{}{}
+		views = append(views, jobToView(job, attemptOf[job.ID]))
+	}
+	lineage := make([]lineageView, 0, len(groups))
+	for _, g := range groups {
+		if sel.Filter.active() && !lineageReturned(g, returned) {
 			continue
 		}
 		latest := g.LatestIDs
@@ -548,12 +560,6 @@ func finishGraph(section readmeta.Section, pid, pipePID string, mrIID *int64, pi
 			history = []int64{}
 		}
 		lineage = append(lineage, lineageView{Name: g.Name, LatestKnown: g.LatestKnown, LatestIDs: latest, HistoryIDs: history})
-	}
-	for _, job := range page.Jobs {
-		if sel.Filter.active() && !sel.Filter.match(job) {
-			continue
-		}
-		views = append(views, jobToView(job, attemptOf[job.ID]))
 	}
 	if views == nil {
 		views = []jobView{}
@@ -580,7 +586,8 @@ func finishGraph(section readmeta.Section, pid, pipePID string, mrIID *int64, pi
 		section.Consistency = readmeta.ConsistencyUnknown
 	}
 	if !page.Partial && page.Paging.PagingKnown && !page.Paging.ExhaustedObserved && page.Paging.SDKNextPage == int64(pageNum)+1 && ok && len(page.Jobs) > 0 {
-		if tok, err := mintGraphCursor(d, actorID, pipePID, pipe.ID, sha, sel, upper, expires, pageNum, page, pid); err == nil {
+		nextLineage := encodeLineageMax(mergeLineageMax(prior, page.Jobs))
+		if tok, err := mintGraphCursor(d, actorID, pipePID, pipe.ID, sha, sel, upper, expires, pageNum, page, pid, nextLineage); err == nil {
 			section.NextCursor = &tok
 		} else {
 			section.AddLimitation(readmeta.CodePartial, "continuation cursor was not issued")
@@ -617,7 +624,7 @@ func finishGraph(section readmeta.Section, pid, pipePID string, mrIID *int64, pi
 	}
 }
 
-func mintGraphCursor(d Deps, actorID int64, pid string, pipelineID int64, sha string, sel graphSelection, upper, expires string, pageNum int, page graphPage, mrProject string) (string, error) {
+func mintGraphCursor(d Deps, actorID int64, pid string, pipelineID int64, sha string, sel graphSelection, upper, expires string, pageNum int, page graphPage, mrProject string, lineage []string) (string, error) {
 	instance, err := cursorInstance(d.Config)
 	if err != nil {
 		return "", err
@@ -644,6 +651,7 @@ func mintGraphCursor(d Deps, actorID int64, pid string, pipelineID int64, sha st
 			LastSHA:          last,
 			ItemsOnPage:      len(page.Jobs),
 			ProviderNextPage: page.Paging.SDKNextPage,
+			LineageMax:       lineage,
 		},
 	}
 	return cursor.Encode(d.Config.CursorKey, payload)
@@ -666,15 +674,28 @@ func graphFilters(sel graphSelection, upper, mrProject string) cursor.Filters {
 	}
 }
 
-// lineageGroupVisible reports whether a full-page lineage group has at least
-// one job the caller will see. Assessment still uses every group.
-func lineageGroupVisible(g lineageGroup, jobs []graphJob, f jobFilter) bool {
-	for _, job := range jobs {
-		if _, ok := g.Attempts[job.ID]; ok && f.match(job) {
+// lineageReturned reports whether the group contains a job that was returned.
+// Assessment still uses every group on the page.
+func lineageReturned(g lineageGroup, returned map[int64]struct{}) bool {
+	for id := range g.Attempts {
+		if _, ok := returned[id]; ok {
 			return true
 		}
 	}
 	return false
+}
+
+func lineageMaxCovers(prior map[string]int64, jobs []graphJob) bool {
+	for _, job := range jobs {
+		if !job.NameKnown {
+			continue
+		}
+		maxID, ok := prior[job.Name]
+		if !ok || job.ID > maxID {
+			return false
+		}
+	}
+	return true
 }
 
 func jobToView(job graphJob, attempt string) jobView {
@@ -684,7 +705,6 @@ func jobToView(job graphJob, attempt string) jobView {
 	view := jobView{
 		ID:           job.ID,
 		AllowFailure: allowPresenceLabel(job.Allow, job.AllowValid),
-		Retried:      allowPresenceLabel(job.Retried, job.RetriedValid),
 		Attempt:      attempt,
 		Policy:       jobPolicy(job).Outcome,
 	}
@@ -819,7 +839,7 @@ func pipelineRefIDs(refs []pipelineRef) []int64 {
 }
 
 func pipelineListed(ctx context.Context, d Deps, pid string, iid, pipelineID int64) (bool, bool, error) {
-	refs, exhausted, err := listMRPipelineRefs(ctx, d, pid, iid)
+	refs, exhausted, err := listMRPipelineRefs(ctx, d, pid, iid, pipelineID)
 	if err != nil {
 		return false, false, err
 	}
@@ -831,7 +851,7 @@ func pipelineListed(ctx context.Context, d Deps, pid string, iid, pipelineID int
 	return false, exhausted, nil
 }
 
-func listMRPipelineRefs(ctx context.Context, d Deps, pid string, iid int64) ([]pipelineRef, bool, error) {
+func listMRPipelineRefs(ctx context.Context, d Deps, pid string, iid, stopAfter int64) ([]pipelineRef, bool, error) {
 	var ids []pipelineRef
 	page := 1
 	for {
@@ -858,6 +878,13 @@ func listMRPipelineRefs(ctx context.Context, d Deps, pid string, iid int64) ([]p
 			return nil, false, safeProviderErr(err)
 		}
 		ids = append(ids, batch...)
+		if stopAfter > 0 {
+			for _, ref := range batch {
+				if ref.ID == stopAfter {
+					return ids, false, nil
+				}
+			}
+		}
 		obs := observeResp(resp)
 		if !obs.PagingKnown {
 			return ids, false, nil

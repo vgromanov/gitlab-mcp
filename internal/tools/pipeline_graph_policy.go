@@ -40,17 +40,15 @@ const (
 
 // graphJob is one parent-pipeline job decoded without SDK bool erasure.
 type graphJob struct {
-	ID           int64
-	Name         string
-	NameKnown    bool
-	Stage        string
-	StageKnown   bool
-	Status       string
-	StatusKnown  bool
-	Allow        readmeta.Presence
-	AllowValid   bool
-	Retried      readmeta.Presence
-	RetriedValid bool
+	ID          int64
+	Name        string
+	NameKnown   bool
+	Stage       string
+	StageKnown  bool
+	Status      string
+	StatusKnown bool
+	Allow       readmeta.Presence
+	AllowValid  bool
 }
 
 type policyOutcome struct {
@@ -85,8 +83,8 @@ type assessInput struct {
 
 // parseGraphJob decodes one raw job object. Malformed identity is an error.
 // A present non-bool allow_failure stays unknown rather than false.
-// GitLab pipeline jobs have no retried field; a decoded value is recorded and
-// is not used to choose the latest attempt.
+// Pipeline jobs have no retried field. include_retried only adds older
+// attempts, which are recognized by job id, not by a synthetic property.
 func parseGraphJob(raw json.RawMessage) (graphJob, error) {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
@@ -100,7 +98,7 @@ func parseGraphJob(raw json.RawMessage) (graphJob, error) {
 	if !ok {
 		return graphJob{}, fmt.Errorf("malformed job")
 	}
-	job := graphJob{ID: id, AllowValid: true, RetriedValid: true}
+	job := graphJob{ID: id, AllowValid: true}
 	if name, known, ok := jsonStringField(fields, "name"); ok {
 		job.Name, job.NameKnown = name, known
 	} else {
@@ -121,12 +119,6 @@ func parseGraphJob(raw json.RawMessage) (graphJob, error) {
 		job.AllowValid = false
 	} else {
 		job.Allow = allow
-	}
-	retried, err := readmeta.DecodeBoolPresence(trimmed, "retried")
-	if err != nil {
-		job.RetriedValid = false
-	} else {
-		job.Retried = retried
 	}
 	return job, nil
 }
@@ -211,10 +203,10 @@ func allowTerminal(job graphJob, allowKnown bool, blockReason string) policyOutc
 
 // buildLineage groups jobs by name, keeps every attempt, and emits policy
 // outcomes for the latest attempt only. History is never dropped.
-// The latest attempt is the greatest job id in the group. GitLab's jobs API
-// does not send retried; include_retried only adds older attempts, and a
-// retry is a new job with a higher id.
-func buildLineage(jobs []graphJob) []lineageGroup {
+// The latest attempt is the greatest job id in the group. prior maps a name
+// to the greatest id already observed on an earlier page. An attempt at or
+// below that id is history and cannot block.
+func buildLineage(jobs []graphJob, prior map[string]int64) []lineageGroup {
 	order := []string{}
 	byKey := map[string][]graphJob{}
 	for _, job := range jobs {
@@ -229,12 +221,12 @@ func buildLineage(jobs []graphJob) []lineageGroup {
 	}
 	out := make([]lineageGroup, 0, len(order))
 	for _, key := range order {
-		out = append(out, lineageOne(byKey[key]))
+		out = append(out, lineageOne(byKey[key], prior))
 	}
 	return out
 }
 
-func lineageOne(jobs []graphJob) lineageGroup {
+func lineageOne(jobs []graphJob, prior map[string]int64) lineageGroup {
 	g := lineageGroup{Attempts: map[int64]string{}, LatestIDs: []int64{}, HistoryIDs: []int64{}}
 	if len(jobs) == 0 {
 		return g
@@ -249,6 +241,18 @@ func lineageOne(jobs []graphJob) lineageGroup {
 			latest = job
 		}
 	}
+	priorMax := int64(0)
+	if jobs[0].NameKnown && prior != nil {
+		priorMax = prior[jobs[0].Name]
+	}
+	if priorMax >= latest.ID {
+		for _, job := range jobs {
+			g.HistoryIDs = append(g.HistoryIDs, job.ID)
+			g.Attempts[job.ID] = attemptHistory
+		}
+		sort.Slice(g.HistoryIDs, func(i, j int) bool { return g.HistoryIDs[i] < g.HistoryIDs[j] })
+		return g
+	}
 	g.LatestKnown = true
 	g.LatestIDs = []int64{latest.ID}
 	g.Attempts[latest.ID] = attemptLatest
@@ -262,6 +266,61 @@ func lineageOne(jobs []graphJob) lineageGroup {
 	}
 	sort.Slice(g.HistoryIDs, func(i, j int) bool { return g.HistoryIDs[i] < g.HistoryIDs[j] })
 	return g
+}
+
+// mergeLineageMax records the greatest id seen for each named job.
+func mergeLineageMax(prior map[string]int64, jobs []graphJob) map[string]int64 {
+	out := make(map[string]int64, len(prior)+len(jobs))
+	for name, id := range prior {
+		out[name] = id
+	}
+	for _, job := range jobs {
+		if !job.NameKnown {
+			continue
+		}
+		if job.ID > out[job.Name] {
+			out[job.Name] = job.ID
+		}
+	}
+	return out
+}
+
+func encodeLineageMax(in map[string]int64) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(in))
+	for name := range in {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	out := make([]string, 0, len(names))
+	for _, name := range names {
+		out = append(out, strconv.FormatInt(in[name], 10)+" "+name)
+	}
+	return out
+}
+
+func decodeLineageMax(items []string) (map[string]int64, error) {
+	if len(items) == 0 {
+		return nil, nil
+	}
+	out := make(map[string]int64, len(items))
+	prev := ""
+	for _, item := range items {
+		i := strings.IndexByte(item, ' ')
+		if i <= 0 || i == len(item)-1 {
+			return nil, fmt.Errorf("malformed lineage")
+		}
+		id, err := strconv.ParseInt(item[:i], 10, 64)
+		name := item[i+1:]
+		if err != nil || id < 1 || name <= prev {
+			return nil, fmt.Errorf("malformed lineage")
+		}
+		prev = name
+		out[name] = id
+	}
+	return out, nil
 }
 
 // assessParent never returns ready. Downstream coverage is unknown until

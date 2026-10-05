@@ -166,7 +166,7 @@ func TestLineageKeepsHistory(t *testing.T) {
 		{ID: 2, Name: "test", NameKnown: true, Status: "success", StatusKnown: true, Allow: readmeta.PresenceFalse, AllowValid: true},
 		{ID: 1, Name: "test", NameKnown: true, Status: "failed", StatusKnown: true, Allow: readmeta.PresenceFalse, AllowValid: true},
 	}
-	groups := buildLineage(jobs)
+	groups := buildLineage(jobs, nil)
 	if len(groups) != 1 || !groups[0].LatestKnown || groups[0].LatestIDs[0] != 2 || len(groups[0].HistoryIDs) != 1 || groups[0].HistoryIDs[0] != 1 {
 		t.Fatalf("%+v", groups[0])
 	}
@@ -182,20 +182,32 @@ func TestLineageKeepsHistory(t *testing.T) {
 		{ID: 3, Name: "test", NameKnown: true, Status: "success", StatusKnown: true, Allow: readmeta.PresenceFalse, AllowValid: true},
 		{ID: 4, Name: "test", NameKnown: true, Status: "failed", StatusKnown: true, Allow: readmeta.PresenceFalse, AllowValid: true},
 	}
-	groups = buildLineage(failedLatest)
+	groups = buildLineage(failedLatest, nil)
 	assessment, _ = assessParent(assessInput{RelationProven: true, Outcomes: groups[0].Outcomes})
 	if assessment != assessBlocked {
 		t.Fatalf("latest failure must block: %s", assessment)
 	}
+
+	olderPage := []graphJob{
+		{ID: 1, Name: "test", NameKnown: true, Status: "failed", StatusKnown: true, Allow: readmeta.PresenceFalse, AllowValid: true},
+	}
+	groups = buildLineage(olderPage, map[string]int64{"test": 2})
+	if groups[0].LatestKnown || groups[0].Attempts[1] != attemptHistory {
+		t.Fatalf("older page treated as latest: %+v", groups[0])
+	}
+	assessment, _ = assessParent(assessInput{RelationProven: true, Outcomes: groups[0].Outcomes})
+	if assessment == assessBlocked {
+		t.Fatal("older attempt on a later page blocked after the latest passed")
+	}
 }
 
 func TestParseGraphJobPresence(t *testing.T) {
-	omitted, err := parseGraphJob([]byte(`{"id":9,"name":"manual-job","status":"manual"}`))
-	if err != nil || omitted.Allow != readmeta.PresenceAbsent || omitted.Retried != readmeta.PresenceAbsent {
+	omitted, err := parseGraphJob([]byte(`{"id":9,"name":"manual-job","status":"manual","retried":false}`))
+	if err != nil || omitted.Allow != readmeta.PresenceAbsent {
 		t.Fatalf("omitted %+v err %v", omitted, err)
 	}
 	explicit, err := parseGraphJob([]byte(`{"id":9,"name":"manual-job","status":"manual","allow_failure":false,"retried":true}`))
-	if err != nil || explicit.Allow != readmeta.PresenceFalse || explicit.Retried != readmeta.PresenceTrue {
+	if err != nil || explicit.Allow != readmeta.PresenceFalse {
 		t.Fatalf("explicit %+v err %v", explicit, err)
 	}
 	if _, err := parseGraphJob([]byte(`{"name":"x"}`)); err == nil {
