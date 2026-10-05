@@ -22,7 +22,7 @@ import (
 	gitlab "gitlab.com/gitlab-org/api/client-go/v2"
 )
 
-// literalExpectedReview28 is the independent AC oracle for the 29 review-profile tools
+// literalExpectedReview28 is the independent AC oracle for the 30 review-profile tools
 // (not derived from production ReviewReadTools()).
 var literalExpectedReview28 = []string{
 	"get_project",
@@ -52,6 +52,7 @@ var literalExpectedReview28 = []string{
 	"list_pipeline_trigger_jobs",
 	"get_pipeline_job",
 	"get_pipeline_job_output",
+	"get_merge_request_pipeline_graph",
 	"get_merge_request_review_queue",
 	"get_merge_request_review_context",
 }
@@ -102,8 +103,8 @@ func TestRegisterAll_toolProfiles(t *testing.T) {
 				UseDailyTools: true,
 			})
 			assertExactToolSet(t, names, literalExpectedReview28)
-			if len(ReviewReadTools()) != 29 {
-				t.Fatal("production ReviewReadTools must stay len 29")
+			if len(ReviewReadTools()) != 30 {
+				t.Fatal("production ReviewReadTools must stay len 30")
 			}
 			for _, bad := range reviewForbiddenTools {
 				if names[bad] {
@@ -121,8 +122,8 @@ func TestRegisterAll_toolProfiles(t *testing.T) {
 		if names["list_pipelines"] {
 			t.Fatal("disabled list_pipelines must be absent")
 		}
-		if len(names) != 28 {
-			t.Fatalf("got %d want 28", len(names))
+		if len(names) != 29 {
+			t.Fatalf("got %d want 29", len(names))
 		}
 	})
 }
@@ -207,10 +208,10 @@ func TestRegisterAll_annotationProbes(t *testing.T) {
 	}
 }
 
-// reviewAuthzPath documents the authorization entry for each of the 29 review tools.
+// reviewAuthzPath documents the authorization entry for each of the 30 review tools.
 // get_merge_request_diff_window uses loadDiffIdentity. The other merge-request
 // content tools still use authorizeMROwnerAndForks. Map keys stay the independent
-// literal 29-tool oracle; this comment is not that oracle.
+// literal 30-tool oracle; this comment is not that oracle.
 var reviewAuthzPath = map[string]string{
 	"get_project":                      "resolveProjectAuthz",
 	"get_merge_request":                "pidMR.resolve",
@@ -239,13 +240,14 @@ var reviewAuthzPath = map[string]string{
 	"list_pipeline_trigger_jobs":       "resolvePipelineProject",
 	"get_pipeline_job":                 "resolvePipelineProject",
 	"get_pipeline_job_output":          "resolvePipelineProject",
+	"get_merge_request_pipeline_graph": "resolveCursorProjectCanonical",
 	"get_merge_request_review_queue":   "AuthorizeCanonicalGroup|authorizeGroupProject|AuthorizeAdditionalProjects",
 	"get_merge_request_review_context": "authorizeProject",
 }
 
 func TestReviewProfile_authzPathTableExact28(t *testing.T) {
-	if len(literalExpectedReview28) != 29 || len(reviewAuthzPath) != 29 {
-		t.Fatalf("literal want 29; list=%d map=%d", len(literalExpectedReview28), len(reviewAuthzPath))
+	if len(literalExpectedReview28) != 30 || len(reviewAuthzPath) != 30 {
+		t.Fatalf("literal want 30; list=%d map=%d", len(literalExpectedReview28), len(reviewAuthzPath))
 	}
 	for _, name := range literalExpectedReview28 {
 		if reviewAuthzPath[name] == "" {
