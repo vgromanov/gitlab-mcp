@@ -355,6 +355,47 @@ func TestReviewContext_childJobPagesStayOffRootJobs(t *testing.T) {
 	}
 }
 
+func TestMergePipelineGraph_coalescesLineageByName(t *testing.T) {
+	name := "build"
+	id := int64(100)
+	first := pipelineGraphOut{
+		ProjectID:  "42",
+		PipelineID: &id,
+		Lineage: []lineageView{{
+			Name:        &name,
+			LatestKnown: true,
+			LatestIDs:   []int64{11},
+			HistoryIDs:  []int64{},
+		}},
+	}
+	second := pipelineGraphOut{
+		ProjectID:  "42",
+		PipelineID: &id,
+		Lineage: []lineageView{{
+			Name:        &name,
+			LatestKnown: false,
+			LatestIDs:   []int64{10},
+			HistoryIDs:  []int64{},
+		}},
+	}
+	merged := pipelineGraphOut{}
+	mergePipelineGraph(&merged, first)
+	mergePipelineGraph(&merged, second)
+	if len(merged.Lineage) != 1 {
+		t.Fatalf("lineage %#v", merged.Lineage)
+	}
+	g := merged.Lineage[0]
+	if g.LatestIDs == nil || len(g.LatestIDs) != 1 || g.LatestIDs[0] != 11 {
+		t.Fatalf("latest %#v", g.LatestIDs)
+	}
+	if len(g.HistoryIDs) != 1 || g.HistoryIDs[0] != 10 {
+		t.Fatalf("history %#v", g.HistoryIDs)
+	}
+	if !g.LatestKnown {
+		t.Fatalf("latest_known %#v", g)
+	}
+}
+
 func TestMergePipelineGraph_refreshesRootPipelineMetadata(t *testing.T) {
 	id := int64(100)
 	running, failed := "running", "failed"

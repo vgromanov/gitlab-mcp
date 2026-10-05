@@ -219,6 +219,16 @@ func (b *Budget) CapLimits(maxItems int, maxBytes int64, maxRequests int) {
 	}
 }
 
+// SetMaxItems sets the retained-item cap for an owned tool budget.
+func (b *Budget) SetMaxItems(maxItems int) {
+	if b == nil || maxItems <= 0 {
+		return
+	}
+	b.mu.Lock()
+	b.MaxItems = maxItems
+	b.mu.Unlock()
+}
+
 // SetMaxRequests sets the request cap for an owned tool budget. Unlike
 // CapLimits, a positive value replaces the current cap even when that
 // relaxes the limit (e.g. raising the default for a single tool call).

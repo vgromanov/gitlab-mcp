@@ -146,7 +146,11 @@ func getMergeRequestPipelineGraph(ctx context.Context, _ *mcp.CallToolRequest, i
 		ctx = igl.WithBudget(ctx, budget)
 	}
 	if in.MaxItems > 0 {
-		budget.CapLimits(in.MaxItems, 0, 0)
+		if ownsBudget {
+			budget.SetMaxItems(in.MaxItems)
+		} else {
+			budget.CapLimits(in.MaxItems, 0, 0)
+		}
 	}
 	if in.MaxRequests > 0 {
 		if ownsBudget {
@@ -154,6 +158,8 @@ func getMergeRequestPipelineGraph(ctx context.Context, _ *mcp.CallToolRequest, i
 		} else {
 			budget.CapLimits(0, 0, in.MaxRequests)
 		}
+	} else if ownsBudget {
+		budget.SetMaxRequests(64)
 	}
 	if ownsBudget {
 		defer budget.Cancel()
@@ -316,32 +322,20 @@ func resumePipelineGraph(ctx context.Context, in pipelineGraphIn, sel graphSelec
 	})
 	gc := payload.GraphCont
 	childResume := gc != nil && gc.RI > 0 && (gc.D > 0 || gc.RI != *payload.Scope.PipelineID || gc.RP != pipePID)
-	if childResume {
+	root := graphNodeKey{Project: pipePID, Pipeline: pipe.ID}
+	if gc != nil && gc.RI > 0 {
+		root = graphNodeKey{Project: gc.RP, Pipeline: gc.RI}
+	}
+	if sel.MRIID > 0 {
+		rel, err = reconcileGraphMRRoot(ctx, d, pid, sel, root)
+		if err != nil {
+			return nil, nil, err
+		}
+	} else if childResume {
 		rel = relationResult{Kind: gc.RK, Proven: gc.Prv, Evidence: []string{"graph_cursor"}, SHAComparison: gc.RS}
 		if rel.Kind == "" {
 			rel.Kind = relUnproven
 		}
-	} else if sel.MRIID > 0 {
-		linked, exhausted, listErr := pipelineListed(ctx, d, pid, sel.MRIID, pipe.ID)
-		if listErr != nil {
-			return nil, nil, listErr
-		}
-		branch := ""
-		if mr, mrErr := loadMergeRequest(ctx, d, pid, sel.MRIID); mrErr != nil {
-			return nil, nil, mrErr
-		} else if mr != nil {
-			branch = mr.SourceBranch
-		}
-		rel = classifyRelation(relationInput{
-			MRIID:         sel.MRIID,
-			SourceBranch:  branch,
-			ListChecked:   true,
-			Linked:        linked,
-			ListExhausted: exhausted,
-			Ref:           deref(pipe.Ref),
-			PipelineSHA:   deref(pipe.SHA),
-			ExpectedSHA:   sel.ExpectedSHA,
-		})
 	}
 	walk, werr := restoreGraphWalk(pipe, payload.GraphCont, sel.MaxDepth, sel.MaxNodes)
 	if werr != nil {
@@ -628,6 +622,45 @@ func unresolvedGraph(section readmeta.Section, pid string, mrIID *int64, rel rel
 	}
 }
 
+func reconcileGraphMRRoot(ctx context.Context, d Deps, mrProject string, sel graphSelection, root graphNodeKey) (relationResult, error) {
+	if sel.MRIID <= 0 {
+		return relationResult{}, nil
+	}
+	chosen, rel, _, err := resolveParentPipeline(ctx, d, mrProject, 0, sel)
+	if err != nil {
+		return relationResult{}, err
+	}
+	if chosen == nil {
+		return relationResult{}, fmt.Errorf("%s: parent pipeline selection drift", cursor.ResyncRequired)
+	}
+	if root.Pipeline > 0 {
+		scope := chosen.ScopeProject
+		if scope == "" {
+			scope = mrProject
+		}
+		if chosen.ID != root.Pipeline || scope != root.Project {
+			return relationResult{}, fmt.Errorf("%s: parent pipeline selection drift", cursor.ResyncRequired)
+		}
+	}
+	return rel, nil
+}
+
+func graphManifestExhausted(fromStart, exhausted bool, page graphPage, sel graphSelection, section readmeta.Section) bool {
+	jobsPartial := page.Partial || !page.Paging.PagingKnown || !page.Paging.ExhaustedObserved
+	return fromStart && exhausted && !jobsPartial && !sel.Filter.active() && !page.Partial && page.Paging.PagingKnown &&
+		section.NextCursor == nil
+}
+
+func graphWalkCertifiable(exhausted bool, page graphPage, sel graphSelection, coverage string, unseen bool, section readmeta.Section, walk *graphWalk) bool {
+	if walk == nil {
+		return false
+	}
+	jobsPartial := page.Partial || !page.Paging.PagingKnown || !page.Paging.ExhaustedObserved
+	return exhausted && !jobsPartial && !sel.Filter.active() && !page.Partial && page.Paging.PagingKnown &&
+		coverage == downstreamCoverageComplete && !unseen && section.NextCursor == nil &&
+		!walk.partial && !walk.block
+}
+
 func finishGraph(ctx context.Context, section readmeta.Section, pid, pipePID string, mrIID *int64, pipe *pipelineView, rel relationResult, page graphPage, sel graphSelection, d Deps, actorID int64, upper, expires string, pageNum int, fromStart bool, prior lineageCarry, walk *graphWalk, budget *igl.Budget) (pipelineGraphOut, error) {
 	if !rel.Proven {
 		section.AddLimitation(readmeta.CodeUnknownCount, "pipeline relation is unproven")
@@ -763,7 +796,27 @@ func finishGraph(ctx context.Context, section readmeta.Section, pid, pipePID str
 	if walk != nil {
 		reasons = appendUniqueReasons(append([]string(nil), walk.reasons...), reasons)
 	}
-	graphComplete := fromStart && exhausted && !sel.Filter.active() && !page.Partial && page.Paging.PagingKnown && coverage == downstreamCoverageComplete && !unseen && section.NextCursor == nil
+	certifiable := graphWalkCertifiable(exhausted, page, sel, coverage, unseen, section, walk)
+	manifestExhausted := graphManifestExhausted(fromStart, exhausted, page, sel, section)
+	signGraph := certifiable && (fromStart || (walk != nil && len(walk.evidence) > 0))
+	if signGraph && walk != nil {
+		if sel.MRIID > 0 && !fromStart {
+			root := walk.root
+			if root.Pipeline < 1 {
+				root = graphNodeKey{Project: pipePID, Pipeline: pipe.ID}
+			}
+			fresh, err := reconcileGraphMRRoot(ctx, d, pid, sel, root)
+			if err != nil {
+				return pipelineGraphOut{}, err
+			}
+			rel = fresh
+			walk.bindRelation(fresh)
+		}
+		if err := walk.revalidateCompleted(ctx, d, sel.PerPage); err != nil {
+			return pipelineGraphOut{}, err
+		}
+	}
+	graphComplete := manifestExhausted && coverage == downstreamCoverageComplete && !unseen
 	if graphComplete {
 		section.ContentComplete = readmeta.ContentCompleteTrue
 		section.ManifestCoverage = readmeta.CoverageFull

@@ -617,7 +617,7 @@ func TestPipelineGraph_headFoundDoesNotExhaustBudget(t *testing.T) {
 		}
 		base.ServeHTTP(w, r)
 	})
-	out, err := callGraph(t, h, pipelineGraphIn{ProjectID: "42", MergeRequestIID: 7, MaxRequests: 8}, nil)
+	out, err := callGraph(t, h, pipelineGraphIn{ProjectID: "42", MergeRequestIID: 7, MaxRequests: 24}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -695,7 +695,7 @@ func TestPipelineGraph_compactLineageCursor(t *testing.T) {
 	h := graphHandler(nil, map[int]string{100: graphPipe("feature", "push")}, jobs, graphMR("feature"), graphPipes("feature"), false)
 	clk := &cursor.FakeClock{T: time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)}
 	d := newCursorDeps(t, h, nil, clk)
-	in := pipelineGraphIn{ProjectID: "42", MergeRequestIID: 7, PerPage: 50}
+	in := pipelineGraphIn{ProjectID: "42", MergeRequestIID: 7, PerPage: 50, MaxItems: 250}
 	_, out, err := getMergeRequestPipelineGraph(context.Background(), nil, in, d)
 	if err != nil {
 		t.Fatal(err)

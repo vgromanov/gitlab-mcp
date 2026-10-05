@@ -189,7 +189,7 @@ func TestPipelineGraph_manyParentJobPagesResumeIntoChild(t *testing.T) {
 		mr:      graphMR("feature"),
 		mrPipes: graphPipes("feature"),
 	}
-	in := pipelineGraphIn{ProjectID: "42", MergeRequestIID: 7, PerPage: jobsPerPage}
+	in := pipelineGraphIn{ProjectID: "42", MergeRequestIID: 7, PerPage: jobsPerPage, MaxItems: 1000, MaxRequests: 128}
 	clk := &cursor.FakeClock{T: time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)}
 	d := newCursorDeps(t, h, nil, clk)
 	tok := ""

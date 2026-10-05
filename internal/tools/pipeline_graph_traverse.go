@@ -221,6 +221,25 @@ func restoreGraphWalk(pipe *pipelineView, gc *cursor.GraphCont, depth, nodes int
 		}
 		w.queue = append(w.queue, qn)
 	}
+	for _, item := range gc.Rg {
+		from, to, kind, ok := cursor.ParseGraphReachEdge(item)
+		if !ok {
+			return nil, fmt.Errorf("%s: graph continuation missing", cursor.ResyncRequired)
+		}
+		fp, fpi, fok := splitVisitKey(from)
+		tp, tpi, tok := splitVisitKey(to)
+		if !fok || !tok {
+			return nil, fmt.Errorf("%s: graph continuation missing", cursor.ResyncRequired)
+		}
+		w.edges = append(w.edges, graphEdgeView{
+			FromProject:  fp,
+			FromPipeline: fpi,
+			ToProject:    tp,
+			ToPipeline:   tpi,
+			Kind:         kind,
+			Provenance:   []string{"graph_resume"},
+		})
+	}
 	restoreGraphReasons(w, gc.Rsn)
 	return w, nil
 }
@@ -361,6 +380,7 @@ func (w *graphWalk) snapshotCont() *cursor.GraphCont {
 		}
 	}
 	sort.Strings(ev)
+	rg := graphReachSnapshot(w.edges)
 	var anc []string
 	for _, a := range w.ancestors {
 		anc = append(anc, a.String())
@@ -390,7 +410,34 @@ func (w *graphWalk) snapshotCont() *cursor.GraphCont {
 		RK:    w.relKind,
 		Prv:   w.relProven,
 		RS:    w.relSHA,
+		Rg:    rg,
 	}
+}
+
+func graphReachSnapshot(edges []graphEdgeView) []string {
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(edges))
+	for _, e := range edges {
+		if e.Kind != edgeKindBridge && e.Kind != edgeKindShared {
+			continue
+		}
+		if e.ToPipeline < 1 {
+			continue
+		}
+		from := graphNodeKey{Project: e.FromProject, Pipeline: e.FromPipeline}.String()
+		to := graphNodeKey{Project: e.ToProject, Pipeline: e.ToPipeline}.String()
+		item, err := cursor.FormatGraphReachEdge(from, to, e.Kind)
+		if err != nil {
+			continue
+		}
+		if _, ok := seen[item]; ok {
+			continue
+		}
+		seen[item] = struct{}{}
+		out = append(out, item)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func uniqueGraphReasons(in []string) []string {

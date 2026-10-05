@@ -394,6 +394,64 @@ func TestPipelineGraph_depthAndNodeStop(t *testing.T) {
 	}
 }
 
+func TestPipelineGraph_resumeSiblingCycleReachability(t *testing.T) {
+	h := &walkServer{
+		pipes: map[string]string{
+			"42/100": walkPipe(100, 42, graphPipeSHA, "feature"),
+			"99/200": walkPipe(200, 99, graphChildSHA, "a"),
+			"99/201": walkPipe(201, 99, graphChildSHA, "b"),
+		},
+		jobs: map[string]string{
+			"42/100/1": "[" + jobJSON(1, "test", "success", "false") + "]",
+			"99/200/1": "[" + jobJSON(10, "a", "success", "false") + "]",
+			"99/201/1": "[" + jobJSON(11, "b1", "success", "false") + "]",
+			"99/201/2": "[" + jobJSON(12, "b2", "success", "false") + "]",
+		},
+		bridges: map[string]string{
+			"42/100/1": "[" + bridgeJSON(50, "to-a", 99, 200, graphChildSHA) + "," + bridgeJSON(51, "to-b", 99, 201, graphChildSHA) + "]",
+			"99/200/1": "[" + bridgeJSON(60, "a-to-b", 99, 201, graphChildSHA) + "]",
+			"99/201/1": "[" + bridgeJSON(61, "b-to-a", 99, 200, graphChildSHA) + "]",
+		},
+		mr:      graphMR("feature"),
+		mrPipes: graphPipes("feature"),
+	}
+	in := pipelineGraphIn{ProjectID: "42", MergeRequestIID: 7, MaxRequests: 64, PerPage: 1}
+	clk := &cursor.FakeClock{T: time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)}
+	d := newCursorDeps(t, h, nil, clk)
+	var tok string
+	for i := 0; i < 12; i++ {
+		in.Cursor = tok
+		_, raw, err := getMergeRequestPipelineGraph(context.Background(), nil, in, d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sec := graphSection(t, raw.(map[string]any))
+		if sec["next_cursor"] == nil {
+			break
+		}
+		tok, _ = sec["next_cursor"].(string)
+		payload, err := cursor.Decode(d.Config.CursorKey, tok, clk.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if payload.GraphCont != nil && payload.GraphCont.NI == 201 && payload.GraphCont.Phase == cursor.GraphPhaseJobs {
+			break
+		}
+	}
+	if tok == "" {
+		t.Fatal("expected paused continuation on sibling B jobs")
+	}
+	in.Cursor = tok
+	_, raw, err := getMergeRequestPipelineGraph(context.Background(), nil, in, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := raw.(map[string]any)
+	if !hasKind(edgeKinds(t, out), edgeKindCycle) {
+		t.Fatalf("resumed sibling cycle missing cycle edge %#v", out["edges"])
+	}
+}
+
 func TestPipelineGraph_siblingBranchCycleNotReady(t *testing.T) {
 	h := &walkServer{
 		pipes: map[string]string{

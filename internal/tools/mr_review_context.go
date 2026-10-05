@@ -1213,7 +1213,7 @@ func mergePipelineGraph(dst *pipelineGraphOut, src pipelineGraphOut) {
 			dst.Pipeline = src.Pipeline
 		}
 		dst.Jobs = append(dst.Jobs, src.Jobs...)
-		dst.Lineage = append(dst.Lineage, src.Lineage...)
+		dst.Lineage = coalesceLineageViews(append(dst.Lineage, src.Lineage...))
 	}
 	for _, n := range src.Nodes {
 		dst.Nodes = mergeGraphNode(dst.Nodes, n)
@@ -1224,6 +1224,58 @@ func mergePipelineGraph(dst *pipelineGraphOut, src pipelineGraphOut) {
 		}
 	}
 	dst.Digest = src.Digest
+}
+
+func coalesceLineageViews(items []lineageView) []lineageView {
+	if len(items) < 2 {
+		return items
+	}
+	byKey := map[string]int{}
+	out := make([]lineageView, 0, len(items))
+	for _, v := range items {
+		key := ""
+		if v.Name != nil {
+			key = *v.Name
+		}
+		if i, ok := byKey[key]; ok {
+			out[i] = mergeLineageViews(out[i], v)
+			continue
+		}
+		byKey[key] = len(out)
+		out = append(out, v)
+	}
+	return out
+}
+
+func mergeLineageViews(a, b lineageView) lineageView {
+	name := a.Name
+	if name == nil {
+		name = b.Name
+	}
+	ids := append(append([]int64{}, a.LatestIDs...), a.HistoryIDs...)
+	ids = append(ids, b.LatestIDs...)
+	ids = append(ids, b.HistoryIDs...)
+	ids = uniqueSortedInt64(ids)
+	if len(ids) == 0 {
+		return lineageView{Name: name, LatestIDs: []int64{}, HistoryIDs: []int64{}, LatestKnown: a.LatestKnown || b.LatestKnown}
+	}
+	maxID := ids[len(ids)-1]
+	hist := ids[:len(ids)-1]
+	return lineageView{Name: name, LatestKnown: a.LatestKnown || b.LatestKnown, LatestIDs: []int64{maxID}, HistoryIDs: hist}
+}
+
+func uniqueSortedInt64(in []int64) []int64 {
+	seen := map[int64]struct{}{}
+	out := make([]int64, 0, len(in))
+	for _, id := range in {
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
 }
 
 func sameRootPipeline(dst, src pipelineGraphOut) bool {

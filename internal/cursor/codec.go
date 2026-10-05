@@ -213,6 +213,7 @@ type GraphCont struct {
 	RK    string   `json:"rk,omitempty"`
 	Prv   bool     `json:"prv,omitempty"`
 	RS    string   `json:"rs,omitempty"`
+	Rg    []string `json:"rg,omitempty"`
 }
 
 // DiffWindowCont binds one diff-manifest window. It stores no patch text.
@@ -1280,6 +1281,9 @@ func validateGraphCont(c *GraphCont) error {
 	if err := validateGraphEvidence(c); err != nil {
 		return err
 	}
+	if err := validateGraphReach(c.Rg); err != nil {
+		return err
+	}
 	if c.RI < 0 || (c.RI == 0 && c.RP != "") {
 		return ErrResyncRequired
 	}
@@ -1345,6 +1349,50 @@ func ParseGraphEvidence(item string) (key, jobs, bridges, meta string, ok bool) 
 		return "", "", "", "", false
 	}
 	return key, jobs, bridges, meta, true
+}
+
+// FormatGraphReachEdge encodes one bridge/shared edge for cycle detection on resume.
+func FormatGraphReachEdge(from, to, kind string) (string, error) {
+	if !validGraphVisitKey(from) || !validGraphVisitKey(to) || (kind != "bridge" && kind != "shared") {
+		return "", ErrResyncRequired
+	}
+	return from + ">" + to + ">" + kind, nil
+}
+
+// ParseGraphReachEdge decodes a FormatGraphReachEdge item.
+func ParseGraphReachEdge(item string) (from, to, kind string, ok bool) {
+	parts := strings.Split(item, ">")
+	if len(parts) != 3 {
+		return "", "", "", false
+	}
+	from, to, kind = parts[0], parts[1], parts[2]
+	if !validGraphVisitKey(from) || !validGraphVisitKey(to) || (kind != "bridge" && kind != "shared") {
+		return "", "", "", false
+	}
+	return from, to, kind, true
+}
+
+func validateGraphReach(items []string) error {
+	if len(items) > MaxGraphVisited*2 {
+		return ErrResyncRequired
+	}
+	seen := map[string]struct{}{}
+	var prev string
+	havePrev := false
+	for _, item := range items {
+		if _, _, _, ok := ParseGraphReachEdge(item); !ok {
+			return ErrResyncRequired
+		}
+		if _, dup := seen[item]; dup {
+			return ErrResyncRequired
+		}
+		seen[item] = struct{}{}
+		if havePrev && item < prev {
+			return ErrResyncRequired
+		}
+		prev, havePrev = item, true
+	}
+	return nil
 }
 
 func validateGraphEvidence(c *GraphCont) error {
