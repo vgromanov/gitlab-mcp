@@ -80,6 +80,7 @@ type reviewScript struct {
 	cancel              context.CancelFunc
 	cancelAt            int
 	hits                int
+	hitsMu              sync.Mutex
 	destHits            int
 	redirected          bool
 	abort               bool
@@ -97,11 +98,14 @@ type reviewScript struct {
 
 func (s *reviewScript) serve(w http.ResponseWriter, r *http.Request) {
 	s.log.add(r.URL.Path, r.URL.RawQuery)
+	s.hitsMu.Lock()
 	if strings.Contains(r.URL.Path, "/projects/999") || strings.Contains(r.URL.Path, "/evil") {
 		s.destHits++
 	}
 	s.hits++
-	if s.cancel != nil && s.cancelAt > 0 && s.hits == s.cancelAt {
+	hit := s.hits
+	s.hitsMu.Unlock()
+	if s.cancel != nil && s.cancelAt > 0 && hit == s.cancelAt {
 		s.cancel()
 		if s.abort {
 			<-r.Context().Done()
