@@ -54,8 +54,8 @@ func TestServiceEnabledAcquireAuthz(t *testing.T) {
 	if !svc.Enabled() || svc.Manager() == nil || svc.Domain() == nil {
 		t.Fatal("enabled surface")
 	}
-	if dom := svc.Domain().Bind("1", "tok"); dom == "" {
-		t.Fatal("bind")
+	if dom, err := svc.Domain().Bind("1", "tok"); err != nil || dom == "" {
+		t.Fatal(err)
 	}
 	if _, err := svc.Acquire(context.Background(), AcquireIntent{ProjectID: "1", MRIID: 1, Depth: 1}, nil); !errors.Is(err, ErrAuthz) {
 		t.Fatalf("nil auth: %v", err)

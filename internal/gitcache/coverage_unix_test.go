@@ -114,7 +114,10 @@ func TestWarmAcquireProveGrant(t *testing.T) {
 	var domain AuthDomain
 	actor := "42"
 	token := "tok"
-	authDomain := domain.Bind(actor, token)
+	authDomain, err := domain.Bind(actor, token)
+	if err != nil {
+		t.Fatal(err)
+	}
 	intent := AcquireIntent{
 		ProjectID: "1", MRIID: 7, Depth: 2, Token: token,
 		ExpectedHead: head, ExpectedBase: base, ExpectedStart: base,

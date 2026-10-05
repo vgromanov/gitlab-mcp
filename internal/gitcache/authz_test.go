@@ -108,8 +108,14 @@ func TestStaticAuthorizerIgnoresCallerGrantMutation(t *testing.T) {
 
 func TestAuthDomainDoesNotPersistToken(t *testing.T) {
 	var d gitcache.AuthDomain
-	a := d.Bind("actor", "token-one")
-	b := d.Bind("actor", "token-two")
+	a, err := d.Bind("actor", "token-one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := d.Bind("actor", "token-two")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if a == "" || b == "" || a == b {
 		t.Fatalf("domain keys: %q %q", a, b)
 	}

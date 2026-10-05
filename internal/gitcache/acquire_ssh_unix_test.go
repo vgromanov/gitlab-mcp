@@ -121,7 +121,10 @@ func TestColdWarmAuthorizedSSHAcquire(t *testing.T) {
 	var domain AuthDomain
 	actor := "ssh-actor"
 	token := "ssh-tok"
-	authDomain := domain.Bind(actor, token)
+	authDomain, err := domain.Bind(actor, token)
+	if err != nil {
+		t.Fatal(err)
+	}
 	g := completeTestGrant(Grant{
 		OriginHost:  "127.0.0.1",
 		ProjectID:   "1",

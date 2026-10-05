@@ -204,10 +204,13 @@ func (a *GitCacheAuthorizer) ResolveGrant(ctx context.Context, intent gitcache.A
 	}
 	var domainKey string
 	if a.d.GitCache != nil {
-		domainKey = a.d.GitCache.Domain().Bind(actorID, token)
+		domainKey, err = a.d.GitCache.Domain().Bind(actorID, token)
 	} else {
 		var local gitcache.AuthDomain
-		domainKey = local.Bind(actorID, token)
+		domainKey, err = local.Bind(actorID, token)
+	}
+	if err != nil {
+		return gitcache.Grant{}, err
 	}
 	policyFP := ""
 	if a.d.Config.PolicyActive() {

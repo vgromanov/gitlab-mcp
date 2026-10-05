@@ -7,6 +7,9 @@ import (
 	"sync"
 )
 
+// readDomainSeed fills the process-local domain key. Tests replace it.
+var readDomainSeed = rand.Read
+
 // AuthDomain is an in-memory, process-local authorization domain key.
 // Raw tokens and reusable token digests are never persisted to disk metadata.
 type AuthDomain struct {
@@ -18,12 +21,17 @@ type AuthDomain struct {
 // Bind derives or refreshes the in-memory domain key from actor+token material.
 // The raw token is not retained. Cold restart yields a new key; old on-disk
 // generations remain charged under recovery/quota until eviction.
-func (d *AuthDomain) Bind(actorID, token string) string {
+// A short or failed seed read leaves the domain unusable and returns
+// ErrUnavailable so a later call can retry. The domain is not marked ready.
+func (d *AuthDomain) Bind(actorID, token string) (string, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	var seed [32]byte
 	if !d.ready {
-		_, _ = rand.Read(seed[:])
+		var seed [32]byte
+		n, err := readDomainSeed(seed[:])
+		if err != nil || n != len(seed) {
+			return "", ErrUnavailable
+		}
 		d.key = seed
 		d.ready = true
 	}
@@ -36,7 +44,7 @@ func (d *AuthDomain) Bind(actorID, token string) string {
 	sum := sha256.Sum256([]byte(token))
 	_, _ = h.Write(sum[:])
 	out := h.Sum(nil)
-	return hex.EncodeToString(out)
+	return hex.EncodeToString(out), nil
 }
 
 // NamespaceID returns a non-secret namespace label for an identity under domain.

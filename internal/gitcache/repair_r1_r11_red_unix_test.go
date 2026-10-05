@@ -396,9 +396,13 @@ func TestR8_MidFetchCancelPreservesTypedSentinel(t *testing.T) {
 	defer mgr.Close(context.Background())
 
 	var domain AuthDomain
+	authDomain, err := domain.Bind("a", token)
+	if err != nil {
+		t.Fatal(err)
+	}
 	g := completeTestGrant(Grant{
 		OriginHost: u.Hostname(), ProjectID: "1", ProjectPath: "g/p", SourceFork: "2",
-		AuthDomain: domain.Bind("a", token), PolicyFP: "fp", MRIID: 7,
+		AuthDomain: authDomain, PolicyFP: "fp", MRIID: 7,
 		MRVersion: MRVersionFromDiffRefs(head, base, base),
 		HeadSHA:   head, BaseSHA: base, StartSHA: base, ActorID: "a",
 		HTTPSURL: srv.URL + "/repo.git",
@@ -475,9 +479,13 @@ func TestR8_MidFetchDeadlinePreservesTypedSentinel(t *testing.T) {
 	defer mgr.Close(context.Background())
 
 	var domain AuthDomain
+	authDomain, err := domain.Bind("a", token)
+	if err != nil {
+		t.Fatal(err)
+	}
 	g := completeTestGrant(Grant{
 		OriginHost: u.Hostname(), ProjectID: "1", ProjectPath: "g/p", SourceFork: "2",
-		AuthDomain: domain.Bind("a", token), PolicyFP: "fp", MRIID: 7,
+		AuthDomain: authDomain, PolicyFP: "fp", MRIID: 7,
 		MRVersion: MRVersionFromDiffRefs(head, base, base),
 		HeadSHA:   head, BaseSHA: base, StartSHA: base, ActorID: "a",
 		HTTPSURL: srv.URL + "/repo.git",
@@ -551,9 +559,13 @@ func TestR9_ServiceConfigCAPathAppliedOnAcquire(t *testing.T) {
 	defer svc.Close(context.Background())
 
 	var domain AuthDomain
+	authDomain, err := domain.Bind("a", token)
+	if err != nil {
+		t.Fatal(err)
+	}
 	g := completeTestGrant(Grant{
 		OriginHost: u.Hostname(), ProjectID: "1", ProjectPath: "g/p", SourceFork: "2",
-		AuthDomain: domain.Bind("a", token), PolicyFP: "fp", MRIID: 7,
+		AuthDomain: authDomain, PolicyFP: "fp", MRIID: 7,
 		MRVersion: MRVersionFromDiffRefs(head, base, base),
 		HeadSHA:   head, BaseSHA: base, StartSHA: base, ActorID: "a",
 		HTTPSURL: srv.URL + "/repo.git",

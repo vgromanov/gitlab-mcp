@@ -102,7 +102,8 @@ repository API (head/source, base and start/target) and later through its fetche
 commit/tree objects; a commit in another role pack supplies no repository proof.
 Expected head/base/start/MRVersion on the intent fail closed when DiffRefs
 move. Namespaces use an in-memory actor/token domain key; cold restart may
-change the key while old generations remain charged.
+change the key while old generations remain charged. A failed or short domain
+seed read leaves the domain unusable so the next call can retry.
 
 Trust is prepared before warm lookup and refreshed before return/publication.
 Explicit CA contents augment an immutable per-process system-root snapshot;

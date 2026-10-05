@@ -254,7 +254,10 @@ func openF2Acquire(t *testing.T, home, addr string, head, base plumbing.Hash) (*
 	t.Cleanup(func() { _ = svc.Close(context.Background()) })
 	var domain AuthDomain
 	actor, token := "f2-actor", "f2-tok"
-	authDomain := domain.Bind(actor, token)
+	authDomain, err := domain.Bind(actor, token)
+	if err != nil {
+		t.Fatal(err)
+	}
 	g := completeTestGrant(Grant{
 		OriginHost: "127.0.0.1", ProjectID: "1", ProjectPath: "g/p", SourceFork: "2",
 		AuthDomain: authDomain, PolicyFP: "fp", MRIID: 7,

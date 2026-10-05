@@ -205,10 +205,14 @@ func TestF3_TwoRoleEndpointsShareKnownHostsEnrollment(t *testing.T) {
 	defer svc.Close(context.Background())
 	var domain AuthDomain
 	actor, token := "f3-2role", "f3-tok"
+	authDomain, err := domain.Bind(actor, token)
+	if err != nil {
+		t.Fatal(err)
+	}
 	g := completeTestGrant(Grant{
 		OriginHost: "127.0.0.1", ProjectID: "1", ProjectPath: "g/p", SourceFork: "2",
 		TargetProjectID: "9", SourcePath: "source", TargetPath: "target",
-		AuthDomain: domain.Bind(actor, token), PolicyFP: "fp", MRIID: 7,
+		AuthDomain: authDomain, PolicyFP: "fp", MRIID: 7,
 		MRVersion: MRVersionFromDiffRefs(head, base, base),
 		HeadSHA:   head, BaseSHA: base, StartSHA: base, ActorID: actor,
 		SourceSSHURL: "ssh://git@" + addr + "/source.git",
@@ -361,9 +365,13 @@ func openF3Acquire(t *testing.T, home, addr string, head, base plumbing.Hash) (*
 	t.Cleanup(func() { _ = svc.Close(context.Background()) })
 	var domain AuthDomain
 	actor, token := "f3-actor", "f3-tok"
+	authDomain, err := domain.Bind(actor, token)
+	if err != nil {
+		t.Fatal(err)
+	}
 	g := completeTestGrant(Grant{
 		OriginHost: "127.0.0.1", ProjectID: "1", ProjectPath: "g/p", SourceFork: "2",
-		AuthDomain: domain.Bind(actor, token), PolicyFP: "fp", MRIID: 7,
+		AuthDomain: authDomain, PolicyFP: "fp", MRIID: 7,
 		MRVersion: MRVersionFromDiffRefs(head, base, base),
 		HeadSHA:   head, BaseSHA: base, StartSHA: base, ActorID: actor,
 		SSHURL: "ssh://git@" + addr + "/repo.git",

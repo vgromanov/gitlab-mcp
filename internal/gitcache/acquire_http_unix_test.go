@@ -98,7 +98,10 @@ func TestColdWarmAuthorizedHTTPAcquire(t *testing.T) {
 
 	var domain AuthDomain
 	actor := "actor-http"
-	authDomain := domain.Bind(actor, token)
+	authDomain, err := domain.Bind(actor, token)
+	if err != nil {
+		t.Fatal(err)
+	}
 	g := completeTestGrant(Grant{
 		OriginHost:  host,
 		ProjectID:   "1",
@@ -209,9 +212,13 @@ func TestAcquireHTTPDeniedTokenAndWrongCA(t *testing.T) {
 	defer mgr.Close(context.Background())
 
 	var domain AuthDomain
+	authDomain, err := domain.Bind("a", "good")
+	if err != nil {
+		t.Fatal(err)
+	}
 	g := completeTestGrant(Grant{
 		OriginHost: host.Hostname(), ProjectID: "1", ProjectPath: "g/p", SourceFork: "2",
-		AuthDomain: domain.Bind("a", "good"), PolicyFP: "fp", MRIID: 7,
+		AuthDomain: authDomain, PolicyFP: "fp", MRIID: 7,
 		MRVersion: MRVersionFromDiffRefs(head, base, base),
 		HeadSHA:   head, BaseSHA: base, StartSHA: base, ActorID: "a",
 		HTTPSURL: srv.URL + "/repo.git",
