@@ -1318,31 +1318,33 @@ func validGraphDigest(s string) bool {
 	return true
 }
 
-// FormatGraphEvidence encodes the jobs and bridges digests of one completed node.
-func FormatGraphEvidence(key, jobs, bridges string) (string, error) {
-	if !validGraphVisitKey(key) || !validGraphDigest(jobs) || !validGraphDigest(bridges) {
+// FormatGraphEvidence encodes the jobs, bridges, and pipeline-metadata digests
+// of one completed node.
+func FormatGraphEvidence(key, jobs, bridges, meta string) (string, error) {
+	if !validGraphVisitKey(key) || !validGraphDigest(jobs) || !validGraphDigest(bridges) || !validGraphDigest(meta) {
 		return "", ErrResyncRequired
 	}
-	return key + "=" + jobs + "=" + bridges, nil
+	return key + "=" + jobs + "=" + bridges + "=" + meta, nil
 }
 
 // ParseGraphEvidence decodes a FormatGraphEvidence item.
-func ParseGraphEvidence(item string) (key, jobs, bridges string, ok bool) {
-	i := strings.LastIndexByte(item, '=')
-	if i < 0 {
-		return "", "", "", false
+func ParseGraphEvidence(item string) (key, jobs, bridges, meta string, ok bool) {
+	rest := item
+	fields := [3]string{}
+	for i := 2; i >= 0; i-- {
+		j := strings.LastIndexByte(rest, '=')
+		if j < 0 {
+			return "", "", "", "", false
+		}
+		fields[i] = rest[j+1:]
+		rest = rest[:j]
 	}
-	bridges = item[i+1:]
-	rest := item[:i]
-	j := strings.LastIndexByte(rest, '=')
-	if j < 0 {
-		return "", "", "", false
+	key = rest
+	jobs, bridges, meta = fields[0], fields[1], fields[2]
+	if !validGraphVisitKey(key) || !validGraphDigest(jobs) || !validGraphDigest(bridges) || !validGraphDigest(meta) {
+		return "", "", "", "", false
 	}
-	jobs, key = rest[j+1:], rest[:j]
-	if !validGraphVisitKey(key) || !validGraphDigest(jobs) || !validGraphDigest(bridges) {
-		return "", "", "", false
-	}
-	return key, jobs, bridges, true
+	return key, jobs, bridges, meta, true
 }
 
 func validateGraphEvidence(c *GraphCont) error {
@@ -1351,7 +1353,7 @@ func validateGraphEvidence(c *GraphCont) error {
 	}
 	seen := map[string]struct{}{}
 	for _, item := range c.Ev {
-		key, _, _, ok := ParseGraphEvidence(item)
+		key, _, _, _, ok := ParseGraphEvidence(item)
 		if !ok {
 			return ErrResyncRequired
 		}

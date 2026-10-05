@@ -123,7 +123,7 @@ type graphWalk struct {
 	stickyIncomplete bool
 	jobsEv           string
 	bridgesEv        string
-	evidence         map[string][2]string
+	evidence         map[string][3]string
 }
 
 var errPipelineForbidden = errors.New("pipeline forbidden")
@@ -195,14 +195,14 @@ func restoreGraphWalk(pipe *pipelineView, gc *cursor.GraphCont, depth, nodes int
 		stickyIncomplete: gc.Inc,
 		jobsEv:           gc.JD,
 		bridgesEv:        gc.BD,
-		evidence:         map[string][2]string{},
+		evidence:         map[string][3]string{},
 	}
 	for _, item := range gc.Ev {
-		key, jd, bd, ok := cursor.ParseGraphEvidence(item)
+		key, jd, bd, md, ok := cursor.ParseGraphEvidence(item)
 		if !ok {
 			return nil, fmt.Errorf("%s: graph continuation missing", cursor.ResyncRequired)
 		}
-		w.evidence[key] = [2]string{jd, bd}
+		w.evidence[key] = [3]string{jd, bd, md}
 	}
 	for _, a := range gc.Anc {
 		p, id, ok := splitVisitKey(a)
@@ -356,7 +356,7 @@ func (w *graphWalk) snapshotCont() *cursor.GraphCont {
 	rsn := uniqueGraphReasons(w.reasons)
 	ev := make([]string, 0, len(w.evidence))
 	for key, pair := range w.evidence {
-		if item, err := cursor.FormatGraphEvidence(key, pair[0], pair[1]); err == nil {
+		if item, err := cursor.FormatGraphEvidence(key, pair[0], pair[1], pair[2]); err == nil {
 			ev = append(ev, item)
 		}
 	}

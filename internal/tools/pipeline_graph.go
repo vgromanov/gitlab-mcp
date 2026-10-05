@@ -426,7 +426,7 @@ func resumeGraphBridges(ctx context.Context, section *readmeta.Section, pid, pip
 		if !bridgePagingExhausted(page) {
 			markIncompleteBridgePaging(section, walk, page)
 		}
-		walk.completeNode(graphNodeKey{Project: pipePID, Pipeline: pipe.ID})
+		walk.completeNode(graphNodeKey{Project: pipePID, Pipeline: pipe.ID}, pipe)
 		if err := walkQueuedChildren(ctx, section, pid, sel, d, actorID, payload.UpperBound, payload.ExpiresAt, walk, budget); err != nil {
 			return nil, nil, err
 		}
@@ -889,7 +889,7 @@ func walkBridgesAndChildren(ctx context.Context, section *readmeta.Section, root
 	if !bridgePagingExhausted(bpage) {
 		markIncompleteBridgePaging(section, walk, bpage)
 	}
-	walk.completeNode(graphNodeKey{Project: pipePID, Pipeline: pipe.ID})
+	walk.completeNode(graphNodeKey{Project: pipePID, Pipeline: pipe.ID}, pipe)
 	if err := walkQueuedChildren(ctx, section, rootPID, sel, d, actorID, upper, expires, walk, budget); err != nil {
 		return err
 	}

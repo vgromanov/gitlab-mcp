@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 
@@ -42,14 +44,34 @@ func bridgePageTokens(page bridgePage) []string {
 	return out
 }
 
+// pipelineMetaDigest pins the pipeline-level fields that the signed graph digest
+// also hashes, so a status change with unchanged jobs and bridges is still drift.
+func pipelineMetaDigest(p *pipelineView) string {
+	if p == nil {
+		return ""
+	}
+	raw, err := json.Marshal(struct {
+		ID          int64  `json:"id"`
+		Status      string `json:"status"`
+		Source      string `json:"source"`
+		Ref         string `json:"ref"`
+		SHA         string `json:"sha"`
+		StatusKnown bool   `json:"status_known"`
+	}{p.ID, deref(p.Status), deref(p.Source), deref(p.Ref), deref(p.SHA), p.StatusKnown})
+	if err != nil {
+		return ""
+	}
+	return chainEvidence("", string(raw))
+}
+
 // completeNode marks a node's jobs and bridges as fully read and pins that
 // evidence so later child continuations can detect upstream drift.
-func (w *graphWalk) completeNode(k graphNodeKey) {
+func (w *graphWalk) completeNode(k graphNodeKey, pipe *pipelineView) {
 	w.visited[k.String()] = struct{}{}
 	if w.evidence == nil {
-		w.evidence = map[string][2]string{}
+		w.evidence = map[string][3]string{}
 	}
-	w.evidence[k.String()] = [2]string{w.jobsEv, w.bridgesEv}
+	w.evidence[k.String()] = [3]string{w.jobsEv, w.bridgesEv, pipelineMetaDigest(pipe)}
 	w.jobsEv, w.bridgesEv = "", ""
 }
 
@@ -91,6 +113,13 @@ func (w *graphWalk) revalidateCompleted(ctx context.Context, d Deps, perPage int
 			return err
 		}
 		if kind != "" {
+			return drift
+		}
+		current, err := loadPipeline(ctx, d, a.Project, a.Pipeline)
+		if err != nil || current == nil || pipelineMetaDigest(current) != want[2] {
+			if err != nil && !errors.Is(err, errPipelineForbidden) {
+				return err
+			}
 			return drift
 		}
 		jobs := ""

@@ -971,3 +971,25 @@ func TestPipelineGraph_revalidationNotChargedToCallBudget(t *testing.T) {
 		t.Fatalf("large-root graph did not resume through child: child=%v coverage=%v", sawChild, last["downstream_coverage"])
 	}
 }
+
+func TestPipelineGraph_childCursorDetectsRootStatusOnlyDrift(t *testing.T) {
+	h := ancestorDriftServer()
+	d, in, tok := childContinuation(t, h)
+	h.pipes["42/100"] = strings.Replace(h.pipes["42/100"], `"status":"success"`, `"status":"failed"`, 1)
+	in.Cursor = tok
+	_, _, err := getMergeRequestPipelineGraph(context.Background(), nil, in, d)
+	if err == nil || !strings.Contains(err.Error(), cursor.ResyncRequired) {
+		t.Fatalf("root status-only drift not detected: %v", err)
+	}
+}
+
+func TestPipelineGraph_childCursorDetectsSiblingStatusOnlyDrift(t *testing.T) {
+	h := twoChildDriftServer()
+	d, in, tok := secondChildContinuation(t, h)
+	h.pipes["99/200"] = strings.Replace(h.pipes["99/200"], `"status":"success"`, `"status":"failed"`, 1)
+	in.Cursor = tok
+	_, _, err := getMergeRequestPipelineGraph(context.Background(), nil, in, d)
+	if err == nil || !strings.Contains(err.Error(), cursor.ResyncRequired) {
+		t.Fatalf("sibling status-only drift not detected: %v", err)
+	}
+}
