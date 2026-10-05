@@ -70,7 +70,7 @@ func TestReviewLiveBinding_independentTuple(t *testing.T) {
 func TestReviewContext_fillerCompleteRejected(t *testing.T) {
 	key := []byte("0123456789abcdef0123456789abcdef")
 	now := time.Date(2026, 10, 4, 12, 0, 0, 0, time.UTC)
-	for _, name := range []string{"pipeline_graph", "diff_manifest"} {
+	for _, name := range []string{"diff_manifest"} {
 		p := reviewContextPayload(now)
 		p.ContextRef.Requested = []string{name}
 		p.ContextRef.Complete = []string{name}

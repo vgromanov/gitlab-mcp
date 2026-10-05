@@ -27,8 +27,14 @@ const (
 	assessBlocked = "blocked"
 	assessPartial = "partial"
 	assessUnknown = "unknown"
+	assessReady   = "ready"
 
-	downstreamCoverageUnknown = "unknown"
+	downstreamCoverageUnknown  = "unknown"
+	downstreamCoveragePartial  = "partial"
+	downstreamCoverageComplete = "complete"
+
+	bridgeCapabilityBridges = "bridges"
+	bridgeCapabilityUnknown = "unknown"
 
 	attemptLatest  = "latest"
 	attemptHistory = "history"
@@ -85,6 +91,8 @@ type assessInput struct {
 	JobsPartial       bool
 	RelationProven    bool
 	Outcomes          []policyOutcome
+	Downstream        string
+	UnseenEdge        bool
 }
 
 // parseGraphJob decodes one raw job object. Malformed identity is an error.
@@ -270,6 +278,7 @@ func lineageOne(jobs []graphJob, prior lineageCarry) lineageGroup {
 		for _, job := range jobs {
 			g.Attempts[job.ID] = attemptUnknown
 		}
+		g.Outcomes = append(g.Outcomes, policyOutcome{Outcome: policyUnknown, Reason: "unknown_policy"})
 		return g
 	}
 	if seen && priorMax >= latest.ID {
@@ -394,7 +403,26 @@ func parseLineageFP(item string) (uint64, int64, error) {
 // assessParent never returns ready. Downstream coverage is unknown until
 // bridge traversal exists, and a visible required failure is still blocked.
 func assessParent(in assessInput) (string, []string) {
-	reasons := []string{"downstream_unknown"}
+	in.Downstream = downstreamCoverageUnknown
+	in.UnseenEdge = true
+	return assessGraph(in)
+}
+
+// assessGraph returns ready only when parent and downstream policy pass and
+// every edge was observed. An unseen, denied, or incomplete child is not ready.
+func assessGraph(in assessInput) (string, []string) {
+	reasons := []string{}
+	coverage := in.Downstream
+	if coverage == "" {
+		coverage = downstreamCoverageUnknown
+	}
+	if coverage != downstreamCoverageComplete || in.UnseenEdge {
+		if coverage == downstreamCoveragePartial {
+			reasons = append(reasons, "downstream_partial")
+		} else {
+			reasons = append(reasons, "downstream_unknown")
+		}
+	}
 	if in.PipelineMissing {
 		return assessUnknown, sortReasons(append(reasons, "pipeline_missing"))
 	}
@@ -410,7 +438,7 @@ func assessParent(in assessInput) (string, []string) {
 	if !in.RelationProven {
 		reasons = append(reasons, "relation_unproven")
 	}
-	hasBlock, hasPartial := false, false
+	hasBlock, hasPartial, hasUnknown := false, false, false
 	for _, o := range in.Outcomes {
 		switch o.Outcome {
 		case policyBlock:
@@ -424,16 +452,20 @@ func assessParent(in assessInput) (string, []string) {
 				reasons = append(reasons, o.Reason)
 			}
 		case policyUnknown:
+			hasUnknown = true
 			if o.Reason != "" {
 				reasons = append(reasons, o.Reason)
 			}
 		}
 	}
+	complete := coverage == downstreamCoverageComplete && !in.UnseenEdge && !in.JobsPartial && !in.Filter && in.RelationProven && !hasBlock && !hasPartial && !hasUnknown
 	switch {
 	case hasBlock:
 		return assessBlocked, sortReasons(reasons)
-	case in.JobsPartial || hasPartial:
+	case in.JobsPartial || hasPartial || coverage == downstreamCoveragePartial:
 		return assessPartial, sortReasons(reasons)
+	case complete:
+		return assessReady, sortReasons(reasons)
 	default:
 		return assessUnknown, sortReasons(reasons)
 	}

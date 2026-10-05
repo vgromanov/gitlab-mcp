@@ -47,6 +47,7 @@ type reviewContextItemIn struct {
 	Cursors             []reviewContextCursorIn `json:"cursors,omitempty"`
 	DiscussionSelection discussionSelection     `json:"discussion_selection,omitempty" jsonschema:"semantic or all; omit for semantic"`
 	discResume          *cursor.Payload         `json:"-"`
+	graphCursor         string                  `json:"-"`
 }
 
 type getMergeRequestReviewContextIn struct {
@@ -91,9 +92,11 @@ type reviewContextItemOut struct {
 	ApprovalDigest           *string                     `json:"approval_digest,omitempty"`
 	Discussions              *discussionsView            `json:"discussions,omitempty"`
 	DiffManifest             *diffWindowOut              `json:"diff_manifest,omitempty"`
+	PipelineGraph            *pipelineGraphOut           `json:"pipeline_graph,omitempty"`
 	Sections                 map[string]readmeta.Section `json:"sections"`
 	Cause                    string                      `json:"cause,omitempty"`
 	diffManifestDigest       string
+	pipelineGraphDigest      string
 }
 
 type reviewContextOut struct {
@@ -278,6 +281,7 @@ func reviewSectionAllowed(name string) bool {
 func rejectReviewCursors(d Deps, items []reviewContextItemIn, now time.Time) error {
 	for i, item := range items {
 		var resume *cursor.Payload
+		var graphTok string
 		for _, c := range item.Cursors {
 			if c.Cursor == "" {
 				continue
@@ -289,25 +293,36 @@ func rejectReviewCursors(d Deps, items []reviewContextItemIn, now time.Time) err
 			if err != nil {
 				return fmt.Errorf("%s: cursor validation failed", cursor.ResyncRequired)
 			}
-			if decoded.Tool != cursor.ToolReviewContext || decoded.Section != cursor.SectionReviewDiscussions || decoded.DiscussionsCont == nil {
+			switch {
+			case decoded.Tool == cursor.ToolReviewContext && decoded.Section == cursor.SectionReviewDiscussions && decoded.DiscussionsCont != nil:
+				if !itemWants(item, "discussions") || c.Section != "discussions" {
+					return fmt.Errorf("%s: review context does not resume section cursors", cursor.ResyncRequired)
+				}
+				if resume != nil {
+					return fmt.Errorf("%s: review context does not resume section cursors", cursor.ResyncRequired)
+				}
+				if decoded.Filters.Selection != itemDiscSelection(item) {
+					return fmt.Errorf("%s: discussion cursor selection", cursor.ResyncRequired)
+				}
+				if decoded.Scope.MergeRequestIID == nil || *decoded.Scope.MergeRequestIID != item.MergeRequestIID {
+					return fmt.Errorf("%s: discussion cursor binding", cursor.ResyncRequired)
+				}
+				copyDecoded := decoded
+				resume = &copyDecoded
+			case decoded.Tool == cursor.ToolPipelineGraph && decoded.Section == cursor.SectionPipelineGraph && decoded.GraphCont != nil:
+				if !itemWants(item, "pipeline_graph") || c.Section != "pipeline_graph" {
+					return fmt.Errorf("%s: review context does not resume section cursors", cursor.ResyncRequired)
+				}
+				if graphTok != "" {
+					return fmt.Errorf("%s: review context does not resume section cursors", cursor.ResyncRequired)
+				}
+				graphTok = c.Cursor
+			default:
 				return fmt.Errorf("%s: review context does not resume section cursors", cursor.ResyncRequired)
 			}
-			if !itemWants(item, "discussions") || c.Section != "discussions" {
-				return fmt.Errorf("%s: review context does not resume section cursors", cursor.ResyncRequired)
-			}
-			if resume != nil {
-				return fmt.Errorf("%s: review context does not resume section cursors", cursor.ResyncRequired)
-			}
-			if decoded.Filters.Selection != itemDiscSelection(item) {
-				return fmt.Errorf("%s: discussion cursor selection", cursor.ResyncRequired)
-			}
-			if decoded.Scope.MergeRequestIID == nil || *decoded.Scope.MergeRequestIID != item.MergeRequestIID {
-				return fmt.Errorf("%s: discussion cursor binding", cursor.ResyncRequired)
-			}
-			copyDecoded := decoded
-			resume = &copyDecoded
 		}
 		item.discResume = resume
+		item.graphCursor = graphTok
 		items[i] = item
 	}
 	return nil
@@ -410,6 +425,7 @@ func (rt *reviewRuntime) sealRequested(item reviewContextItemIn, out *reviewCont
 		out.ReviewClean = false
 		out.ContextRef = nil
 		rt.dropDiffManifestClaim(out, out.Cause, "closing")
+		rt.dropPipelineGraphClaim(out, out.Cause, "closing")
 	}
 }
 
@@ -652,6 +668,23 @@ func (rt *reviewRuntime) one(item reviewContextItemIn) reviewContextItemOut {
 			return out
 		}
 	}
+	if itemWants(item, "pipeline_graph") {
+		if err := rt.phaseErr("section"); err != nil {
+			out.Cause = reviewClassify(err)
+			out.ContextRef = nil
+			out.Metadata = nil
+			return out
+		}
+		rt.readPipelineGraph(item, owner, first.bracket, &out)
+		if out.Cause == readmeta.CodeBudgetRequests || out.Cause == readmeta.CodeBudgetBytes || out.Cause == readmeta.CodeBudgetElapsed || out.Cause == readmeta.CodeBudgetItems || out.Cause == readmeta.CodeCancelled || out.Cause == cursor.ResyncRequired {
+			out.ContextRef = nil
+			if out.Cause == cursor.ResyncRequired {
+				rt.fail = fmt.Errorf("%s: pipeline graph cursor", cursor.ResyncRequired)
+			}
+			rt.finalizeDiscBound(&out)
+			return out
+		}
+	}
 	if err := rt.phaseErr("bracket"); err != nil {
 		return rt.failClosedManifest(&out, reviewClassify(err))
 	}
@@ -672,6 +705,7 @@ func (rt *reviewRuntime) one(item reviewContextItemIn) reviewContextItemOut {
 		out.Metadata = nil
 		out.ContextRef = nil
 		rt.dropDiffManifestClaim(&out, readmeta.CodeInconsistent, "bracket")
+		rt.dropPipelineGraphClaim(&out, readmeta.CodeInconsistent, "bracket")
 		rt.markSection(&out, "metadata", readmeta.ContentCompleteUnknown, out.ObservationalConsistency)
 		rt.finalizeDiscBound(&out)
 		return out
@@ -696,6 +730,7 @@ func (rt *reviewRuntime) one(item reviewContextItemIn) reviewContextItemOut {
 		out.Metadata = nil
 		out.ContextRef = nil
 		rt.dropDiffManifestClaim(&out, readmeta.CodeInconsistent, "bracket")
+		rt.dropPipelineGraphClaim(&out, readmeta.CodeInconsistent, "bracket")
 		rt.markSection(&out, "metadata", readmeta.ContentCompleteUnknown, out.ObservationalConsistency)
 		rt.finalizeDiscBound(&out)
 		return out
@@ -741,6 +776,10 @@ func (rt *reviewRuntime) one(item reviewContextItemIn) reviewContextItemOut {
 		}
 		if name == "diff_manifest" && diffManifestComplete(out) {
 			complete = append(complete, "diff_manifest")
+			continue
+		}
+		if name == "pipeline_graph" && pipelineGraphComplete(out) {
+			complete = append(complete, "pipeline_graph")
 			continue
 		}
 		excluded = append(excluded, name)
@@ -881,6 +920,7 @@ func (rt *reviewRuntime) failClosedManifest(out *reviewContextItemOut, cause str
 	out.ContextRef = nil
 	out.ReviewClean = false
 	rt.dropDiffManifestClaim(out, cause, "closing")
+	rt.dropPipelineGraphClaim(out, cause, "closing")
 	rt.finalizeDiscBound(out)
 	return *out
 }
@@ -941,9 +981,212 @@ func (rt *reviewRuntime) beforeMint() {
 	}
 }
 
+func (rt *reviewRuntime) dropPipelineGraphClaim(out *reviewContextItemOut, code, msg string) {
+	if out == nil {
+		return
+	}
+	claimed := out.pipelineGraphDigest != ""
+	out.pipelineGraphDigest = ""
+	sec, ok := out.Sections["pipeline_graph"]
+	if !ok || !claimed {
+		if out.PipelineGraph != nil {
+			out.PipelineGraph.Digest = nil
+		}
+		return
+	}
+	sec.ContentComplete = readmeta.ContentCompleteUnknown
+	sec.Consistency = readmeta.ConsistencyUnknown
+	sec.ManifestCoverage = readmeta.CoverageUnknown
+	sec.PaginationExhausted = false
+	sec.NextCursor = nil
+	sec.AddLimitation(code, msg)
+	out.Sections["pipeline_graph"] = sec
+	if out.PipelineGraph != nil {
+		out.PipelineGraph.Digest = nil
+		out.PipelineGraph.Section = sec
+	}
+	out.ReviewClean = false
+}
+
+func pipelineGraphComplete(out reviewContextItemOut) bool {
+	if out.PipelineGraph == nil || out.pipelineGraphDigest == "" {
+		return false
+	}
+	sec, ok := out.Sections["pipeline_graph"]
+	return ok && sec.ContentComplete == readmeta.ContentCompleteTrue && sec.Consistency == readmeta.ConsistencyConsistent && sec.NextCursor == nil
+}
+
+func (rt *reviewRuntime) readPipelineGraph(item reviewContextItemIn, owner CanonicalProject, br reviewBracket, out *reviewContextItemOut) {
+	sec := newPipelineGraphSection(rt.now)
+	in := pipelineGraphIn{
+		ProjectID:         strconv.FormatInt(owner.ID, 10),
+		MergeRequestIID:   item.MergeRequestIID,
+		ExpectedSourceSHA: br.SourceSHA,
+		Cursor:            item.graphCursor,
+	}
+	var merged pipelineGraphOut
+	tok := item.graphCursor
+	for page := 0; page < cursor.MaxGraphVisited; page++ {
+		in.Cursor = tok
+		_, raw, err := getMergeRequestPipelineGraph(rt.ctx, nil, in, rt.d)
+		if err != nil {
+			if strings.HasPrefix(err.Error(), cursor.ResyncRequired) {
+				out.Cause = cursor.ResyncRequired
+				return
+			}
+			code := reviewClassify(err)
+			if code == readmeta.CodeBudgetRequests || code == readmeta.CodeBudgetBytes || code == readmeta.CodeBudgetElapsed || code == readmeta.CodeBudgetItems || code == readmeta.CodeCancelled {
+				out.Cause = code
+				return
+			}
+			sec.AddLimitation(code, "pipeline graph")
+			sec.ContentComplete = readmeta.ContentCompleteFalse
+			sec.Consistency = readmeta.ConsistencyUnknown
+			out.Sections["pipeline_graph"] = sec
+			return
+		}
+		pageOut, ok := decodePipelineGraphOut(raw)
+		if !ok {
+			sec.AddLimitation(readmeta.CodePartial, "pipeline graph")
+			sec.ContentComplete = readmeta.ContentCompleteFalse
+			out.Sections["pipeline_graph"] = sec
+			return
+		}
+		mergePipelineGraph(&merged, pageOut)
+		if pageOut.Section.NextCursor == nil || strings.TrimSpace(*pageOut.Section.NextCursor) == "" {
+			break
+		}
+		tok = *pageOut.Section.NextCursor
+	}
+	if merged.Section.CapabilityVersion == "" {
+		merged.Section = sec
+	}
+	if merged.DownstreamCoverage == downstreamCoverageComplete && merged.Section.NextCursor == nil && !sectionHasCode(merged.Section, readmeta.CodePartial) {
+		if merged.Digest == nil || *merged.Digest == "" {
+			dig := encodeGraphDigest(merged.Nodes, merged.Edges, merged.Assessment, merged.DownstreamCoverage)
+			if dig != "" {
+				merged.Digest = &dig
+			}
+		}
+		if merged.Digest != nil {
+			merged.Section.ContentComplete = readmeta.ContentCompleteTrue
+			merged.Section.PaginationExhausted = true
+			if merged.Section.Consistency == "" {
+				merged.Section.Consistency = readmeta.ConsistencyConsistent
+			}
+			out.pipelineGraphDigest = *merged.Digest
+		}
+	} else {
+		merged.Section.ContentComplete = readmeta.ContentCompleteFalse
+		merged.Digest = nil
+	}
+	out.PipelineGraph = &merged
+	out.Sections["pipeline_graph"] = merged.Section
+}
+
+func sectionHasCode(sec readmeta.Section, code string) bool {
+	for _, lim := range sec.Limitations {
+		if lim.Code == code {
+			return true
+		}
+	}
+	return false
+}
+
+func decodePipelineGraphOut(raw any) (pipelineGraphOut, bool) {
+	if raw == nil {
+		return pipelineGraphOut{}, false
+	}
+	if got, ok := raw.(pipelineGraphOut); ok {
+		return got, true
+	}
+	body, err := json.Marshal(raw)
+	if err != nil {
+		return pipelineGraphOut{}, false
+	}
+	var out pipelineGraphOut
+	if err := json.Unmarshal(body, &out); err != nil {
+		return pipelineGraphOut{}, false
+	}
+	return out, true
+}
+
+func mergePipelineGraph(dst *pipelineGraphOut, src pipelineGraphOut) {
+	if dst == nil {
+		return
+	}
+	if dst.ProjectID == "" {
+		*dst = src
+		if dst.Nodes == nil {
+			dst.Nodes = []graphNodeView{}
+		}
+		if dst.Edges == nil {
+			dst.Edges = []graphEdgeView{}
+		}
+		return
+	}
+	dst.Section = src.Section
+	dst.Assessment = src.Assessment
+	dst.DownstreamCoverage = src.DownstreamCoverage
+	dst.BridgesVisited = dst.BridgesVisited || src.BridgesVisited
+	dst.BridgeCapability = src.BridgeCapability
+	dst.Reasons = appendUniqueReasons(dst.Reasons, src.Reasons)
+	dst.Jobs = append(dst.Jobs, src.Jobs...)
+	dst.Lineage = append(dst.Lineage, src.Lineage...)
+	for _, n := range src.Nodes {
+		dst.Nodes = mergeGraphNode(dst.Nodes, n)
+	}
+	for _, e := range src.Edges {
+		if !graphHasEdge(dst.Edges, e) {
+			dst.Edges = append(dst.Edges, e)
+		}
+	}
+	dst.Digest = src.Digest
+}
+
+func mergeGraphNode(nodes []graphNodeView, n graphNodeView) []graphNodeView {
+	for i := range nodes {
+		if nodes[i].ProjectID == n.ProjectID && nodes[i].PipelineID == n.PipelineID {
+			nodes[i].Jobs = append(nodes[i].Jobs, n.Jobs...)
+			nodes[i].Lineage = append(nodes[i].Lineage, n.Lineage...)
+			if n.Pipeline != nil {
+				nodes[i].Pipeline = n.Pipeline
+			}
+			return nodes
+		}
+	}
+	return append(nodes, n)
+}
+
+func graphHasEdge(edges []graphEdgeView, e graphEdgeView) bool {
+	for _, got := range edges {
+		if got.FromProject == e.FromProject && got.FromPipeline == e.FromPipeline && got.ToProject == e.ToProject && got.ToPipeline == e.ToPipeline && got.Kind == e.Kind {
+			if (got.BridgeID == nil && e.BridgeID == nil) || (got.BridgeID != nil && e.BridgeID != nil && *got.BridgeID == *e.BridgeID) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func appendUniqueReasons(dst, src []string) []string {
+	seen := map[string]struct{}{}
+	for _, r := range dst {
+		seen[r] = struct{}{}
+	}
+	for _, r := range src {
+		if _, ok := seen[r]; ok {
+			continue
+		}
+		seen[r] = struct{}{}
+		dst = append(dst, r)
+	}
+	return dst
+}
+
 func (rt *reviewRuntime) fillUnsupported(item reviewContextItemIn, out *reviewContextItemOut) {
 	for _, name := range item.Sections {
-		if name == "metadata" || name == "approvals" {
+		if name == "metadata" || name == "approvals" || name == "pipeline_graph" {
 			continue
 		}
 		out.Sections[name] = unsupportedReviewSection(rt.now, name)
@@ -1423,6 +1666,11 @@ func metaDigestOf(out reviewContextItemOut) map[string]string {
 	if out.diffManifestDigest != "" {
 		if sec, ok := out.Sections["diff_manifest"]; ok && sec.ContentComplete == readmeta.ContentCompleteTrue && sec.Consistency == readmeta.ConsistencyConsistent {
 			dig["diff_manifest"] = out.diffManifestDigest
+		}
+	}
+	if out.pipelineGraphDigest != "" {
+		if sec, ok := out.Sections["pipeline_graph"]; ok && sec.ContentComplete == readmeta.ContentCompleteTrue && sec.Consistency == readmeta.ConsistencyConsistent {
+			dig["pipeline_graph"] = out.pipelineGraphDigest
 		}
 	}
 	return dig

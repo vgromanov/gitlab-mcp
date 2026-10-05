@@ -1,0 +1,445 @@
+package tools
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"net/http"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/config"
+	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/cursor"
+	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/tools/readmeta"
+)
+
+const graphChildSHA = "cccccccccccccccccccccccccccccccccccccccc"
+
+type walkHit struct {
+	method string
+	path   string
+}
+
+type walkServer struct {
+	hits    *[]walkHit
+	pipes   map[string]string
+	jobs    map[string]string
+	bridges map[string]string
+	mr      string
+	mrPipes string
+	status  map[string]int
+}
+
+func (s *walkServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if s.hits != nil {
+		*s.hits = append(*s.hits, walkHit{method: r.Method, path: r.URL.Path})
+	}
+	if code, ok := s.status[r.URL.Path]; ok {
+		http.Error(w, `{"message":"denied"}`, code)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	path := r.URL.Path
+	switch {
+	case path == "/api/v4/user":
+		_, _ = io.WriteString(w, `{"id":7,"username":"alice"}`)
+	case strings.HasPrefix(path, "/api/v4/projects/") && !strings.Contains(path, "/merge_requests") && !strings.Contains(path, "/pipelines"):
+		id := strings.Trim(strings.TrimPrefix(path, "/api/v4/projects/"), "/")
+		if i := strings.Index(id, "/"); i >= 0 {
+			id = id[:i]
+		}
+		if _, err := strconv.Atoi(id); err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = fmt.Fprintf(w, `{"id":%s,"path_with_namespace":"g/p","namespace":{"id":1,"kind":"group"}}`, id)
+	case strings.Contains(path, "/merge_requests/") && strings.HasSuffix(path, "/pipelines"):
+		w.Header().Set("X-Next-Page", "0")
+		if s.mrPipes == "" {
+			_, _ = io.WriteString(w, `[]`)
+			return
+		}
+		_, _ = io.WriteString(w, s.mrPipes)
+	case strings.Contains(path, "/merge_requests/"):
+		if s.mr == "" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = io.WriteString(w, s.mr)
+	case strings.Contains(path, "/bridges"):
+		s.writePaged(w, r, s.bridges, path)
+	case strings.HasSuffix(path, "/jobs"):
+		s.writePaged(w, r, s.jobs, path)
+	case strings.Contains(path, "/pipelines/"):
+		key := pipeKey(path)
+		body, ok := s.pipes[key]
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = io.WriteString(w, body)
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+func (s *walkServer) writePaged(w http.ResponseWriter, r *http.Request, pages map[string]string, path string) {
+	page := r.URL.Query().Get("page")
+	if page == "" {
+		page = "1"
+	}
+	key := pipeKey(path) + "/" + page
+	body, ok := pages[key]
+	next := "0"
+	if ok {
+		if n, err := strconv.Atoi(page); err == nil {
+			if _, more := pages[pipeKey(path)+"/"+strconv.Itoa(n+1)]; more {
+				next = strconv.Itoa(n + 1)
+			}
+		}
+	} else {
+		body = "[]"
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Next-Page", next)
+	w.Header().Set("X-Page", page)
+	_, _ = io.WriteString(w, body)
+}
+
+func pipeKey(path string) string {
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	var proj, pipe string
+	for i, p := range parts {
+		if p == "projects" && i+1 < len(parts) {
+			proj = parts[i+1]
+		}
+		if p == "pipelines" && i+1 < len(parts) {
+			pipe = parts[i+1]
+		}
+	}
+	return proj + "/" + pipe
+}
+
+func walkPipe(id, project int, sha, ref string) string {
+	return fmt.Sprintf(`{"id":%d,"project_id":%d,"sha":%q,"ref":%q,"status":"success","source":"push"}`, id, project, sha, ref)
+}
+
+func bridgeJSON(id int, name string, childProject, childPipe int, childSHA string) string {
+	if childProject < 1 {
+		return fmt.Sprintf(`{"id":%d,"name":%q,"stage":"test","status":"success","allow_failure":false,"downstream_pipeline":null}`, id, name)
+	}
+	return fmt.Sprintf(`{"id":%d,"name":%q,"stage":"test","status":"success","allow_failure":false,"downstream_pipeline":{"id":%d,"project_id":%d,"sha":%q,"status":"success"}}`, id, name, childPipe, childProject, childSHA)
+}
+
+func callWalk(t *testing.T, h http.Handler, in pipelineGraphIn, cfg *config.Config) (map[string]any, []walkHit, error) {
+	t.Helper()
+	var hits []walkHit
+	wrapped := h
+	if srv, ok := h.(*walkServer); ok {
+		srv.hits = &hits
+		wrapped = srv
+	}
+	clk := &cursor.FakeClock{T: time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)}
+	d := newCursorDeps(t, wrapped, cfg, clk)
+	_, out, err := getMergeRequestPipelineGraph(context.Background(), nil, in, d)
+	if err != nil {
+		return nil, hits, err
+	}
+	m, ok := out.(map[string]any)
+	if !ok {
+		t.Fatalf("out %T", out)
+	}
+	return m, hits, nil
+}
+
+func edgeKinds(t *testing.T, out map[string]any) []string {
+	t.Helper()
+	raw, _ := out["edges"].([]any)
+	kinds := make([]string, 0, len(raw))
+	for _, item := range raw {
+		e := item.(map[string]any)
+		kinds = append(kinds, fmt.Sprint(e["kind"]))
+	}
+	return kinds
+}
+
+func hasKind(kinds []string, want string) bool {
+	for _, k := range kinds {
+		if k == want {
+			return true
+		}
+	}
+	return false
+}
+
+func TestPipelineGraph_readyEmptyDownstream(t *testing.T) {
+	h := &walkServer{
+		pipes:   map[string]string{"42/100": walkPipe(100, 42, graphPipeSHA, "feature")},
+		jobs:    map[string]string{"42/100/1": "[" + jobJSON(1, "test", "success", "false") + "]"},
+		mr:      graphMR("feature"),
+		mrPipes: graphPipes("feature"),
+	}
+	out, hits, err := callWalk(t, h, pipelineGraphIn{ProjectID: "42", MergeRequestIID: 7}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireReadyComplete(t, out)
+	if graphSection(t, out)["content_complete"] != readmeta.ContentCompleteTrue || out["digest"] == nil {
+		t.Fatalf("complete graph %#v", graphSection(t, out))
+	}
+	sawBridges := false
+	for _, hit := range hits {
+		if strings.Contains(hit.path, "/bridges") {
+			sawBridges = true
+		}
+	}
+	if !sawBridges {
+		t.Fatal("empty downstream still lists bridges")
+	}
+}
+
+func TestPipelineGraph_twoPageBridgesAndJobs(t *testing.T) {
+	h := &walkServer{
+		pipes: map[string]string{
+			"42/100": walkPipe(100, 42, graphPipeSHA, "feature"),
+			"99/200": walkPipe(200, 99, graphChildSHA, "child"),
+			"99/201": walkPipe(201, 99, graphChildSHA, "child2"),
+		},
+		jobs: map[string]string{
+			"42/100/1": "[" + jobJSON(1, "parent", "success", "false") + "]",
+			"99/200/1": "[" + jobJSON(10, "child-a", "success", "false") + "]",
+			"99/200/2": "[" + jobJSON(11, "child-b", "success", "false") + "]",
+			"99/201/1": "[" + jobJSON(12, "child-c", "success", "false") + "]",
+		},
+		bridges: map[string]string{
+			"42/100/1": "[" + bridgeJSON(50, "one", 99, 200, graphChildSHA) + "]",
+			"42/100/2": "[" + bridgeJSON(51, "two", 99, 201, graphChildSHA) + "]",
+		},
+		mr:      graphMR("feature"),
+		mrPipes: graphPipes("feature"),
+	}
+	in := pipelineGraphIn{ProjectID: "42", MergeRequestIID: 7, PerPage: 1}
+	clk := &cursor.FakeClock{T: time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)}
+	var hits []walkHit
+	h.hits = &hits
+	d := newCursorDeps(t, h, nil, clk)
+	_, raw, err := getMergeRequestPipelineGraph(context.Background(), nil, in, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	last, ok := raw.(map[string]any)
+	if !ok {
+		t.Fatalf("out %T", raw)
+	}
+	tok, _ := graphSection(t, last)["next_cursor"].(string)
+	for i := 0; i < 6 && tok != ""; i++ {
+		in.Cursor = tok
+		_, raw, err = getMergeRequestPipelineGraph(context.Background(), nil, in, d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		last = raw.(map[string]any)
+		tok, _ = graphSection(t, last)["next_cursor"].(string)
+	}
+	if last["downstream_coverage"] != downstreamCoverageComplete {
+		t.Fatalf("paginated graph stuck: assessment=%v coverage=%v cursor=%v nodes=%#v hits=%#v section=%#v", last["assessment"], last["downstream_coverage"], tok, last["nodes"], hits, last["section"])
+	}
+}
+
+func TestPipelineGraph_deniedChildNoContent(t *testing.T) {
+	h := &walkServer{
+		pipes: map[string]string{
+			"42/100": walkPipe(100, 42, graphPipeSHA, "feature"),
+		},
+		jobs:    map[string]string{"42/100/1": "[" + jobJSON(1, "test", "success", "false") + "]"},
+		bridges: map[string]string{"42/100/1": "[" + bridgeJSON(50, "sec", 99, 200, graphChildSHA) + "]"},
+		mr:      graphMR("feature"),
+		mrPipes: graphPipes("feature"),
+	}
+	cfg := &config.Config{AllowedProjectIDs: []string{"42"}}
+	out, hits, err := callWalk(t, h, pipelineGraphIn{ProjectID: "42", MergeRequestIID: 7}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireNotReady(t, out)
+	if !hasKind(edgeKinds(t, out), edgeKindDenied) {
+		t.Fatalf("edges %#v", out["edges"])
+	}
+	for _, hit := range hits {
+		if strings.Contains(hit.path, "/projects/99/pipelines") {
+			t.Fatalf("unauthorized child content %s", hit.path)
+		}
+	}
+}
+
+func TestPipelineGraph_forbiddenChild(t *testing.T) {
+	h := &walkServer{
+		pipes: map[string]string{
+			"42/100": walkPipe(100, 42, graphPipeSHA, "feature"),
+		},
+		jobs:    map[string]string{"42/100/1": "[" + jobJSON(1, "test", "success", "false") + "]"},
+		bridges: map[string]string{"42/100/1": "[" + bridgeJSON(50, "sec", 99, 200, graphChildSHA) + "]"},
+		status:  map[string]int{"/api/v4/projects/99/pipelines/200": http.StatusForbidden},
+		mr:      graphMR("feature"),
+		mrPipes: graphPipes("feature"),
+	}
+	out, _, err := callWalk(t, h, pipelineGraphIn{ProjectID: "42", MergeRequestIID: 7}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireNotReady(t, out)
+	if !hasKind(edgeKinds(t, out), edgeKindInaccessible) {
+		t.Fatalf("edges %#v", out["edges"])
+	}
+	if out["assessment"] == assessReady {
+		t.Fatal("inaccessible child ready")
+	}
+}
+
+func TestPipelineGraph_unknownIdentityAndMissing(t *testing.T) {
+	h := &walkServer{
+		pipes:   map[string]string{"42/100": walkPipe(100, 42, graphPipeSHA, "feature")},
+		jobs:    map[string]string{"42/100/1": "[" + jobJSON(1, "test", "success", "false") + "]"},
+		bridges: map[string]string{"42/100/1": "[" + bridgeJSON(50, "ghost", 0, 0, "") + "]"},
+		mr:      graphMR("feature"),
+		mrPipes: graphPipes("feature"),
+	}
+	out, _, err := callWalk(t, h, pipelineGraphIn{ProjectID: "42", MergeRequestIID: 7}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireNotReady(t, out)
+	if !hasKind(edgeKinds(t, out), edgeKindMissing) {
+		t.Fatalf("edges %#v", out["edges"])
+	}
+}
+
+func TestPipelineGraph_depthAndNodeStop(t *testing.T) {
+	h := &walkServer{
+		pipes: map[string]string{
+			"42/100": walkPipe(100, 42, graphPipeSHA, "feature"),
+			"99/200": walkPipe(200, 99, graphChildSHA, "child"),
+			"99/201": walkPipe(201, 99, graphChildSHA, "child2"),
+			"99/202": walkPipe(202, 99, graphChildSHA, "child3"),
+		},
+		jobs: map[string]string{
+			"42/100/1": "[" + jobJSON(1, "test", "success", "false") + "]",
+			"99/200/1": "[" + jobJSON(10, "c", "success", "false") + "]",
+			"99/201/1": "[" + jobJSON(11, "c", "success", "false") + "]",
+			"99/202/1": "[" + jobJSON(12, "c", "success", "false") + "]",
+		},
+		bridges: map[string]string{
+			"42/100/1": "[" + bridgeJSON(50, "a", 99, 200, graphChildSHA) + "," + bridgeJSON(51, "b", 99, 201, graphChildSHA) + "," + bridgeJSON(52, "c", 99, 202, graphChildSHA) + "]",
+			"99/200/1": "[" + bridgeJSON(60, "g", 99, 202, graphChildSHA) + "]",
+		},
+		mr:      graphMR("feature"),
+		mrPipes: graphPipes("feature"),
+	}
+	out, _, err := callWalk(t, h, pipelineGraphIn{ProjectID: "42", MergeRequestIID: 7, MaxDepth: 1, MaxNodes: 2}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireNotReady(t, out)
+	kinds := edgeKinds(t, out)
+	if !hasKind(kinds, edgeKindDepthStop) && !hasKind(kinds, edgeKindNodeStop) {
+		t.Fatalf("expected depth or node stop, got %#v", kinds)
+	}
+}
+
+func TestPipelineGraph_diamondAndCycle(t *testing.T) {
+	h := &walkServer{
+		pipes: map[string]string{
+			"42/100": walkPipe(100, 42, graphPipeSHA, "feature"),
+			"99/200": walkPipe(200, 99, graphChildSHA, "b"),
+			"99/201": walkPipe(201, 99, graphChildSHA, "c"),
+			"99/202": walkPipe(202, 99, graphChildSHA, "d"),
+		},
+		jobs: map[string]string{
+			"42/100/1": "[" + jobJSON(1, "test", "success", "false") + "]",
+			"99/200/1": "[" + jobJSON(10, "b", "success", "false") + "]",
+			"99/201/1": "[" + jobJSON(11, "c", "success", "false") + "]",
+			"99/202/1": "[" + jobJSON(12, "d", "success", "false") + "]",
+		},
+		bridges: map[string]string{
+			"42/100/1": "[" + bridgeJSON(50, "to-b", 99, 200, graphChildSHA) + "," + bridgeJSON(51, "to-c", 99, 201, graphChildSHA) + "]",
+			"99/200/1": "[" + bridgeJSON(60, "to-d", 99, 202, graphChildSHA) + "]",
+			"99/201/1": "[" + bridgeJSON(61, "to-d", 99, 202, graphChildSHA) + "," + bridgeJSON(62, "to-root", 42, 100, graphPipeSHA) + "]",
+		},
+		mr:      graphMR("feature"),
+		mrPipes: graphPipes("feature"),
+	}
+	out, hits, err := callWalk(t, h, pipelineGraphIn{ProjectID: "42", MergeRequestIID: 7, MaxRequests: 64}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kinds := edgeKinds(t, out)
+	if !hasKind(kinds, edgeKindShared) || !hasKind(kinds, edgeKindCycle) {
+		t.Fatalf("diamond/cycle edges %#v", kinds)
+	}
+	dJobs := 0
+	for _, hit := range hits {
+		if strings.Contains(hit.path, "/projects/99/pipelines/202/jobs") {
+			dJobs++
+		}
+	}
+	if dJobs != 1 {
+		t.Fatalf("shared child refetched %d times", dJobs)
+	}
+}
+
+func TestPipelineGraph_mixedSHAKeepsBridgeProvenance(t *testing.T) {
+	h := &walkServer{
+		pipes: map[string]string{
+			"42/100": walkPipe(100, 42, graphPipeSHA, "feature"),
+			"99/200": walkPipe(200, 99, graphChildSHA, "child"),
+		},
+		jobs: map[string]string{
+			"42/100/1": "[" + jobJSON(1, "test", "success", "false") + "]",
+			"99/200/1": "[" + jobJSON(10, "child", "success", "false") + "]",
+		},
+		bridges: map[string]string{"42/100/1": "[" + bridgeJSON(50, "trig", 99, 200, graphChildSHA) + "]"},
+		mr:      graphMR("feature"),
+		mrPipes: graphPipes("feature"),
+	}
+	out, _, err := callWalk(t, h, pipelineGraphIn{ProjectID: "42", MergeRequestIID: 7, ExpectedSourceSHA: graphSrcSHA, MaxRequests: 64}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rel := out["relation"].(map[string]any)
+	if rel["proven"] != true || rel["sha_comparison"] != shaDifferent {
+		t.Fatalf("parent relation %#v", rel)
+	}
+	found := false
+	for _, item := range out["edges"].([]any) {
+		e := item.(map[string]any)
+		if e["kind"] == edgeKindBridge && e["sha_comparison"] == shaDifferent && e["to_pipeline"] == float64(200) {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("missing mixed-SHA bridge %#v", out["edges"])
+	}
+	if out["assessment"] != assessReady {
+		t.Fatalf("distinct SHAs with bridge proof: %v", out["assessment"])
+	}
+}
+
+func TestPipelineGraph_bridges404UnknownCapability(t *testing.T) {
+	h := &walkServer{
+		pipes:   map[string]string{"42/100": walkPipe(100, 42, graphPipeSHA, "feature")},
+		jobs:    map[string]string{"42/100/1": "[" + jobJSON(1, "test", "success", "false") + "]"},
+		status:  map[string]int{"/api/v4/projects/42/pipelines/100/bridges": http.StatusNotFound},
+		mr:      graphMR("feature"),
+		mrPipes: graphPipes("feature"),
+	}
+	out, _, err := callWalk(t, h, pipelineGraphIn{ProjectID: "42", MergeRequestIID: 7}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireNotReady(t, out)
+	if out["downstream_coverage"] != downstreamCoverageUnknown || out["bridge_capability"] != bridgeCapabilityUnknown {
+		t.Fatalf("404 bridges %#v", out)
+	}
+}

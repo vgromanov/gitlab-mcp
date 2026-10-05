@@ -883,8 +883,8 @@ func TestDiscussionsEvidenceAndDC1(t *testing.T) {
 	pipe.ContextRef.Excluded = []string{}
 	pipe.ContextRef.Digests = map[string]string{"pipeline_graph": strings.Repeat("ab", 32)}
 	pipe.Filters.Selection = "pipeline_graph"
-	if _, err := Encode(key, pipe); err == nil {
-		t.Fatal("pipeline_graph complete")
+	if _, err := Encode(key, pipe); err != nil {
+		t.Fatalf("pipeline_graph complete: %v", err)
 	}
 	meta := reviewContextPayload(now)
 	if _, err := Encode(key, meta); err != nil {

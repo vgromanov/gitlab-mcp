@@ -32,7 +32,9 @@ func graphHandler(hits *[]graphHit, pipes map[int]string, jobs map[string]string
 			*hits = append(*hits, graphHit{method: r.Method, path: r.URL.Path, raw: r.URL.RawQuery})
 		}
 		if strings.Contains(r.URL.Path, "/bridges") {
-			http.Error(w, "bridges out of scope", http.StatusInternalServerError)
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("X-Next-Page", "0")
+			_, _ = io.WriteString(w, `[]`)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -147,7 +149,22 @@ func graphSection(t *testing.T, out map[string]any) map[string]any {
 
 func requireNotReady(t *testing.T, out map[string]any) {
 	t.Helper()
-	if out["assessment"] == "ready" || out["downstream_coverage"] != "unknown" || out["bridges_visited"] != false {
+	if out["assessment"] == "ready" {
+		t.Fatalf("assessment=%v downstream=%v bridges=%v", out["assessment"], out["downstream_coverage"], out["bridges_visited"])
+	}
+}
+
+func requireReadyComplete(t *testing.T, out map[string]any) {
+	t.Helper()
+	if out["assessment"] != assessReady || out["downstream_coverage"] != downstreamCoverageComplete || out["bridges_visited"] != true {
+		t.Fatalf("assessment=%v downstream=%v bridges=%v", out["assessment"], out["downstream_coverage"], out["bridges_visited"])
+	}
+}
+
+func requireJobsOnlyUnknownDownstream(t *testing.T, out map[string]any) {
+	t.Helper()
+	requireNotReady(t, out)
+	if out["downstream_coverage"] != "unknown" || out["bridges_visited"] != false {
 		t.Fatalf("assessment=%v downstream=%v bridges=%v", out["assessment"], out["downstream_coverage"], out["bridges_visited"])
 	}
 }
@@ -189,13 +206,17 @@ func TestPipelineGraph_manualAndMissingFields(t *testing.T) {
 	if !foundAbsent {
 		t.Fatalf("jobs %#v", out["jobs"])
 	}
+	sawBridges := false
 	for _, hit := range hits {
 		if strings.Contains(hit.path, "/bridges") {
-			t.Fatal("bridges requested")
+			sawBridges = true
 		}
 		if strings.HasSuffix(hit.path, "/jobs") && !strings.Contains(hit.raw, "include_retried=true") {
 			t.Fatalf("jobs query %s", hit.raw)
 		}
+	}
+	if !sawBridges {
+		t.Fatal("expected exhausted parent jobs to list bridges")
 	}
 }
 
@@ -223,7 +244,7 @@ func TestPipelineGraph_branchRef(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	requireNotReady(t, out)
+	requireReadyComplete(t, out)
 	rel := out["relation"].(map[string]any)
 	if rel["kind"] != relBranch || rel["proven"] != true || rel["sha_comparison"] != shaDifferent {
 		t.Fatalf("relation %#v", rel)
@@ -310,7 +331,7 @@ func TestPipelineGraph_missingFilterPartialAndRetry(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		requireNotReady(t, out)
+		requireReadyComplete(t, out)
 		if out["assessment"] == assessBlocked {
 			t.Fatal("retried failure must not block the latest success")
 		}
@@ -405,7 +426,7 @@ func TestPipelineGraph_forkHeadUsesSourceProject(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	requireNotReady(t, out.(map[string]any))
+	requireJobsOnlyUnknownDownstream(t, out.(map[string]any))
 	sec := graphSection(t, out.(map[string]any))
 	tok, _ := sec["next_cursor"].(string)
 	if tok == "" {
@@ -416,7 +437,7 @@ func TestPipelineGraph_forkHeadUsesSourceProject(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	requireNotReady(t, out2.(map[string]any))
+	requireReadyComplete(t, out2.(map[string]any))
 	sawForkPipe, sawForkJobs := false, false
 	forkAuth, forkPipe := -1, -1
 	for i, hit := range hits {
@@ -465,7 +486,7 @@ func TestPipelineGraph_retrySplitAcrossPages(t *testing.T) {
 		t.Fatal(err)
 	}
 	page2 := out2.(map[string]any)
-	requireNotReady(t, page2)
+	requireReadyComplete(t, page2)
 	if page2["assessment"] == assessBlocked {
 		t.Fatal("older failed attempt on the next page blocked")
 	}
@@ -524,7 +545,7 @@ func TestPipelineGraph_stopsAtHeadPipeline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	requireNotReady(t, out)
+	requireReadyComplete(t, out)
 	if out["pipeline"] == nil || out["pipeline"].(map[string]any)["id"] != float64(100) {
 		t.Fatalf("pipeline %#v", out["pipeline"])
 	}
@@ -570,7 +591,7 @@ func TestPipelineGraph_headFoundDoesNotExhaustBudget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	requireNotReady(t, out)
+	requireReadyComplete(t, out)
 	if out["pipeline"] == nil || out["pipeline"].(map[string]any)["id"] != float64(100) {
 		t.Fatalf("pipeline %#v", out["pipeline"])
 	}
@@ -611,7 +632,7 @@ func TestPipelineGraph_noHeadWalksPipelineList(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	requireNotReady(t, out)
+	requireReadyComplete(t, out)
 	if out["pipeline"] == nil || out["pipeline"].(map[string]any)["id"] != float64(200) {
 		t.Fatalf("pipeline %#v", out["pipeline"])
 	}
@@ -680,6 +701,9 @@ func TestPipelineGraph_compactLineageCursor(t *testing.T) {
 	}
 	next := out2.(map[string]any)
 	requireNotReady(t, next)
+	if next["assessment"] == assessReady {
+		t.Fatal("saturated unseen required failure must not be ready")
+	}
 	if next["assessment"] == assessBlocked {
 		t.Fatal("saturated or historical failure blocked")
 	}

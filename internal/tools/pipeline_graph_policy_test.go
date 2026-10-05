@@ -78,6 +78,43 @@ func TestAssessParentNeverReady(t *testing.T) {
 	}
 }
 
+func TestAssessGraphReadyRequiresCompleteDownstream(t *testing.T) {
+	pass := []policyOutcome{{Outcome: policyPass}}
+	got, reasons := assessGraph(assessInput{
+		RelationProven: true,
+		Outcomes:       pass,
+		Downstream:     downstreamCoverageComplete,
+	})
+	if got != assessReady {
+		t.Fatalf("complete graph %q reasons %v", got, reasons)
+	}
+	got, _ = assessGraph(assessInput{
+		RelationProven: true,
+		Outcomes:       pass,
+		Downstream:     downstreamCoverageComplete,
+		UnseenEdge:     true,
+	})
+	if got == assessReady {
+		t.Fatal("unseen edge must not be ready")
+	}
+	got, _ = assessGraph(assessInput{
+		RelationProven: true,
+		Outcomes:       pass,
+		Downstream:     downstreamCoveragePartial,
+	})
+	if got != assessPartial {
+		t.Fatalf("partial coverage %q", got)
+	}
+	got, _ = assessGraph(assessInput{
+		RelationProven: true,
+		Outcomes:       []policyOutcome{{Outcome: policyBlock, Reason: "failed_required"}},
+		Downstream:     downstreamCoverageComplete,
+	})
+	if got != assessBlocked {
+		t.Fatalf("child block %q", got)
+	}
+}
+
 func TestClassifyRelationEvidence(t *testing.T) {
 	const (
 		pipelineSHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -238,8 +275,11 @@ func TestLineageCarryCapsFingerprints(t *testing.T) {
 	}
 	unseen := []graphJob{{ID: 99, Name: "brand-new", NameKnown: true, Status: "failed", StatusKnown: true, Allow: readmeta.PresenceFalse, AllowValid: true}}
 	groups := buildLineage(unseen, carry)
-	if groups[0].LatestKnown || len(groups[0].Outcomes) != 0 || groups[0].Attempts[99] != attemptUnknown {
+	if groups[0].LatestKnown || groups[0].Attempts[99] != attemptUnknown {
 		t.Fatalf("saturated unseen %+v", groups[0])
+	}
+	if len(groups[0].Outcomes) != 1 || groups[0].Outcomes[0].Outcome != policyUnknown {
+		t.Fatalf("saturated unseen must stay unknown, not block: %+v", groups[0])
 	}
 }
 

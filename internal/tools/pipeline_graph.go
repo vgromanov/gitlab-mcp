@@ -40,6 +40,8 @@ type pipelineGraphIn struct {
 	PerPage           int      `json:"per_page,omitempty"`
 	MaxItems          int      `json:"max_items,omitempty"`
 	MaxRequests       int      `json:"max_requests,omitempty"`
+	MaxDepth          int      `json:"max_depth,omitempty"`
+	MaxNodes          int      `json:"max_nodes,omitempty"`
 }
 
 type pipelineView struct {
@@ -91,6 +93,10 @@ type pipelineGraphOut struct {
 	BridgesVisited     bool             `json:"bridges_visited"`
 	JobFilterApplied   bool             `json:"job_filter_applied"`
 	Reasons            []string         `json:"reasons"`
+	Nodes              []graphNodeView  `json:"nodes"`
+	Edges              []graphEdgeView  `json:"edges"`
+	BridgeCapability   string           `json:"bridge_capability,omitempty"`
+	Digest             *string          `json:"digest,omitempty"`
 }
 
 type graphSelection struct {
@@ -98,6 +104,8 @@ type graphSelection struct {
 	MRIID       int64
 	Filter      jobFilter
 	PerPage     int
+	MaxDepth    int
+	MaxNodes    int
 }
 
 type graphPage struct {
@@ -107,8 +115,8 @@ type graphPage struct {
 	Paging  readmeta.PagingObservation
 }
 
-// getMergeRequestPipelineGraph reads one parent pipeline and one page of its
-// jobs. It does not traverse bridges, play jobs, or embed review context.
+// getMergeRequestPipelineGraph reads a parent pipeline, paginated jobs, and
+// authorized downstream bridges with visited-set cycle detection.
 func getMergeRequestPipelineGraph(ctx context.Context, _ *mcp.CallToolRequest, in pipelineGraphIn, d Deps) (*mcp.CallToolResult, any, error) {
 	rawCursor := in.Cursor
 	if rawCursor != "" {
@@ -120,7 +128,7 @@ func getMergeRequestPipelineGraph(ctx context.Context, _ *mcp.CallToolRequest, i
 	if d.Config == nil || !d.Config.CursorSigningEnabled() {
 		return nil, nil, errors.New(errCursorKeyMissingGraph)
 	}
-	if in.MergeRequestIID < 0 || in.PipelineID < 0 || in.PerPage < 0 || in.MaxItems < 0 || in.MaxRequests < 0 {
+	if in.MergeRequestIID < 0 || in.PipelineID < 0 || in.PerPage < 0 || in.MaxItems < 0 || in.MaxRequests < 0 || in.MaxDepth < 0 || in.MaxNodes < 0 {
 		return nil, nil, fmt.Errorf("invalid pipeline graph input")
 	}
 	if in.PerPage > 50 {
@@ -167,7 +175,11 @@ func normalizeGraphSelection(in pipelineGraphIn) (graphSelection, error) {
 	if per == 0 {
 		per = graphDefaultPerPage
 	}
-	return graphSelection{ExpectedSHA: expected, MRIID: in.MergeRequestIID, Filter: filter, PerPage: per}, nil
+	depth, nodes, err := parseGraphBounds(in)
+	if err != nil {
+		return graphSelection{}, err
+	}
+	return graphSelection{ExpectedSHA: expected, MRIID: in.MergeRequestIID, Filter: filter, PerPage: per, MaxDepth: depth, MaxNodes: nodes}, nil
 }
 
 func initialPipelineGraph(ctx context.Context, in pipelineGraphIn, sel graphSelection, d Deps, budget *igl.Budget, now time.Time) (*mcp.CallToolResult, any, error) {
@@ -205,7 +217,12 @@ func initialPipelineGraph(ctx context.Context, in pipelineGraphIn, sel graphSele
 	}
 	upper := now.UTC().Format(time.RFC3339Nano)
 	expires := now.UTC().Add(d.Config.CursorTTL()).Format(time.RFC3339Nano)
-	return nil, Out(finishGraph(section, pid, pipePID, mrIID, chosen, rel, page, sel, d, actorID, upper, expires, 1, true, lineageCarry{})), nil
+	walk := newGraphWalk(chosen, pipePID, sel.MaxDepth, sel.MaxNodes)
+	out, err := finishGraph(ctx, section, pid, pipePID, mrIID, chosen, rel, page, sel, d, actorID, upper, expires, 1, true, lineageCarry{}, walk, budget)
+	if err != nil {
+		return nil, nil, err
+	}
+	return nil, Out(out), nil
 }
 
 func resumePipelineGraph(ctx context.Context, in pipelineGraphIn, sel graphSelection, d Deps, budget *igl.Budget, now time.Time, tok string) (*mcp.CallToolResult, any, error) {
@@ -263,7 +280,7 @@ func resumePipelineGraph(ctx context.Context, in pipelineGraphIn, sel graphSelec
 	}
 	pipe, err := loadPipeline(ctx, d, pipePID, *payload.Scope.PipelineID)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, wrapPipelineLoadErr(err)
 	}
 	if pipe == nil || pipe.SHA == nil || len(payload.ImmutableRefs) != 1 || *pipe.SHA != payload.ImmutableRefs[0] {
 		return nil, nil, fmt.Errorf("%s: pinned pipeline SHA mismatch", cursor.ResyncRequired)
@@ -272,32 +289,11 @@ func resumePipelineGraph(ctx context.Context, in pipelineGraphIn, sel graphSelec
 	if err := cursor.MatchBinding(payload, instance, actorID, d.Config.PolicyFingerprint(), toolPipelineGraph, sectionPipelineGraph, scope, payload.Filters, payload.ImmutableRefs, payload.UpperBound); err != nil {
 		return nil, nil, fmt.Errorf("%s: binding mismatch", cursor.ResyncRequired)
 	}
-	guard, err := collectJobPage(ctx, d, budget, pipePID, pipe.ID, payload.PageState.Page, sel.PerPage, nil)
-	if err != nil || guard.Partial {
-		return nil, nil, fmt.Errorf("%s: previous-page guard failed", cursor.ResyncRequired)
+	section := newPipelineGraphSection(now)
+	var mrIID *int64
+	if sel.MRIID > 0 {
+		mrIID = &sel.MRIID
 	}
-	ids := jobIDStrings(guard.Jobs)
-	last := ""
-	if len(ids) > 0 {
-		last = ids[len(ids)-1]
-	}
-	if cursor.SequenceDigest(ids) != payload.PageState.SequenceDigest || last != payload.PageState.LastSHA || len(ids) != payload.PageState.ItemsOnPage {
-		return nil, nil, fmt.Errorf("%s: previous-page boundary drift", cursor.ResyncRequired)
-	}
-	if !guard.Paging.PagingKnown || guard.Paging.SDKNextPage != payload.PageState.ProviderNextPage || payload.PageState.ProviderNextPage != int64(payload.PageState.Page)+1 {
-		return nil, nil, fmt.Errorf("%s: previous-page boundary drift", cursor.ResyncRequired)
-	}
-	prior, err := decodeLineageCarry(payload.PageState.LineageMax)
-	if err != nil {
-		return nil, nil, fmt.Errorf("%s: previous-page boundary drift", cursor.ResyncRequired)
-	}
-	if !lineageCarryCovers(prior, guard.Jobs) {
-		return nil, nil, fmt.Errorf("%s: previous-page boundary drift", cursor.ResyncRequired)
-	}
-	nextPage := int(payload.PageState.ProviderNextPage)
-	// Relation evidence runs before the next jobs page. A later item-cap
-	// stop cancels the shared budget, and an MR list after that would drop
-	// the jobs already retained.
 	rel := classifyRelation(relationInput{
 		MRIID:       sel.MRIID,
 		ListChecked: false,
@@ -327,16 +323,100 @@ func resumePipelineGraph(ctx context.Context, in pipelineGraphIn, sel graphSelec
 			ExpectedSHA:   sel.ExpectedSHA,
 		})
 	}
+	walk, werr := restoreGraphWalk(pipe, payload.GraphCont, sel.MaxDepth, sel.MaxNodes)
+	if werr != nil {
+		return nil, nil, werr
+	}
+	if payload.GraphCont != nil && payload.GraphCont.Phase == cursor.GraphPhaseBridges {
+		return resumeGraphBridges(ctx, &section, pid, pipePID, mrIID, pipe, rel, sel, d, actorID, &payload, walk, budget)
+	}
+	guard, err := collectJobPage(ctx, d, budget, pipePID, pipe.ID, payload.PageState.Page, sel.PerPage, nil)
+	if err != nil || guard.Partial {
+		return nil, nil, fmt.Errorf("%s: previous-page guard failed", cursor.ResyncRequired)
+	}
+	ids := jobIDStrings(guard.Jobs)
+	last := ""
+	if len(ids) > 0 {
+		last = ids[len(ids)-1]
+	}
+	if cursor.SequenceDigest(ids) != payload.PageState.SequenceDigest || last != payload.PageState.LastSHA || len(ids) != payload.PageState.ItemsOnPage {
+		return nil, nil, fmt.Errorf("%s: previous-page boundary drift", cursor.ResyncRequired)
+	}
+	if !guard.Paging.PagingKnown || observedNextPage(guard.Paging) != payload.PageState.ProviderNextPage || payload.PageState.ProviderNextPage != int64(payload.PageState.Page)+1 {
+		return nil, nil, fmt.Errorf("%s: previous-page boundary drift", cursor.ResyncRequired)
+	}
+	prior, err := decodeLineageCarry(payload.PageState.LineageMax)
+	if err != nil {
+		return nil, nil, fmt.Errorf("%s: previous-page boundary drift", cursor.ResyncRequired)
+	}
+	if !lineageCarryCovers(prior, guard.Jobs) {
+		return nil, nil, fmt.Errorf("%s: previous-page boundary drift", cursor.ResyncRequired)
+	}
+	nextPage := int(payload.PageState.ProviderNextPage)
 	page, err := collectJobPage(ctx, d, budget, pipePID, pipe.ID, nextPage, sel.PerPage, idSet(ids))
 	if err != nil {
 		return nil, nil, err
 	}
-	section := newPipelineGraphSection(now)
-	var mrIID *int64
-	if sel.MRIID > 0 {
-		mrIID = &sel.MRIID
+	out, err := finishGraph(ctx, section, pid, pipePID, mrIID, pipe, rel, page, sel, d, actorID, payload.UpperBound, payload.ExpiresAt, nextPage, false, prior, walk, budget)
+	if err != nil {
+		return nil, nil, err
 	}
-	return nil, Out(finishGraph(section, pid, pipePID, mrIID, pipe, rel, page, sel, d, actorID, payload.UpperBound, payload.ExpiresAt, nextPage, false, prior)), nil
+	return nil, Out(out), nil
+}
+
+func resumeGraphBridges(ctx context.Context, section *readmeta.Section, pid, pipePID string, mrIID *int64, pipe *pipelineView, rel relationResult, sel graphSelection, d Deps, actorID int64, payload *cursor.Payload, walk *graphWalk, budget *igl.Budget) (*mcp.CallToolResult, any, error) {
+	if section == nil {
+		return nil, nil, fmt.Errorf("%s: graph continuation missing", cursor.ResyncRequired)
+	}
+	guard, err := collectBridgePage(ctx, d, budget, pipePID, pipe.ID, payload.PageState.Page, sel.PerPage, nil)
+	if err != nil || guard.Partial || guard.Unsupported || guard.Inaccessible {
+		return nil, nil, fmt.Errorf("%s: previous-page guard failed", cursor.ResyncRequired)
+	}
+	ids := make([]string, 0, len(guard.Bridges))
+	for _, br := range guard.Bridges {
+		ids = append(ids, strconv.FormatInt(br.Job.ID, 10))
+	}
+	last := ""
+	if len(ids) > 0 {
+		last = ids[len(ids)-1]
+	}
+	if cursor.SequenceDigest(ids) != payload.PageState.SequenceDigest || last != payload.PageState.LastSHA || len(ids) != payload.PageState.ItemsOnPage {
+		return nil, nil, fmt.Errorf("%s: previous-page boundary drift", cursor.ResyncRequired)
+	}
+	if !guard.Paging.PagingKnown || observedNextPage(guard.Paging) != payload.PageState.ProviderNextPage || payload.PageState.ProviderNextPage != int64(payload.PageState.Page)+1 {
+		return nil, nil, fmt.Errorf("%s: previous-page boundary drift", cursor.ResyncRequired)
+	}
+	nextPage := int(payload.PageState.ProviderNextPage)
+	page, err := collectBridgePage(ctx, d, budget, pipePID, pipe.ID, nextPage, sel.PerPage, idSet(ids))
+	if err != nil {
+		return nil, nil, err
+	}
+	walk.ingestBridges(graphNodeKey{Project: pipePID, Pipeline: pipe.ID}, deref(pipe.SHA), page)
+	if page.Partial {
+		section.AddLimitation(readmeta.CodePartial, page.Reason)
+		walk.unseen = true
+		walk.coverage = downstreamCoveragePartial
+	} else if next, more := pagingContinues(page.Paging, nextPage); more && len(page.Bridges) > 0 {
+		sha, _ := readmeta.ObservedHeadSHA(deref(pipe.SHA))
+		if err := mintBridgeCursor(section, d, actorID, pipePID, pipe.ID, sha, sel, payload.UpperBound, payload.ExpiresAt, nextPage, page, pid, walk, next); err != nil {
+			return nil, nil, err
+		}
+	} else {
+		walk.visited[graphNodeKey{Project: pipePID, Pipeline: pipe.ID}.String()] = struct{}{}
+		if err := walkQueuedChildren(ctx, section, pid, sel, d, actorID, payload.UpperBound, payload.ExpiresAt, walk, budget); err != nil {
+			return nil, nil, err
+		}
+		if len(walk.queue) == 0 && !walk.unseen && walk.cap == bridgeCapabilityBridges {
+			walk.coverage = downstreamCoverageComplete
+			walk.unseen = false
+		}
+	}
+	empty := graphPage{Paging: readmeta.PagingObservation{PagingKnown: true, ExhaustedObserved: true}}
+	out, err := finishGraph(ctx, *section, pid, pipePID, mrIID, pipe, rel, empty, sel, d, actorID, payload.UpperBound, payload.ExpiresAt, nextPage, false, lineageCarry{}, walk, budget)
+	if err != nil {
+		return nil, nil, err
+	}
+	return nil, Out(out), nil
 }
 
 type mrFacts struct {
@@ -355,7 +435,7 @@ func resolveParentPipeline(ctx context.Context, d Deps, pid string, pipelineID i
 	if pipelineID > 0 {
 		pipe, err := loadPipeline(ctx, d, pid, pipelineID)
 		if err != nil {
-			return nil, rel, nil, err
+			return nil, rel, nil, wrapPipelineLoadErr(err)
 		}
 		if pipe == nil {
 			rel.SHAComparison = compareSHA("", sel.ExpectedSHA)
@@ -419,7 +499,7 @@ func resolveParentPipeline(ctx context.Context, d Deps, pid string, pipelineID i
 	}
 	pipe, err := loadPipeline(ctx, d, scope, chosenID)
 	if err != nil {
-		return nil, rel, nil, err
+		return nil, rel, nil, wrapPipelineLoadErr(err)
 	}
 	if pipe == nil {
 		return nil, rel, []readmeta.Limitation{{Code: readmeta.CodeInaccessible, Message: "pipeline not found"}}, nil
@@ -508,8 +588,7 @@ func unresolvedGraph(section readmeta.Section, pid string, mrIID *int64, rel rel
 	}
 }
 
-func finishGraph(section readmeta.Section, pid, pipePID string, mrIID *int64, pipe *pipelineView, rel relationResult, page graphPage, sel graphSelection, d Deps, actorID int64, upper, expires string, pageNum int, fromStart bool, prior lineageCarry) pipelineGraphOut {
-	section.AddLimitation(readmeta.CodeUnsupported, "downstream coverage is unknown")
+func finishGraph(ctx context.Context, section readmeta.Section, pid, pipePID string, mrIID *int64, pipe *pipelineView, rel relationResult, page graphPage, sel graphSelection, d Deps, actorID int64, upper, expires string, pageNum int, fromStart bool, prior lineageCarry, walk *graphWalk, budget *igl.Budget) (pipelineGraphOut, error) {
 	if !rel.Proven {
 		section.AddLimitation(readmeta.CodeUnknownCount, "pipeline relation is unproven")
 	}
@@ -524,16 +603,9 @@ func finishGraph(section readmeta.Section, pid, pipePID string, mrIID *int64, pi
 		section.HeadSHA = &sha
 	}
 	groups := buildLineage(page.Jobs, prior)
-	var outcomes []policyOutcome
-	for _, g := range groups {
-		outcomes = append(outcomes, g.Outcomes...)
+	if walk != nil {
+		walk.recordOutcomes(groups)
 	}
-	assessment, reasons := assessParent(assessInput{
-		Filter:         sel.Filter.active(),
-		JobsPartial:    page.Partial || !page.Paging.ExhaustedObserved,
-		RelationProven: rel.Proven,
-		Outcomes:       outcomes,
-	})
 	attemptOf := map[int64]string{}
 	for _, g := range groups {
 		for id, attempt := range g.Attempts {
@@ -563,17 +635,21 @@ func finishGraph(section readmeta.Section, pid, pipePID string, mrIID *int64, pi
 	n := len(views)
 	section.Counts.Items = &n
 	exhausted := page.Paging.ExhaustedObserved && !page.Partial
-	section.PaginationExhausted = exhausted
-	complete := fromStart && exhausted && !sel.Filter.active() && !page.Partial && page.Paging.PagingKnown
-	if complete {
-		section.ContentComplete = readmeta.ContentCompleteTrue
-		section.ManifestCoverage = readmeta.CoverageFull
-	} else if page.Partial || sel.Filter.active() || !exhausted {
-		section.ContentComplete = readmeta.ContentCompleteFalse
-		section.ManifestCoverage = readmeta.CoveragePartial
-	} else {
-		section.ContentComplete = readmeta.ContentCompleteFalse
-		section.ManifestCoverage = readmeta.CoveragePartial
+	jobsPartial := page.Partial || !page.Paging.ExhaustedObserved
+	role := nodeRoleParent
+	if walk != nil && walk.depth > 0 {
+		role = nodeRoleDownstream
+	}
+	if walk != nil && (len(page.Jobs) > 0 || (walk.phase == cursor.GraphPhaseJobs && !graphHasNode(walk, pipePID, pipe.ID))) {
+		walk.nodes = append(walk.nodes, graphNodeView{
+			ProjectID:  pipePID,
+			PipelineID: pipe.ID,
+			Depth:      walk.depth,
+			Role:       role,
+			Pipeline:   pipe,
+			Jobs:       views,
+			Lineage:    lineage,
+		})
 	}
 	section.PatchCoverage = readmeta.CoverageUnknown
 	if rel.Proven {
@@ -581,29 +657,83 @@ func finishGraph(section readmeta.Section, pid, pipePID string, mrIID *int64, pi
 	} else {
 		section.Consistency = readmeta.ConsistencyUnknown
 	}
-	if !page.Partial && page.Paging.PagingKnown && !page.Paging.ExhaustedObserved && page.Paging.SDKNextPage == int64(pageNum)+1 && ok && len(page.Jobs) > 0 {
+
+	next, more := pagingContinues(page.Paging, pageNum)
+	needJobsCursor := !page.Partial && more && ok && len(page.Jobs) > 0
+	if needJobsCursor && walk != nil {
+		walk.phase = cursor.GraphPhaseJobs
+		walk.coverage = downstreamCoverageUnknown
+		walk.unseen = true
 		nextLineage := encodeLineageCarry(mergeLineageCarry(prior, page.Jobs))
-		if tok, err := mintGraphCursor(d, actorID, pipePID, pipe.ID, sha, sel, upper, expires, pageNum, page, pid, nextLineage); err == nil {
+		if tok, err := mintGraphCursor(d, actorID, pipePID, pipe.ID, sha, sel, upper, expires, pageNum, jobIDStrings(page.Jobs), next, len(page.Jobs), pid, nextLineage, walk.snapshotCont()); err == nil {
 			section.NextCursor = &tok
 		} else {
 			section.AddLimitation(readmeta.CodePartial, "continuation cursor was not issued")
-			section.ContentComplete = readmeta.ContentCompleteFalse
 		}
-	} else if !exhausted && section.NextCursor == nil && !page.Paging.PagingKnown {
+	} else if !exhausted && !page.Paging.PagingKnown {
 		section.AddLimitation(readmeta.CodeUnknownCount, "paging metadata unavailable")
-		if section.ContentComplete == readmeta.ContentCompleteTrue {
-			section.ContentComplete = readmeta.ContentCompleteUnknown
+		if walk != nil {
+			walk.unseen = true
 		}
 	}
-	if assessment == "ready" {
-		assessment = assessUnknown
-		reasons = sortReasons(append(reasons, "downstream_unknown"))
+
+	if exhausted && walk != nil && section.NextCursor == nil && walk.phase == cursor.GraphPhaseJobs {
+		if err := walkBridgesAndChildren(ctx, &section, pid, pipePID, pipe, sha, sel, d, actorID, upper, expires, walk, budget); err != nil {
+			return pipelineGraphOut{}, err
+		}
+	}
+
+	coverage := downstreamCoverageUnknown
+	unseen := true
+	outcomes := groupsOutcomes(groups)
+	if walk != nil {
+		coverage = walk.coverage
+		unseen = walk.unseen
+		outcomes = walk.outcomes
+		if walk.block {
+			outcomes = append(outcomes, policyOutcome{Outcome: policyBlock})
+		}
+		if walk.partial {
+			outcomes = append(outcomes, policyOutcome{Outcome: policyPartial})
+		}
+		if walk.unknown {
+			outcomes = append(outcomes, policyOutcome{Outcome: policyUnknown})
+		}
+		if walk.bridgesOn {
+			section.AddLimitation(readmeta.CodeUnsupported, "")
+			section.Limitations = dropEmptyUnsupported(section.Limitations)
+		}
+	} else {
+		section.AddLimitation(readmeta.CodeUnsupported, "downstream coverage is unknown")
+	}
+	if coverage == downstreamCoverageUnknown {
+		section.AddLimitation(readmeta.CodeUnsupported, "downstream coverage is unknown")
+	} else if coverage == downstreamCoveragePartial {
+		section.AddLimitation(readmeta.CodePartial, "downstream coverage is partial")
+	}
+	assessment, reasons := assessGraph(assessInput{
+		Filter:         sel.Filter.active(),
+		JobsPartial:    jobsPartial || (walk != nil && walk.partial),
+		RelationProven: rel.Proven,
+		Outcomes:       outcomes,
+		Downstream:     coverage,
+		UnseenEdge:     unseen,
+	})
+	graphComplete := fromStart && exhausted && !sel.Filter.active() && !page.Partial && page.Paging.PagingKnown && coverage == downstreamCoverageComplete && !unseen && section.NextCursor == nil
+	if graphComplete {
+		section.ContentComplete = readmeta.ContentCompleteTrue
+		section.ManifestCoverage = readmeta.CoverageFull
+		section.PaginationExhausted = true
+	} else {
+		section.ContentComplete = readmeta.ContentCompleteFalse
+		section.ManifestCoverage = readmeta.CoveragePartial
+		section.PaginationExhausted = exhausted && coverage == downstreamCoverageComplete && section.NextCursor == nil
 	}
 	if rel.Evidence == nil {
 		rel.Evidence = []string{}
 	}
 	id := pipe.ID
-	return pipelineGraphOut{
+	out := pipelineGraphOut{
 		Section:            section,
 		ProjectID:          pid,
 		MergeRequestIID:    mrIID,
@@ -613,20 +743,302 @@ func finishGraph(section readmeta.Section, pid, pipePID string, mrIID *int64, pi
 		Jobs:               views,
 		Lineage:            lineage,
 		Assessment:         assessment,
-		DownstreamCoverage: downstreamCoverageUnknown,
-		BridgesVisited:     false,
+		DownstreamCoverage: coverage,
+		BridgesVisited:     walk != nil && walk.bridgesOn,
 		JobFilterApplied:   sel.Filter.active(),
 		Reasons:            reasons,
 	}
+	if walk != nil {
+		out.Nodes = walk.nodes
+		out.Edges = walk.edges
+		out.BridgeCapability = walk.cap
+		if out.Nodes == nil {
+			out.Nodes = []graphNodeView{}
+		}
+		if out.Edges == nil {
+			out.Edges = []graphEdgeView{}
+		}
+	}
+	if graphComplete {
+		dig := encodeGraphDigest(out.Nodes, out.Edges, assessment, coverage)
+		if dig != "" {
+			out.Digest = &dig
+		}
+	}
+	return out, nil
 }
 
-func mintGraphCursor(d Deps, actorID int64, pid string, pipelineID int64, sha string, sel graphSelection, upper, expires string, pageNum int, page graphPage, mrProject string, lineage []string) (string, error) {
+func pagingContinues(obs readmeta.PagingObservation, pageNum int) (int64, bool) {
+	if !obs.PagingKnown || obs.ExhaustedObserved {
+		return 0, false
+	}
+	want := int64(pageNum) + 1
+	if obs.SDKNextPage == want {
+		return obs.SDKNextPage, true
+	}
+	if n, err := strconv.ParseInt(strings.TrimSpace(obs.HeaderValue), 10, 64); err == nil && n == want {
+		return n, true
+	}
+	return 0, false
+}
+
+func observedNextPage(obs readmeta.PagingObservation) int64 {
+	if obs.SDKNextPage > 0 {
+		return obs.SDKNextPage
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(obs.HeaderValue), 10, 64)
+	if err != nil || n < 1 {
+		return 0
+	}
+	return n
+}
+
+func wrapPipelineLoadErr(err error) error {
+	if errors.Is(err, errPipelineForbidden) {
+		return fmt.Errorf("%s: gitlab request failed", readmeta.CodeHTTPError)
+	}
+	return err
+}
+
+func graphHasNode(w *graphWalk, project string, pipelineID int64) bool {
+	if w == nil {
+		return false
+	}
+	for _, n := range w.nodes {
+		if n.ProjectID == project && n.PipelineID == pipelineID {
+			return true
+		}
+	}
+	return false
+}
+
+func groupsOutcomes(groups []lineageGroup) []policyOutcome {
+	var out []policyOutcome
+	for _, g := range groups {
+		out = append(out, g.Outcomes...)
+	}
+	return out
+}
+
+func dropEmptyUnsupported(in []readmeta.Limitation) []readmeta.Limitation {
+	out := in[:0]
+	for _, lim := range in {
+		if lim.Code == readmeta.CodeUnsupported && lim.Message == "" {
+			continue
+		}
+		out = append(out, lim)
+	}
+	return out
+}
+
+func walkBridgesAndChildren(ctx context.Context, section *readmeta.Section, rootPID, pipePID string, pipe *pipelineView, sha string, sel graphSelection, d Deps, actorID int64, upper, expires string, walk *graphWalk, budget *igl.Budget) error {
+	if section == nil {
+		return fmt.Errorf("%s: graph continuation missing", cursor.ResyncRequired)
+	}
+	walk.phase = cursor.GraphPhaseBridges
+	bpage, err := collectBridgePage(ctx, d, budget, pipePID, pipe.ID, 1, sel.PerPage, nil)
+	if err != nil {
+		return err
+	}
+	if bpage.Partial {
+		section.AddLimitation(readmeta.CodePartial, bpage.Reason)
+		walk.unseen = true
+		walk.coverage = downstreamCoveragePartial
+		walk.bridgesOn = true
+		next, _ := pagingContinues(bpage.Paging, 1)
+		return mintBridgeCursor(section, d, actorID, pipePID, pipe.ID, sha, sel, upper, expires, 1, bpage, rootPID, walk, next)
+	}
+	walk.ingestBridges(graphNodeKey{Project: pipePID, Pipeline: pipe.ID}, deref(pipe.SHA), bpage)
+	if bpage.Unsupported || bpage.Inaccessible {
+		return nil
+	}
+	next, moreBridges := pagingContinues(bpage.Paging, 1)
+	if moreBridges && len(bpage.Bridges) > 0 {
+		walk.unseen = true
+		walk.coverage = downstreamCoveragePartial
+		return mintBridgeCursor(section, d, actorID, pipePID, pipe.ID, sha, sel, upper, expires, 1, bpage, rootPID, walk, next)
+	}
+	walk.visited[graphNodeKey{Project: pipePID, Pipeline: pipe.ID}.String()] = struct{}{}
+	if err := walkQueuedChildren(ctx, section, rootPID, sel, d, actorID, upper, expires, walk, budget); err != nil {
+		return err
+	}
+	if len(walk.queue) == 0 && !walk.unseen && walk.cap == bridgeCapabilityBridges {
+		walk.coverage = downstreamCoverageComplete
+		walk.unseen = false
+	} else if len(walk.queue) > 0 {
+		walk.coverage = downstreamCoveragePartial
+		walk.unseen = true
+	}
+	return nil
+}
+
+func mintBridgeCursor(section *readmeta.Section, d Deps, actorID int64, pipePID string, pipelineID int64, sha string, sel graphSelection, upper, expires string, pageNum int, page bridgePage, mrProject string, walk *graphWalk, nextPage int64) error {
+	if section == nil || page.Partial || !page.Paging.PagingKnown || len(page.Bridges) == 0 || nextPage < 1 {
+		return nil
+	}
+	ids := make([]string, 0, len(page.Bridges))
+	for _, br := range page.Bridges {
+		ids = append(ids, strconv.FormatInt(br.Job.ID, 10))
+	}
+	walk.phase = cursor.GraphPhaseBridges
+	tok, err := mintGraphCursor(d, actorID, pipePID, pipelineID, sha, sel, upper, expires, pageNum, ids, nextPage, len(page.Bridges), mrProject, nil, walk.snapshotCont())
+	if err != nil {
+		section.AddLimitation(readmeta.CodePartial, "continuation cursor was not issued")
+		return nil
+	}
+	section.NextCursor = &tok
+	return nil
+}
+
+func walkQueuedChildren(ctx context.Context, section *readmeta.Section, rootPID string, sel graphSelection, d Deps, actorID int64, upper, expires string, walk *graphWalk, budget *igl.Budget) error {
+	if section == nil {
+		return fmt.Errorf("%s: graph continuation missing", cursor.ResyncRequired)
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			walk.unseen = true
+			walk.coverage = downstreamCoveragePartial
+			return nil
+		}
+		next, ok := walk.popNext()
+		if !ok {
+			return nil
+		}
+		walk.current = next.Key
+		walk.depth = next.Depth
+		walk.ancestors = next.Ancestors
+		kind, err := walk.authorize(ctx, d, next.Key.Project)
+		if err != nil {
+			return err
+		}
+		if kind != "" {
+			walk.unseen = true
+			walk.coverage = downstreamCoveragePartial
+			walk.edges = append(walk.edges, graphEdgeView{
+				ToProject:  next.Key.Project,
+				ToPipeline: next.Key.Pipeline,
+				Kind:       kind,
+				Capability: walk.cap,
+				Provenance: []string{"authorize_before_content"},
+			})
+			continue
+		}
+		child, err := loadPipeline(ctx, d, next.Key.Project, next.Key.Pipeline)
+		if err != nil {
+			if errors.Is(err, errPipelineForbidden) {
+				walk.unseen = true
+				walk.coverage = downstreamCoveragePartial
+				walk.edges = append(walk.edges, graphEdgeView{
+					ToProject:  next.Key.Project,
+					ToPipeline: next.Key.Pipeline,
+					Kind:       edgeKindInaccessible,
+					Capability: walk.cap,
+					Provenance: []string{"child_403"},
+				})
+				continue
+			}
+			return err
+		}
+		if child == nil {
+			walk.unseen = true
+			walk.coverage = downstreamCoveragePartial
+			walk.edges = append(walk.edges, graphEdgeView{
+				ToProject:  next.Key.Project,
+				ToPipeline: next.Key.Pipeline,
+				Kind:       edgeKindInaccessible,
+				Capability: walk.cap,
+				Provenance: []string{"child_missing"},
+			})
+			continue
+		}
+		scope, err := bindPipelineProject(ctx, d, next.Key.Project, child.ProjectID)
+		if err != nil {
+			kind, aerr := walk.authorize(ctx, d, next.Key.Project)
+			if aerr != nil {
+				return aerr
+			}
+			if kind == "" {
+				return err
+			}
+			walk.unseen = true
+			walk.edges = append(walk.edges, graphEdgeView{ToProject: next.Key.Project, ToPipeline: next.Key.Pipeline, Kind: kind, Provenance: []string{"bind_child"}})
+			continue
+		}
+		child.ScopeProject = scope
+		page, err := collectJobPage(ctx, d, budget, scope, child.ID, 1, sel.PerPage, nil)
+		if err != nil {
+			return err
+		}
+		walk.current = next.Key
+		walk.pipe = child
+		walk.depth = next.Depth
+		walk.phase = cursor.GraphPhaseJobs
+		groups := buildLineage(page.Jobs, lineageCarry{})
+		walk.recordOutcomes(groups)
+		attemptOf := map[int64]string{}
+		for _, g := range groups {
+			for id, attempt := range g.Attempts {
+				attemptOf[id] = attempt
+			}
+		}
+		views := make([]jobView, 0, len(page.Jobs))
+		returned := map[int64]struct{}{}
+		for _, job := range page.Jobs {
+			if sel.Filter.active() && !sel.Filter.match(job) {
+				continue
+			}
+			returned[job.ID] = struct{}{}
+			views = append(views, jobToView(job, attemptOf[job.ID]))
+		}
+		lineage := make([]lineageView, 0, len(groups))
+		for _, g := range groups {
+			view, lok := lineageViewFor(g, returned, sel.Filter.active())
+			if !lok {
+				continue
+			}
+			lineage = append(lineage, view)
+		}
+		walk.nodes = append(walk.nodes, graphNodeView{
+			ProjectID:  scope,
+			PipelineID: child.ID,
+			Depth:      next.Depth,
+			Role:       nodeRoleDownstream,
+			Pipeline:   child,
+			Jobs:       views,
+			Lineage:    lineage,
+		})
+		childSHA, _ := readmeta.ObservedHeadSHA(deref(child.SHA))
+		nextJobs, moreJobs := pagingContinues(page.Paging, 1)
+		childJobsExhausted := !moreJobs && !page.Partial && page.Paging.PagingKnown
+		if !childJobsExhausted {
+			walk.unseen = true
+			walk.coverage = downstreamCoveragePartial
+			if moreJobs && childSHA != "" && len(page.Jobs) > 0 {
+				nextLineage := encodeLineageCarry(mergeLineageCarry(lineageCarry{}, page.Jobs))
+				if tok, err := mintGraphCursor(d, actorID, scope, child.ID, childSHA, sel, upper, expires, 1, jobIDStrings(page.Jobs), nextJobs, len(page.Jobs), rootPID, nextLineage, walk.snapshotCont()); err == nil {
+					section.NextCursor = &tok
+				}
+			}
+			return nil
+		}
+		if err := walkBridgesAndChildren(ctx, section, rootPID, scope, child, childSHA, sel, d, actorID, upper, expires, walk, budget); err != nil {
+			return err
+		}
+		if section.NextCursor != nil {
+			return nil
+		}
+	}
+}
+
+func mintGraphCursor(d Deps, actorID int64, pid string, pipelineID int64, sha string, sel graphSelection, upper, expires string, pageNum int, ids []string, nextPage int64, itemsOnPage int, mrProject string, lineage []string, gc *cursor.GraphCont) (string, error) {
 	instance, err := cursorInstance(d.Config)
 	if err != nil {
 		return "", err
 	}
-	ids := jobIDStrings(page.Jobs)
-	last := ids[len(ids)-1]
+	last := ""
+	if len(ids) > 0 {
+		last = ids[len(ids)-1]
+	}
 	id := pipelineID
 	payload := cursor.Payload{
 		SchemaVersion: cursor.SchemaV1,
@@ -640,13 +1052,14 @@ func mintGraphCursor(d Deps, actorID int64, pid string, pipelineID int64, sha st
 		ImmutableRefs: []string{sha},
 		UpperBound:    upper,
 		ExpiresAt:     expires,
+		GraphCont:     gc,
 		PageState: cursor.PageState{
 			Page:             pageNum,
 			PerPage:          sel.PerPage,
 			SequenceDigest:   cursor.SequenceDigest(ids),
 			LastSHA:          last,
-			ItemsOnPage:      len(page.Jobs),
-			ProviderNextPage: page.Paging.SDKNextPage,
+			ItemsOnPage:      itemsOnPage,
+			ProviderNextPage: nextPage,
 			LineageMax:       lineage,
 		},
 	}
@@ -660,19 +1073,19 @@ func graphFilters(sel graphSelection, upper, mrProject string) cursor.Filters {
 	}
 	return cursor.Filters{
 		RefName:     sel.ExpectedSHA,
-		Path:        filterCanonical(sel.Filter),
+		Path:        filterCanonical(sel.Filter) + fmt.Sprintf(";depth=%d;nodes=%d", sel.MaxDepth, sel.MaxNodes),
 		Since:       mr,
 		CallerUntil: mrProject,
 		Until:       upper,
 		Order:       "provider",
-		Selection:   "parent_jobs",
+		Selection:   "graph",
 		PerPage:     sel.PerPage,
 	}
 }
 
 // lineageViewFor copies a group into the response. Assessment still uses
 // every group on the page. A filter omits a group with no returned job and
-// drops ids that were not returned. LatestKnown stays true only when that
+// drops ids that were not returned. LatestKnown stays true when that
 // latest id is in the returned set.
 func lineageViewFor(g lineageGroup, returned map[int64]struct{}, filter bool) (lineageView, bool) {
 	if filter && !lineageHasReturned(g, returned) {
@@ -801,6 +1214,9 @@ func loadPipeline(ctx context.Context, d Deps, pid string, id int64) (*pipelineV
 	if err != nil {
 		if providerStatus(err) == http.StatusNotFound {
 			return nil, nil
+		}
+		if providerStatus(err) == http.StatusForbidden {
+			return nil, errPipelineForbidden
 		}
 		return nil, safeProviderErr(err)
 	}

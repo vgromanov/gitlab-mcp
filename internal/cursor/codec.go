@@ -54,6 +54,18 @@ const (
 	DiffWindowSchemaDM1 = "dm1"
 	// DiffManifestEvidenceV1 is the only complete-manifest evidence version.
 	DiffManifestEvidenceV1 = "diff_manifest.v1"
+	// ToolPipelineGraph is the parent/downstream CI graph aggregate.
+	ToolPipelineGraph = "get_merge_request_pipeline_graph"
+	// SectionPipelineGraph is the pipeline graph section binding.
+	SectionPipelineGraph = "pipeline_graph"
+	// GraphContSchemaG1 is the locked graph-walk continuation schema.
+	GraphContSchemaG1 = "g1"
+	// GraphPhaseJobs is the jobs-list phase of a graph node.
+	GraphPhaseJobs = "jobs"
+	// GraphPhaseBridges is the bridges-list phase of a graph node.
+	GraphPhaseBridges = "bridges"
+	// MaxGraphVisited caps signed visited+queue entries.
+	MaxGraphVisited = 16
 	// ReviewWriteFresh is the absolute write-freshness window from retrieved_at.
 	ReviewWriteFresh = 5 * time.Minute
 	// ResyncRequired is the uniform fail-closed continuation error token.
@@ -171,6 +183,25 @@ type Payload struct {
 	ContextRef      *ContextRef      `json:"context_ref,omitempty"`
 	DiscussionsCont *DiscussionsCont `json:"discussions_cont,omitempty"`
 	DiffWindow      *DiffWindowCont  `json:"diff_window,omitempty"`
+	GraphCont       *GraphCont       `json:"graph_cont,omitempty"`
+}
+
+// GraphCont is the g1 walk continuation for pipeline_graph.
+// It stores node identities and policy flags only: no job names, SHAs, or traces.
+type GraphCont struct {
+	V     string   `json:"v"`
+	Phase string   `json:"phase"`
+	NP    string   `json:"np"`
+	NI    int64    `json:"ni"`
+	D     int      `json:"d"`
+	Vis   []string `json:"vis,omitempty"`
+	Q     []string `json:"q,omitempty"`
+	N     int      `json:"n"`
+	Block bool     `json:"block,omitempty"`
+	Part  bool     `json:"part,omitempty"`
+	Unk   bool     `json:"unk,omitempty"`
+	Cov   string   `json:"cov"`
+	Cap   string   `json:"cap,omitempty"`
 }
 
 // DiffWindowCont binds one diff-manifest window. It stores no patch text.
@@ -407,6 +438,7 @@ func validatePayload(p *Payload) error {
 	isReview := p.Scope.Kind == ScopeReviewContext && p.Tool == ToolReviewContext && p.Section == SectionReviewContext
 	isDisc := p.Tool == ToolReviewContext && p.Section == SectionReviewDiscussions
 	isDiff := p.Tool == ToolDiffWindow && p.Section == SectionDiffManifest
+	isGraph := p.Tool == ToolPipelineGraph && p.Section == SectionPipelineGraph
 	if p.QueueCont != nil && !isQueue {
 		return ErrResyncRequired
 	}
@@ -417,6 +449,9 @@ func validatePayload(p *Payload) error {
 		return ErrResyncRequired
 	}
 	if p.DiscussionsCont != nil && !isDisc {
+		return ErrResyncRequired
+	}
+	if p.GraphCont != nil && !isGraph {
 		return ErrResyncRequired
 	}
 	if isReview {
@@ -446,8 +481,21 @@ func validatePayload(p *Payload) error {
 		if err := validateDiscussionsCursor(p); err != nil {
 			return err
 		}
+	} else if isGraph {
+		if p.GraphCont == nil || p.ContextRef != nil || p.QueueCont != nil || p.DiscussionsCont != nil || p.DiffWindow != nil {
+			return ErrResyncRequired
+		}
+		if err := validateImmutableRefs(p.ImmutableRefs); err != nil {
+			return err
+		}
+		if err := validatePageState(p.PageState, p.Filters.PerPage); err != nil {
+			return err
+		}
+		if err := validateGraphCont(p.GraphCont); err != nil {
+			return err
+		}
 	} else if isDiff {
-		if p.DiffWindow == nil || p.ContextRef != nil || p.QueueCont != nil || p.DiscussionsCont != nil {
+		if p.DiffWindow == nil || p.ContextRef != nil || p.QueueCont != nil || p.DiscussionsCont != nil || p.GraphCont != nil {
 			return ErrResyncRequired
 		}
 		if p.Scope.Kind != ScopeProject || strings.TrimSpace(p.Scope.ProjectID) == "" || p.Scope.MergeRequestIID == nil || *p.Scope.MergeRequestIID < 1 {
@@ -1127,7 +1175,7 @@ func reviewSectionName(name string) bool {
 }
 
 func reviewCompleteEvidence(name string) bool {
-	return name == "metadata" || name == "approvals" || name == "discussions" || name == "diff_manifest"
+	return name == "metadata" || name == "approvals" || name == "discussions" || name == "diff_manifest" || name == "pipeline_graph"
 }
 
 func validateDiscussionsCursor(p *Payload) error {
@@ -1185,6 +1233,104 @@ func validateDiscussionsCursor(p *Payload) error {
 		return ErrResyncRequired
 	}
 	return nil
+}
+
+func validateGraphCont(c *GraphCont) error {
+	if c == nil || c.V != GraphContSchemaG1 {
+		return ErrResyncRequired
+	}
+	if c.Phase != GraphPhaseJobs && c.Phase != GraphPhaseBridges {
+		return ErrResyncRequired
+	}
+	if strings.TrimSpace(c.NP) == "" || c.NP != strings.TrimSpace(c.NP) || c.NI < 1 || c.D < 0 {
+		return ErrResyncRequired
+	}
+	if c.N < 1 || c.N > MaxGraphVisited {
+		return ErrResyncRequired
+	}
+	if c.Cov != "unknown" && c.Cov != "partial" && c.Cov != "complete" {
+		return ErrResyncRequired
+	}
+	if c.Cap != "" && c.Cap != "bridges" && c.Cap != "unknown" {
+		return ErrResyncRequired
+	}
+	if err := validateGraphKeyList(c.Vis, false); err != nil {
+		return err
+	}
+	if err := validateGraphKeyList(c.Q, true); err != nil {
+		return err
+	}
+	if len(c.Vis)+len(c.Q) > MaxGraphVisited {
+		return ErrResyncRequired
+	}
+	return nil
+}
+
+func validateGraphKeyList(items []string, queued bool) error {
+	if len(items) > MaxGraphVisited {
+		return ErrResyncRequired
+	}
+	seen := map[string]struct{}{}
+	var prev string
+	havePrev := false
+	for _, item := range items {
+		if item == "" || item != strings.TrimSpace(item) {
+			return ErrResyncRequired
+		}
+		if _, dup := seen[item]; dup {
+			return ErrResyncRequired
+		}
+		if queued {
+			if !validGraphQueueKey(item) {
+				return ErrResyncRequired
+			}
+		} else {
+			if !validGraphVisitKey(item) {
+				return ErrResyncRequired
+			}
+			if havePrev && item <= prev {
+				return ErrResyncRequired
+			}
+			prev = item
+			havePrev = true
+		}
+		seen[item] = struct{}{}
+	}
+	return nil
+}
+
+func validGraphVisitKey(item string) bool {
+	proj, id, ok := splitGraphKey(item)
+	return ok && proj != "" && id > 0
+}
+
+func validGraphQueueKey(item string) bool {
+	// project:pipeline:depth
+	i := strings.LastIndexByte(item, ':')
+	if i <= 0 || i == len(item)-1 {
+		return false
+	}
+	depth, err := strconv.Atoi(item[i+1:])
+	if err != nil || depth < 1 {
+		return false
+	}
+	return validGraphVisitKey(item[:i])
+}
+
+func splitGraphKey(item string) (string, int64, bool) {
+	i := strings.LastIndexByte(item, ':')
+	if i <= 0 || i == len(item)-1 {
+		return "", 0, false
+	}
+	id, err := strconv.ParseInt(item[i+1:], 10, 64)
+	if err != nil || id < 1 {
+		return "", 0, false
+	}
+	proj := item[:i]
+	if proj == "" || proj != strings.TrimSpace(proj) {
+		return "", 0, false
+	}
+	return proj, id, true
 }
 
 // ReviewLiveRefs is an independently observed provenance tuple.

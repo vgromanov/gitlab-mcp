@@ -865,11 +865,15 @@ func TestReviewContext_registeredMatrix(t *testing.T) {
 		if ap["content_complete"] == readmeta.ContentCompleteTrue || ap["consistency"] == readmeta.ConsistencyConsistent {
 			t.Fatalf("approval promoted: %#v", ap)
 		}
-		for _, name := range []string{"pipeline_graph", "diff_manifest"} {
+		for _, name := range []string{"diff_manifest"} {
 			sec := asMap(t, asMap(t, item["sections"])[name])
 			if sec["content_complete"] != readmeta.ContentCompleteUnknown || sec["head_sha"] != nil || sec["next_cursor"] != nil {
 				t.Fatalf("%s filler: %#v", name, sec)
 			}
+		}
+		pg := asMap(t, asMap(t, item["sections"])["pipeline_graph"])
+		if pg["content_complete"] == readmeta.ContentCompleteTrue {
+			t.Fatalf("graph without CI fixtures must stay incomplete: %#v", pg)
 		}
 		disc := asMap(t, asMap(t, item["sections"])["discussions"])
 		if disc["content_complete"] == readmeta.ContentCompleteTrue || disc["next_cursor"] != nil {
