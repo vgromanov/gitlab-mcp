@@ -600,9 +600,11 @@ func filterCanonical(f jobFilter) string {
 	return "names=" + canonJoin(f.Names) + ";stages=" + canonJoin(f.Stages) + ";statuses=" + canonJoin(f.Statuses)
 }
 
+// canonJoin prefixes the token count so an empty list cannot encode the
+// same as a singleton sentinel such as "-".
 func canonJoin(xs []string) string {
 	if len(xs) == 0 {
-		return "-"
+		return "0"
 	}
-	return strings.Join(xs, ",")
+	return strconv.Itoa(len(xs)) + ":" + strings.Join(xs, ",")
 }

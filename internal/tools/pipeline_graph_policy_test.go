@@ -242,3 +242,30 @@ func TestLineageCarryCapsFingerprints(t *testing.T) {
 		t.Fatalf("saturated unseen %+v", groups[0])
 	}
 }
+
+func TestFilterCanonicalDoesNotCollapseSentinel(t *testing.T) {
+	empty, err := normalizeJobFilter(nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name     string
+		names    []string
+		stages   []string
+		statuses []string
+	}{
+		{"name", []string{"-"}, nil, nil},
+		{"stage", nil, []string{"-"}, nil},
+		{"status", nil, nil, []string{"-"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := normalizeJobFilter(tc.names, tc.stages, tc.statuses)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if filterCanonical(empty) == filterCanonical(got) {
+				t.Fatalf("empty and sentinel encode the same: %s", filterCanonical(empty))
+			}
+		})
+	}
+}

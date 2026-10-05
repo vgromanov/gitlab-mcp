@@ -295,10 +295,9 @@ func resumePipelineGraph(ctx context.Context, in pipelineGraphIn, sel graphSelec
 		return nil, nil, fmt.Errorf("%s: previous-page boundary drift", cursor.ResyncRequired)
 	}
 	nextPage := int(payload.PageState.ProviderNextPage)
-	page, err := collectJobPage(ctx, d, budget, pipePID, pipe.ID, nextPage, sel.PerPage, idSet(ids))
-	if err != nil {
-		return nil, nil, err
-	}
+	// Relation evidence runs before the next jobs page. A later item-cap
+	// stop cancels the shared budget, and an MR list after that would drop
+	// the jobs already retained.
 	rel := classifyRelation(relationInput{
 		MRIID:       sel.MRIID,
 		ListChecked: false,
@@ -327,6 +326,10 @@ func resumePipelineGraph(ctx context.Context, in pipelineGraphIn, sel graphSelec
 			PipelineSHA:   deref(pipe.SHA),
 			ExpectedSHA:   sel.ExpectedSHA,
 		})
+	}
+	page, err := collectJobPage(ctx, d, budget, pipePID, pipe.ID, nextPage, sel.PerPage, idSet(ids))
+	if err != nil {
+		return nil, nil, err
 	}
 	section := newPipelineGraphSection(now)
 	var mrIID *int64
@@ -1026,10 +1029,25 @@ func collectJobPage(ctx context.Context, d Deps, budget *igl.Budget, pid string,
 			out.Reason = "budget"
 			return out, nil
 		}
+		// A later framing error still leaves complete elements in out.Jobs.
+		// Keep that prefix, and do not read paging from the broken response.
+		if len(out.Jobs) > 0 && streamDecodeStopped(err) {
+			out.Partial = true
+			out.Reason = "malformed response"
+			return out, nil
+		}
 		return graphPage{}, safeProviderErr(err)
 	}
 	out.Paging = observeResp(resp)
 	return out, nil
+}
+
+func streamDecodeStopped(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "stream array:") || strings.Contains(msg, "stream array element:")
 }
 
 func observeResp(resp *gitlab.Response) readmeta.PagingObservation {

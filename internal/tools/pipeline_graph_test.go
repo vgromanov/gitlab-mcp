@@ -771,3 +771,135 @@ func TestPipelineGraph_statusOutcomesAndCancel(t *testing.T) {
 		}
 	})
 }
+
+func TestPipelineGraph_mrContinuationKeepsBudgetItem(t *testing.T) {
+	jobs := map[string]string{
+		"1": "[" + jobJSON(1, "test", "success", "false") + "," + jobJSON(2, "lint", "success", "false") + "]",
+		"2": "[" + jobJSON(3, "deploy", "success", "false") + "," + jobJSON(4, "gate", "manual", "false") + "]",
+	}
+	h := graphHandler(nil, map[int]string{100: graphPipe("feature", "push")}, jobs, graphMR("feature"), graphPipes("feature"), false)
+	clk := &cursor.FakeClock{T: time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)}
+	d := newCursorDeps(t, h, nil, clk)
+	in := pipelineGraphIn{ProjectID: "42", MergeRequestIID: 7, PerPage: 2}
+	_, out, err := getMergeRequestPipelineGraph(context.Background(), nil, in, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tok, _ := graphSection(t, out.(map[string]any))["next_cursor"].(string)
+	if tok == "" {
+		t.Fatal("missing cursor")
+	}
+	in.Cursor = tok
+	in.MaxItems = 3
+	_, out2, err := getMergeRequestPipelineGraph(context.Background(), nil, in, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := out2.(map[string]any)
+	requireNotReady(t, page)
+	got := page["jobs"].([]any)
+	if len(got) != 1 || got[0].(map[string]any)["id"] != float64(3) {
+		t.Fatalf("jobs %#v", got)
+	}
+	sec := graphSection(t, page)
+	if !sectionMessage(sec, "budget_items") || sec["next_cursor"] != nil || sec["pagination_exhausted"] == true {
+		t.Fatalf("section %#v", sec)
+	}
+}
+
+func TestPipelineGraph_truncatedJobPageKeepsPrefix(t *testing.T) {
+	job := jobJSON(1, "test", "success", "false")
+	for _, tc := range []struct {
+		name    string
+		body    string
+		message string
+	}{
+		{"framing", "[" + job + ",{", "malformed response"},
+		{"malformed object", "[" + job + ",{}]", "malformed job"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			base := graphHandler(nil, map[int]string{100: graphPipe("feature", "push")}, nil, "", "", false)
+			h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if strings.HasSuffix(r.URL.Path, "/jobs") {
+					w.Header().Set("Content-Type", "application/json")
+					w.Header().Set("X-Next-Page", "2")
+					_, _ = io.WriteString(w, tc.body)
+					return
+				}
+				base.ServeHTTP(w, r)
+			})
+			out, err := callGraph(t, h, pipelineGraphIn{ProjectID: "42", PipelineID: 100}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			requireNotReady(t, out)
+			got := out["jobs"].([]any)
+			if len(got) != 1 || got[0].(map[string]any)["id"] != float64(1) {
+				t.Fatalf("jobs %#v", got)
+			}
+			sec := graphSection(t, out)
+			if !sectionMessage(sec, tc.message) || sec["next_cursor"] != nil || sec["pagination_exhausted"] == true || sec["content_complete"] == readmeta.ContentCompleteTrue {
+				t.Fatalf("section %#v", sec)
+			}
+		})
+	}
+}
+
+func TestPipelineGraph_filterSentinelBinding(t *testing.T) {
+	jobs := map[string]string{
+		"1": "[" + jobJSON(1, "test", "success", "false") + "]",
+		"2": "[" + jobJSON(2, "test", "success", "false") + "]",
+	}
+	h := graphHandler(nil, map[int]string{100: graphPipe("feature", "push")}, jobs, "", "", false)
+	clk := &cursor.FakeClock{T: time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)}
+	d := newCursorDeps(t, h, nil, clk)
+	mint := func(in pipelineGraphIn) string {
+		t.Helper()
+		_, out, err := getMergeRequestPipelineGraph(context.Background(), nil, in, d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tok, _ := graphSection(t, out.(map[string]any))["next_cursor"].(string)
+		if tok == "" {
+			t.Fatal("missing cursor")
+		}
+		return tok
+	}
+	base := pipelineGraphIn{ProjectID: "42", PipelineID: 100, PerPage: 1}
+	for _, tc := range []struct {
+		name   string
+		dashed pipelineGraphIn
+	}{
+		{"names", pipelineGraphIn{ProjectID: "42", PipelineID: 100, PerPage: 1, JobNames: []string{"-"}}},
+		{"stages", pipelineGraphIn{ProjectID: "42", PipelineID: 100, PerPage: 1, JobStages: []string{"-"}}},
+		{"statuses", pipelineGraphIn{ProjectID: "42", PipelineID: 100, PerPage: 1, JobStatuses: []string{"-"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			plain := mint(base)
+			resume := tc.dashed
+			resume.Cursor = plain
+			_, _, err := getMergeRequestPipelineGraph(context.Background(), nil, resume, d)
+			if err == nil || !strings.Contains(err.Error(), "filter mismatch") {
+				t.Fatalf("empty cursor resumed with dash filter: %v", err)
+			}
+			dashed := mint(tc.dashed)
+			resume = base
+			resume.Cursor = dashed
+			_, _, err = getMergeRequestPipelineGraph(context.Background(), nil, resume, d)
+			if err == nil || !strings.Contains(err.Error(), "filter mismatch") {
+				t.Fatalf("dash cursor resumed without filter: %v", err)
+			}
+		})
+	}
+}
+
+func sectionMessage(sec map[string]any, message string) bool {
+	lims, _ := sec["limitations"].([]any)
+	for _, item := range lims {
+		lim, _ := item.(map[string]any)
+		if lim["message"] == message || lim["code"] == message {
+			return true
+		}
+	}
+	return false
+}
