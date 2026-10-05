@@ -1111,6 +1111,68 @@ func TestWritableReservesCommitFrame(t *testing.T) {
 	}
 }
 
+func TestBeginReplaysUnderByteCap(t *testing.T) {
+	cfg, _ := fixedNow(t)
+	s := openStore(t, cfg)
+	ctx := context.Background()
+	hash := PayloadHash([]byte("a"))
+	if _, err := s.Begin(ctx, ident("k"), hash, BeginOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	n, err := bytesOnDisk(s.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.maxBytes = n + 1000
+	if err := s.Writable(); !errors.Is(err, ErrFull) {
+		t.Fatalf("writable: %v", err)
+	}
+	if _, err := s.Begin(ctx, ident("k"), hash, BeginOptions{}); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if _, err := s.Begin(ctx, ident("other"), PayloadHash([]byte("b")), BeginOptions{}); !errors.Is(err, ErrFull) {
+		t.Fatalf("new key: %v", err)
+	}
+}
+
+func TestCheckpointDoesNotDoubleWALWithReader(t *testing.T) {
+	cfg, _ := fixedNow(t)
+	s := openStore(t, cfg)
+	ctx := context.Background()
+	if _, err := s.db.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		t.Fatal(err)
+	}
+	afterInit, err := bytesOnDisk(s.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// One Begin commits near 78KiB from a fresh ~57KiB store. Leave
+	// room for that write but not for a second copy of the WAL.
+	s.maxBytes = afterInit + 22000
+	reader := openStore(t, cfg)
+	rtx, err := reader.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var epoch string
+	if err := rtx.QueryRowContext(ctx, `SELECT value FROM meta WHERE key='epoch'`).Scan(&epoch); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Begin(ctx, ident("k"), PayloadHash([]byte("a")), BeginOptions{}); err != nil {
+		t.Fatalf("begin: %v (max %d init %d)", err, s.maxBytes, afterInit)
+	}
+	after, err := bytesOnDisk(s.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after > s.maxBytes {
+		t.Fatalf("size %d over cap %d; blocked TRUNCATE copied WAL into the main file", after, s.maxBytes)
+	}
+	if err := rtx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestFailedInitLeavesFileForBlockedPeer(t *testing.T) {
 	cfg, _ := fixedNow(t)
 	ctx := context.Background()

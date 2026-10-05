@@ -417,7 +417,7 @@ func (s *Store) Close() error {
 func (s *Store) Writable() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := s.writableLocked(true); err != nil {
+	if err := s.writableLocked(true, true); err != nil {
 		return err
 	}
 	var n int
@@ -445,7 +445,10 @@ func (s *Store) writeTx(ctx context.Context, requireDispatch bool, fn func(*sql.
 func (s *Store) commitWrite(ctx context.Context, requireDispatch bool, fn func(*sql.Tx) error, afterCommit func()) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := s.writableLocked(requireDispatch); err != nil {
+	// Byte cap is enforced in guardBytes after the statement work, so a
+	// Begin replay of an existing identity can return the receipt without
+	// inserting — the same as the MaxRows path.
+	if err := s.writableLocked(requireDispatch, false); err != nil {
 		return err
 	}
 	before, err := existingSidecars(s.path)
@@ -587,7 +590,38 @@ func walCommitReserve(pageSize int64) int64 {
 }
 
 func (s *Store) reclaimWAL() {
+	if s == nil || s.db == nil {
+		return
+	}
+	wal, err := fileSize(s.path + "-wal")
+	if err != nil || wal == 0 {
+		return
+	}
+	n, err := bytesOnDisk(s.path)
+	if err != nil {
+		return
+	}
+	// TRUNCATE copies WAL frames into the main file first. A reader
+	// snapshot can then block deleting the WAL, so db+wal+shm grows
+	// by that second copy. Skip when the copy would exceed the cap
+	// unless no other snapshot is live (BEGIN EXCLUSIVE succeeds).
+	if n+wal > s.maxBytes && !s.exclusiveIdle() {
+		return
+	}
 	_, _ = s.db.ExecContext(context.Background(), `PRAGMA wal_checkpoint(TRUNCATE)`)
+}
+
+func (s *Store) exclusiveIdle() bool {
+	ctx := context.Background()
+	if _, err := s.db.ExecContext(ctx, `PRAGMA busy_timeout=0`); err != nil {
+		return false
+	}
+	defer func() { _, _ = s.db.ExecContext(ctx, `PRAGMA busy_timeout=5000`) }()
+	if _, err := s.db.ExecContext(ctx, `BEGIN EXCLUSIVE`); err != nil {
+		return false
+	}
+	_, _ = s.db.ExecContext(ctx, `ROLLBACK`)
+	return true
 }
 
 func (s *Store) noteAccepted() {
@@ -625,7 +659,7 @@ func (s *Store) readyLocked() error {
 	return nil
 }
 
-func (s *Store) writableLocked(requireDispatch bool) error {
+func (s *Store) writableLocked(requireDispatch, checkBytes bool) error {
 	if err := s.readyLocked(); err != nil {
 		return err
 	}
@@ -655,6 +689,9 @@ func (s *Store) writableLocked(requireDispatch bool) error {
 	n, err := s.accountedBytes()
 	if err != nil {
 		return err
+	}
+	if !checkBytes {
+		return nil
 	}
 	var pageSize int64
 	if err := s.db.QueryRow(`PRAGMA page_size`).Scan(&pageSize); err != nil {
