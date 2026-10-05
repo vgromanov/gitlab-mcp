@@ -800,7 +800,7 @@ func finishGraph(ctx context.Context, section readmeta.Section, pid, pipePID str
 	manifestExhausted := graphManifestExhausted(fromStart, exhausted, page, sel, section)
 	signGraph := certifiable && (fromStart || (walk != nil && len(walk.evidence) > 0))
 	if signGraph && walk != nil {
-		if sel.MRIID > 0 && !fromStart {
+		if sel.MRIID > 0 {
 			root := walk.root
 			if root.Pipeline < 1 {
 				root = graphNodeKey{Project: pipePID, Pipeline: pipe.ID}

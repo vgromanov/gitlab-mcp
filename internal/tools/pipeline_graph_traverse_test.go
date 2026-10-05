@@ -187,6 +187,50 @@ func hasKind(kinds []string, want string) bool {
 	return false
 }
 
+func TestPipelineGraph_freshCompleteDetectsHeadPipelineDrift(t *testing.T) {
+	var mrLoads int
+	base := &walkServer{
+		pipes: map[string]string{
+			"42/100": walkPipe(100, 42, graphPipeSHA, "feature"),
+			"42/101": walkPipe(101, 42, graphPipeSHA, "feature"),
+		},
+		jobs: map[string]string{
+			"42/100/1": "[" + jobJSON(1, "test", "success", "false") + "]",
+			"42/101/1": "[" + jobJSON(2, "test", "success", "false") + "]",
+		},
+		mr:      graphMR("feature"),
+		mrPipes: graphPipes("feature"),
+	}
+	var listN int
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		if strings.Contains(path, "/merge_requests/7/pipelines") {
+			listN++
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("X-Next-Page", "0")
+			if listN == 1 {
+				_, _ = io.WriteString(w, graphPipes("feature"))
+				return
+			}
+			_, _ = io.WriteString(w, `[{"id":101,"project_id":42,"sha":"`+graphPipeSHA+`","ref":"feature","status":"success"}]`)
+			return
+		}
+		if strings.Contains(path, "/merge_requests/7") && !strings.Contains(path, "/pipelines") {
+			mrLoads++
+			w.Header().Set("Content-Type", "application/json")
+			if mrLoads >= 2 {
+				_, _ = fmt.Fprintf(w, `{"id":1,"iid":7,"project_id":42,"source_branch":"feature","sha":%q,"head_pipeline":{"id":101,"project_id":42,"sha":%q,"ref":"feature","status":"success"}}`, graphSrcSHA, graphPipeSHA)
+				return
+			}
+		}
+		base.ServeHTTP(w, r)
+	})
+	_, _, err := callWalk(t, h, pipelineGraphIn{ProjectID: "42", MergeRequestIID: 7, MaxRequests: 64}, nil)
+	if err == nil || !strings.Contains(err.Error(), cursor.ResyncRequired) {
+		t.Fatalf("head pipeline drift: %v", err)
+	}
+}
+
 func TestPipelineGraph_readyEmptyDownstream(t *testing.T) {
 	h := &walkServer{
 		pipes:   map[string]string{"42/100": walkPipe(100, 42, graphPipeSHA, "feature")},

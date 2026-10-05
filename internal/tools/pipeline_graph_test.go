@@ -585,8 +585,8 @@ func TestPipelineGraph_stopsAtHeadPipeline(t *testing.T) {
 			lists++
 		}
 	}
-	if lists != 1 {
-		t.Fatalf("pipeline list requests %d %#v", lists, hits)
+	if lists != 2 {
+		t.Fatalf("pipeline list requests %d %#v (initial select + closing reconcile)", lists, hits)
 	}
 }
 
@@ -631,8 +631,8 @@ func TestPipelineGraph_headFoundDoesNotExhaustBudget(t *testing.T) {
 			lists++
 		}
 	}
-	if lists != 1 {
-		t.Fatalf("pipeline list requests %d", lists)
+	if lists != 2 {
+		t.Fatalf("pipeline list requests %d (initial select + closing reconcile)", lists)
 	}
 }
 
@@ -672,8 +672,8 @@ func TestPipelineGraph_noHeadWalksPipelineList(t *testing.T) {
 			lists++
 		}
 	}
-	if lists != 2 {
-		t.Fatalf("pipeline list requests %d", lists)
+	if lists != 4 {
+		t.Fatalf("pipeline list requests %d (two-page discovery + closing reconcile)", lists)
 	}
 }
 
