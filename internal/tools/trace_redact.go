@@ -57,7 +57,7 @@ func (r *traceRedactor) Flush() (string, int) {
 
 func (r *traceRedactor) drain(final bool) {
 	if final {
-		text, n := redactBytes(r.hold, r.token)
+		text, n := redactBytesAt(r.hold, r.token, true)
 		r.out = append(r.out, text...)
 		r.count += n
 		r.hold = nil
@@ -71,7 +71,7 @@ func (r *traceRedactor) drain(final bool) {
 		return
 	}
 	cut := len(r.hold) - keep
-	spans := matchSpans(r.hold, r.token)
+	spans := matchSpans(r.hold, r.token, false)
 	for _, sp := range spans {
 		if sp[1] > cut && sp[0] < cut {
 			cut = sp[0]
@@ -83,7 +83,7 @@ func (r *traceRedactor) drain(final bool) {
 	if cut <= 0 {
 		return
 	}
-	text, n := redactBytes(r.hold[:cut], r.token)
+	text, n := redactBytesAt(r.hold[:cut], r.token, false)
 	r.out = append(r.out, text...)
 	r.count += n
 	r.hold = append([]byte(nil), r.hold[cut:]...)
@@ -94,13 +94,15 @@ func (r *traceRedactor) drain(final bool) {
 // removed from the window so a secret split on the boundary cannot leak.
 // The spans are placeholder byte ranges in the returned string.
 func redactRange(src []byte, from, to int, token string) (string, [][2]int) {
-	return redactRangeEdges(src, from, to, token, false, false)
+	return redactRangeEdges(src, from, to, token, false, false, false)
 }
 
 // redactRangeEdges is redactRange plus optional boundary suppression.
 // hideHead redacts an ambiguous prefix when bytes before from were not fetched.
 // hideTail redacts an ambiguous suffix when bytes at and after to were not fetched.
-func redactRangeEdges(src []byte, from, to int, token string, hideHead, hideTail bool) (string, [][2]int) {
+// atEOF treats the end of src as a finished credential boundary, so a short
+// complete Bearer value with no trailing delimiter still redacts.
+func redactRangeEdges(src []byte, from, to int, token string, hideHead, hideTail, atEOF bool) (string, [][2]int) {
 	if from < 0 {
 		from = 0
 	}
@@ -110,7 +112,7 @@ func redactRangeEdges(src []byte, from, to int, token string, hideHead, hideTail
 	if from > to {
 		from = to
 	}
-	spans := matchSpans(src, []byte(token))
+	spans := matchSpans(src, []byte(token), atEOF)
 	if hideHead {
 		// Bytes before the buffer were not fetched. A credential that begins
 		// there is withheld only where it overlaps the returned window.
@@ -270,7 +272,7 @@ func missingPrefixMatch(data []byte, prefix, token string) int {
 		synthetic := make([]byte, 0, cut+limit)
 		synthetic = append(synthetic, pb[:cut]...)
 		synthetic = append(synthetic, data[:limit]...)
-		_, e, ok := longestMatchAt(synthetic, 0, []byte(token))
+		_, e, ok := longestMatchAt(synthetic, 0, []byte(token), false)
 		if !ok || e <= cut {
 			continue
 		}
@@ -399,26 +401,23 @@ func incompleteUserinfoEnd(src []byte, to int) int {
 	if _, _, ok := parseUserinfo(src[:to], abs); ok {
 		return -1
 	}
-	// A userinfo prefix that reaches the cut is ambiguous.
+	// A userinfo prefix that reaches the cut is ambiguous, including a
+	// username-only form that has not yet seen @.
 	j := abs + 3
 	if j >= to {
 		return -1
 	}
-	sawColon := false
 	for j < to {
 		c := src[j]
 		if c <= ' ' || c == '/' {
 			return -1
-		}
-		if c == ':' {
-			sawColon = true
 		}
 		if c == '@' {
 			return -1
 		}
 		j++
 	}
-	if sawColon {
+	if j > abs+3 {
 		return abs
 	}
 	return -1
@@ -542,10 +541,14 @@ func countOverlapping(spans [][2]int, from, to int) int {
 }
 
 func redactBytes(src, token []byte) ([]byte, int) {
+	return redactBytesAt(src, token, true)
+}
+
+func redactBytesAt(src, token []byte, atEOF bool) ([]byte, int) {
 	if len(src) == 0 {
 		return nil, 0
 	}
-	spans := matchSpans(src, token)
+	spans := matchSpans(src, token, atEOF)
 	if len(spans) == 0 {
 		return append([]byte(nil), src...), 0
 	}
@@ -562,7 +565,7 @@ func redactBytes(src, token []byte) ([]byte, int) {
 	return b.Bytes(), len(spans)
 }
 
-func matchSpans(src, token []byte) [][2]int {
+func matchSpans(src, token []byte, atEOF bool) [][2]int {
 	cands := candidateStarts(src, token)
 	var spans [][2]int
 	prevEnd := 0
@@ -570,7 +573,7 @@ func matchSpans(src, token []byte) [][2]int {
 		if abs < prevEnd {
 			continue
 		}
-		s, e, ok := longestMatchAt(src, abs, token)
+		s, e, ok := longestMatchAt(src, abs, token, atEOF)
 		if !ok || e <= s {
 			continue
 		}
@@ -638,7 +641,7 @@ func asciiLowerCopy(src []byte) []byte {
 	return dst
 }
 
-func longestMatchAt(src []byte, i int, token []byte) (int, int, bool) {
+func longestMatchAt(src []byte, i int, token []byte, atEOF bool) (int, int, bool) {
 	bestS, bestE := 0, 0
 	found := false
 	try := func(s, e int, ok bool) {
@@ -649,7 +652,7 @@ func longestMatchAt(src []byte, i int, token []byte) (int, int, bool) {
 		found = true
 	}
 	try(parseAuthHeader(src, i))
-	try(parseBearer(src, i))
+	try(parseBearer(src, i, atEOF))
 	try(parsePrivateToken(src, i))
 	try(parseGlpat(src, i))
 	try(parseUserinfo(src, i))
@@ -693,7 +696,7 @@ func parseAuthHeader(src []byte, i int) (int, int, bool) {
 	return i, j, true
 }
 
-func parseBearer(src []byte, i int) (int, int, bool) {
+func parseBearer(src []byte, i int, atEOF bool) (int, int, bool) {
 	if !hasFoldPrefix(src[i:], "bearer") {
 		return 0, 0, false
 	}
@@ -712,10 +715,10 @@ func parseBearer(src []byte, i int) (int, int, bool) {
 	if j == start {
 		return 0, 0, false
 	}
-	// A delimiter means the value is complete. Bearer abc is still a secret.
-	// A short value that runs off the end of this buffer is a scan cut, not a
-	// finished token; boundary suppression handles that when the read is not EOF.
-	if j == len(src) && j-start < 8 {
+	// A delimiter, or a proven EOF, finishes the value. Bearer abc is still
+	// a secret. A short value that runs off a truncated buffer is a scan cut;
+	// hideTail withholds that unless this read is the end of the trace.
+	if j == len(src) && j-start < 8 && !atEOF {
 		return 0, 0, false
 	}
 	return i, j, true
@@ -764,38 +767,30 @@ func parseUserinfo(src []byte, i int) (int, int, bool) {
 	}
 	j := i + 3
 	userStart := j
-	for j < len(src) && j-userStart < 256 && src[j] != ':' && src[j] != '@' && src[j] != '/' && src[j] > ' ' {
-		j++
-	}
-	// https://:secret@host has an empty username. The colon is the delimiter,
-	// not a failed match.
-	if j == userStart && (j >= len(src) || src[j] != ':') {
-		return 0, 0, false
-	}
-	// 256 bytes only recognizes userinfo. A longer username still runs to ':'.
-	if j-userStart >= 256 && j < len(src) && src[j] != ':' && src[j] != '@' && src[j] != '/' && src[j] > ' ' {
-		for j < len(src) && src[j] != ':' && src[j] != '@' && src[j] != '/' && src[j] > ' ' {
-			j++
+	passStart := -1
+	for j < len(src) {
+		c := src[j]
+		if c <= ' ' || c == '/' {
+			return 0, 0, false
 		}
-	}
-	if j >= len(src) || src[j] != ':' {
-		return 0, 0, false
-	}
-	j++
-	passStart := j
-	for j < len(src) && j-passStart < 256 && src[j] != '@' && src[j] != '/' && src[j] > ' ' {
-		j++
-	}
-	if j == passStart {
-		return 0, 0, false
-	}
-	// A longer password continues through '@' rather than failing the match.
-	if j-passStart >= 256 && j < len(src) && src[j] != '@' && src[j] != '/' && src[j] > ' ' {
-		for j < len(src) && src[j] != '@' && src[j] != '/' && src[j] > ' ' {
-			j++
+		if c == '@' {
+			break
 		}
+		if c == ':' && passStart < 0 {
+			passStart = j + 1
+		}
+		j++
 	}
 	if j >= len(src) || src[j] != '@' {
+		return 0, 0, false
+	}
+	if j == userStart {
+		return 0, 0, false
+	}
+	if passStart < 0 {
+		return i + 3, j + 1, true
+	}
+	if passStart-1 == userStart && passStart == j {
 		return 0, 0, false
 	}
 	return i + 3, j + 1, true

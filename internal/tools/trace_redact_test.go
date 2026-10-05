@@ -58,12 +58,12 @@ func TestCapTraceLines_pathologicalLine(t *testing.T) {
 
 func TestRedactRangeEdges_splitBoundaries(t *testing.T) {
 	head := []byte("lpat-" + strings.Repeat("a", 20))
-	out, spans := redactRangeEdges(head, 0, len(head), "", true, false)
+	out, spans := redactRangeEdges(head, 0, len(head), "", true, false, false)
 	if strings.Contains(out, "lpat-") || strings.Contains(out, strings.Repeat("a", 20)) || len(spans) != 1 {
 		t.Fatalf("head %q spans %d", out, len(spans))
 	}
 	tail := []byte("glpat-bbbb")
-	out, spans = redactRangeEdges(tail, 0, len(tail), "", false, true)
+	out, spans = redactRangeEdges(tail, 0, len(tail), "", false, true, false)
 	if strings.Contains(out, "glpat-") || strings.Contains(out, "bbbb") || len(spans) != 1 {
 		t.Fatalf("tail %q spans %d", out, len(spans))
 	}
@@ -136,6 +136,10 @@ func TestRedact_shortCompleteBearer(t *testing.T) {
 	if strings.Contains(cut.text, "abc") || strings.Contains(cut.text, "Bearer") {
 		t.Fatalf("cut %q", cut.text)
 	}
+	eof := selectPrefix([]byte("Bearer abc"), 0, 0, 1<<20, jobTraceHardLine, "", true)
+	if strings.Contains(eof.text, "abc") || strings.Contains(eof.text, "Bearer") || eof.redactions < 1 {
+		t.Fatalf("eof %q count %d", eof.text, eof.redactions)
+	}
 }
 
 func TestRedact_longUserinfo(t *testing.T) {
@@ -164,6 +168,18 @@ func TestRedact_passwordOnlyUserinfo(t *testing.T) {
 	}
 }
 
+func TestRedact_userinfoWithoutPassword(t *testing.T) {
+	body := "https://opaque-token@example.com/path\nhttps://secret:@example.com/x\nhttps://example.com/ok\n"
+	out, n := redactBytes([]byte(body), nil)
+	s := string(out)
+	if strings.Contains(s, "opaque-token") || strings.Contains(s, "secret") || n < 2 {
+		t.Fatalf("n %d out %q", n, s)
+	}
+	if !strings.Contains(s, "example.com/path") || !strings.Contains(s, "example.com/ok") {
+		t.Fatalf("out %q", s)
+	}
+}
+
 func TestSelectPrefix_manyGlpatSpansStayLinear(t *testing.T) {
 	unit := []byte("glpat-" + strings.Repeat("a", 16) + ":")
 	raw := bytes.Repeat(unit, (1<<20)/len(unit))
@@ -180,16 +196,16 @@ func TestSelectPrefix_manyGlpatSpansStayLinear(t *testing.T) {
 func TestRedactRangeEdges_openCredentialBeyondLookbehind(t *testing.T) {
 	secret := strings.Repeat("s", 600)
 	src := []byte(secret + " next")
-	out, _ := redactRangeEdges(src, 520, 560, "", true, false)
+	out, _ := redactRangeEdges(src, 520, 560, "", true, false, false)
 	if strings.Contains(out, "s") {
 		t.Fatalf("suffix %q", out)
 	}
 	kept := []byte(strings.Repeat("s", 100) + " hello")
-	out2, _ := redactRangeEdges(kept, len(kept)-5, len(kept), "", true, false)
+	out2, _ := redactRangeEdges(kept, len(kept)-5, len(kept), "", true, false, false)
 	if out2 != "hello" {
 		t.Fatalf("kept %q", out2)
 	}
-	plain, _ := redactRangeEdges(src, 520, 560, "", false, false)
+	plain, _ := redactRangeEdges(src, 520, 560, "", false, false, false)
 	if !strings.Contains(plain, "s") {
 		t.Fatalf("anchored window redacted %q", plain)
 	}

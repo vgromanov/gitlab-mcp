@@ -125,7 +125,7 @@ type tracePiece struct {
 
 func finishPiece(text string, spans [][2]int, start, end int64, known bool, maxOut, maxLine int, eof, whole, keepTail bool) tracePiece {
 	text, spans = normalizeUTF8Spans(text, spans)
-	capped, lineCapped, spans := capTraceLinesTracked(text, spans, maxLine)
+	capped, lineCapped, spans := capTraceLinesTracked(text, spans, maxLine, keepTail)
 	var trimmed string
 	var outCapped bool
 	keptFrom := 0
@@ -165,7 +165,7 @@ func selectPrefix(data []byte, base int64, lines, maxOut, maxLine int, token str
 	}
 	// A scan that stops before EOF can end inside a credential. Withhold that
 	// suffix; bytes kept only as line context are still searched.
-	text, spans := redactRangeEdges(data, start, end, token, false, !eof)
+	text, spans := redactRangeEdges(data, start, end, token, false, !eof, eof)
 	p := finishPiece(text, spans, base+int64(start), base+int64(end), true, maxOut, maxLine, eof, whole && end == len(data), false)
 	p.full = p.full && whole
 	return p
@@ -186,7 +186,7 @@ func selectTail(data []byte, base int64, lead, lines, maxOut, maxLine int, token
 		start = lead + tailStart(data[lead:], lines)
 	}
 	// hideHead withholds a credential that began before the fetched buffer.
-	text, spans := redactRangeEdges(data, start, len(data), token, base > 0, false)
+	text, spans := redactRangeEdges(data, start, len(data), token, base > 0, false, eof || proven)
 	whole := start == 0 && lead == 0 && eof
 	p := finishPiece(text, spans, base+int64(start), base+int64(len(data)), true, maxOut, maxLine, eof || proven, whole, true)
 	p.proven = proven
@@ -206,13 +206,13 @@ func selectError(data []byte, base int64, match string, maxOut, maxLine int, tok
 		return tracePiece{}
 	}
 	lineClosed := e < len(data) || (e == len(data) && (len(data) == 0 || data[len(data)-1] == '\n' || eof))
-	text, spans := redactRangeEdges(data, s, e, token, false, !eof)
+	text, spans := redactRangeEdges(data, s, e, token, false, !eof, eof)
 	p := finishPiece(text, spans, base+int64(s), base+int64(e), true, maxOut, maxLine, eof, s == 0 && e == len(data), false)
 	p.proven = lineClosed && !p.lineCapped && !p.outCapped
 	return p
 }
 
-func selectRange(data []byte, observedStart, wantStart int64, wantEnd *int64, maxOut, maxLine int, token string, sizeKnown bool, total int64) tracePiece {
+func selectRange(data []byte, observedStart, wantStart int64, wantEnd *int64, maxOut, maxLine int, token string, sizeKnown bool, total int64, scan int) tracePiece {
 	if observedStart > wantStart {
 		return tracePiece{}
 	}
@@ -229,17 +229,19 @@ func selectRange(data []byte, observedStart, wantStart int64, wantEnd *int64, ma
 		if rel < end {
 			end = rel
 		}
+	} else if scan > 0 {
+		capAt := start + scan
+		if capAt < end {
+			end = capAt
+		}
 	}
 	observedEnd := observedStart + int64(len(data))
 	reachedEnd := sizeKnown && observedEnd == total
-	// Lookahead may stop inside a credential. Seal that open suffix unless
-	// the fetched buffer is the end of the trace.
+	fetchedToWindowEnd := end == len(data)
 	hideHead := observedStart > 0
-	hideTail := !reachedEnd
-	text, spans := redactRangeEdges(data, start, end, token, hideHead, hideTail)
+	hideTail := !(reachedEnd && fetchedToWindowEnd)
+	text, spans := redactRangeEdges(data, start, end, token, hideHead, hideTail, reachedEnd && fetchedToWindowEnd)
 	windowEnd := observedStart + int64(end)
-	// A 206 body ends when the requested bytes end. That is the full trace
-	// only when the observed window is exactly [0, total).
 	coversTotal := sizeKnown && wantStart == 0 && windowEnd == total
 	return finishPiece(text, spans, wantStart, windowEnd, true, maxOut, maxLine, coversTotal, coversTotal, false)
 }
@@ -324,46 +326,75 @@ func errorSpan(data []byte, literal string) (int, int, bool) {
 	return s, e, true
 }
 
-func capTraceLinesTracked(s string, spans [][2]int, maxLine int) (string, bool, [][2]int) {
+func capTraceLinesTracked(s string, spans [][2]int, maxLine int, keepTail bool) (string, bool, [][2]int) {
 	if utf8.ValidString(s) && !lineExceeds(s, maxLine) {
 		return s, false, spans
 	}
 	if maxLine <= 0 {
 		maxLine = jobTraceDefaultLine
 	}
+	marker := "…[line_capped]"
 	var b strings.Builder
 	capped := false
-	lineLen := 0
 	var copied []struct{ src, dst, n int }
 	dst := 0
-	for i := 0; i < len(s); {
-		if s[i] == '\n' {
-			b.WriteByte('\n')
-			copied = append(copied, struct{ src, dst, n int }{i, dst, 1})
-			dst++
-			lineLen = 0
-			i++
-			continue
+	i := 0
+	for i < len(s) {
+		lineEnd := i
+		for lineEnd < len(s) && s[lineEnd] != '\n' {
+			lineEnd++
 		}
-		_, size := utf8.DecodeRuneInString(s[i:])
-		if size <= 0 {
-			size = 1
-		}
-		if lineLen >= maxLine || lineLen+size > maxLine {
+		line := s[i:lineEnd]
+		if lineExceeds(line, maxLine) {
 			capped = true
-			for i < len(s) && s[i] != '\n' {
-				i++
+			if keepTail {
+				cut := 0
+				if len(line) > maxLine {
+					cut = len(line) - maxLine
+				}
+				for cut < len(line) && !utf8.RuneStart(line[cut]) {
+					cut++
+				}
+				b.WriteString(marker)
+				dst += len(marker)
+				if cut < len(line) {
+					b.WriteString(line[cut:])
+					copied = append(copied, struct{ src, dst, n int }{i + cut, dst, len(line) - cut})
+					dst += len(line) - cut
+				}
+			} else {
+				lineLen := 0
+				k := 0
+				for k < len(line) {
+					_, size := utf8.DecodeRuneInString(line[k:])
+					if size <= 0 {
+						size = 1
+					}
+					if lineLen+size > maxLine {
+						break
+					}
+					b.WriteString(line[k : k+size])
+					copied = append(copied, struct{ src, dst, n int }{i + k, dst, size})
+					dst += size
+					lineLen += size
+					k += size
+				}
+				b.WriteString(marker)
+				dst += len(marker)
 			}
-			marker := "…[line_capped]"
-			b.WriteString(marker)
-			dst += len(marker)
+		} else if len(line) > 0 {
+			b.WriteString(line)
+			copied = append(copied, struct{ src, dst, n int }{i, dst, len(line)})
+			dst += len(line)
+		}
+		if lineEnd < len(s) {
+			b.WriteByte('\n')
+			copied = append(copied, struct{ src, dst, n int }{lineEnd, dst, 1})
+			dst++
+			i = lineEnd + 1
 			continue
 		}
-		b.WriteString(s[i : i+size])
-		copied = append(copied, struct{ src, dst, n int }{i, dst, size})
-		dst += size
-		lineLen += size
-		i += size
+		i = lineEnd
 	}
 	if !capped {
 		return b.String(), false, spans

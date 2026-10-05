@@ -341,23 +341,25 @@ func readJobTrace(ctx context.Context, d Deps, pid string, jobID int64, q traceQ
 		req := igl.JobTraceRequest{
 			ProjectID: pid, JobID: jobID, RangeStart: &reqStart, MaxScanBytes: int64(q.scan),
 		}
+		fetch := int64(q.scan) + 2*lb
+		if fetch > int64(jobTraceHardScan) {
+			fetch = int64(jobTraceHardScan)
+		}
 		if q.end != nil {
 			// Adding the margin near math.MaxInt64 wraps to a negative end.
 			// traceRangeHeader then sends a one-byte range. Saturate instead.
 			end := traceEndWithMargin(*q.end, lb)
 			req.RangeEndExcl = &end
-			// Keep both the lookbehind and the trailing margin inside the read,
-			// even when the requested window already fills max_scan_bytes.
-			fetch := int64(q.scan) + 2*lb
-			if fetch > int64(jobTraceHardScan) {
-				fetch = int64(jobTraceHardScan)
-			}
 			span := end - reqStart
 			if span > 0 && span < fetch {
 				req.MaxScanBytes = span
 			} else if fetch > req.MaxScanBytes {
 				req.MaxScanBytes = fetch
 			}
+		} else if fetch > req.MaxScanBytes {
+			// Open-ended ranges still need lookbehind and a trailing margin so
+			// the selected bytes are reachable inside the scan cap.
+			req.MaxScanBytes = fetch
 		}
 		res := igl.StreamJobTrace(ctx, d.Client, req)
 		if errors.Is(res.Err, igl.ErrRangeIgnored) {
@@ -414,7 +416,7 @@ func buildTraceWindow(q traceQuery, res igl.JobTraceResult, meta traceReadMeta, 
 	case q.selector == "error":
 		piece = selectError(res.Data, base, q.errorMatch, q.output, q.line, token, res.EOF)
 	case q.selector == "range":
-		piece = selectRange(res.Data, base, *q.start, q.end, q.output, q.line, token, res.SizeKnown, res.Size)
+		piece = selectRange(res.Data, base, *q.start, q.end, q.output, q.line, token, res.SizeKnown, res.Size, q.scan)
 	default:
 		piece = selectPrefix(res.Data, base, q.lines, q.output, q.line, token, res.EOF)
 	}

@@ -826,6 +826,89 @@ func TestGetPipelineJobOutput_shortCompleteBearer(t *testing.T) {
 	}
 }
 
+func TestGetPipelineJobOutput_unterminatedShortBearer(t *testing.T) {
+	d := authzDeps(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/trace") {
+			_, _ = io.WriteString(w, "Bearer abc")
+			return
+		}
+		_, _ = io.WriteString(w, `{"id":42}`)
+	}))
+	_, out, err := getPipelineJobOutput(context.Background(), nil, getPipelineJobOutputIn{
+		ProjectID: "42", JobID: 8,
+	}, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := decodeTrace(t, out)["trace"].(string)
+	w := traceWindow(t, out)
+	if strings.Contains(text, "Bearer") || strings.Contains(text, "abc") || int(w["redaction_count"].(float64)) < 1 {
+		t.Fatalf("trace %q window %#v", text, w)
+	}
+}
+
+func TestGetPipelineJobOutput_tailLineCapKeepsEnd(t *testing.T) {
+	raw := append(bytes.Repeat([]byte("a"), 70_000), []byte(" END-SENTINEL\n")...)
+	d := authzDeps(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, "/trace") {
+			_, _ = io.WriteString(w, `{"id":42}`)
+			return
+		}
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-%d/%d", len(raw)-1, len(raw)))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(raw)
+	}))
+	_, out, err := getPipelineJobOutput(context.Background(), nil, getPipelineJobOutputIn{
+		ProjectID: "42", JobID: 8, Selector: "tail", MaxLines: 1, MaxScanBytes: len(raw), MaxBytes: 1 << 20,
+	}, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := decodeTrace(t, out)["trace"].(string)
+	w := traceWindow(t, out)
+	if w["tail_proven"] != true || !strings.Contains(text, "END-SENTINEL") {
+		t.Fatalf("tail %q window %#v", text, w)
+	}
+}
+
+func TestGetPipelineJobOutput_openRangeIncludesLookbehind(t *testing.T) {
+	raw := bytes.Repeat([]byte(" "), 2000)
+	copy(raw[1000:], []byte("MARKER"))
+	start := int64(1000)
+	var rng string
+	d := authzDeps(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, "/trace") {
+			_, _ = io.WriteString(w, `{"id":42}`)
+			return
+		}
+		rng = r.Header.Get("Range")
+		var from int
+		if _, err := fmt.Sscanf(rng, "bytes=%d-", &from); err != nil {
+			t.Fatalf("range %q", rng)
+		}
+		if from >= int(start) {
+			t.Errorf("open range started at window: %q", rng)
+		}
+		if from < 0 {
+			from = 0
+		}
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", from, len(raw)-1, len(raw)))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(raw[from:])
+	}))
+	_, out, err := getPipelineJobOutput(context.Background(), nil, getPipelineJobOutputIn{
+		ProjectID: "42", JobID: 8, Selector: "range", StartByte: &start, MaxScanBytes: 100, MaxBytes: 1 << 20,
+	}, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := decodeTrace(t, out)["trace"].(string)
+	w := traceWindow(t, out)
+	if !strings.Contains(text, "MARKER") || w["range_honored"] != true || w["source_start"].(float64) != float64(start) {
+		t.Fatalf("trace %q window %#v range %q", text, w, rng)
+	}
+}
+
 func TestGetPipelineJobOutput_rangeEndNearMaxIntDoesNotCollapse(t *testing.T) {
 	start := int64(0)
 	end := int64(math.MaxInt64 - 10)

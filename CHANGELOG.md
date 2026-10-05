@@ -29,7 +29,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   redacted, and a range end near `math.MaxInt64` does not wrap when the
   redaction margin is added. Password-only URL userinfo (`https://:secret@host`)
   is redacted, and line-cap span remapping stays linear in the retained
-  window (RVG-136).
+  window. Proven EOF finishes a short unterminated `Bearer` value, userinfo
+  that ends at `@` without a password is redacted, a tail line cap keeps the
+  end of the last line, and an open-ended range still fetches the redaction
+  margin (RVG-136).
 - Legacy MR diff getters (`get_merge_request_diffs`, `get_merge_request_file_diff`,
   `get_merge_request_conflicts`) now include honest `pagination` / `section`
   completeness metadata on their existing object responses (RVG-127 /
