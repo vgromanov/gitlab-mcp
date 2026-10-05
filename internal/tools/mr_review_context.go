@@ -1045,7 +1045,13 @@ func (rt *reviewRuntime) readPipelineGraph(item reviewContextItemIn, owner Canon
 	var merged pipelineGraphOut
 	startedFromCursor := strings.TrimSpace(item.graphCursor) != ""
 	tok := item.graphCursor
-	for page := 0; page < cursor.MaxGraphVisited; page++ {
+	// MaxGraphVisited bounds signed nodes, not graph-tool pages. Keep paging
+	// until the section is exhausted or the shared review budget stops us.
+	for page := 0; page < reviewCeilRequests; page++ {
+		if err := rt.ctx.Err(); err != nil {
+			out.Cause = reviewClassify(err)
+			return
+		}
 		in.Cursor = tok
 		_, raw, err := getMergeRequestPipelineGraph(rt.ctx, nil, in, rt.d)
 		if err != nil {

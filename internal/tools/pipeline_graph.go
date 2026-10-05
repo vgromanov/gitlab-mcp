@@ -419,11 +419,14 @@ func resumeGraphBridges(ctx context.Context, section *readmeta.Section, pid, pip
 			return nil, nil, err
 		}
 	} else {
+		if !bridgePagingExhausted(page) {
+			markIncompleteBridgePaging(section, walk, page)
+		}
 		walk.visited[graphNodeKey{Project: pipePID, Pipeline: pipe.ID}.String()] = struct{}{}
 		if err := walkQueuedChildren(ctx, section, pid, sel, d, actorID, payload.UpperBound, payload.ExpiresAt, walk, budget); err != nil {
 			return nil, nil, err
 		}
-		if len(walk.queue) == 0 && !walk.unseen && walk.cap == bridgeCapabilityBridges {
+		if len(walk.queue) == 0 && !walk.unseen && walk.cap == bridgeCapabilityBridges && bridgePagingExhausted(page) {
 			walk.coverage = downstreamCoverageComplete
 			walk.unseen = false
 		}
@@ -878,18 +881,47 @@ func walkBridgesAndChildren(ctx context.Context, section *readmeta.Section, root
 		walk.coverage = downstreamCoveragePartial
 		return mintBridgeCursor(section, d, actorID, pipePID, pipe.ID, sha, sel, upper, expires, 1, bpage, rootPID, walk, next)
 	}
+	if !bridgePagingExhausted(bpage) {
+		markIncompleteBridgePaging(section, walk, bpage)
+	}
 	walk.visited[graphNodeKey{Project: pipePID, Pipeline: pipe.ID}.String()] = struct{}{}
 	if err := walkQueuedChildren(ctx, section, rootPID, sel, d, actorID, upper, expires, walk, budget); err != nil {
 		return err
 	}
-	if len(walk.queue) == 0 && !walk.unseen && walk.cap == bridgeCapabilityBridges {
+	if len(walk.queue) == 0 && !walk.unseen && walk.cap == bridgeCapabilityBridges && bridgePagingExhausted(bpage) {
 		walk.coverage = downstreamCoverageComplete
 		walk.unseen = false
-	} else if len(walk.queue) > 0 {
-		walk.coverage = downstreamCoveragePartial
+	} else if len(walk.queue) > 0 || !bridgePagingExhausted(bpage) {
+		if walk.coverage == downstreamCoverageComplete {
+			walk.coverage = downstreamCoveragePartial
+		}
 		walk.unseen = true
 	}
 	return nil
+}
+
+func bridgePagingExhausted(page bridgePage) bool {
+	return !page.Partial && page.Paging.ExhaustedObserved
+}
+
+func markIncompleteBridgePaging(section *readmeta.Section, walk *graphWalk, page bridgePage) {
+	if walk != nil {
+		walk.unseen = true
+		walk.stickyIncomplete = true
+		if page.Paging.PagingKnown {
+			walk.coverage = downstreamCoveragePartial
+		} else {
+			walk.coverage = downstreamCoverageUnknown
+		}
+	}
+	if section == nil {
+		return
+	}
+	if page.Paging.PagingKnown {
+		section.AddLimitation(readmeta.CodePartial, "bridge paging is not exhausted")
+		return
+	}
+	section.AddLimitation(readmeta.CodeUnknownCount, "paging metadata unavailable")
 }
 
 func mintBridgeCursor(section *readmeta.Section, d Deps, actorID int64, pipePID string, pipelineID int64, sha string, sel graphSelection, upper, expires string, pageNum int, page bridgePage, mrProject string, walk *graphWalk, nextPage int64) error {
