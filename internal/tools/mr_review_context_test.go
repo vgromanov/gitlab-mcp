@@ -93,15 +93,19 @@ type reviewScript struct {
 	secondTgt           string
 	discussions         func(http.ResponseWriter, *http.Request)
 	discStatus          int
+	mu                  sync.Mutex
 }
 
 func (s *reviewScript) serve(w http.ResponseWriter, r *http.Request) {
 	s.log.add(r.URL.Path, r.URL.RawQuery)
+	s.mu.Lock()
 	if strings.Contains(r.URL.Path, "/projects/999") || strings.Contains(r.URL.Path, "/evil") {
 		s.destHits++
 	}
 	s.hits++
-	if s.cancel != nil && s.cancelAt > 0 && s.hits == s.cancelAt {
+	hit := s.hits
+	s.mu.Unlock()
+	if s.cancel != nil && s.cancelAt > 0 && hit == s.cancelAt {
 		s.cancel()
 		if s.abort {
 			<-r.Context().Done()
