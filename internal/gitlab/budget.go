@@ -270,6 +270,9 @@ type budgetTransport struct {
 }
 
 func (t *budgetTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if err := checkCacheBinding(req); err != nil {
+		return nil, err
+	}
 	b := BudgetFromContext(req.Context())
 	if b == nil {
 		return t.next.RoundTrip(req)

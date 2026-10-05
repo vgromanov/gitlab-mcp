@@ -46,6 +46,18 @@ type Config struct {
 	// CursorKey is the raw operator secret from GITLAB_MCP_CURSOR_KEY.
 	// Empty allows legacy startup; cursor-dependent paths fail closed at use.
 	CursorKey []byte
+
+	// Native object cache (RVG-131). Disabled by default. Separate from API TLS.
+	GitCacheEnabled             bool
+	GitCacheRoot                string
+	GitCacheQuotaBytes          int64
+	GitCacheCACertPath          string
+	GitCacheInsecure            bool
+	GitCacheAllowedInsecureHost string
+
+	// gitCacheQuotaErr is set when an explicit quota is malformed or negative.
+	// Unset quota stays zero and later selects the derived default.
+	gitCacheQuotaErr error
 }
 
 func envBool(key string, def bool) bool {
@@ -67,6 +79,32 @@ func envString(key, def string) string {
 	return def
 }
 
+func envInt64(key string, def int64) int64 {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		return def
+	}
+	return n
+}
+
+// parseExplicitQuota accepts an empty value as unset (zero). A present value
+// must be a non-negative integer; malformed and negative values are errors.
+func parseExplicitQuota(raw string) (int64, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0, nil
+	}
+	n, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("GITLAB_MCP_GIT_CACHE_QUOTA_BYTES must be a non-negative integer")
+	}
+	return n, nil
+}
+
 func parseCSV(raw string) []string {
 	if strings.TrimSpace(raw) == "" {
 		return nil
@@ -84,30 +122,36 @@ func parseCSV(raw string) []string {
 // Load parses flags then merges environment. Call from main after flag.Parse().
 func Load() *Config {
 	c := &Config{
-		APIURL:             envString("GITLAB_API_URL", "https://gitlab.com/api/v4"),
-		Token:              envString("GITLAB_PERSONAL_ACCESS_TOKEN", ""),
-		ReadOnly:           envBool("GITLAB_READ_ONLY_MODE", false),
-		Wiki:               envBool("USE_GITLAB_WIKI", false),
-		Milestone:          envBool("USE_MILESTONE", false),
-		Pipeline:           envBool("USE_PIPELINE", false),
-		UseDailyTools:      envBool("USE_DAILY_TOOLS", false),
-		Issues:             envBool("USE_ISSUES", false),
-		WorkItems:          envBool("USE_WORK_ITEMS", false),
-		Labels:             envBool("USE_LABELS", false),
-		Drafts:             envBool("USE_DRAFTS", false),
-		Webhooks:           envBool("USE_WEBHOOKS", false),
-		Timeline:           envBool("USE_TIMELINE", false),
-		EnabledTools:       parseCSV(envString("GITLAB_ENABLED_TOOLS", "")),
-		DisabledTools:      parseCSV(envString("GITLAB_DISABLED_TOOLS", "")),
-		ToolProfile:        NormalizeToolProfile(envString("GITLAB_TOOL_PROFILE", "")),
-		StreamableHTTP:     envBool("STREAMABLE_HTTP", false),
-		Host:               envString("HOST", "127.0.0.1"),
-		Port:               envString("PORT", "3002"),
-		DefaultProjectID:   envString("GITLAB_PROJECT_ID", ""),
-		CACertPath:         envString("GITLAB_CA_CERT_PATH", ""),
-		InsecureSkipVerify: envBool("GITLAB_INSECURE", false),
-		HTTPProxy:          envString("HTTP_PROXY", ""),
-		HTTPSProxy:         envString("HTTPS_PROXY", ""),
+		APIURL:                      envString("GITLAB_API_URL", "https://gitlab.com/api/v4"),
+		Token:                       envString("GITLAB_PERSONAL_ACCESS_TOKEN", ""),
+		ReadOnly:                    envBool("GITLAB_READ_ONLY_MODE", false),
+		Wiki:                        envBool("USE_GITLAB_WIKI", false),
+		Milestone:                   envBool("USE_MILESTONE", false),
+		Pipeline:                    envBool("USE_PIPELINE", false),
+		UseDailyTools:               envBool("USE_DAILY_TOOLS", false),
+		Issues:                      envBool("USE_ISSUES", false),
+		WorkItems:                   envBool("USE_WORK_ITEMS", false),
+		Labels:                      envBool("USE_LABELS", false),
+		Drafts:                      envBool("USE_DRAFTS", false),
+		Webhooks:                    envBool("USE_WEBHOOKS", false),
+		Timeline:                    envBool("USE_TIMELINE", false),
+		EnabledTools:                parseCSV(envString("GITLAB_ENABLED_TOOLS", "")),
+		DisabledTools:               parseCSV(envString("GITLAB_DISABLED_TOOLS", "")),
+		ToolProfile:                 NormalizeToolProfile(envString("GITLAB_TOOL_PROFILE", "")),
+		StreamableHTTP:              envBool("STREAMABLE_HTTP", false),
+		Host:                        envString("HOST", "127.0.0.1"),
+		Port:                        envString("PORT", "3002"),
+		DefaultProjectID:            envString("GITLAB_PROJECT_ID", ""),
+		CACertPath:                  envString("GITLAB_CA_CERT_PATH", ""),
+		InsecureSkipVerify:          envBool("GITLAB_INSECURE", false),
+		HTTPProxy:                   envString("HTTP_PROXY", ""),
+		HTTPSProxy:                  envString("HTTPS_PROXY", ""),
+		GitCacheEnabled:             envBool("GITLAB_MCP_GIT_CACHE", false),
+		GitCacheRoot:                envString("GITLAB_MCP_GIT_CACHE_ROOT", ""),
+		GitCacheQuotaBytes:          0,
+		GitCacheCACertPath:          envString("GITLAB_MCP_GIT_CACHE_CA_CERT_PATH", ""),
+		GitCacheInsecure:            envBool("GITLAB_MCP_GIT_CACHE_INSECURE", false),
+		GitCacheAllowedInsecureHost: envString("GITLAB_MCP_GIT_CACHE_INSECURE_HOST", "gitlabci.raiffeisen.ru"),
 	}
 	if raw := envString("GITLAB_ALLOWED_PROJECT_IDS", ""); raw != "" {
 		c.AllowedProjectIDs = parseCSV(raw)
@@ -119,30 +163,39 @@ func Load() *Config {
 	if v, ok := os.LookupEnv("GITLAB_MCP_CURSOR_KEY"); ok {
 		c.CursorKey = []byte(v)
 	}
+	quota, quotaErr := parseExplicitQuota(os.Getenv("GITLAB_MCP_GIT_CACHE_QUOTA_BYTES"))
+	c.GitCacheQuotaBytes = quota
+	c.gitCacheQuotaErr = quotaErr
 
 	var (
-		flagToken      = flag.String("token", "", "GitLab PAT (overrides GITLAB_PERSONAL_ACCESS_TOKEN)")
-		flagAPIURL     = flag.String("api-url", "", "GitLab API base URL")
-		flagReadOnly   = flag.Bool("read-only", false, "Read-only mode")
-		flagWiki       = flag.Bool("use-wiki", false, "Enable wiki tools")
-		flagMilestone  = flag.Bool("use-milestone", false, "Enable milestone tools")
-		flagPipeline   = flag.Bool("use-pipeline", false, "Enable pipeline tools")
-		flagDaily      = flag.Bool("use-daily-tools", false, "Restricted mode: register Aug-2026 daily census tools")
-		flagIssues     = flag.Bool("use-issues", false, "Restricted mode: enable issues family (also enters restricted mode)")
-		flagWorkItems  = flag.Bool("use-work-items", false, "Restricted mode: enable work items family")
-		flagLabels     = flag.Bool("use-labels", false, "Restricted mode: enable labels family")
-		flagDrafts     = flag.Bool("use-drafts", false, "Restricted mode: enable MR drafts family")
-		flagWebhooks   = flag.Bool("use-webhooks", false, "Restricted mode: enable webhooks family")
-		flagTimeline   = flag.Bool("use-timeline", false, "Restricted mode: enable timeline family")
-		flagEnabled    = flag.String("enabled-tools", "", "Comma-separated extra tools (enters restricted mode when non-empty)")
-		flagDisabled   = flag.String("disabled-tools", "", "Comma-separated tools to exclude")
-		flagProfile    = flag.String("tool-profile", "", "Tool profile ceiling: daily|review_read|review_write (empty clears env)")
-		flagStreamHTTP = flag.Bool("streamable-http", false, "Serve streamable HTTP instead of stdio")
-		flagHost       = flag.String("host", "", "HTTP listen host")
-		flagPort       = flag.String("port", "", "HTTP listen port")
-		flagDefProject = flag.String("default-project", "", "Default project id or path")
-		flagCACert     = flag.String("ca-cert", "", "Path to PEM CA bundle")
-		flagInsecure   = flag.Bool("insecure", false, "Skip TLS verify (dev only)")
+		flagToken                = flag.String("token", "", "GitLab PAT (overrides GITLAB_PERSONAL_ACCESS_TOKEN)")
+		flagAPIURL               = flag.String("api-url", "", "GitLab API base URL")
+		flagReadOnly             = flag.Bool("read-only", false, "Read-only mode")
+		flagWiki                 = flag.Bool("use-wiki", false, "Enable wiki tools")
+		flagMilestone            = flag.Bool("use-milestone", false, "Enable milestone tools")
+		flagPipeline             = flag.Bool("use-pipeline", false, "Enable pipeline tools")
+		flagDaily                = flag.Bool("use-daily-tools", false, "Restricted mode: register Aug-2026 daily census tools")
+		flagIssues               = flag.Bool("use-issues", false, "Restricted mode: enable issues family (also enters restricted mode)")
+		flagWorkItems            = flag.Bool("use-work-items", false, "Restricted mode: enable work items family")
+		flagLabels               = flag.Bool("use-labels", false, "Restricted mode: enable labels family")
+		flagDrafts               = flag.Bool("use-drafts", false, "Restricted mode: enable MR drafts family")
+		flagWebhooks             = flag.Bool("use-webhooks", false, "Restricted mode: enable webhooks family")
+		flagTimeline             = flag.Bool("use-timeline", false, "Restricted mode: enable timeline family")
+		flagEnabled              = flag.String("enabled-tools", "", "Comma-separated extra tools (enters restricted mode when non-empty)")
+		flagDisabled             = flag.String("disabled-tools", "", "Comma-separated tools to exclude")
+		flagProfile              = flag.String("tool-profile", "", "Tool profile ceiling: daily|review_read|review_write (empty clears env)")
+		flagStreamHTTP           = flag.Bool("streamable-http", false, "Serve streamable HTTP instead of stdio")
+		flagHost                 = flag.String("host", "", "HTTP listen host")
+		flagPort                 = flag.String("port", "", "HTTP listen port")
+		flagDefProject           = flag.String("default-project", "", "Default project id or path")
+		flagCACert               = flag.String("ca-cert", "", "Path to PEM CA bundle")
+		flagInsecure             = flag.Bool("insecure", false, "Skip TLS verify (dev only)")
+		flagGitCache             = flag.Bool("git-cache", false, "Enable native object cache (disabled by default)")
+		flagGitCacheRoot         = flag.String("git-cache-root", "", "Dedicated native cache root directory")
+		flagGitCacheQuota        = flag.Int64("git-cache-quota-bytes", 0, "Logical disk quota for the cache root")
+		flagGitCacheCA           = flag.String("git-cache-ca-cert", "", "Cache-only PEM CA file augmenting system roots")
+		flagGitCacheInsecure     = flag.Bool("git-cache-insecure", false, "Cache-only insecure TLS for configured host")
+		flagGitCacheInsecureHost = flag.String("git-cache-insecure-host", "", "Hostname allowed for cache-only insecure TLS")
 	)
 	flag.Parse()
 
@@ -212,6 +265,29 @@ func Load() *Config {
 	}
 	if flagVisited("insecure") {
 		c.InsecureSkipVerify = *flagInsecure
+	}
+	if flagVisited("git-cache") {
+		c.GitCacheEnabled = *flagGitCache
+	}
+	if *flagGitCacheRoot != "" {
+		c.GitCacheRoot = *flagGitCacheRoot
+	}
+	if flagVisited("git-cache-quota-bytes") {
+		if *flagGitCacheQuota < 0 {
+			c.gitCacheQuotaErr = fmt.Errorf("--git-cache-quota-bytes must be a non-negative integer")
+		} else {
+			c.GitCacheQuotaBytes = *flagGitCacheQuota
+			c.gitCacheQuotaErr = nil
+		}
+	}
+	if *flagGitCacheCA != "" {
+		c.GitCacheCACertPath = *flagGitCacheCA
+	}
+	if flagVisited("git-cache-insecure") {
+		c.GitCacheInsecure = *flagGitCacheInsecure
+	}
+	if *flagGitCacheInsecureHost != "" {
+		c.GitCacheAllowedInsecureHost = *flagGitCacheInsecureHost
 	}
 
 	if c.Token == "" {
@@ -304,6 +380,17 @@ func (c *Config) Validate() error {
 	}
 	if err := cursor.ValidateKey(c.CursorKey); err != nil {
 		return err
+	}
+	if c.gitCacheQuotaErr != nil {
+		return c.gitCacheQuotaErr
+	}
+	if c.GitCacheEnabled {
+		if strings.TrimSpace(c.GitCacheRoot) == "" {
+			return fmt.Errorf("GITLAB_MCP_GIT_CACHE_ROOT is required when the native git cache is enabled")
+		}
+		if c.GitCacheInsecure && strings.TrimSpace(c.GitCacheAllowedInsecureHost) == "" {
+			return fmt.Errorf("GITLAB_MCP_GIT_CACHE_INSECURE_HOST is required when cache insecure TLS is enabled")
+		}
 	}
 	return nil
 }

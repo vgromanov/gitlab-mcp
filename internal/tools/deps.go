@@ -5,6 +5,7 @@ import (
 
 	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/config"
 	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/cursor"
+	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/gitcache"
 
 	gitlab "gitlab.com/gitlab-org/api/client-go/v2"
 )
@@ -19,6 +20,11 @@ type Deps struct {
 	Guarded *gitlab.Client
 	// Clock is optional; nil uses real UTC time (cursor expiry / upper bound).
 	Clock cursor.Clock
+	// GitCache is the optional native object cache service. Nil/disabled means
+	// ordinary API tools keep working without Git. No public cache tool is
+	// registered from this dependency. An enabled service is used by
+	// get_merge_request to acquire that merge request's authorized objects.
+	GitCache *gitcache.Service
 }
 
 func (d Deps) now() time.Time {
