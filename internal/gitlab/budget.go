@@ -198,6 +198,20 @@ func (b *Budget) Stats() (requests int, bytes int64, items int) {
 	return b.requests, b.bytesRead, b.items
 }
 
+// EnsureMinBytes raises a positive MaxBytes cap up to need. A zero or
+// negative cap stays unlimited. Never lowers a cap. bytesRead is unchanged,
+// so a read already charged against the old cap still counts.
+func (b *Budget) EnsureMinBytes(need int64) {
+	if b == nil || need <= 0 {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.MaxBytes > 0 && b.MaxBytes < need {
+		b.MaxBytes = need
+	}
+}
+
 // CapLimits tightens MaxItems/MaxBytes/MaxRequests under the budget mutex.
 // Each positive argument is applied only when it is stricter than the current
 // cap (or when the current cap is unlimited/non-positive). Never relaxes.
@@ -300,20 +314,24 @@ type cappedBody struct {
 	r      io.ReadCloser
 	b      *Budget
 	ctx    context.Context
-	mu     sync.Mutex
+	readMu sync.Mutex // serializes Read; never held by Close
+	mu     sync.Mutex // guards closed; never held across r.Read or r.Close
 	closed bool
 }
 
 func (c *cappedBody) Read(p []byte) (int, error) {
+	c.readMu.Lock()
+	defer c.readMu.Unlock()
+
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if c.closed {
+		c.mu.Unlock()
 		return 0, io.EOF
 	}
 	if c.ctx != nil {
 		if err := c.ctx.Err(); err != nil {
-			_ = c.r.Close()
-			c.closed = true
+			c.mu.Unlock()
+			_ = c.closeUnderlying()
 			if errors.Is(err, context.DeadlineExceeded) {
 				return 0, ErrBudgetElapsed
 			}
@@ -322,34 +340,53 @@ func (c *cappedBody) Read(p []byte) (int, error) {
 	}
 	allowed, rerr := c.b.reserveBytes(len(p))
 	if rerr != nil {
-		_ = c.r.Close()
-		c.closed = true
+		c.mu.Unlock()
+		_ = c.closeUnderlying()
 		return 0, rerr
 	}
 	if allowed == 0 {
-		_ = c.r.Close()
-		c.closed = true
+		c.mu.Unlock()
+		_ = c.closeUnderlying()
 		return 0, ErrBudgetBytes
 	}
-	buf := p[:allowed]
-	n, err := c.r.Read(buf)
+	r := c.r
+	c.mu.Unlock()
+
+	// The scan reader closes this body on cancel. Holding mu across the
+	// blocking read deadlocks that Close, so a timed-out trace never returns.
+	n, err := r.Read(p[:allowed])
+
+	c.mu.Lock()
 	if int64(n) < int64(allowed) {
 		c.b.releaseBytes(int64(allowed) - int64(n))
 	}
-	if err != nil && c.ctx != nil && errors.Is(c.ctx.Err(), context.DeadlineExceeded) {
-		_ = c.r.Close()
-		c.closed = true
+	deadline := err != nil && c.ctx != nil && errors.Is(c.ctx.Err(), context.DeadlineExceeded)
+	c.mu.Unlock()
+	if deadline {
+		_ = c.closeUnderlying()
 		return n, ErrBudgetElapsed
 	}
 	return n, err
 }
 
 func (c *cappedBody) Close() error {
+	return c.closeUnderlying()
+}
+
+// closeUnderlying closes the wrapped body without waiting for Read.
+// Read can be blocked inside r.Read; Close must still complete so that read
+// can unblock.
+func (c *cappedBody) closeUnderlying() error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if c.closed {
+		c.mu.Unlock()
 		return nil
 	}
 	c.closed = true
-	return c.r.Close()
+	r := c.r
+	c.mu.Unlock()
+	if r == nil {
+		return nil
+	}
+	return r.Close()
 }

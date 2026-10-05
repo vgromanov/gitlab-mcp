@@ -121,6 +121,38 @@ func TestSelectPrefix_scanCutWithholdsShortCredential(t *testing.T) {
 	}
 }
 
+func TestRedact_longUserinfo(t *testing.T) {
+	pass := strings.Repeat("p", 300)
+	user := strings.Repeat("u", 300)
+	body := "https://user:" + pass + "@host/x\nhttps://" + user + ":pw@host/y\nhttps://example.com/x\n"
+	out, n := redactBytes([]byte(body), nil)
+	s := string(out)
+	if strings.Contains(s, pass) || strings.Contains(s, user) || strings.Contains(s, ":pw@") {
+		t.Fatalf("leaked %q", s)
+	}
+	if !strings.Contains(s, "host/x") || !strings.Contains(s, "example.com/x") || n < 2 {
+		t.Fatalf("n %d out %q", n, s)
+	}
+}
+
+func TestRedactRangeEdges_openCredentialBeyondLookbehind(t *testing.T) {
+	secret := strings.Repeat("s", 600)
+	src := []byte(secret + " next")
+	out, _ := redactRangeEdges(src, 520, 560, "", true, false)
+	if strings.Contains(out, "s") {
+		t.Fatalf("suffix %q", out)
+	}
+	kept := []byte(strings.Repeat("s", 100) + " hello")
+	out2, _ := redactRangeEdges(kept, len(kept)-5, len(kept), "", true, false)
+	if out2 != "hello" {
+		t.Fatalf("kept %q", out2)
+	}
+	plain, _ := redactRangeEdges(src, 520, 560, "", false, false)
+	if !strings.Contains(plain, "s") {
+		t.Fatalf("anchored window redacted %q", plain)
+	}
+}
+
 func TestTrimOutputBytes_runeBoundary(t *testing.T) {
 	s := "ok" + string(rune(0x1F600)) + "tail"
 	cut, trimmed := trimOutputBytes(s, len("ok")+1)

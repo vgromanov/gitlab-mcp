@@ -279,9 +279,26 @@ func finalizeJobTrace(out *JobTraceResult, req JobTraceRequest, hdr http.Header,
 		}
 		retained := int64(len(out.Data))
 		if out.Truncated {
-			if crStart > math.MaxInt64-retained {
+			// A local scan cap may keep a prefix of the attested span. A body
+			// larger than that span is framing, not a truncated window: do not
+			// invent an end past the declared range.
+			if endExcl < crStart {
 				out.Data = []byte{}
 				out.Err = fmt.Errorf("Content-Range length mismatch")
+				out.RangeHonored = false
+				return
+			}
+			providerSpan := endExcl - crStart
+			if retained > providerSpan {
+				out.Data = []byte{}
+				out.Err = fmt.Errorf("Content-Range length mismatch")
+				out.RangeHonored = false
+				return
+			}
+			if retained > 0 && crStart > math.MaxInt64-retained {
+				out.Data = []byte{}
+				out.Err = fmt.Errorf("Content-Range length mismatch")
+				out.RangeHonored = false
 				return
 			}
 			end := crStart + retained
@@ -443,6 +460,9 @@ func (s *scanLimitReader) Read(p []byte) (int, error) {
 	} else {
 		select {
 		case <-s.ctx.Done():
+			// Close the body without waiting on a lock Read still holds.
+			// A reader that only returns after Close must be able to finish
+			// so this receive cannot outlive the deadline.
 			_ = s.Close()
 			r = <-ch
 			if r.n > 0 {

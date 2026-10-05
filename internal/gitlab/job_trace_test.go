@@ -145,6 +145,66 @@ func TestStreamJobTrace_cancelClosesReader(t *testing.T) {
 	}
 }
 
+func TestStreamJobTrace_cancelDuringBudgetedRead(t *testing.T) {
+	body := &gateBody{started: make(chan struct{}), unblock: make(chan struct{})}
+	rt := &scriptedRT{status: http.StatusOK, body: body}
+	b := DefaultBudget()
+	b.MaxBytes = 1 << 20
+	ctx, cancel := context.WithCancel(WithBudget(context.Background(), b))
+	defer cancel()
+	done := make(chan JobTraceResult, 1)
+	go func() {
+		done <- StreamJobTrace(ctx, clientWithRT(t, rt), JobTraceRequest{ProjectID: "42", JobID: 1, MaxScanBytes: 100})
+	}()
+	select {
+	case <-body.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("read did not start")
+	}
+	cancel()
+	select {
+	case res := <-done:
+		if !errors.Is(res.Err, context.Canceled) {
+			t.Fatalf("err %v", res.Err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancel deadlocked in cappedBody")
+	}
+}
+
+func TestStreamJobTrace_capped206RejectsSpanOverflow(t *testing.T) {
+	start := int64(100)
+	rt := &scriptedRT{
+		status:  http.StatusPartialContent,
+		headers: http.Header{"Content-Range": []string{"bytes 100-101/999"}},
+		body:    io.NopCloser(bytes.NewReader(bytes.Repeat([]byte("a"), 50))),
+	}
+	res := StreamJobTrace(context.Background(), clientWithRT(t, rt), JobTraceRequest{
+		ProjectID: "42", JobID: 1, RangeStart: &start, MaxScanBytes: 8,
+	})
+	if res.Err == nil || len(res.Data) != 0 || res.ObservedStart != nil || res.ObservedEndExcl != nil || res.RangeHonored {
+		t.Fatalf("%+v %q", res, res.Data)
+	}
+}
+
+func TestStreamJobTrace_capped206WithinSpanKeepsPrefix(t *testing.T) {
+	start := int64(100)
+	rt := &scriptedRT{
+		status:  http.StatusPartialContent,
+		headers: http.Header{"Content-Range": []string{"bytes 100-199/999"}},
+		body:    io.NopCloser(bytes.NewReader(bytes.Repeat([]byte("a"), 50))),
+	}
+	res := StreamJobTrace(context.Background(), clientWithRT(t, rt), JobTraceRequest{
+		ProjectID: "42", JobID: 1, RangeStart: &start, MaxScanBytes: 8,
+	})
+	if res.Err != nil {
+		t.Fatal(res.Err)
+	}
+	if !res.Truncated || !res.RangeHonored || len(res.Data) != 8 || res.ObservedEndExcl == nil || *res.ObservedEndExcl != 108 {
+		t.Fatalf("%+v %q", res, res.Data)
+	}
+}
+
 type gateBody struct {
 	started chan struct{}
 	unblock chan struct{}

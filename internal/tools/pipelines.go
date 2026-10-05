@@ -217,14 +217,19 @@ func getPipelineJobOutput(ctx context.Context, _ *mcp.CallToolRequest, in getPip
 	if d.Config != nil {
 		token = d.Config.Token
 	}
-	if igl.BudgetFromContext(ctx) == nil {
-		b := igl.DefaultBudget()
-		// Tail and range reads keep a redaction margin outside the retained
-		// window, and the copier needs one extra byte to observe EOF.
-		b.MaxBytes = traceBudgetBytes(q.scan, traceContextMargin(token))
+	// Tail and range reads keep a redaction margin outside the retained window,
+	// and the copier needs one extra byte to observe EOF. A budget already on
+	// the context must be raised to that size: BudgetInterceptor would otherwise
+	// cut the suffix back and a long trace would be cleared as an unproven tail.
+	need := traceBudgetBytes(q.scan, traceContextMargin(token))
+	if b := igl.BudgetFromContext(ctx); b == nil {
+		b = igl.DefaultBudget()
+		b.MaxBytes = need
 		b.MaxRequests = 4
 		b.MaxElapsed = 30 * time.Second
 		ctx = igl.WithBudget(ctx, b)
+	} else {
+		b.EnsureMinBytes(need)
 	}
 	res, meta, err := readJobTrace(ctx, d, pid, in.JobID, q)
 	if err != nil {

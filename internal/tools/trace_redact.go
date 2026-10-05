@@ -117,6 +117,12 @@ func redactRangeEdges(src []byte, from, to int, token string, hideHead, hideTail
 		if s, e, ok := ambiguousHead(src, 0, token); ok && s < to && e > from {
 			spans = append(spans, [2]int{s, e})
 		}
+		// Authorization and PRIVATE-TOKEN values have no length cap, so a
+		// 512-byte lookbehind can start inside the secret. When nothing before
+		// the window delimited that value, withhold the leading token.
+		if s, e, ok := leadingUnanchoredToken(src, from, to); ok {
+			spans = append(spans, [2]int{s, e})
+		}
 	}
 	if hideTail {
 		// The buffer is not a proven end of the trace. Suppress a credential
@@ -211,6 +217,43 @@ func ambiguousHead(src []byte, from int, token string) (int, int, bool) {
 		return 0, 0, false
 	}
 	return from, from + best, true
+}
+
+// leadingUnanchoredToken withholds a credential continuation when the fetched
+// buffer does not start at the source and no delimiter appears before the
+// window. The marker then sits before the bytes we have, so prefix matching
+// cannot see it. The returned span is clipped to the window.
+func leadingUnanchoredToken(src []byte, from, to int) (int, int, bool) {
+	if from < 0 {
+		from = 0
+	}
+	if to > len(src) {
+		to = len(src)
+	}
+	if from >= to {
+		return 0, 0, false
+	}
+	limit := from
+	if limit > len(src) {
+		limit = len(src)
+	}
+	for i := 0; i < limit; i++ {
+		if isTraceDelim(src[i]) {
+			return 0, 0, false
+		}
+	}
+	end := from
+	for end < to && !isTraceDelim(src[end]) {
+		end++
+	}
+	if end <= from {
+		return 0, 0, false
+	}
+	return from, end, true
+}
+
+func isTraceDelim(c byte) bool {
+	return c <= ' ' || c == '"' || c == '\''
 }
 
 func missingPrefixMatch(data []byte, prefix, token string) int {
@@ -342,15 +385,17 @@ func incompleteBearerEnd(src []byte, to int) int {
 }
 
 func incompleteUserinfoEnd(src []byte, to int) int {
-	back := to - (3 + 256 + 1 + 256)
-	if back < 0 {
-		back = 0
+	if to <= 0 {
+		return -1
 	}
-	rel := bytes.LastIndex(src[back:to], []byte("://"))
+	if to > len(src) {
+		to = len(src)
+	}
+	rel := bytes.LastIndex(src[:to], []byte("://"))
 	if rel < 0 {
 		return -1
 	}
-	abs := back + rel
+	abs := rel
 	if _, _, ok := parseUserinfo(src[:to], abs); ok {
 		return -1
 	}
@@ -716,7 +761,16 @@ func parseUserinfo(src []byte, i int) (int, int, bool) {
 	for j < len(src) && j-userStart < 256 && src[j] != ':' && src[j] != '@' && src[j] != '/' && src[j] > ' ' {
 		j++
 	}
-	if j == userStart || j >= len(src) || src[j] != ':' {
+	if j == userStart {
+		return 0, 0, false
+	}
+	// 256 bytes only recognizes userinfo. A longer username still runs to ':'.
+	if j-userStart >= 256 && j < len(src) && src[j] != ':' && src[j] != '@' && src[j] != '/' && src[j] > ' ' {
+		for j < len(src) && src[j] != ':' && src[j] != '@' && src[j] != '/' && src[j] > ' ' {
+			j++
+		}
+	}
+	if j >= len(src) || src[j] != ':' {
 		return 0, 0, false
 	}
 	j++
@@ -724,7 +778,16 @@ func parseUserinfo(src []byte, i int) (int, int, bool) {
 	for j < len(src) && j-passStart < 256 && src[j] != '@' && src[j] != '/' && src[j] > ' ' {
 		j++
 	}
-	if j == passStart || j >= len(src) || src[j] != '@' {
+	if j == passStart {
+		return 0, 0, false
+	}
+	// A longer password continues through '@' rather than failing the match.
+	if j-passStart >= 256 && j < len(src) && src[j] != '@' && src[j] != '/' && src[j] > ' ' {
+		for j < len(src) && src[j] != '@' && src[j] != '/' && src[j] > ' ' {
+			j++
+		}
+	}
+	if j >= len(src) || src[j] != '@' {
 		return 0, 0, false
 	}
 	return i + 3, j + 1, true

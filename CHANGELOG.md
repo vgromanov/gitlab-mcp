@@ -21,7 +21,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `output_bytes` / `redaction_count` follow the UTF-8 text actually returned.
   The trace byte budget includes the redaction margin, a scan that stops
   before EOF withholds a cut-off credential, and Authorization /
-  `PRIVATE-TOKEN` values are redacted through their delimiter (RVG-136).
+  `PRIVATE-TOKEN` values are redacted through their delimiter. A window that
+  starts inside a long credential withholds that leading token, URL userinfo
+  is redacted through `@` past 256 bytes, a scan-capped 206 larger than its
+  declared `Content-Range` is rejected, and cancelling a blocked trace read
+  does not deadlock the budget wrapper (RVG-136).
 - Legacy MR diff getters (`get_merge_request_diffs`, `get_merge_request_file_diff`,
   `get_merge_request_conflicts`) now include honest `pagination` / `section`
   completeness metadata on their existing object responses (RVG-127 /
