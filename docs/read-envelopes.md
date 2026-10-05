@@ -189,6 +189,27 @@ envelope shape. Empty filtered `get_merge_request_file_diff` results and empty
 }
 ```
 
+## Job traces
+
+`get_pipeline_job_output` keeps the legacy `truncate_lines` prefix and adds `selector` `prefix` (default), `tail`, `error`, or `range`. Redaction always runs. It is best-effort pattern redaction (authorization/bearer headers, `PRIVATE-TOKEN`, `glpat-` tokens, URL userinfo, and the configured token), not proof that every secret is gone. There is no redaction opt-out.
+
+The tool does not call `GetTraceFile`. The trace is streamed with a scan cap (default 1 MiB, hard 8 MiB), an output cap (default 256 KiB, hard 1 MiB), a retained line cap (64 KiB), and a 30s deadline. A line longer than the line cap is cut and marked `…[line_capped]` (`too_large`). Cancellation closes the response body.
+
+`window` is separate from `section`:
+
+| Field | Meaning |
+|---|---|
+| `source_start`, `source_end_exclusive` | Byte offsets in the original trace, before redaction. JSON null when the offset was not attested. |
+| `total_bytes`, `total_known` | `total_bytes` is the provider size when `total_known` is true, otherwise JSON null. Unknown is never reported as 0. |
+| `output_bytes` | Length of the returned redacted `trace`. It is not the source span. |
+| `redaction_count` | Replacements that overlap the returned window. |
+| `scanned_bytes` | Body bytes actually read, including at most one peek byte past the retain cap. |
+| `range_honored` | True only when the server answered 206 with a matching `Content-Range`. |
+| `tail_proven` | True only when the returned text is a real tail (206 anchored at the end, or a body that ended inside the scan cap). A scan that stops early yields an empty `trace` and `tail_proven=false`, not the scanned prefix. |
+| `error_region_proven` | True when `selector=error` found a complete matching line inside the scan. The default literals are `ERROR`, `FATAL`, `panic:`, and `Traceback`. `error_match` is a literal, not a regexp. |
+
+`start_byte` is inclusive and `end_byte` is exclusive. A `Range` that the server ignores for a non-zero start is not scanned past the cap to chase that offset. `head_sha` is null. `pagination_exhausted` stays false: a job trace has no page list, and exhaustion would not prove complete content. `content_complete=true` only when the source span is the full known trace. A partial window or budget stop is `false`. An unread ignored range is `unknown`. `consistency` stays `unknown`. `manifest_coverage=full` only when the total size is known; `patch_coverage=full` only for that full span. `counts.bytes` is `output_bytes`, `counts.items` is the output line count, and `counts.files` is null.
+
 ## Paging honesty
 
 `pagination_exhausted` is true only when raw `X-Next-Page` is present and indicates no further page.

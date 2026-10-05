@@ -214,7 +214,7 @@ This document describes the tool surface currently registered by
 - `list_pipeline_jobs`
 - `list_pipeline_trigger_jobs`
 - `get_pipeline_job`
-- `get_pipeline_job_output`
+- `get_pipeline_job_output` — bounded, always-redacted trace window. See [read envelopes](read-envelopes.md#job-traces).
 - `create_pipeline`
 - `retry_pipeline`
 - `cancel_pipeline`

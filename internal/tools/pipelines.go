@@ -2,12 +2,15 @@ package tools
 
 import (
 	"context"
-	"io"
+	"errors"
+	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	gitlab "gitlab.com/gitlab-org/api/client-go/v2"
+	igl "gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/gitlab"
 	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/tools/readmeta"
 )
 
@@ -18,7 +21,7 @@ func RegisterPipelines(s *mcp.Server, d Deps) {
 	AddTool(s, d, false, "pipeline", &mcp.Tool{Name: "list_pipeline_jobs", Description: "List jobs in a pipeline"}, listPipelineJobs)
 	AddTool(s, d, false, "pipeline", &mcp.Tool{Name: "list_pipeline_trigger_jobs", Description: "List bridge/trigger jobs in a pipeline"}, listPipelineTriggerJobs)
 	AddTool(s, d, false, "pipeline", &mcp.Tool{Name: "get_pipeline_job", Description: "Get a pipeline job"}, getPipelineJob)
-	AddTool(s, d, false, "pipeline", &mcp.Tool{Name: "get_pipeline_job_output", Description: "Get job trace/log output"}, getPipelineJobOutput)
+	AddTool(s, d, false, "pipeline", &mcp.Tool{Name: "get_pipeline_job_output", Description: "Get a bounded redacted job trace window (prefix, tail, error region, or byte range). Credential patterns are always redacted. This tool does not download an unlimited trace."}, getPipelineJobOutput)
 	AddTool(s, d, true, "pipeline", &mcp.Tool{Name: "create_pipeline", Description: "Create a pipeline for a ref"}, createPipeline)
 	AddTool(s, d, true, "pipeline", &mcp.Tool{Name: "retry_pipeline", Description: "Retry failed/canceled jobs in a pipeline"}, retryPipeline)
 	AddTool(s, d, true, "pipeline", &mcp.Tool{Name: "cancel_pipeline", Description: "Cancel a pipeline"}, cancelPipeline)
@@ -189,6 +192,13 @@ type getPipelineJobOutputIn struct {
 	ProjectID     string `json:"project_id"`
 	JobID         int64  `json:"job_id"`
 	TruncateLines int    `json:"truncate_lines,omitempty"`
+	Selector      string `json:"selector,omitempty"`
+	ErrorMatch    string `json:"error_match,omitempty"`
+	StartByte     *int64 `json:"start_byte,omitempty"`
+	EndByte       *int64 `json:"end_byte,omitempty"`
+	MaxBytes      int    `json:"max_bytes,omitempty"`
+	MaxScanBytes  int    `json:"max_scan_bytes,omitempty"`
+	MaxLines      int    `json:"max_lines,omitempty"`
 }
 
 func getPipelineJobOutput(ctx context.Context, _ *mcp.CallToolRequest, in getPipelineJobOutputIn, d Deps) (*mcp.CallToolResult, any, error) {
@@ -196,19 +206,259 @@ func getPipelineJobOutput(ctx context.Context, _ *mcp.CallToolRequest, in getPip
 	if err != nil {
 		return nil, nil, err
 	}
-	r, _, err := d.Client.Jobs.GetTraceFile(pid, in.JobID, gitlab.WithContext(ctx))
+	q, err := normalizeTraceQuery(in)
 	if err != nil {
 		return nil, nil, err
 	}
-	b, err := io.ReadAll(r)
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if igl.BudgetFromContext(ctx) == nil {
+		b := igl.DefaultBudget()
+		b.MaxBytes = int64(q.scan) + 1
+		b.MaxRequests = 4
+		b.MaxElapsed = 30 * time.Second
+		ctx = igl.WithBudget(ctx, b)
+	}
+	token := ""
+	if d.Config != nil {
+		token = d.Config.Token
+	}
+	res, meta, err := readJobTrace(ctx, d, pid, in.JobID, q)
 	if err != nil {
 		return nil, nil, err
 	}
-	out := string(b)
-	if in.TruncateLines > 0 {
-		out = TruncateLines(out, in.TruncateLines)
+	win, piece := buildTraceWindow(q, res, meta, token)
+	sec := sectionForTrace(d.now(), win, piece, meta)
+	return nil, Out(map[string]any{
+		"trace":   piece.text,
+		"window":  win,
+		"section": sec,
+	}), nil
+}
+
+type traceReadMeta struct {
+	rangeIgnored bool
+	unprovenTail bool
+	scanStopped  bool
+}
+
+func readJobTrace(ctx context.Context, d Deps, pid string, jobID int64, q traceQuery) (igl.JobTraceResult, traceReadMeta, error) {
+	var meta traceReadMeta
+	switch q.selector {
+	case "tail":
+		first := igl.StreamJobTrace(ctx, d.Client, igl.JobTraceRequest{
+			ProjectID: pid, JobID: jobID, SuffixBytes: int64(q.scan), MaxScanBytes: int64(q.scan),
+		})
+		if errors.Is(first.Err, igl.ErrRangeIgnored) {
+			meta.rangeIgnored = true
+			second := igl.StreamJobTrace(ctx, d.Client, igl.JobTraceRequest{
+				ProjectID: pid, JobID: jobID, MaxScanBytes: int64(q.scan),
+			})
+			if err := safeTraceErr(second.Err); err != nil {
+				return second, meta, err
+			}
+			if second.Truncated || !second.EOF {
+				meta.unprovenTail = true
+				meta.scanStopped = true
+				second.Data = []byte{}
+			}
+			return second, meta, nil
+		}
+		if err := safeTraceErr(first.Err); err != nil {
+			return first, meta, err
+		}
+		if !first.SuffixAnchored {
+			meta.unprovenTail = true
+			meta.scanStopped = first.Truncated
+			first.Data = []byte{}
+		}
+		return first, meta, nil
+	case "range":
+		start := *q.start
+		lb := jobTraceLookbehind
+		if d.Config != nil && len(d.Config.Token) > lb {
+			lb = len(d.Config.Token)
+			if lb > traceTokenHold {
+				lb = traceTokenHold
+			}
+		}
+		reqStart := start - int64(lb)
+		if reqStart < 0 {
+			reqStart = 0
+		}
+		req := igl.JobTraceRequest{
+			ProjectID: pid, JobID: jobID, RangeStart: &reqStart, MaxScanBytes: int64(q.scan),
+		}
+		if q.end != nil {
+			end := *q.end
+			req.RangeEndExcl = &end
+			span := end - reqStart
+			if span > 0 && span < int64(q.scan) {
+				req.MaxScanBytes = span
+			}
+		}
+		res := igl.StreamJobTrace(ctx, d.Client, req)
+		if errors.Is(res.Err, igl.ErrRangeIgnored) {
+			meta.rangeIgnored = true
+			res.Err = nil
+			res.Data = []byte{}
+			return res, meta, nil
+		}
+		if err := safeTraceErr(res.Err); err != nil {
+			return res, meta, err
+		}
+		return res, meta, nil
+	default:
+		res := igl.StreamJobTrace(ctx, d.Client, igl.JobTraceRequest{
+			ProjectID: pid, JobID: jobID, MaxScanBytes: int64(q.scan),
+		})
+		if err := safeTraceErr(res.Err); err != nil {
+			return res, meta, err
+		}
+		if res.Truncated {
+			meta.scanStopped = true
+		}
+		return res, meta, nil
 	}
-	return nil, Out(map[string]any{"trace": out}), nil
+}
+
+func buildTraceWindow(q traceQuery, res igl.JobTraceResult, meta traceReadMeta, token string) (jobTraceWindow, tracePiece) {
+	win := jobTraceWindow{
+		Selector:     q.selector,
+		ScannedBytes: res.Scanned,
+		RangeHonored: res.RangeHonored,
+		TotalKnown:   res.SizeKnown,
+	}
+	if res.SizeKnown {
+		sz := res.Size
+		win.TotalBytes = &sz
+	}
+	base := int64(0)
+	if res.ObservedStart != nil {
+		base = *res.ObservedStart
+	}
+	var piece tracePiece
+	switch {
+	case meta.rangeIgnored && q.selector == "range":
+		piece = tracePiece{}
+	case meta.unprovenTail:
+		piece = tracePiece{}
+	case q.selector == "tail":
+		piece = selectTail(res.Data, base, q.lines, q.output, q.line, token, res.EOF || res.SuffixAnchored, true)
+	case q.selector == "error":
+		piece = selectError(res.Data, base, q.errorMatch, q.output, q.line, token, res.EOF)
+	case q.selector == "range":
+		piece = selectRange(res.Data, base, *q.start, q.end, q.output, q.line, token, res.EOF)
+	default:
+		piece = selectPrefix(res.Data, base, q.lines, q.output, q.line, token, res.EOF)
+	}
+	win.TailProven = q.selector == "tail" && piece.proven && !meta.unprovenTail
+	win.ErrorRegionProven = q.selector == "error" && piece.proven
+	win.LineCapped = piece.lineCapped
+	win.OutputBytes = len(piece.text)
+	win.RedactionCount = piece.redactions
+	win.SourceStart = piece.start
+	win.SourceEndExclusive = piece.end
+	if meta.rangeIgnored {
+		win.RangeHonored = false
+	}
+	return win, piece
+}
+
+func sectionForTrace(now time.Time, win jobTraceWindow, piece tracePiece, meta traceReadMeta) readmeta.Section {
+	sec := newJobTraceSection(now)
+	items := 0
+	if piece.text != "" {
+		items = strings.Count(piece.text, "\n") + 1
+	}
+	bytesN := int64(win.OutputBytes)
+	sec.Counts.Items = &items
+	sec.Counts.Bytes = &bytesN
+	if win.TotalKnown {
+		sec.ManifestCoverage = readmeta.CoverageFull
+	}
+	switch {
+	case meta.rangeIgnored && win.Selector == "range":
+		sec.ContentComplete = readmeta.ContentCompleteUnknown
+		sec.PatchCoverage = readmeta.CoverageUnknown
+		sec.AddLimitation(readmeta.CodeUnsupported, "Range ignored; requested window was not read")
+	case win.Selector == "range" && win.SourceStart == nil:
+		sec.ContentComplete = readmeta.ContentCompleteFalse
+		sec.PatchCoverage = readmeta.CoverageUnknown
+		sec.AddLimitation(readmeta.CodeBudgetBytes, "requested range was past the bounded scan")
+		if !win.RangeHonored {
+			sec.AddLimitation(readmeta.CodeUnsupported, "Range ignored; offset was not reached")
+		}
+	case win.Selector == "tail" && !win.TailProven:
+		sec.ContentComplete = readmeta.ContentCompleteFalse
+		sec.PatchCoverage = readmeta.CoverageUnknown
+		sec.AddLimitation(readmeta.CodeBudgetBytes, "scan budget exhausted before a proven tail")
+		if meta.rangeIgnored {
+			sec.AddLimitation(readmeta.CodeUnsupported, "Range ignored; tail was not read from the end")
+		}
+	case win.Selector == "error" && !win.ErrorRegionProven && piece.text == "":
+		if meta.scanStopped {
+			sec.ContentComplete = readmeta.ContentCompleteFalse
+			sec.PatchCoverage = readmeta.CoverageUnknown
+			sec.AddLimitation(readmeta.CodeBudgetBytes, "scan budget exhausted before an error region")
+		} else {
+			sec.ContentComplete = readmeta.ContentCompleteTrue
+			sec.PatchCoverage = readmeta.CoverageFull
+			if win.TotalKnown {
+				sec.ManifestCoverage = readmeta.CoverageFull
+			}
+		}
+	case piece.full && win.TotalKnown:
+		sec.ContentComplete = readmeta.ContentCompleteTrue
+		sec.PatchCoverage = readmeta.CoverageFull
+	case win.SourceStart != nil:
+		sec.ContentComplete = readmeta.ContentCompleteFalse
+		sec.PatchCoverage = readmeta.CoveragePartial
+	default:
+		sec.ContentComplete = readmeta.ContentCompleteUnknown
+		sec.PatchCoverage = readmeta.CoverageUnknown
+	}
+	if piece.lineCapped {
+		sec.AddLimitation(readmeta.CodeTooLarge, "a line exceeded the retained line cap")
+		if sec.ContentComplete == readmeta.ContentCompleteTrue {
+			sec.ContentComplete = readmeta.ContentCompleteFalse
+			sec.PatchCoverage = readmeta.CoveragePartial
+		}
+	}
+	if piece.outCapped {
+		sec.AddLimitation(readmeta.CodePartial, "output byte cap trimmed the window")
+		if sec.ContentComplete == readmeta.ContentCompleteTrue {
+			sec.ContentComplete = readmeta.ContentCompleteFalse
+			sec.PatchCoverage = readmeta.CoveragePartial
+		}
+	}
+	if meta.scanStopped && win.Selector == "prefix" {
+		sec.AddLimitation(readmeta.CodeBudgetBytes, "scan budget stopped the prefix")
+		if sec.ContentComplete == readmeta.ContentCompleteTrue {
+			sec.ContentComplete = readmeta.ContentCompleteFalse
+			sec.PatchCoverage = readmeta.CoveragePartial
+		}
+	}
+	return sec
+}
+
+func safeTraceErr(err error) error {
+	if err == nil || errors.Is(err, igl.ErrRangeIgnored) {
+		return nil
+	}
+	if errors.Is(err, context.Canceled) {
+		return fmt.Errorf("%s: job trace cancelled", readmeta.CodeCancelled)
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, igl.ErrBudgetElapsed) {
+		return fmt.Errorf("%s: job trace budget elapsed", readmeta.CodeBudgetElapsed)
+	}
+	if errors.Is(err, igl.ErrBudgetBytes) || errors.Is(err, igl.ErrBudgetRequests) {
+		return fmt.Errorf("%s: job trace budget exhausted", readmeta.CodeBudgetBytes)
+	}
+	if errors.Is(err, gitlab.ErrNotFound) {
+		return fmt.Errorf("%s: job trace not found", readmeta.CodeInaccessible)
+	}
+	return fmt.Errorf("%s: job trace request failed", readmeta.CodeHTTPError)
 }
 
 type createPipelineIn struct {
