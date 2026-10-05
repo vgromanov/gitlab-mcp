@@ -315,6 +315,7 @@ func finalizeJobTrace(out *JobTraceResult, req JobTraceRequest, hdr http.Header,
 			out.ObservedEndExcl = &end
 			out.RangeHonored = true
 			out.SuffixAnchored = false
+			applyJobTraceObjectEOF(out)
 			return
 		}
 		providerSpan := endExcl - crStart
@@ -328,6 +329,7 @@ func finalizeJobTrace(out *JobTraceResult, req JobTraceRequest, hdr http.Header,
 		out.ObservedEndExcl = &endExcl
 		out.RangeHonored = true
 		out.SuffixAnchored = out.SizeKnown && endExcl == out.Size
+		applyJobTraceObjectEOF(out)
 		_ = maxScan
 	case http.StatusOK:
 		start := int64(0)
@@ -371,6 +373,17 @@ func finalizeJobTrace(out *JobTraceResult, req JobTraceRequest, hdr http.Header,
 			out.Err = fmt.Errorf("unexpected status %d", out.Status)
 			out.Data = []byte{}
 		}
+	}
+}
+
+// applyJobTraceObjectEOF clears EOF when a 206 attests a larger object than
+// the bytes we kept. HTTP body EOF on bytes 0-1/5 is not the end of the trace.
+func applyJobTraceObjectEOF(out *JobTraceResult) {
+	if out == nil || !out.SizeKnown || out.ObservedEndExcl == nil {
+		return
+	}
+	if *out.ObservedEndExcl != out.Size {
+		out.EOF = false
 	}
 }
 

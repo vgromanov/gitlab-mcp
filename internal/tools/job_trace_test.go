@@ -1293,6 +1293,38 @@ func TestGetPipelineJobOutput_errorStarTotalIsNotComplete(t *testing.T) {
 	}
 }
 
+func TestGetPipelineJobOutput_zeroBased206PrefixAndErrorAreNotComplete(t *testing.T) {
+	for _, sel := range []string{"", "error"} {
+		sel := sel
+		d := authzDeps(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !strings.Contains(r.URL.Path, "/trace") {
+				_, _ = io.WriteString(w, `{"id":42}`)
+				return
+			}
+			if r.Header.Get("Range") != "" {
+				t.Errorf("%s sent Range %q", sel, r.Header.Get("Range"))
+			}
+			w.Header().Set("Content-Range", "bytes 0-1/5")
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = io.WriteString(w, "ab")
+		}))
+		d.Config.Token = "fixture-pat"
+		in := getPipelineJobOutputIn{ProjectID: "42", JobID: 8}
+		if sel != "" {
+			in.Selector = sel
+		}
+		_, raw, err := getPipelineJobOutput(context.Background(), nil, in, d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sec := traceSection(t, raw)
+		w := traceWindow(t, raw)
+		if w["total_known"] != true || sec["content_complete"] == readmeta.ContentCompleteTrue || sec["patch_coverage"] == readmeta.CoverageFull {
+			t.Fatalf("selector %q complete %#v window %#v", sel, sec, w)
+		}
+	}
+}
+
 func TestGetPipelineJobOutput_quotedAuthContinuationAtRangeCut(t *testing.T) {
 	prefix := `Authorization: Bearer "`
 	payload := strings.Repeat("A ", 400) + "SECRET-MARKER"

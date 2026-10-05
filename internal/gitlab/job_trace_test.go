@@ -93,6 +93,38 @@ func TestStreamJobTrace_unexpectedNonzero206Rejected(t *testing.T) {
 	}
 }
 
+func TestStreamJobTrace_zeroBased206DoesNotEOFShortSpan(t *testing.T) {
+	rt := &scriptedRT{
+		status:  http.StatusPartialContent,
+		headers: http.Header{"Content-Range": []string{"bytes 0-1/5"}},
+		body:    io.NopCloser(bytes.NewReader([]byte("ab"))),
+	}
+	res := StreamJobTrace(context.Background(), clientWithRT(t, rt), JobTraceRequest{
+		ProjectID: "42", JobID: 1, MaxScanBytes: 4096,
+	})
+	if res.Err != nil {
+		t.Fatal(res.Err)
+	}
+	if string(res.Data) != "ab" || !res.SizeKnown || res.Size != 5 || res.EOF || res.SuffixAnchored {
+		t.Fatalf("short 206 attested as object EOF: %+v %q", res, res.Data)
+	}
+	full := []byte("abcde")
+	rt2 := &scriptedRT{
+		status:  http.StatusPartialContent,
+		headers: http.Header{"Content-Range": []string{"bytes 0-4/5"}},
+		body:    io.NopCloser(bytes.NewReader(full)),
+	}
+	res = StreamJobTrace(context.Background(), clientWithRT(t, rt2), JobTraceRequest{
+		ProjectID: "42", JobID: 1, MaxScanBytes: 4096,
+	})
+	if res.Err != nil {
+		t.Fatal(res.Err)
+	}
+	if string(res.Data) != "abcde" || !res.EOF || !res.SizeKnown || res.Size != 5 || !res.SuffixAnchored {
+		t.Fatalf("covering 206 %+v %q", res, res.Data)
+	}
+}
+
 func TestStreamJobTrace_shortContentLengthIsIncomplete(t *testing.T) {
 	var n atomic.Int64
 	var closes atomic.Int64

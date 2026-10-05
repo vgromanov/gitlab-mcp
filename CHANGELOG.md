@@ -30,7 +30,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   After authorization, the remaining byte and request caps are raised by
   whatever identity lookups already charged, so a fitting tail is not cut
   short and group ancestry does not spend the trace GET. A 206 whose
-  `Content-Range` total is `*` does not complete an error search. Quoted
+  `Content-Range` total is `*` does not complete an error search. A 206 whose
+  span is `bytes 0-1/5` is not object EOF for prefix or error selectors:
+  the response body ended, but bytes 2–4 were never read. Quoted
   Authorization values that continue across a range cut are withheld even
   when the lookbehind contains spaces.
   Tail and range windows keep redaction context outside the returned

@@ -424,6 +424,7 @@ func buildTraceWindow(q traceQuery, res igl.JobTraceResult, meta traceReadMeta, 
 		base = *res.ObservedStart
 	}
 	var piece tracePiece
+	objectEOF := jobTraceObjectEOF(res)
 	switch {
 	case meta.rangeIgnored && q.selector == "range":
 		piece = tracePiece{}
@@ -436,11 +437,11 @@ func buildTraceWindow(q traceQuery, res igl.JobTraceResult, meta traceReadMeta, 
 		}
 		piece = selectTail(res.Data, base, lead, q.lines, q.output, q.line, token, res.EOF || res.SuffixAnchored, true)
 	case q.selector == "error":
-		piece = selectError(res.Data, base, q.errorMatch, q.output, q.line, token, res.EOF)
+		piece = selectError(res.Data, base, q.errorMatch, q.output, q.line, token, objectEOF)
 	case q.selector == "range":
 		piece = selectRange(res.Data, base, *q.start, q.end, q.output, q.line, token, res.SizeKnown, res.Size, q.scan)
 	default:
-		piece = selectPrefix(res.Data, base, q.lines, q.output, q.line, token, res.EOF)
+		piece = selectPrefix(res.Data, base, q.lines, q.output, q.line, token, objectEOF)
 	}
 	win.TailProven = q.selector == "tail" && piece.proven && !meta.unprovenTail
 	win.ErrorRegionProven = q.selector == "error" && piece.proven
@@ -456,6 +457,28 @@ func buildTraceWindow(q traceQuery, res igl.JobTraceResult, meta traceReadMeta, 
 		win.RangeHonored = false
 	}
 	return win, piece
+}
+
+// jobTraceObjectEOF is true only when the retained bytes are the end of the
+// trace object, not merely the end of a 206 body. A Content-Range of
+// bytes 0-1/5 EOFs the response without covering bytes 2-4.
+func jobTraceObjectEOF(res igl.JobTraceResult) bool {
+	if !res.EOF {
+		return false
+	}
+	if !res.SizeKnown {
+		return true
+	}
+	var start, end int64
+	if res.ObservedStart != nil {
+		start = *res.ObservedStart
+	}
+	if res.ObservedEndExcl != nil {
+		end = *res.ObservedEndExcl
+	} else {
+		end = start + int64(len(res.Data))
+	}
+	return start == 0 && end == res.Size
 }
 
 func sectionForTrace(now time.Time, win jobTraceWindow, piece tracePiece, meta traceReadMeta) readmeta.Section {
@@ -502,10 +525,15 @@ func sectionForTrace(now time.Time, win jobTraceWindow, piece tracePiece, meta t
 			// object size. That is not a finished search of the whole trace.
 			sec.ContentComplete = readmeta.ContentCompleteUnknown
 			sec.PatchCoverage = readmeta.CoverageUnknown
-		} else {
+		} else if piece.full {
 			sec.ContentComplete = readmeta.ContentCompleteTrue
 			sec.PatchCoverage = readmeta.CoverageFull
 			sec.ManifestCoverage = readmeta.CoverageFull
+		} else {
+			// Known total, but the observed span is not the whole object
+			// (for example 206 bytes 0-1/5).
+			sec.ContentComplete = readmeta.ContentCompleteFalse
+			sec.PatchCoverage = readmeta.CoverageUnknown
 		}
 	case piece.full && win.TotalKnown:
 		sec.ContentComplete = readmeta.ContentCompleteTrue
