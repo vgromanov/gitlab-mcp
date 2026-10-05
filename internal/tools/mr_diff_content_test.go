@@ -3157,12 +3157,8 @@ func TestDiffContentRepair_P2_markerNonCropPropagatesMalformed(t *testing.T) {
 		if badF == nil || keepF == nil {
 			t.Fatalf("missing paths %#v", byPath)
 		}
-		if asString(badF["status"]) != diffFileStatusMalformed {
-			t.Fatalf("bad status=%v want malformed limitations=%v", badF["status"], badF["limitations"])
-		}
-		if wins, _ := badF["windows"].([]any); len(wins) != 0 {
-			t.Fatalf("bad windows must be empty; got %#v", wins)
-		}
+		// Prove good-sibling exact bytes/hashes BEFORE bad malformed assertion so old-source
+		// red still records keep.go evidence when bad status remains incorrectly text.
 		if asString(keepF["status"]) != diffFileStatusText {
 			t.Fatalf("keep status=%v", keepF["status"])
 		}
@@ -3171,10 +3167,13 @@ func TestDiffContentRepair_P2_markerNonCropPropagatesMalformed(t *testing.T) {
 			t.Fatalf("keep windows %#v", wins)
 		}
 		gotText := asString(asMap(t, wins[0])["text"])
+		wh := asMap(t, asMap(t, wins[0])["window_hash"])
+		rc, _ := out["returned_content_hash"].(map[string]any)
+		t.Logf("P2_KEEP_SIBLING actual text=%q window_hash.scope=%v window_hash.value=%v returned_content_hash.scope=%v returned_content_hash.value=%v",
+			gotText, wh["scope"], wh["value"], rc["scope"], rc["value"])
 		if gotText != wantGoodWindow {
 			t.Fatalf("keep window text=%q want %q", gotText, wantGoodWindow)
 		}
-		wh := asMap(t, asMap(t, wins[0])["window_hash"])
 		if asString(wh["scope"]) != diffContentWindowHashScope || asString(wh["value"]) != wantGoodWindowSHA {
 			t.Fatalf("keep window_hash=%#v want scope=%s value=%s", wh, diffContentWindowHashScope, wantGoodWindowSHA)
 		}
@@ -3182,9 +3181,15 @@ func TestDiffContentRepair_P2_markerNonCropPropagatesMalformed(t *testing.T) {
 		if hex.EncodeToString(sum[:]) != wantGoodWindowSHA {
 			t.Fatalf("test oracle drift: %s", hex.EncodeToString(sum[:]))
 		}
-		rc := asMap(t, out["returned_content_hash"])
 		if asString(rc["scope"]) != diffContentReturnHashScope || asString(rc["value"]) != wantReturnedConcatSHA {
 			t.Fatalf("returned_content_hash=%#v want %s/%s", rc, diffContentReturnHashScope, wantReturnedConcatSHA)
+		}
+		// Bad-file malformed closure (expected red on unrepaired 6c production).
+		if asString(badF["status"]) != diffFileStatusMalformed {
+			t.Fatalf("bad status=%v want malformed limitations=%v", badF["status"], badF["limitations"])
+		}
+		if badWins, _ := badF["windows"].([]any); len(badWins) != 0 {
+			t.Fatalf("bad windows must be empty; got %#v", badWins)
 		}
 	})
 
@@ -3278,6 +3283,34 @@ func TestDiffContentRepair_P2_markerNonCropPropagatesMalformed(t *testing.T) {
 		for _, w := range wins2 {
 			if strings.Contains(w.Text, "+new") && !strings.Contains(w.Text, `\ No newline`) {
 				t.Fatalf("must not emit detached line without marker: %q", w.Text)
+			}
+		}
+	})
+
+	t.Run("helper_deletion_marker_budget_boundary_keeps_attachment", func(t *testing.T) {
+		patch := "@@ -1 +0,0 @@\n-old\n\\ No newline at end of file\n"
+		parsed := parseUnifiedDiff(patch)
+		if !parsed.ok {
+			t.Fatal("parse deletion EOF marker")
+		}
+		hdr := len("@@ -1 +0,0 @@\n")
+		unit := len("-old\n") + len("\\ No newline at end of file\n")
+		exact := &contentEmitBudget{maxLines: 1 + 2, maxBytes: hdr + unit}
+		wins, ok, trunc, _ := selectDiffWindows(parsed, 0, exact)
+		if !ok || trunc || len(wins) != 1 {
+			t.Fatalf("deletion exact budget ok=%v trunc=%v wins=%d", ok, trunc, len(wins))
+		}
+		if !strings.Contains(wins[0].Text, "-old") || !strings.Contains(wins[0].Text, `\ No newline at end of file`) {
+			t.Fatalf("deletion exact budget must keep marker: %q", wins[0].Text)
+		}
+		below := &contentEmitBudget{maxLines: 1 + 2, maxBytes: hdr + unit - 1}
+		wins2, ok2, trunc2, _ := selectDiffWindows(parsed, 0, below)
+		if !ok2 || !trunc2 {
+			t.Fatalf("deletion below-budget must truncate ok=%v trunc=%v", ok2, trunc2)
+		}
+		for _, w := range wins2 {
+			if strings.Contains(w.Text, "-old") && !strings.Contains(w.Text, `\ No newline`) {
+				t.Fatalf("must not emit detached deletion without marker: %q", w.Text)
 			}
 		}
 	})
