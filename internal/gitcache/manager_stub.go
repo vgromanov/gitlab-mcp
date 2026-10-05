@@ -2,8 +2,13 @@
 
 package gitcache
 
-// Root is unavailable outside Linux and Darwin. Calls fail closed.
-type Root struct{}
+import "context"
 
-// Open refuses to create a cache root on an unaudited platform.
-func Open(string, string, uint64) (*Root, error) { return nil, ErrUnsupported }
+// Manager is unavailable outside Linux and Darwin.
+type Manager struct{}
+
+// OpenManager refuses to create a cache root on an unsupported platform.
+func OpenManager(string, int64) (*Manager, error) { return nil, ErrPlatform }
+
+// Close implements the shutdown surface.
+func (m *Manager) Close(context.Context) error { return ErrPlatform }

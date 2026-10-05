@@ -9,6 +9,7 @@ import (
 	gitlab "gitlab.com/gitlab-org/api/client-go/v2"
 
 	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/config"
+	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/gitcache"
 	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/tools"
 	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/version"
 )
@@ -18,13 +19,22 @@ import (
 type ServerOption func(*serverOptions)
 
 type serverOptions struct {
-	guarded *gitlab.Client
+	guarded  *gitlab.Client
+	gitCache *gitcache.Service
 }
 
 // WithGuardedClient supplies the WithoutRetries publication/mutation/GraphQL client.
 func WithGuardedClient(c *gitlab.Client) ServerOption {
 	return func(o *serverOptions) {
 		o.guarded = c
+	}
+}
+
+// WithGitCache wires the optional native object cache service into tool Deps.
+// No public cache tool is registered.
+func WithGitCache(s *gitcache.Service) ServerOption {
+	return func(o *serverOptions) {
+		o.gitCache = s
 	}
 }
 
@@ -44,7 +54,7 @@ func NewServer(cfg *config.Config, client *gitlab.Client, logger *slog.Logger, o
 		Logger:       logger,
 		Instructions: "GitLab MCP: PAT-authenticated tools for projects, MRs, issues, CI, wiki, releases, and GraphQL.",
 	})
-	tools.RegisterAll(s, tools.Deps{Config: cfg, Client: client, Guarded: so.guarded})
+	tools.RegisterAll(s, tools.Deps{Config: cfg, Client: client, Guarded: so.guarded, GitCache: so.gitCache})
 	tools.WarnUnknownSelectionTools(cfg, logger)
 	return s
 }

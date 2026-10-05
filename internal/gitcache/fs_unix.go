@@ -3,839 +3,142 @@
 package gitcache
 
 import (
-	"bytes"
-	"encoding/binary"
-	"errors"
 	"fmt"
-	"io"
 	"os"
-	"os/exec"
+	"path/filepath"
 	"strings"
-	"sync"
 	"syscall"
-	"time"
+
+	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/gitcache/bounds"
 )
 
-func walkRoot(path string) (*os.File, error) {
-	if !strings.HasPrefix(path, "/") || strings.Contains(path, "//") {
-		return nil, ErrPath
+// walkRoot opens each path component with O_DIRECTORY|O_NOFOLLOW and never
+// Fchdir. The final directory must be owned by the effective uid and must not
+// be group- or world-writable. Symlink components are rejected.
+func walkRoot(path string) (*os.File, uint64, error) {
+	if path == "" || !filepath.IsAbs(path) || len(path) > bounds.MaxPathBytes {
+		return nil, 0, ErrPath
 	}
-	parts := strings.Split(path, "/")
-	// parts[0] is empty because of the leading slash.
+	clean := filepath.Clean(path)
+	if clean != path && clean+"/" != path {
+		// allow trailing slash only via Clean normalization check
+	}
+	parts := strings.Split(strings.TrimPrefix(clean, "/"), "/")
+	if len(parts) > bounds.MaxPathDepth || len(parts) == 0 || (len(parts) == 1 && parts[0] == "") {
+		return nil, 0, ErrPath
+	}
 	fd, err := syscall.Open("/", syscall.O_RDONLY|syscall.O_DIRECTORY, 0)
 	if err != nil {
-		return nil, ErrPath
+		return nil, 0, ErrPath
 	}
-	for _, name := range parts[1:] {
-		if !componentOK(name) {
-			syscall.Close(fd)
-			return nil, ErrPath
+	cur := fd
+	for i, name := range parts {
+		if name == "" || name == "." || name == ".." || strings.Contains(name, string(os.PathSeparator)) {
+			syscall.Close(cur)
+			return nil, 0, ErrPath
 		}
-		next, err := openatDir(fd, name)
-		syscall.Close(fd)
+		if len(name) > 255 {
+			syscall.Close(cur)
+			return nil, 0, ErrPath
+		}
+		next, err := openatDir(cur, name)
+		syscall.Close(cur)
 		if err != nil {
-			return nil, ErrPath
+			return nil, 0, fmt.Errorf("%w: %v", ErrPath, err)
 		}
-		fd = next
+		cur = next
+		if i == len(parts)-1 {
+			st, err := fstat(cur)
+			if err != nil {
+				syscall.Close(cur)
+				return nil, 0, ErrPath
+			}
+			if st.Mode&syscall.S_IFMT != syscall.S_IFDIR {
+				syscall.Close(cur)
+				return nil, 0, ErrPath
+			}
+			if uint32(st.Uid) != uint32(os.Geteuid()) {
+				syscall.Close(cur)
+				return nil, 0, ErrPath
+			}
+			if st.Mode&0o7777 != 0o700 {
+				syscall.Close(cur)
+				return nil, 0, ErrPath
+			}
+			f := os.NewFile(uintptr(cur), clean)
+			return f, uint64(st.Dev), nil
+		}
 	}
-	var st syscall.Stat_t
-	if err := syscall.Fstat(fd, &st); err != nil {
-		syscall.Close(fd)
-		return nil, ErrPath
-	}
-	if st.Mode&syscall.S_IFMT != syscall.S_IFDIR {
-		syscall.Close(fd)
-		return nil, ErrPath
-	}
-	if st.Uid != uint32(os.Geteuid()) {
-		syscall.Close(fd)
-		return nil, ErrPath
-	}
-	if st.Mode&0777 != 0700 {
-		syscall.Close(fd)
-		return nil, ErrPath
-	}
-	dup, err := syscall.Dup(fd)
-	syscall.Close(fd)
-	if err != nil {
-		return nil, ErrPath
-	}
-	return os.NewFile(uintptr(dup), "gitcache-root"), nil
+	syscall.Close(cur)
+	return nil, 0, ErrPath
 }
 
 func componentOK(name string) bool {
-	if name == "" || name == "." || name == ".." || strings.Contains(name, "/") {
+	if name == "" || name == "." || name == ".." {
 		return false
 	}
-	for _, c := range name {
-		switch {
-		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
-		case c == '.' || c == '_' || c == '-':
-		default:
-			return false
-		}
+	if strings.Contains(name, "/") || strings.Contains(name, "\x00") {
+		return false
 	}
-	return true
-}
-
-type fsClient struct {
-	cmd      *exec.Cmd
-	in       io.WriteCloser
-	out      io.Reader
-	mu       sync.Mutex
-	pgid     int
-	dead     bool
-	killErr  error
-	callHook func(op byte) error
-}
-
-// fsHelperArg is the helper argv. Production uses __gitcache_fs.
-// A test may select an ACK stand-in that never completes a valid ready frame.
-var fsHelperArg = "__gitcache_fs"
-
-func startFS(helper string, root *os.File) (*fsClient, error) {
-	if helper == "" || helper[0] != '/' {
-		return nil, ErrPath
-	}
-	cmd := exec.Command(helper, fsHelperArg)
-	cmd.Env = AllowEnv()
-	cmd.Stdin = nil
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		return nil, err
-	}
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, err
-	}
-	cmd.ExtraFiles = []*os.File{root}
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	stderrR, stderrW, err := os.Pipe()
-	if err != nil {
-		return nil, err
-	}
-	cmd.Stderr = stderrW
-	if err := cmd.Start(); err != nil {
-		stderrR.Close()
-		stderrW.Close()
-		return nil, err
-	}
-	stderrW.Close()
-	go drainLimit(stderrR, cmd.Process.Pid, 64<<10)
-	var ready [8]byte
-	if err := readFullDeadline(stdout, ready[:], ackWait); err != nil || ready != [8]byte{} {
-		qerr := QuiesceGroup(cmd.Process.Pid, cmd.Wait)
-		stdin.Close()
-		if qerr != nil {
-			return nil, ErrNotQuiescent
-		}
-		return nil, ErrBusy
-	}
-	return &fsClient{cmd: cmd, in: stdin, out: stdout, pgid: cmd.Process.Pid}, nil
-}
-
-func readFullDeadline(r io.Reader, buf []byte, d time.Duration) (err error) {
-	f, ok := r.(interface{ SetReadDeadline(time.Time) error })
-	if !ok {
-		return ErrNotQuiescent
-	}
-	if err := f.SetReadDeadline(time.Now().Add(d)); err != nil {
-		return err
-	}
-	defer func() {
-		if cerr := f.SetReadDeadline(time.Time{}); cerr != nil && err == nil {
-			err = cerr
-		}
-	}()
-	_, err = io.ReadFull(r, buf)
-	return err
-}
-
-func writeFullDeadline(w io.Writer, p []byte, d time.Duration) (err error) {
-	f, ok := w.(interface{ SetWriteDeadline(time.Time) error })
-	if !ok {
-		return ErrNotQuiescent
-	}
-	if err := f.SetWriteDeadline(time.Now().Add(d)); err != nil {
-		return err
-	}
-	defer func() {
-		if cerr := f.SetWriteDeadline(time.Time{}); cerr != nil && err == nil {
-			err = cerr
-		}
-	}()
-	var n int
-	n, err = w.Write(p)
-	if err != nil {
-		return err
-	}
-	if n != len(p) {
-		return io.ErrShortWrite
-	}
-	return nil
-}
-
-// helperFsyncFault is a test-only injection. Production leaves it nil.
-// It runs only after a physical write has returned a byte count.
-var helperFsyncFault func() error
-
-func drainLimit(r io.ReadCloser, pid, n int) {
-	defer r.Close()
-	buf := make([]byte, 4096)
-	total := 0
-	for total < n {
-		k, err := r.Read(buf)
-		total += k
-		if err != nil {
-			return
-		}
-	}
-	_ = syscall.Kill(-pid, syscall.SIGKILL)
-}
-
-func (c *fsClient) call(op byte, payload []byte) ([]byte, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.dead {
-		return nil, ErrClosed
-	}
-	if c.callHook != nil {
-		if err := c.callHook(op); err != nil {
-			return nil, err
-		}
-	}
-	if len(payload) > 1<<20 {
-		return nil, ErrQuota
-	}
-	var hdr [5]byte
-	binary.LittleEndian.PutUint32(hdr[:4], uint32(len(payload)))
-	hdr[4] = op
-	if err := writeFullDeadline(c.in, hdr[:], ackWait); err != nil {
-		c.killLocked()
-		return nil, ErrNotQuiescent
-	}
-	if err := writeFullDeadline(c.in, payload, ackWait); err != nil {
-		c.killLocked()
-		return nil, ErrNotQuiescent
-	}
-	var rh [8]byte
-	if err := readFullDeadline(c.out, rh[:], ackWait); err != nil {
-		c.killLocked()
-		return nil, ErrNotQuiescent
-	}
-	status := binary.LittleEndian.Uint32(rh[:4])
-	n := binary.LittleEndian.Uint32(rh[4:])
-	if n > 1<<20 {
-		if kerr := c.killLocked(); kerr != nil {
-			return nil, kerr
-		}
-		return nil, ErrCorrupt
-	}
-	buf := make([]byte, n)
-	if err := readFullDeadline(c.out, buf, ackWait); err != nil {
-		c.killLocked()
-		return nil, ErrNotQuiescent
-	}
-	if status != 0 {
-		return buf, fsStatus(status)
-	}
-	return buf, nil
-}
-
-func fsStatus(code uint32) error {
-	switch code {
-	case 1:
-		return ErrBusy
-	case 2:
-		return ErrCorrupt
-	case 3:
-		return ErrPath
-	case 4:
-		return ErrQuota
-	case 6:
-		return ErrAbsent
-	default:
-		return ErrUnsupported
-	}
-}
-
-func (c *fsClient) killLocked() error {
-	if c.dead {
-		return c.killErr
-	}
-	c.dead = true
-	if c.pgid <= 1 {
-		c.killErr = ErrNotQuiescent
-		return c.killErr
-	}
-	_ = syscall.Kill(-c.pgid, syscall.SIGKILL)
-	if c.cmd == nil {
-		c.killErr = ErrNotQuiescent
-		return c.killErr
-	}
-	waitErr := c.cmd.Wait()
-	var exitErr *exec.ExitError
-	if !errors.As(waitErr, &exitErr) {
-		c.killErr = ErrNotQuiescent
-		return c.killErr
-	}
-	ws, ok := exitErr.Sys().(syscall.WaitStatus)
-	if !ok || !ws.Signaled() || ws.Signal() != syscall.SIGKILL {
-		c.killErr = ErrNotQuiescent
-		return c.killErr
-	}
-	if err := syscall.Kill(-c.pgid, 0); !errors.Is(err, syscall.ESRCH) {
-		c.killErr = ErrNotQuiescent
-		return c.killErr
-	}
-	return nil
-}
-
-func (c *fsClient) crash() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.dead = true
-	if c.pgid <= 1 {
-		return
-	}
-	_ = syscall.Kill(-c.pgid, syscall.SIGKILL)
-	if c.cmd != nil {
-		_ = c.cmd.Wait()
-	}
-	_ = syscall.Kill(-c.pgid, 0)
-}
-
-func (c *fsClient) stop() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.dead {
-		return c.killErr
-	}
-	c.dead = true
-	_ = c.in.Close()
-	waitErr := c.cmd.Wait()
-	err := syscall.Kill(-c.pgid, 0)
-	if err == nil {
-		_ = syscall.Kill(-c.pgid, syscall.SIGKILL)
-		return ErrNotQuiescent
-	}
-	if !errors.Is(err, syscall.ESRCH) {
-		return ErrNotQuiescent
-	}
-	if waitErr != nil {
-		return waitErr
-	}
-	return nil
-}
-
-func runFSHelper() int {
-	root := 3
-	var st syscall.Stat_t
-	if err := syscall.Fstat(root, &st); err != nil {
-		return 2
-	}
-	if st.Mode&syscall.S_IFMT != syscall.S_IFDIR || st.Mode&0777 != 0700 || uint32(st.Uid) != uint32(os.Geteuid()) {
-		return 2
-	}
-	if err := syscall.Fchdir(root); err != nil {
-		return 2
-	}
-	h := &fsHelper{root: root, dev: uint64(st.Dev)}
-	if _, err := os.Stdout.Write(make([]byte, 8)); err != nil {
-		return 2
-	}
-	in := os.Stdin
-	for {
-		var hdr [5]byte
-		if _, err := io.ReadFull(in, hdr[:]); err != nil {
-			return 0
-		}
-		n := binary.LittleEndian.Uint32(hdr[:4])
-		if n > 1<<20 {
-			writeStatus(os.Stdout, 4, nil)
-			return 4
-		}
-		payload := make([]byte, n)
-		if _, err := io.ReadFull(in, payload); err != nil {
-			return 2
-		}
-		status, body := h.op(hdr[4], payload)
-		if err := writeStatus(os.Stdout, status, body); err != nil {
-			return 2
-		}
-	}
-}
-
-func writeStatus(w io.Writer, status uint32, body []byte) error {
-	var rh [8]byte
-	binary.LittleEndian.PutUint32(rh[:4], status)
-	binary.LittleEndian.PutUint32(rh[4:], uint32(len(body)))
-	if _, err := w.Write(rh[:]); err != nil {
-		return err
-	}
-	_, err := w.Write(body)
-	return err
-}
-
-type fsHelper struct {
-	root int
-	dev  uint64
-}
-
-func (h *fsHelper) op(op byte, payload []byte) (uint32, []byte) {
-	switch op {
-	case 1: // write path\0 uint64 max, uint64 off, data
-		return h.write(payload)
-	case 2: // read
-		return h.read(payload)
-	case 3:
-		return h.mkdir(payload)
-	case 4:
-		return h.rename(payload)
-	case 5:
-		return h.unlink(payload)
-	case 6:
-		return h.lstat(payload)
-	case 7:
-		return h.list(payload)
-	case 8:
-		if err := syscall.Fsync(h.root); err != nil {
-			return 5, nil
-		}
-		return 0, nil
-	case 9:
-		return h.openStat(payload)
-	default:
-		return 5, nil
-	}
-}
-
-func (h *fsHelper) recheckRoot() error {
-	var st syscall.Stat_t
-	if err := syscall.Fstat(h.root, &st); err != nil {
-		return err
-	}
-	if uint64(st.Dev) != h.dev || observedUID(&st) != uint32(os.Geteuid()) {
-		return ErrPath
-	}
-	if st.Mode&syscall.S_IFMT != syscall.S_IFDIR || st.Mode&0777 != 0700 {
-		return ErrPath
-	}
-	return nil
-}
-
-func (h *fsHelper) at(rel string, fn func(base string) error) error {
-	if err := h.recheckRoot(); err != nil {
-		return err
-	}
-	if err := syscall.Fchdir(h.root); err != nil {
-		return err
-	}
-	parts, err := splitRel(rel)
-	if err != nil {
-		return err
-	}
-	for _, p := range parts[:len(parts)-1] {
-		if err := h.step(p); err != nil {
-			return err
-		}
-	}
-	return fn(parts[len(parts)-1])
-}
-
-func (h *fsHelper) step(name string) error {
-	var st syscall.Stat_t
-	if err := syscall.Lstat(name, &st); err != nil {
-		return err
-	}
-	if st.Mode&syscall.S_IFMT == syscall.S_IFLNK || uint64(st.Dev) != h.dev {
-		return ErrPath
-	}
-	if st.Mode&syscall.S_IFMT != syscall.S_IFDIR {
-		return ErrPath
-	}
-	fd, err := syscall.Open(name, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
-	if err != nil {
-		return err
-	}
-	if err := fstatHeld(fd, h.dev, true, 0700); err != nil {
-		syscall.Close(fd)
-		return err
-	}
-	err = syscall.Fchdir(fd)
-	syscall.Close(fd)
-	return err
-}
-
-var observedUID = func(st *syscall.Stat_t) uint32 { return uint32(st.Uid) }
-
-func fstatHeld(fd int, dev uint64, dir bool, mode uint64) error {
-	var st syscall.Stat_t
-	if err := syscall.Fstat(fd, &st); err != nil {
-		return err
-	}
-	if uint64(st.Dev) != dev || observedUID(&st) != uint32(os.Geteuid()) {
-		return ErrPath
-	}
-	if dir {
-		if st.Mode&syscall.S_IFMT != syscall.S_IFDIR || st.Mode&0777 != 0700 {
-			return ErrPath
-		}
-		return nil
-	}
-	if st.Mode&syscall.S_IFMT != syscall.S_IFREG || st.Nlink != 1 {
-		return ErrPath
-	}
-	got := uint64(st.Mode & 0777)
-	if mode != 0 && got != mode {
-		return ErrPath
-	}
-	if mode == 0 && got != 0600 && got != 0444 {
-		return ErrPath
-	}
-	return nil
+	return len(name) <= 255
 }
 
 func splitRel(rel string) ([]string, error) {
-	if rel == "" || strings.HasPrefix(rel, "/") || strings.Contains(rel, "//") {
+	rel = strings.Trim(rel, "/")
+	if rel == "" {
 		return nil, ErrPath
 	}
 	parts := strings.Split(rel, "/")
-	if len(parts) == 0 || len(parts) > 8 {
+	if len(parts) > bounds.MaxPathDepth {
 		return nil, ErrPath
 	}
+	var out []string
+	var n int
 	for _, p := range parts {
 		if !componentOK(p) {
 			return nil, ErrPath
 		}
+		n += len(p) + 1
+		if n > bounds.MaxPathBytes {
+			return nil, ErrPath
+		}
+		out = append(out, p)
 	}
-	return parts, nil
+	return out, nil
 }
 
-func (h *fsHelper) write(payload []byte) (uint32, []byte) {
-	z := bytes.IndexByte(payload, 0)
-	if z <= 0 || len(payload) < z+1+16 {
-		return 3, nil
+func checkRegular(st *syscall.Stat_t, rootDev uint64) error {
+	if uint64(st.Dev) != rootDev {
+		return ErrPath
 	}
-	rel := string(payload[:z])
-	max := binary.LittleEndian.Uint64(payload[z+1 : z+9])
-	off := binary.LittleEndian.Uint64(payload[z+9 : z+17])
-	data := payload[z+17:]
-	if uint64(len(data)) > max || off > max-uint64(len(data)) {
-		return 4, nil
+	if st.Mode&syscall.S_IFMT != syscall.S_IFREG {
+		return ErrPath
 	}
-	var n int
-	err := h.at(rel, func(base string) error {
-		var st syscall.Stat_t
-		lerr := syscall.Lstat(base, &st)
-		if lerr == nil && (st.Mode&syscall.S_IFMT != syscall.S_IFREG || st.Nlink != 1 || uint64(st.Dev) != h.dev) {
-			return ErrPath
-		}
-		flags := syscall.O_WRONLY | syscall.O_NOFOLLOW | syscall.O_NONBLOCK
-		if errors.Is(lerr, syscall.ENOENT) {
-			flags |= syscall.O_CREAT | syscall.O_EXCL
-		} else if lerr != nil {
-			return lerr
-		}
-		fd, err := syscall.Open(base, flags, 0600)
-		if err != nil {
-			return err
-		}
-		defer syscall.Close(fd)
-		want := uint64(0600)
-		if err := fstatHeld(fd, h.dev, false, want); err != nil {
-			return err
-		}
-		if off == 0 {
-			if err := syscall.Ftruncate(fd, 0); err != nil {
-				return err
-			}
-		}
-		if _, err := syscall.Seek(fd, int64(off), io.SeekStart); err != nil {
-			return err
-		}
-		wn, err := syscall.Write(fd, data)
-		n = wn
-		if err != nil {
-			return err
-		}
-		if wn != len(data) {
-			return ErrQuota
-		}
-		if helperFsyncFault != nil {
-			if err := helperFsyncFault(); err != nil {
-				return err
-			}
-		}
-		if err := syscall.Fsync(fd); err != nil {
-			return err
-		}
-		return h.fsyncCwd()
-	})
-	var out [4]byte
-	binary.LittleEndian.PutUint32(out[:], uint32(n))
-	if err != nil {
-		return mapErr(err), out[:]
+	if st.Nlink != 1 {
+		return ErrPath
 	}
-	return 0, out[:]
-}
-
-func (h *fsHelper) read(payload []byte) (uint32, []byte) {
-	rel := string(payload)
-	var buf []byte
-	err := h.at(rel, func(base string) error {
-		var st syscall.Stat_t
-		if err := syscall.Lstat(base, &st); err != nil {
-			return err
-		}
-		if st.Mode&syscall.S_IFMT != syscall.S_IFREG || st.Nlink != 1 || uint64(st.Dev) != h.dev {
-			return ErrPath
-		}
-		if st.Size < 0 || uint64(st.Size) > 1<<20 {
-			return ErrQuota
-		}
-		fd, err := syscall.Open(base, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
-		if err != nil {
-			return err
-		}
-		defer syscall.Close(fd)
-		if err := fstatHeld(fd, h.dev, false, 0); err != nil {
-			return err
-		}
-		var got syscall.Stat_t
-		if err := syscall.Fstat(fd, &got); err != nil {
-			return err
-		}
-		if got.Size < 0 || uint64(got.Size) > 1<<20 {
-			return ErrQuota
-		}
-		buf = make([]byte, got.Size)
-		return readFullFD(fd, buf)
-	})
-	if err != nil {
-		return mapErr(err), nil
+	if uint32(st.Uid) != uint32(os.Geteuid()) {
+		return ErrPath
 	}
-	return 0, buf
-}
-
-func (h *fsHelper) mkdir(payload []byte) (uint32, []byte) {
-	err := h.at(string(payload), func(base string) error {
-		if err := syscall.Mkdir(base, 0700); err != nil {
-			return err
-		}
-		return h.fsyncCwd()
-	})
-	if err != nil {
-		return mapErr(err), nil
-	}
-	_ = syscall.Fchdir(h.root)
-	_ = syscall.Fsync(h.root)
-	return 0, nil
-}
-
-func (h *fsHelper) rename(payload []byte) (uint32, []byte) {
-	parts := bytes.Split(payload, []byte{0})
-	if len(parts) != 2 {
-		return 3, nil
-	}
-	oldRel, newRel := string(parts[0]), string(parts[1])
-	oldParts, err := splitRel(oldRel)
-	if err != nil {
-		return 3, nil
-	}
-	newParts, err := splitRel(newRel)
-	if err != nil {
-		return 3, nil
-	}
-	if len(oldParts) != len(newParts) {
-		return 3, nil
-	}
-	for i := 0; i < len(oldParts)-1; i++ {
-		if oldParts[i] != newParts[i] {
-			return 3, nil
-		}
-	}
-	err = h.at(oldRel, func(base string) error {
-		if err := syscall.Rename(base, newParts[len(newParts)-1]); err != nil {
-			return err
-		}
-		return h.fsyncCwd()
-	})
-	if err != nil {
-		return mapErr(err), nil
-	}
-	return 0, nil
-}
-
-func (h *fsHelper) unlink(payload []byte) (uint32, []byte) {
-	err := h.at(string(payload), func(base string) error {
-		var st syscall.Stat_t
-		if err := syscall.Lstat(base, &st); err != nil {
-			return err
-		}
-		if st.Mode&syscall.S_IFMT == syscall.S_IFLNK {
-			if err := syscall.Unlink(base); err != nil {
-				return err
-			}
-			return h.fsyncCwd()
-		}
-		if st.Mode&syscall.S_IFMT == syscall.S_IFDIR {
-			if err := syscall.Rmdir(base); err != nil {
-				return err
-			}
-			return h.fsyncCwd()
-		}
-		if st.Nlink != 1 || uint64(st.Dev) != h.dev {
-			return ErrPath
-		}
-		if err := syscall.Unlink(base); err != nil {
-			return err
-		}
-		return h.fsyncCwd()
-	})
-	if err != nil {
-		return mapErr(err), nil
-	}
-	return 0, nil
-}
-
-func (h *fsHelper) lstat(payload []byte) (uint32, []byte) {
-	var line string
-	err := h.at(string(payload), func(base string) error {
-		var st syscall.Stat_t
-		if err := syscall.Lstat(base, &st); err != nil {
-			return err
-		}
-		line = fmt.Sprintf("%d %d %d %d %d", st.Mode, st.Nlink, st.Size, st.Uid, st.Dev)
-		return nil
-	})
-	if err != nil {
-		return mapErr(err), nil
-	}
-	return 0, []byte(line)
-}
-
-func (h *fsHelper) openStat(payload []byte) (uint32, []byte) {
-	var line string
-	err := h.at(string(payload), func(base string) error {
-		fd, err := syscall.Open(base, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
-		if err != nil {
-			return err
-		}
-		defer syscall.Close(fd)
-		var st syscall.Stat_t
-		if err := syscall.Fstat(fd, &st); err != nil {
-			return err
-		}
-		kind := st.Mode & syscall.S_IFMT
-		if kind != syscall.S_IFREG && kind != syscall.S_IFDIR {
-			return ErrPath
-		}
-		if uint64(st.Dev) != h.dev || observedUID(&st) != uint32(os.Geteuid()) {
-			return ErrPath
-		}
-		line = fmt.Sprintf("%d %d %d %d %d", st.Mode, st.Nlink, st.Size, st.Uid, st.Dev)
-		return nil
-	})
-	if err != nil {
-		return mapErr(err), nil
-	}
-	return 0, []byte(line)
-}
-
-func (h *fsHelper) list(payload []byte) (uint32, []byte) {
-	if err := syscall.Fchdir(h.root); err != nil {
-		return 5, nil
-	}
-	rel := string(payload)
-	if rel != "" && rel != "." {
-		parts, err := splitRel(rel)
-		if err != nil {
-			return 3, nil
-		}
-		for _, p := range parts {
-			if err := h.step(p); err != nil {
-				return mapErr(err), nil
-			}
-		}
-	}
-	fd, err := syscall.Open(".", syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
-	if err != nil {
-		return 5, nil
-	}
-	if err := fstatHeld(fd, h.dev, true, 0700); err != nil {
-		syscall.Close(fd)
-		return 3, nil
-	}
-	f := os.NewFile(uintptr(fd), "cwd")
-	defer f.Close()
-	var names []string
-	var nbytes int
-	for {
-		chunk, err := f.Readdirnames(32)
-		if err != nil && len(chunk) == 0 {
-			if err == io.EOF {
-				break
-			}
-			return 5, nil
-		}
-		for _, name := range chunk {
-			if len(name) > 255 || nbytes+len(name)+1 > 8192 || len(names) >= 128 {
-				return 2, nil
-			}
-			names = append(names, name)
-			nbytes += len(name) + 1
-		}
-		if err == io.EOF {
-			break
-		}
-	}
-	return 0, []byte(strings.Join(names, "\n"))
-}
-
-func (h *fsHelper) fsyncCwd() error {
-	fd, err := syscall.Open(".", syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
-	if err != nil {
-		return err
-	}
-	if err := fstatHeld(fd, h.dev, true, 0700); err != nil {
-		syscall.Close(fd)
-		return err
-	}
-	defer syscall.Close(fd)
-	return syscall.Fsync(fd)
-}
-
-func readFullFD(fd int, buf []byte) error {
-	for len(buf) > 0 {
-		n, err := syscall.Read(fd, buf)
-		if n > 0 {
-			buf = buf[n:]
-			continue
-		}
-		if err != nil {
-			return err
-		}
-		return io.EOF
+	// Private regular files only: reject any group/other bits.
+	if st.Mode&0o7777 != 0o600 {
+		return ErrPath
 	}
 	return nil
 }
 
-func mapErr(err error) uint32 {
-	switch {
-	case err == nil:
-		return 0
-	case errors.Is(err, ErrBusy), errors.Is(err, syscall.EWOULDBLOCK), errors.Is(err, syscall.EAGAIN):
-		return 1
-	case errors.Is(err, ErrCorrupt):
-		return 2
-	case errors.Is(err, ErrPath), errors.Is(err, syscall.ELOOP), errors.Is(err, syscall.ENOTDIR):
-		return 3
-	case errors.Is(err, ErrQuota), errors.Is(err, syscall.EFBIG):
-		return 4
-	case errors.Is(err, syscall.ENOENT):
-		return 6
-	default:
-		return 5
+func checkDir(st *syscall.Stat_t, rootDev uint64) error {
+	if uint64(st.Dev) != rootDev {
+		return ErrPath
 	}
+	if st.Mode&syscall.S_IFMT != syscall.S_IFDIR {
+		return ErrPath
+	}
+	if uint32(st.Uid) != uint32(os.Geteuid()) {
+		return ErrPath
+	}
+	if st.Mode&0o7777 != 0o700 {
+		return ErrPath
+	}
+	return nil
 }

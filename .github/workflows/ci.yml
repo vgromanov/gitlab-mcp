@@ -56,6 +56,26 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+  gitcache-native:
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15-intel, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Native gitcache tests
+        run: go test -mod=vendor -race -count=1 -tags=gitcache_ci -timeout=10m ./internal/gitcache/...
+
   integration:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
@@ -79,39 +99,3 @@ jobs:
 
       - name: Integration tests
         run: go test -tags=integration -timeout=10m ./...
-
-  gitcache-native:
-    timeout-minutes: 15
-    permissions:
-      contents: read
-    strategy:
-      fail-fast: false
-      max-parallel: 2
-      matrix:
-        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15-intel, macos-15]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-          cache: false
-
-      - name: Build pinned Git 2.50.1 fixture
-        env:
-          RUNNER_TEMP: ${{ runner.temp }}
-        run: ./scripts/ci/build-git-cache-fixture.sh
-
-      - name: Compile uninstrumented helper
-        env:
-          RUNNER_TEMP: ${{ runner.temp }}
-        run: CGO_ENABLED=0 go test -mod=vendor -c -o "$RUNNER_TEMP/gitcache-helper.test" ./internal/gitcache
-
-      - name: Native enforcement tests
-        env:
-          RUNNER_TEMP: ${{ runner.temp }}
-          GITCACHE_GIT: ${{ runner.temp }}/git-src/git-2.50.1/git
-          GITCACHE_IDENTITY: ${{ runner.temp }}/gitcache-identity
-          GITCACHE_HELPER: ${{ runner.temp }}/gitcache-helper.test
-        run: go test -mod=vendor -race -count=1 -tags=gitcache_ci -timeout=10m ./internal/gitcache

@@ -3,239 +3,234 @@ package gitcache
 import (
 	"crypto/sha256"
 	"encoding/binary"
-	"encoding/hex"
+	"errors"
+
+	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/gitcache/bounds"
 )
 
 const (
-	stateEmpty uint8 = iota
-	stateReserved
-	stateActive
-	stateQuiescent
-	stateVerified
-	stateCommitted
+	// Exactly 8 bytes; longer literals truncate on copy and fail parse.
+	ledgerMagic   = "GITCACHE"
+	ledgerVersion = uint32(2)
+	slotBytes     = 256
+	slotCount     = 64
+	headerBytes   = 256
 )
 
-const magic = "GITCACHE"
+// SlotState is the durable generation lifecycle.
+type SlotState uint8
 
-// Slot is one fixed ledger record. Frozen slots were not committed when the
-// process that reserved them died. They keep a full reservation and are not modified.
+const (
+	SlotEmpty SlotState = iota
+	SlotReserved
+	SlotStaging
+	SlotActive
+	SlotCommitted
+	SlotDeleting
+	SlotAmbiguous
+)
+
+// Slot is one fixed ledger record.
 type Slot struct {
-	ID        string
-	Domain    string
-	Tip       string
-	DestID    string
-	State     uint8
-	Frozen    bool
-	Pack      uint64
-	Index     uint64
-	Access    uint64
-	ReadCount uint32
-	PinSync   bool
+	State          SlotState
+	ID             [32]byte
+	Charge         uint64
+	PackSize       uint64
+	IndexSize      uint64
+	MetaSize       uint64
+	ReadCount      uint32
+	Flags          uint32
+	ManifestDigest [32]byte
 }
 
-func (s Slot) activeReservation() bool {
-	return s.State != stateEmpty && s.State != stateCommitted
-}
-
-func (s Slot) charge() (uint64, error) {
-	if s.State == stateEmpty {
-		return 0, nil
-	}
-	if s.activeReservation() || s.Frozen {
-		return Reserve, nil
-	}
-	return CommittedCharge(s.Pack, s.Index)
-}
-
-type header struct {
-	Quota uint64
+type ledgerHeader struct {
+	Magic   [8]byte
+	Version uint32
+	Quota   uint64
 }
 
 func emptyLedger(quota uint64) ([]byte, error) {
-	if err := QuotaOK(quota); err != nil {
-		return nil, err
-	}
-	buf := make([]byte, LedgerLen)
-	copy(buf[:8], magic)
-	binary.LittleEndian.PutUint32(buf[8:12], 1)
-	binary.LittleEndian.PutUint64(buf[16:24], quota)
-	binary.LittleEndian.PutUint32(buf[24:28], MaxSlots)
-	binary.LittleEndian.PutUint32(buf[28:32], 256)
-	sum := hashLedger(buf)
-	copy(buf[32:64], sum[:])
+	buf := make([]byte, headerBytes+slotCount*slotBytes)
+	copy(buf[:8], ledgerMagic)
+	binary.LittleEndian.PutUint32(buf[8:12], ledgerVersion)
+	binary.LittleEndian.PutUint64(buf[12:20], quota)
+	sum := hashLedger(buf[:len(buf)-32])
+	copy(buf[len(buf)-32:], sum[:])
 	return buf, nil
 }
 
 func hashLedger(buf []byte) [32]byte {
-	tmp := make([]byte, len(buf))
-	copy(tmp, buf)
-	for i := 32; i < 64 && i < len(tmp); i++ {
-		tmp[i] = 0
-	}
-	return sha256.Sum256(tmp)
+	return sha256.Sum256(buf)
 }
 
-func parseLedger(buf []byte) (header, []Slot, error) {
-	if len(buf) != LedgerLen {
-		return header{}, nil, ErrCorrupt
+func parseLedger(buf []byte) (ledgerHeader, []Slot, error) {
+	if len(buf) != headerBytes+slotCount*slotBytes {
+		return ledgerHeader{}, nil, ErrCorrupt
 	}
-	if string(buf[:8]) != magic {
-		return header{}, nil, ErrCorrupt
-	}
-	if binary.LittleEndian.Uint32(buf[8:12]) != 1 {
-		return header{}, nil, ErrCorrupt
-	}
-	sum := hashLedger(buf)
-	var got [32]byte
-	copy(got[:], buf[32:64])
-	if got != sum {
-		return header{}, nil, ErrCorrupt
-	}
-	q := binary.LittleEndian.Uint64(buf[16:24])
-	if err := QuotaOK(q); err != nil {
-		return header{}, nil, ErrCorrupt
-	}
-	if binary.LittleEndian.Uint32(buf[24:28]) != MaxSlots {
-		return header{}, nil, ErrCorrupt
-	}
-	slots := make([]Slot, MaxSlots)
-	for i := 0; i < MaxSlots; i++ {
-		s, err := parseSlot(buf[256+i*256 : 256+(i+1)*256])
-		if err != nil {
-			return header{}, nil, err
+	sum := hashLedger(buf[:len(buf)-32])
+	if string(buf[len(buf)-32:]) != string(sum[:]) {
+		// compare correctly
+		var got [32]byte
+		copy(got[:], buf[len(buf)-32:])
+		if got != sum {
+			return ledgerHeader{}, nil, ErrCorrupt
 		}
-		if s.State != stateEmpty && s.State != stateCommitted {
-			s.Frozen = true
+	}
+	var h ledgerHeader
+	copy(h.Magic[:], buf[:8])
+	if string(h.Magic[:]) != ledgerMagic {
+		return ledgerHeader{}, nil, ErrCorrupt
+	}
+	h.Version = binary.LittleEndian.Uint32(buf[8:12])
+	if h.Version != ledgerVersion {
+		return ledgerHeader{}, nil, ErrCorrupt
+	}
+	h.Quota = binary.LittleEndian.Uint64(buf[12:20])
+	slots := make([]Slot, slotCount)
+	off := headerBytes
+	for i := range slots {
+		s, err := parseSlot(buf[off : off+slotBytes])
+		if err != nil {
+			return ledgerHeader{}, nil, err
 		}
 		slots[i] = s
+		off += slotBytes
 	}
-	if _, err := accounted(q, slots); err != nil {
-		return header{}, nil, err
-	}
-	return header{Quota: q}, slots, nil
+	return h, slots, nil
 }
 
-func parseSlot(rec []byte) (Slot, error) {
-	var s Slot
-	if len(rec) != 256 {
-		return s, ErrCorrupt
+func parseSlot(b []byte) (Slot, error) {
+	if len(b) != slotBytes {
+		return Slot{}, ErrCorrupt
 	}
-	var sum, got [32]byte
-	copy(got[:], rec[176:208])
-	zero := append([]byte(nil), rec...)
-	for i := 176; i < 208; i++ {
-		zero[i] = 0
-	}
-	sum = sha256.Sum256(zero)
-	if got != sum {
-		return s, ErrCorrupt
-	}
-	id := cString(rec[0:32])
-	dom := cString(rec[32:64])
-	tip := cString(rec[64:104])
-	dest := cString(rec[104:136])
-	s.State = rec[136]
-	s.ID, s.Domain, s.Tip, s.DestID = id, dom, tip, dest
-	s.Pack = binary.LittleEndian.Uint64(rec[144:152])
-	s.Index = binary.LittleEndian.Uint64(rec[152:160])
-	s.Access = binary.LittleEndian.Uint64(rec[160:168])
-	s.ReadCount = binary.LittleEndian.Uint32(rec[168:172])
-	switch s.State {
-	case stateEmpty:
-		if id != "" || s.Pack != 0 || s.Index != 0 || s.ReadCount != 0 {
-			return Slot{}, ErrCorrupt
-		}
-	case stateReserved, stateActive, stateQuiescent, stateVerified:
-		if !hex32(id) {
-			return Slot{}, ErrCorrupt
-		}
-	case stateCommitted:
-		if !hex32(id) {
-			return Slot{}, ErrCorrupt
-		}
-		if _, err := CommittedCharge(s.Pack, s.Index); err != nil {
-			return Slot{}, ErrCorrupt
-		}
+	st := SlotState(b[0])
+	switch st {
+	case SlotEmpty, SlotReserved, SlotStaging, SlotActive, SlotCommitted, SlotDeleting, SlotAmbiguous:
 	default:
+		return Slot{}, ErrCorrupt
+	}
+	var s Slot
+	s.State = st
+	copy(s.ID[:], b[1:33])
+	s.Charge = binary.LittleEndian.Uint64(b[33:41])
+	s.PackSize = binary.LittleEndian.Uint64(b[41:49])
+	s.IndexSize = binary.LittleEndian.Uint64(b[49:57])
+	s.MetaSize = binary.LittleEndian.Uint64(b[57:65])
+	s.ReadCount = binary.LittleEndian.Uint32(b[65:69])
+	s.Flags = binary.LittleEndian.Uint32(b[69:73])
+	copy(s.ManifestDigest[:], b[73:105])
+	if st != SlotEmpty && s.Charge == 0 {
 		return Slot{}, ErrCorrupt
 	}
 	return s, nil
 }
 
-func putSlot(rec []byte, s Slot) error {
-	for i := range rec {
-		rec[i] = 0
+func encodeLedger(h ledgerHeader, slots []Slot) ([]byte, error) {
+	if len(slots) != slotCount {
+		return nil, errors.New("gitcache: slot count")
 	}
-	if len(s.ID) > 32 || len(s.Domain) > 32 || len(s.Tip) > 40 || len(s.DestID) > 32 {
-		return ErrCorrupt
+	buf := make([]byte, headerBytes+slotCount*slotBytes)
+	copy(buf[:8], ledgerMagic)
+	binary.LittleEndian.PutUint32(buf[8:12], ledgerVersion)
+	binary.LittleEndian.PutUint64(buf[12:20], h.Quota)
+	off := headerBytes
+	for _, s := range slots {
+		encodeSlot(buf[off:off+slotBytes], s)
+		off += slotBytes
 	}
-	copy(rec[0:32], s.ID)
-	copy(rec[32:64], s.Domain)
-	copy(rec[64:104], s.Tip)
-	copy(rec[104:136], s.DestID)
-	rec[136] = s.State
-	binary.LittleEndian.PutUint64(rec[144:152], s.Pack)
-	binary.LittleEndian.PutUint64(rec[152:160], s.Index)
-	binary.LittleEndian.PutUint64(rec[160:168], s.Access)
-	binary.LittleEndian.PutUint32(rec[168:172], s.ReadCount)
-	sum := sha256.Sum256(rec)
-	copy(rec[176:208], sum[:])
-	return nil
-}
-
-func writeLedger(quota uint64, slots []Slot) ([]byte, error) {
-	buf, err := emptyLedger(quota)
-	if err != nil {
-		return nil, err
-	}
-	if len(slots) != MaxSlots {
-		return nil, ErrCorrupt
-	}
-	for i := range slots {
-		if err := putSlot(buf[256+i*256:256+(i+1)*256], slots[i]); err != nil {
-			return nil, err
-		}
-	}
-	sum := hashLedger(buf)
-	copy(buf[32:64], sum[:])
-	if _, _, err := parseLedger(buf); err != nil {
-		return nil, err
-	}
+	sum := hashLedger(buf[:len(buf)-32])
+	copy(buf[len(buf)-32:], sum[:])
 	return buf, nil
 }
 
-func accounted(quota uint64, slots []Slot) (uint64, error) {
-	sum := RootBytes
-	var err error
-	for i := range slots {
-		c, e := slots[i].charge()
-		if e != nil {
-			return 0, e
-		}
-		sum, err = Add(sum, c)
-		if err != nil {
-			return 0, err
-		}
+func encodeSlot(b []byte, s Slot) {
+	for i := range b {
+		b[i] = 0
 	}
-	if sum > quota {
-		return sum, ErrQuota
-	}
-	return sum, nil
+	b[0] = byte(s.State)
+	copy(b[1:33], s.ID[:])
+	binary.LittleEndian.PutUint64(b[33:41], s.Charge)
+	binary.LittleEndian.PutUint64(b[41:49], s.PackSize)
+	binary.LittleEndian.PutUint64(b[49:57], s.IndexSize)
+	binary.LittleEndian.PutUint64(b[57:65], s.MetaSize)
+	binary.LittleEndian.PutUint32(b[65:69], s.ReadCount)
+	binary.LittleEndian.PutUint32(b[69:73], s.Flags)
+	copy(b[73:105], s.ManifestDigest[:])
 }
 
-func hex32(s string) bool {
-	if len(s) != 32 {
-		return false
+func chargedTotal(slots []Slot) (uint64, error) {
+	var total uint64
+	for _, s := range slots {
+		if s.State == SlotEmpty {
+			continue
+		}
+		if s.Charge == 0 {
+			return 0, ErrCorrupt
+		}
+		n := total + s.Charge
+		if n < total {
+			return 0, ErrOverflow
+		}
+		total = n
 	}
-	_, err := hex.DecodeString(s)
-	return err == nil
+	return total, nil
 }
 
-func cString(b []byte) string {
-	for i, c := range b {
-		if c == 0 {
-			return string(b[:i])
-		}
+// validateLedgerSemantics rejects checksum-valid but accounting-invalid ledgers.
+func validateLedgerSemantics(h ledgerHeader, slots []Slot) error {
+	if h.Quota < uint64(bounds.BrootBytes) || h.Quota > uint64(^uint64(0)>>1) {
+		return ErrCorrupt
 	}
-	return string(b)
+	seen := make(map[[32]byte]struct{}, slotCount)
+	var zero [32]byte
+	var total uint64
+	for _, s := range slots {
+		switch s.State {
+		case SlotEmpty:
+			if s.Flags != 0 || s.ManifestDigest != zero || s.Charge != 0 || s.PackSize != 0 || s.IndexSize != 0 || s.MetaSize != 0 || s.ReadCount != 0 || s.ID != zero {
+				return ErrCorrupt
+			}
+			continue
+		case SlotReserved, SlotStaging, SlotActive, SlotCommitted, SlotDeleting, SlotAmbiguous:
+		default:
+			return ErrCorrupt
+		}
+		if s.Charge == 0 || s.Flags != 0 || s.ReadCount > bounds.MaxReaders || s.Charge > uint64(bounds.GenerationCharge()) {
+			return ErrCorrupt
+		}
+		if s.ID == zero {
+			return ErrCorrupt
+		}
+		if _, dup := seen[s.ID]; dup {
+			return ErrCorrupt
+		}
+		seen[s.ID] = struct{}{}
+		if s.State == SlotCommitted && (s.ManifestDigest == zero || s.PackSize < 32 || s.IndexSize < 1072 || s.MetaSize == 0) {
+			return ErrCorrupt
+		}
+		sum := s.PackSize + s.IndexSize
+		if sum < s.PackSize {
+			return ErrOverflow
+		}
+		sum2 := sum + s.MetaSize
+		if sum2 < sum {
+			return ErrOverflow
+		}
+		if sum2 > s.Charge {
+			return ErrCorrupt
+		}
+		if s.PackSize > uint64(bounds.MaxPackBytes) || s.IndexSize > uint64(bounds.MaxIndexBytes) || s.MetaSize > uint64(bounds.MaxMetaBytes) {
+			return ErrCorrupt
+		}
+		n := total + s.Charge
+		if n < total {
+			return ErrOverflow
+		}
+		total = n
+	}
+	broot := uint64(bounds.BrootBytes)
+	if broot+total < broot || broot+total > h.Quota {
+		return ErrCorrupt
+	}
+	return nil
 }
