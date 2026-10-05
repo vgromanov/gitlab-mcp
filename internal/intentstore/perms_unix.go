@@ -257,7 +257,7 @@ var ancestorUID = func() uint32 { return uint32(os.Geteuid()) }
 // can write. The owner of a directory can rename its entries whatever the
 // mode, so a 0700 directory owned by another user (for example
 // /tmp/alice when running as root) lets that user swap a symlink in between
-// the path walk and sql.Open.
+// the path walk and the database open.
 func checkSharedDirMode(st unix.Stat_t) error {
 	if st.Mode&unix.S_IFMT != unix.S_IFDIR {
 		return ErrUnsafePermissions

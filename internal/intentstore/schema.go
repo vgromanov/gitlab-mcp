@@ -7,15 +7,13 @@ import (
 )
 
 const (
-	// ApplicationID is the SQLite application_id for this store ("GMIS").
-	ApplicationID uint32 = 0x474D4953
 	// SchemaName is stored in meta and must match on every open.
 	SchemaName = "gitlab-mcp-intent"
-	// SchemaVersion is the current user_version.
+	// SchemaVersion is the current on-disk schema version.
 	SchemaVersion = 1
 	// DefaultMaxRows is the row cap when Config.MaxRows is unset.
 	DefaultMaxRows = 10000
-	// DefaultMaxBytes is the db+wal+shm cap when Config.MaxBytes is unset.
+	// DefaultMaxBytes is the data-file size cap when Config.MaxBytes is unset.
 	DefaultMaxBytes int64 = 32 << 20
 	// DefaultRetention is how long finalized receipt details are kept.
 	DefaultRetention = 30 * 24 * time.Hour
@@ -215,45 +213,60 @@ func allowedOutcome(from, to State) bool {
 	}
 }
 
-const schemaSQL = `
-CREATE TABLE meta (
-  key TEXT PRIMARY KEY,
-  value TEXT NOT NULL
-);
-CREATE TABLE intents (
-  operation_id TEXT PRIMARY KEY,
-  instance_id TEXT NOT NULL,
-  actor TEXT NOT NULL,
-  project TEXT NOT NULL,
-  mr TEXT NOT NULL,
-  operation_kind TEXT NOT NULL,
-  caller_key TEXT NOT NULL,
-  payload_hash TEXT NOT NULL,
-  state TEXT NOT NULL,
-  expected_head TEXT,
-  observed_head TEXT,
-  upstream_ids TEXT,
-  verification_state TEXT,
-  created_unix_nano INTEGER NOT NULL,
-  updated_unix_nano INTEGER NOT NULL,
-  sending_unix_nano INTEGER,
-  finalized_unix_nano INTEGER,
-  expires_unix_nano INTEGER,
-  compacted INTEGER NOT NULL DEFAULT 0,
-  row_epoch TEXT NOT NULL,
-  UNIQUE (instance_id, actor, project, mr, operation_kind, caller_key)
-);
-CREATE TRIGGER intents_insert_epoch
-BEFORE INSERT ON intents
-WHEN NEW.row_epoch != (SELECT value FROM meta WHERE key = 'epoch')
-BEGIN
-  SELECT RAISE(ABORT, 'stale epoch');
-END;
-CREATE TRIGGER intents_send_epoch
-BEFORE UPDATE OF state ON intents
-WHEN NEW.state = 'sending'
-  AND OLD.row_epoch != (SELECT value FROM meta WHERE key = 'epoch')
-BEGIN
-  SELECT RAISE(ABORT, 'stale epoch');
-END;
-`
+// The store is a single bbolt file. bbolt is pure Go, takes an advisory
+// file lock per open handle, and keeps everything in that one file, so
+// there are no sidecar files to permission-check or count against the cap.
+var (
+	bucketMeta     = []byte("meta")
+	bucketIntents  = []byte("intents")
+	bucketIdentity = []byte("identity")
+
+	keySchemaName    = []byte("schema_name")
+	keySchemaVersion = []byte("schema_version")
+	keyEpoch         = []byte("epoch")
+)
+
+const (
+	// containerMagic is the bbolt file magic. It sits at headerMagicOffset in
+	// the first page header and lets a non-database file be refused before
+	// anything opens it for writing.
+	containerMagic    uint32 = 0xED0CDAED
+	headerMagicOffset        = 16
+	headerLen                = headerMagicOffset + 4
+
+	// pageSize is fixed so the file format does not depend on the host page size.
+	pageSize = 4096
+	// allocSize bounds how far the data file grows past the pages in use.
+	allocSize = 256 << 10
+)
+
+// row is the persisted form of one intent. Zero timestamps mean "unset".
+type row struct {
+	OperationID       string   `json:"operation_id"`
+	Instance          string   `json:"instance"`
+	Actor             string   `json:"actor"`
+	Project           string   `json:"project"`
+	MR                string   `json:"mr"`
+	Kind              string   `json:"kind"`
+	CallerKey         string   `json:"caller_key"`
+	PayloadHash       string   `json:"payload_hash"`
+	State             State    `json:"state"`
+	ExpectedHead      string   `json:"expected_head,omitempty"`
+	ObservedHead      string   `json:"observed_head,omitempty"`
+	UpstreamIDs       []string `json:"upstream_ids,omitempty"`
+	VerificationState string   `json:"verification_state,omitempty"`
+	CreatedUnixNano   int64    `json:"created"`
+	UpdatedUnixNano   int64    `json:"updated"`
+	SendingUnixNano   int64    `json:"sending,omitempty"`
+	FinalizedUnixNano int64    `json:"finalized,omitempty"`
+	ExpiresUnixNano   int64    `json:"expires,omitempty"`
+	Compacted         bool     `json:"compacted,omitempty"`
+	RowEpoch          string   `json:"row_epoch"`
+}
+
+// identityKey joins the identity fields with NUL. validIdentField rejects
+// NUL, so distinct identities cannot collide.
+func identityKey(id Identity) []byte {
+	return []byte(id.Instance + "\x00" + id.Actor + "\x00" + id.Project + "\x00" +
+		id.MR + "\x00" + id.Kind + "\x00" + id.CallerKey)
+}

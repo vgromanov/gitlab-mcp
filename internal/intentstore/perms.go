@@ -1,6 +1,7 @@
 package intentstore
 
 import (
+	"encoding/binary"
 	"errors"
 	"io"
 	"os"
@@ -10,14 +11,14 @@ import (
 func isSymlink(info os.FileInfo) bool {
 	m := info.Mode()
 	// Go 1.25 reports a Windows directory junction or mount point as
-	// ModeIrregular (reparse point), not ModeSymlink. sql.Open would
-	// otherwise follow it after the walk accepted the component.
+	// ModeIrregular (reparse point), not ModeSymlink. The database open
+	// would otherwise follow it after the walk accepted the component.
 	return m&os.ModeSymlink != 0 || m&os.ModeIrregular != 0
 }
 
 // rejectDotDot refuses a path that still contains `..`. filepath.Clean
 // would collapse /safe/link/../db before the descriptor walk, while
-// sql.Open still receives the original name and can land under the link.
+// the database open still receives the original name and can land under the link.
 func rejectDotDot(path string) error {
 	for _, part := range strings.FieldsFunc(path, func(r rune) bool {
 		return r == '/' || r == '\\'
@@ -118,88 +119,26 @@ func lstat(path string) (os.FileInfo, error) {
 	return info, nil
 }
 
-// classifyHeader rejects non-empty files that are not SQLite.
-// Empty files are initialized by Open.
+// classifyHeader rejects non-empty files that are not an intent-store
+// container. Empty files are initialized by Open.
 func classifyHeader(path string) error {
 	f, err := os.Open(path)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-	buf := make([]byte, 16)
-	n, err := f.Read(buf)
-	if err != nil && !errors.Is(err, io.EOF) {
-		return ErrCorrupt
-	}
-	if n == 0 {
+	buf := make([]byte, headerLen)
+	n, err := io.ReadFull(f, buf)
+	if n == 0 && errors.Is(err, io.EOF) {
 		return nil
 	}
-	const magic = "SQLite format 3\x00"
-	if n < len(magic) || string(buf[:len(magic)]) != magic {
+	if err != nil {
+		return ErrCorrupt
+	}
+	if binary.LittleEndian.Uint32(buf[headerMagicOffset:]) != containerMagic {
 		return ErrCorrupt
 	}
 	return nil
-}
-
-func sidecarPaths(path string) []string {
-	return []string{path, path + "-wal", path + "-shm"}
-}
-
-func existingSidecars(path string) (map[string]struct{}, error) {
-	out := map[string]struct{}{}
-	for _, p := range sidecarPaths(path)[1:] {
-		info, err := os.Lstat(p)
-		if err != nil {
-			if os.IsNotExist(err) {
-				continue
-			}
-			return nil, err
-		}
-		if isSymlink(info) {
-			return nil, ErrSymlink
-		}
-		if err := checkFileMode(p, info); err != nil {
-			return nil, err
-		}
-		out[p] = struct{}{}
-	}
-	return out, nil
-}
-
-func lockDownNewSidecars(path string, before map[string]struct{}) error {
-	for _, p := range sidecarPaths(path)[1:] {
-		info, err := os.Lstat(p)
-		if err != nil {
-			if os.IsNotExist(err) {
-				continue
-			}
-			return err
-		}
-		if isSymlink(info) {
-			return ErrSymlink
-		}
-		if _, ok := before[p]; ok {
-			if err := checkFileMode(p, info); err != nil {
-				return err
-			}
-			continue
-		}
-		if err := establishPrivate(p, false); err != nil {
-			return err
-		}
-		info, err = os.Lstat(p)
-		if err != nil {
-			return err
-		}
-		if err := checkFileMode(p, info); err != nil {
-			return err
-		}
-	}
-	info, err := os.Lstat(path)
-	if err != nil {
-		return err
-	}
-	return checkFileMode(path, info)
 }
 
 func fileSize(path string) (int64, error) {
@@ -214,22 +153,4 @@ func fileSize(path string) (int64, error) {
 		return 0, ErrSymlink
 	}
 	return info.Size(), nil
-}
-
-func bytesOnDisk(path string) (int64, error) {
-	var total int64
-	for _, p := range sidecarPaths(path) {
-		info, err := os.Lstat(p)
-		if err != nil {
-			if os.IsNotExist(err) {
-				continue
-			}
-			return 0, err
-		}
-		if isSymlink(info) {
-			return 0, ErrSymlink
-		}
-		total += info.Size()
-	}
-	return total, nil
 }

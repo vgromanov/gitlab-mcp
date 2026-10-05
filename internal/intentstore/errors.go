@@ -3,15 +3,15 @@ package intentstore
 import "errors"
 
 var (
-	// ErrUnrelatedDatabase means the file is SQLite but not this store.
+	// ErrUnrelatedDatabase means the file is a database but not this store.
 	ErrUnrelatedDatabase = errors.New("intent store: unrelated database")
 	// ErrUnsafePermissions means a directory or database file mode is not private.
 	ErrUnsafePermissions = errors.New("intent store: unsafe permissions")
-	// ErrSymlink means the database path, its parent, or a WAL/SHM sidecar is a symlink.
+	// ErrSymlink means the database path, its parent, or an ancestor is a symlink.
 	ErrSymlink = errors.New("intent store: symlink refused")
 	// ErrReadOnly means the database cannot accept a durable write.
 	ErrReadOnly = errors.New("intent store: database is read-only")
-	// ErrCorrupt means the file is not a readable SQLite database.
+	// ErrCorrupt means the file is not a readable intent database.
 	ErrCorrupt = errors.New("intent store: corrupt database")
 	// ErrPayloadConflict means the idempotency key already exists with another payload hash.
 	ErrPayloadConflict = errors.New("intent store: payload conflict")

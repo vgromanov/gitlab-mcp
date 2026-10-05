@@ -314,7 +314,7 @@ const (
 // rejectUntrustedAncestor refuses a directory that a principal other than
 // this user, SYSTEM, Administrators, or TrustedInstaller can delete, rename,
 // or re-ACL. Such a principal can swap the validated private parent for a
-// junction between the path walk and sql.Open.
+// junction between the path walk and the database open.
 func rejectUntrustedAncestor(path string) error {
 	sd, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION|windows.OWNER_SECURITY_INFORMATION)
 	if err != nil || sd == nil {

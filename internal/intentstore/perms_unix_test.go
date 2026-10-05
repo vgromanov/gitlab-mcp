@@ -204,7 +204,7 @@ func TestOpenRejectsDotDotPastSymlink(t *testing.T) {
 	if err := os.Symlink(evil, link); err != nil {
 		t.Fatal(err)
 	}
-	// Clean would walk /safe/db while SQLite would open under the link.
+	// Clean would walk /safe/db while the store would open under the link.
 	attack := link + "/../db/intent.db"
 	if _, err := Open(Config{Path: attack}); err == nil {
 		t.Fatal("accepted .. after symlink")

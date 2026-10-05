@@ -2,16 +2,12 @@ package intentstore
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"time"
-)
 
-const receiptCols = `operation_id, instance_id, actor, project, mr, operation_kind, caller_key,
-payload_hash, state, expected_head, observed_head, upstream_ids, verification_state,
-created_unix_nano, updated_unix_nano, sending_unix_nano, finalized_unix_nano, expires_unix_nano,
-compacted, row_epoch`
+	bolt "go.etcd.io/bbolt"
+)
 
 // Begin persists a prepared intent or returns the existing row for the same key.
 func (s *Store) Begin(ctx context.Context, id Identity, payloadHash string, opts BeginOptions) (Receipt, error) {
@@ -25,59 +21,55 @@ func (s *Store) Begin(ctx context.Context, id Identity, payloadHash string, opts
 		return Receipt{}, ErrInvalidOutcome
 	}
 	var out Receipt
-	err := s.writeTx(ctx, true, func(tx *sql.Tx) error {
-		existing, err := getByIdentityTx(ctx, tx, id, s.epoch)
+	err := s.writeTx(ctx, true, func(tx *bolt.Tx) error {
+		existing, err := rowByIdentity(tx, id)
 		if err == nil {
 			if existing.PayloadHash != payloadHash {
 				return ErrPayloadConflict
 			}
-			out = existing
-			return nil
+			out = existing.receipt(s.epoch)
+			return errNoCommit
 		}
 		if !errors.Is(err, ErrNotFound) {
 			return err
 		}
-		var n int
-		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM intents`).Scan(&n); err != nil {
-			return mapDriver(err)
-		}
-		if n >= s.maxRows {
+		if rowCount(tx) >= s.maxRows {
 			return ErrFull
+		}
+		if err := s.overByteCap(); err != nil {
+			return err
 		}
 		op, err := newID()
 		if err != nil {
 			return err
 		}
-		now := s.now()
-		var expires any
+		now := s.now().UnixNano()
+		r := row{
+			OperationID:     op,
+			Instance:        id.Instance,
+			Actor:           id.Actor,
+			Project:         id.Project,
+			MR:              id.MR,
+			Kind:            id.Kind,
+			CallerKey:       id.CallerKey,
+			PayloadHash:     payloadHash,
+			State:           StatePrepared,
+			ExpectedHead:    opts.ExpectedHead,
+			CreatedUnixNano: now,
+			UpdatedUnixNano: now,
+			RowEpoch:        s.epoch,
+		}
 		if !opts.ExpiresAt.IsZero() {
-			expires = opts.ExpiresAt.UTC().UnixNano()
+			r.ExpiresUnixNano = opts.ExpiresAt.UTC().UnixNano()
 		}
-		var head any
-		if opts.ExpectedHead != "" {
-			head = opts.ExpectedHead
+		if err := putRow(tx, r); err != nil {
+			return err
 		}
-		res, err := tx.ExecContext(ctx, `INSERT INTO intents (
-			operation_id, instance_id, actor, project, mr, operation_kind, caller_key,
-			payload_hash, state, expected_head, created_unix_nano, updated_unix_nano, expires_unix_nano,
-			compacted, row_epoch
-		) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, value
-			FROM meta WHERE key='epoch' AND value=?`,
-			op, id.Instance, id.Actor, id.Project, id.MR, id.Kind, id.CallerKey,
-			payloadHash, string(StatePrepared), head, now.UnixNano(), now.UnixNano(), expires, s.epoch,
-		)
-		if err != nil {
-			return mapDriver(err)
+		if err := tx.Bucket(bucketIdentity).Put(identityKey(id), []byte(op)); err != nil {
+			return err
 		}
-		inserted, err := res.RowsAffected()
-		if err != nil {
-			return mapDriver(err)
-		}
-		if inserted != 1 {
-			return ErrStaleEpoch
-		}
-		out, err = getByIDTx(ctx, tx, op, s.epoch)
-		return err
+		out = r.receipt(s.epoch)
+		return nil
 	})
 	return out, err
 }
@@ -88,49 +80,33 @@ func (s *Store) ClaimSending(ctx context.Context, operationID string) (Receipt, 
 		return Receipt{}, ErrNotFound
 	}
 	var out Receipt
-	err := s.writeTx(ctx, true, func(tx *sql.Tx) error {
-		rec, err := getByIDTx(ctx, tx, operationID, s.epoch)
+	err := s.writeTx(ctx, true, func(tx *bolt.Tx) error {
+		r, err := rowByID(tx, operationID)
 		if err != nil {
 			return err
 		}
-		if !rec.EpochCurrent {
+		if r.RowEpoch != s.epoch {
 			return ErrStaleEpoch
 		}
-		switch rec.State {
+		switch r.State {
 		case StateSending:
 			return ErrAlreadySending
 		case StatePrepared:
 		default:
 			return ErrTerminal
 		}
-		if !rec.ExpiresAt.IsZero() && !s.now().Before(rec.ExpiresAt) {
+		now := s.now()
+		if r.ExpiresUnixNano != 0 && !now.Before(nano(r.ExpiresUnixNano)) {
 			return ErrExpired
 		}
-		now := s.now()
-		res, err := tx.ExecContext(ctx, `UPDATE intents SET state=?, sending_unix_nano=?, updated_unix_nano=?
-			WHERE operation_id=? AND state=?
-			  AND row_epoch=(SELECT value FROM meta WHERE key='epoch')
-			  AND row_epoch=?`,
-			string(StateSending), now.UnixNano(), now.UnixNano(), operationID, string(StatePrepared), s.epoch)
-		if err != nil {
-			return mapDriver(err)
+		r.State = StateSending
+		r.SendingUnixNano = now.UnixNano()
+		r.UpdatedUnixNano = now.UnixNano()
+		if err := putRow(tx, r); err != nil {
+			return err
 		}
-		n, err := res.RowsAffected()
-		if err != nil {
-			return mapDriver(err)
-		}
-		if n != 1 {
-			current, err := getByIDTx(ctx, tx, operationID, s.epoch)
-			if err != nil {
-				return err
-			}
-			if !current.EpochCurrent {
-				return ErrStaleEpoch
-			}
-			return ErrAlreadySending
-		}
-		out, err = getByIDTx(ctx, tx, operationID, s.epoch)
-		return err
+		out = r.receipt(s.epoch)
+		return nil
 	})
 	return out, err
 }
@@ -143,66 +119,40 @@ func (s *Store) RecordOutcome(ctx context.Context, operationID string, outcome O
 		return Receipt{}, ErrInvalidOutcome
 	}
 	var out Receipt
-	err := s.writeTx(ctx, false, func(tx *sql.Tx) error {
-		rec, err := getByIDTx(ctx, tx, operationID, s.epoch)
+	err := s.writeTx(ctx, false, func(tx *bolt.Tx) error {
+		r, err := rowByID(tx, operationID)
 		if err != nil {
 			return err
 		}
-		if rec.Compacted || isFinalized(rec.State) {
+		if r.Compacted || isFinalized(r.State) {
 			return ErrTerminal
 		}
-		if !allowedOutcome(rec.State, outcome.State) {
+		if !allowedOutcome(r.State, outcome.State) {
 			return ErrInvalidState
 		}
-		now := s.now()
-		finalized := rec.FinalizedAt
-		if isFinalized(outcome.State) && finalized.IsZero() {
-			finalized = now
-		}
-		ids := rec.UpstreamIDs
-		if outcome.UpstreamIDs != nil {
-			ids = outcome.UpstreamIDs
-		}
-		raw, err := json.Marshal(ids)
-		if err != nil {
-			return ErrInvalidOutcome
-		}
-		observed := rec.ObservedHead
-		if outcome.ObservedHead != "" {
-			observed = outcome.ObservedHead
-		}
-		verify := rec.VerificationState
-		if outcome.VerificationState != "" {
-			verify = outcome.VerificationState
-		}
-		var observedArg, verifyArg, finalizedArg, upstreamArg any
-		if observed != "" {
-			observedArg = observed
-		}
-		if verify != "" {
-			verifyArg = verify
-		}
-		if ids != nil {
-			upstreamArg = string(raw)
-		}
-		if !finalized.IsZero() {
-			finalizedArg = finalized.UTC().UnixNano()
-		}
-		res, err := tx.ExecContext(ctx, `UPDATE intents SET state=?, observed_head=?, upstream_ids=?, verification_state=?,
-			updated_unix_nano=?, finalized_unix_nano=? WHERE operation_id=? AND row_epoch=?`,
-			string(outcome.State), observedArg, upstreamArg, verifyArg, now.UnixNano(), finalizedArg, operationID, s.epoch)
-		if err != nil {
-			return mapDriver(err)
-		}
-		n, err := res.RowsAffected()
-		if err != nil {
-			return mapDriver(err)
-		}
-		if n != 1 {
+		if r.RowEpoch != s.epoch {
 			return ErrStaleEpoch
 		}
-		out, err = getByIDTx(ctx, tx, operationID, s.epoch)
-		return err
+		now := s.now().UnixNano()
+		if isFinalized(outcome.State) && r.FinalizedUnixNano == 0 {
+			r.FinalizedUnixNano = now
+		}
+		if outcome.UpstreamIDs != nil {
+			r.UpstreamIDs = outcome.UpstreamIDs
+		}
+		if outcome.ObservedHead != "" {
+			r.ObservedHead = outcome.ObservedHead
+		}
+		if outcome.VerificationState != "" {
+			r.VerificationState = outcome.VerificationState
+		}
+		r.State = outcome.State
+		r.UpdatedUnixNano = now
+		if err := putRow(tx, r); err != nil {
+			return err
+		}
+		out = r.receipt(s.epoch)
+		return nil
 	})
 	return out, err
 }
@@ -211,11 +161,8 @@ func (s *Store) RecordOutcome(ctx context.Context, operationID string, outcome O
 func (s *Store) Get(ctx context.Context, operationID string) (Receipt, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := s.readyLocked(); err != nil {
-		return Receipt{}, err
-	}
-	return s.receiptSnapshot(ctx, func(tx *sql.Tx, epoch string) (Receipt, error) {
-		return getByIDTx(ctx, tx, operationID, epoch)
+	return s.receiptSnapshot(ctx, func(tx *bolt.Tx) (row, error) {
+		return rowByID(tx, operationID)
 	})
 }
 
@@ -226,58 +173,74 @@ func (s *Store) GetByIdentity(ctx context.Context, id Identity) (Receipt, error)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := s.readyLocked(); err != nil {
-		return Receipt{}, err
-	}
-	return s.receiptSnapshot(ctx, func(tx *sql.Tx, epoch string) (Receipt, error) {
-		return getByIdentityTx(ctx, tx, id, epoch)
+	return s.receiptSnapshot(ctx, func(tx *bolt.Tx) (row, error) {
+		return rowByIdentity(tx, id)
 	})
 }
 
 // receiptSnapshot loads meta.epoch and the receipt from one read
-// transaction. A reset committed between standalone queries could
-// otherwise mark an old row current and a new row stale.
-func (s *Store) receiptSnapshot(ctx context.Context, load func(*sql.Tx, string) (Receipt, error)) (Receipt, error) {
-	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
-	if err != nil {
-		return Receipt{}, mapDriver(err)
-	}
-	defer tx.Rollback()
-	epoch, err := readEpoch(ctx, tx)
-	if err != nil {
-		return Receipt{}, err
-	}
-	if afterReadEpoch != nil {
-		afterReadEpoch()
-	}
-	return load(tx, epoch)
+// transaction. The read holds the file lock, so a reset cannot commit
+// between the two lookups and mark an old row current or a new row stale.
+func (s *Store) receiptSnapshot(ctx context.Context, load func(*bolt.Tx) (row, error)) (Receipt, error) {
+	var out Receipt
+	err := s.view(ctx, func(tx *bolt.Tx) error {
+		epoch, err := readEpoch(tx)
+		if err != nil {
+			return err
+		}
+		if afterReadEpoch != nil {
+			afterReadEpoch()
+		}
+		r, err := load(tx)
+		if err != nil {
+			return err
+		}
+		out = r.receipt(epoch)
+		return nil
+	})
+	return out, err
 }
 
 // Compact drops finalized receipt details older than the retention window.
 // Tombstones keep the key, payload hash, and outcome. In-flight and uncertain
 // rows are left intact.
 func (s *Store) Compact(ctx context.Context) (int, error) {
-	var n int64
-	err := s.writeTx(ctx, false, func(tx *sql.Tx) error {
+	n := 0
+	err := s.writeTx(ctx, false, func(tx *bolt.Tx) error {
 		now := s.now()
 		cutoff := now.Add(-s.retention).UnixNano()
-		res, err := tx.ExecContext(ctx, `UPDATE intents SET
-			expected_head=NULL, observed_head=NULL, upstream_ids=NULL, verification_state=NULL,
-			compacted=1, updated_unix_nano=?
-			WHERE compacted=0
-			  AND state IN (?, ?, ?, ?)
-			  AND finalized_unix_nano IS NOT NULL
-			  AND finalized_unix_nano <= ?`,
-			now.UnixNano(),
-			string(StatePublished), string(StatePublishedOnChangedHead), string(StateStale), string(StateRejected),
-			cutoff)
+		var due []row
+		err := tx.Bucket(bucketIntents).ForEach(func(_, v []byte) error {
+			var r row
+			if err := json.Unmarshal(v, &r); err != nil {
+				return ErrCorrupt
+			}
+			if !r.Compacted && isFinalized(r.State) && r.FinalizedUnixNano != 0 && r.FinalizedUnixNano <= cutoff {
+				due = append(due, r)
+			}
+			return nil
+		})
 		if err != nil {
-			return mapDriver(err)
+			return err
 		}
-		n, err = res.RowsAffected()
-		return err
+		if len(due) == 0 {
+			return errNoCommit
+		}
+		for _, r := range due {
+			r.ExpectedHead = ""
+			r.ObservedHead = ""
+			r.UpstreamIDs = nil
+			r.VerificationState = ""
+			r.Compacted = true
+			r.UpdatedUnixNano = now.UnixNano()
+			if err := putRow(tx, r); err != nil {
+				return err
+			}
+		}
+		n = len(due)
+		return nil
 	})
-	return int(n), err
+	return n, err
 }
 
 // ResetEpoch records a new epoch. Dispatch must already be disabled.
@@ -285,36 +248,26 @@ func (s *Store) Compact(ctx context.Context) (int, error) {
 // changes only after the meta update commits. The update requires
 // meta.epoch to still equal this handle's epoch, so a disabled store
 // cannot reset a newer epoch written by another process. Begin and
-// ClaimSending reload meta.epoch inside the same immediate transaction
-// and stamp or claim a row only when that value is still this store's
-// epoch. The schema triggers abort a commit that would tag a prepared or
-// sending row with any other epoch.
+// ClaimSending read meta.epoch inside the same exclusive transaction and
+// stamp or claim a row only when that value is still this store's epoch.
 func (s *Store) ResetEpoch(ctx context.Context, confirmation string) error {
 	if confirmation != EpochResetConfirmation {
 		return ErrConfirmation
 	}
 	var next string
-	return s.commitWrite(ctx, false, func(tx *sql.Tx) error {
+	return s.commitWrite(ctx, false, func(tx *bolt.Tx) error {
 		if s.dispatch {
 			return ErrDispatchEnabled
 		}
-		if err := s.requireCurrentEpoch(ctx, tx); err != nil {
+		if err := s.requireCurrentEpoch(tx); err != nil {
 			return err
 		}
 		epoch, err := newID()
 		if err != nil {
 			return err
 		}
-		res, err := tx.ExecContext(ctx, `UPDATE meta SET value=? WHERE key='epoch' AND value=?`, epoch, s.epoch)
-		if err != nil {
-			return mapDriver(err)
-		}
-		affected, err := res.RowsAffected()
-		if err != nil {
-			return mapDriver(err)
-		}
-		if affected != 1 {
-			return ErrStaleEpoch
+		if err := tx.Bucket(bucketMeta).Put(keyEpoch, []byte(epoch)); err != nil {
+			return err
 		}
 		next = epoch
 		return nil
@@ -323,68 +276,70 @@ func (s *Store) ResetEpoch(ctx context.Context, confirmation string) error {
 	})
 }
 
-type rowQuery interface {
-	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
-}
-
-func getByIDTx(ctx context.Context, q rowQuery, operationID, epoch string) (Receipt, error) {
-	row := q.QueryRowContext(ctx, `SELECT `+receiptCols+` FROM intents WHERE operation_id=?`, operationID)
-	rec, err := scanReceipt(row, epoch)
-	if errors.Is(err, sql.ErrNoRows) {
-		return Receipt{}, ErrNotFound
-	}
-	return rec, err
-}
-
-func getByIdentityTx(ctx context.Context, q rowQuery, id Identity, epoch string) (Receipt, error) {
-	row := q.QueryRowContext(ctx, `SELECT `+receiptCols+` FROM intents WHERE
-		instance_id=? AND actor=? AND project=? AND mr=? AND operation_kind=? AND caller_key=?`,
-		id.Instance, id.Actor, id.Project, id.MR, id.Kind, id.CallerKey)
-	rec, err := scanReceipt(row, epoch)
-	if errors.Is(err, sql.ErrNoRows) {
-		return Receipt{}, ErrNotFound
-	}
-	return rec, err
-}
-
-type scanner interface {
-	Scan(dest ...any) error
-}
-
-func scanReceipt(row scanner, epoch string) (Receipt, error) {
-	var rec Receipt
-	var state, upstream sql.NullString
-	var expected, observed, verify sql.NullString
-	var created, updated int64
-	var sending, finalized, expires sql.NullInt64
-	var compacted int
-	var rowEpoch string
-	err := row.Scan(
-		&rec.OperationID, &rec.Identity.Instance, &rec.Identity.Actor, &rec.Identity.Project, &rec.Identity.MR,
-		&rec.Identity.Kind, &rec.Identity.CallerKey, &rec.PayloadHash, &state, &expected, &observed, &upstream, &verify,
-		&created, &updated, &sending, &finalized, &expires, &compacted, &rowEpoch,
-	)
+func putRow(tx *bolt.Tx, r row) error {
+	raw, err := json.Marshal(r)
 	if err != nil {
-		return Receipt{}, mapDriver(err)
+		return ErrInvalidOutcome
 	}
-	rec.State = State(state.String)
-	rec.ExpectedHead = expected.String
-	rec.ObservedHead = observed.String
-	rec.VerificationState = verify.String
-	rec.CreatedAt = nano(created)
-	rec.UpdatedAt = nano(updated)
-	rec.SendingAt = nullNano(sending)
-	rec.FinalizedAt = nullNano(finalized)
-	rec.ExpiresAt = nullNano(expires)
-	rec.Compacted = compacted != 0
-	rec.Epoch = rowEpoch
-	rec.EpochCurrent = rowEpoch == epoch
-	if upstream.Valid && upstream.String != "" && upstream.String != "null" {
-		if err := json.Unmarshal([]byte(upstream.String), &rec.UpstreamIDs); err != nil {
-			return Receipt{}, ErrCorrupt
-		}
+	return tx.Bucket(bucketIntents).Put([]byte(r.OperationID), raw)
+}
+
+func decodeRow(raw []byte) (row, error) {
+	var r row
+	if err := json.Unmarshal(raw, &r); err != nil {
+		return row{}, ErrCorrupt
 	}
-	return rec, nil
+	return r, nil
+}
+
+func rowByID(tx *bolt.Tx, operationID string) (row, error) {
+	if operationID == "" {
+		return row{}, ErrNotFound
+	}
+	raw := tx.Bucket(bucketIntents).Get([]byte(operationID))
+	if raw == nil {
+		return row{}, ErrNotFound
+	}
+	return decodeRow(raw)
+}
+
+func rowByIdentity(tx *bolt.Tx, id Identity) (row, error) {
+	op := tx.Bucket(bucketIdentity).Get(identityKey(id))
+	if op == nil {
+		return row{}, ErrNotFound
+	}
+	return rowByID(tx, string(op))
+}
+
+func (r row) receipt(epoch string) Receipt {
+	rec := Receipt{
+		OperationID: r.OperationID,
+		PayloadHash: r.PayloadHash,
+		Identity: Identity{
+			Instance:  r.Instance,
+			Actor:     r.Actor,
+			Project:   r.Project,
+			MR:        r.MR,
+			Kind:      r.Kind,
+			CallerKey: r.CallerKey,
+		},
+		State:             r.State,
+		ExpectedHead:      r.ExpectedHead,
+		ObservedHead:      r.ObservedHead,
+		VerificationState: r.VerificationState,
+		CreatedAt:         nano(r.CreatedUnixNano),
+		UpdatedAt:         nano(r.UpdatedUnixNano),
+		SendingAt:         nano(r.SendingUnixNano),
+		FinalizedAt:       nano(r.FinalizedUnixNano),
+		ExpiresAt:         nano(r.ExpiresUnixNano),
+		Compacted:         r.Compacted,
+		Epoch:             r.RowEpoch,
+		EpochCurrent:      r.RowEpoch == epoch,
+	}
+	if len(r.UpstreamIDs) > 0 {
+		rec.UpstreamIDs = append([]string(nil), r.UpstreamIDs...)
+	}
+	return rec
 }
 
 func nano(n int64) time.Time {
@@ -392,11 +347,4 @@ func nano(n int64) time.Time {
 		return time.Time{}
 	}
 	return time.Unix(0, n).UTC()
-}
-
-func nullNano(n sql.NullInt64) time.Time {
-	if !n.Valid {
-		return time.Time{}
-	}
-	return nano(n.Int64)
 }
