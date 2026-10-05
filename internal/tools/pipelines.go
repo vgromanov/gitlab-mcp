@@ -461,13 +461,14 @@ func buildTraceWindow(q traceQuery, res igl.JobTraceResult, meta traceReadMeta, 
 
 // jobTraceObjectEOF is true only when the retained bytes are the end of the
 // trace object, not merely the end of a 206 body. A Content-Range of
-// bytes 0-1/5 EOFs the response without covering bytes 2-4.
+// bytes 0-1/5 EOFs the response without covering bytes 2-4. A 206 whose
+// total is "*" also cannot prove the object ended.
 func jobTraceObjectEOF(res igl.JobTraceResult) bool {
 	if !res.EOF {
 		return false
 	}
 	if !res.SizeKnown {
-		return true
+		return false
 	}
 	var start, end int64
 	if res.ObservedStart != nil {

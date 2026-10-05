@@ -1325,6 +1325,64 @@ func TestGetPipelineJobOutput_zeroBased206PrefixAndErrorAreNotComplete(t *testin
 	}
 }
 
+func TestGetPipelineJobOutput_starTotal206WithholdsCutGlpat(t *testing.T) {
+	body := "ok\nERROR: boom\nglpat-abc"
+	for _, sel := range []string{"", "error"} {
+		sel := sel
+		d := authzDeps(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !strings.Contains(r.URL.Path, "/trace") {
+				_, _ = io.WriteString(w, `{"id":42}`)
+				return
+			}
+			if r.Header.Get("Range") != "" {
+				t.Errorf("%s sent Range %q", sel, r.Header.Get("Range"))
+			}
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-%d/*", len(body)-1))
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = io.WriteString(w, body)
+		}))
+		d.Config.Token = "fixture-pat"
+		in := getPipelineJobOutputIn{ProjectID: "42", JobID: 8}
+		if sel != "" {
+			in.Selector = sel
+		}
+		_, raw, err := getPipelineJobOutput(context.Background(), nil, in, d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		text, _ := decodeTrace(t, raw)["trace"].(string)
+		if strings.Contains(text, "glpat-") {
+			t.Fatalf("selector %q leaked cut glpat %q", sel, text)
+		}
+		sec := traceSection(t, raw)
+		w := traceWindow(t, raw)
+		if w["total_known"] != false || sec["content_complete"] == readmeta.ContentCompleteTrue {
+			t.Fatalf("selector %q complete %#v window %#v", sel, sec, w)
+		}
+	}
+}
+
+func TestJobTraceObjectEOF_unknownSizeIsFalse(t *testing.T) {
+	start := int64(0)
+	end := int64(12)
+	res := igl.JobTraceResult{
+		EOF: true, SizeKnown: false, Data: []byte("pre\nglpat-abc"),
+		ObservedStart: &start, ObservedEndExcl: &end,
+	}
+	if jobTraceObjectEOF(res) {
+		t.Fatal("star-total 206 treated as object EOF")
+	}
+	res.SizeKnown = true
+	res.Size = 12
+	if !jobTraceObjectEOF(res) {
+		t.Fatal("covering known-size 206 should be object EOF")
+	}
+	res.Size = 20
+	if jobTraceObjectEOF(res) {
+		t.Fatal("short known-size 206 treated as object EOF")
+	}
+}
+
 func TestGetPipelineJobOutput_quotedAuthContinuationAtRangeCut(t *testing.T) {
 	prefix := `Authorization: Bearer "`
 	payload := strings.Repeat("A ", 400) + "SECRET-MARKER"

@@ -376,10 +376,18 @@ func finalizeJobTrace(out *JobTraceResult, req JobTraceRequest, hdr http.Header,
 	}
 }
 
-// applyJobTraceObjectEOF clears EOF when a 206 attests a larger object than
-// the bytes we kept. HTTP body EOF on bytes 0-1/5 is not the end of the trace.
+// applyJobTraceObjectEOF clears EOF when a 206 does not cover the whole
+// object. HTTP body EOF on bytes 0-1/5 is not the end of the trace, and a
+// total of "*" cannot prove the object ended either.
 func applyJobTraceObjectEOF(out *JobTraceResult) {
-	if out == nil || !out.SizeKnown || out.ObservedEndExcl == nil {
+	if out == nil {
+		return
+	}
+	if !out.SizeKnown {
+		out.EOF = false
+		return
+	}
+	if out.ObservedEndExcl == nil {
 		return
 	}
 	if *out.ObservedEndExcl != out.Size {

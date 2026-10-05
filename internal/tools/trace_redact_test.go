@@ -188,6 +188,33 @@ func TestRedact_quotedAuthorizationAndBearer(t *testing.T) {
 	}
 }
 
+func TestRedact_escapedQuoteInAuthorization(t *testing.T) {
+	cases := []string{
+		`Authorization: Bearer "secret\"still-secret"`,
+		`Authorization: Bearer 'secret\'still-secret'`,
+		`Authorization: Basic "secret\"still-secret" next`,
+		`pre Bearer "secret\"still-secret" post`,
+	}
+	for _, src := range cases {
+		out, n := redactBytes([]byte(src), nil)
+		s := string(out)
+		for _, leak := range []string{"still-secret", "secret"} {
+			if strings.Contains(s, leak) {
+				t.Fatalf("leaked %q in %q -> %q n=%d", leak, src, s, n)
+			}
+		}
+		if n < 1 || !strings.Contains(s, redactPlaceholder) {
+			t.Fatalf("n %d src %q out %q", n, src, s)
+		}
+	}
+	escapedSlash := `Authorization: Bearer "secret\\"`
+	out, n := redactBytes([]byte(escapedSlash+" next"), nil)
+	s := string(out)
+	if n < 1 || strings.Contains(s, "secret") || !strings.Contains(s, "next") {
+		t.Fatalf("escaped slash n %d out %q", n, s)
+	}
+}
+
 func TestRedact_shortCompleteBearer(t *testing.T) {
 	body := []byte("pre\nBearer abc\npost\n")
 	out, n := redactBytes(body, nil)

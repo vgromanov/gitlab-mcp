@@ -290,6 +290,10 @@ func quotedHeadContinuation(src []byte, from, to int) (int, int, bool) {
 	for i := line; i < from; i++ {
 		c := src[i]
 		if quote != 0 {
+			if c == '\\' && i+1 < from && src[i+1] != '\n' && src[i+1] != '\r' {
+				i++
+				continue
+			}
 			if c == quote {
 				quote = 0
 			}
@@ -307,6 +311,10 @@ func quotedHeadContinuation(src []byte, from, to int) (int, int, bool) {
 			if src[i] == '\n' || src[i] == '\r' {
 				return 0, 0, false
 			}
+			if src[i] == '\\' && i+1 < to && src[i+1] != '\n' && src[i+1] != '\r' {
+				i++
+				continue
+			}
 			if src[i] == '"' || src[i] == '\'' {
 				if i+1 >= to || src[i+1] <= ' ' {
 					return from, i + 1, true
@@ -317,10 +325,18 @@ func quotedHeadContinuation(src []byte, from, to int) (int, int, bool) {
 		return 0, 0, false
 	}
 	end := from
-	for end < to && src[end] != quote && src[end] != '\n' && src[end] != '\r' {
-		end++
-	}
-	if end < to && src[end] == quote {
+	for end < to {
+		if src[end] == '\n' || src[end] == '\r' {
+			break
+		}
+		if src[end] == '\\' && end+1 < to && src[end+1] != '\n' && src[end+1] != '\r' {
+			end += 2
+			continue
+		}
+		if src[end] == quote {
+			end++
+			break
+		}
 		end++
 	}
 	if end <= from {
@@ -899,9 +915,9 @@ func skipSpace(src []byte, j int) int {
 
 // consumeAuthCredential reads one Authorization/Bearer value. A quoted value
 // runs through its closing delimiter (the quotes stay in the span). An
-// unclosed quote runs to the newline or the end of src. Unquoted Authorization
-// values still stop at whitespace or a quote; standalone Bearer tokens keep
-// the token-character set.
+// escaped quote (`\"` or `\'`) is not a closer. An unclosed quote runs to the
+// newline or the end of src. Unquoted Authorization values still stop at
+// whitespace or a quote; standalone Bearer tokens keep the token-character set.
 func consumeAuthCredential(src []byte, j int, tokenChars bool) int {
 	if j >= len(src) {
 		return j
@@ -909,10 +925,17 @@ func consumeAuthCredential(src []byte, j int, tokenChars bool) int {
 	if src[j] == '"' || src[j] == '\'' {
 		quote := src[j]
 		j++
-		for j < len(src) && src[j] != quote && src[j] != '\n' && src[j] != '\r' {
-			j++
-		}
-		if j < len(src) && src[j] == quote {
+		for j < len(src) {
+			if src[j] == '\n' || src[j] == '\r' {
+				return j
+			}
+			if src[j] == '\\' && j+1 < len(src) && src[j+1] != '\n' && src[j+1] != '\r' {
+				j += 2
+				continue
+			}
+			if src[j] == quote {
+				return j + 1
+			}
 			j++
 		}
 		return j

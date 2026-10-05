@@ -125,6 +125,24 @@ func TestStreamJobTrace_zeroBased206DoesNotEOFShortSpan(t *testing.T) {
 	}
 }
 
+func TestStreamJobTrace_starTotal206IsNotObjectEOF(t *testing.T) {
+	body := []byte("pre\nglpat-abc")
+	rt := &scriptedRT{
+		status:  http.StatusPartialContent,
+		headers: http.Header{"Content-Range": []string{"bytes 0-12/*"}},
+		body:    io.NopCloser(bytes.NewReader(body)),
+	}
+	res := StreamJobTrace(context.Background(), clientWithRT(t, rt), JobTraceRequest{
+		ProjectID: "42", JobID: 1, MaxScanBytes: 4096,
+	})
+	if res.Err != nil {
+		t.Fatal(res.Err)
+	}
+	if string(res.Data) != string(body) || res.SizeKnown || res.EOF || res.SuffixAnchored {
+		t.Fatalf("star-total 206 attested as object EOF: %+v %q", res, res.Data)
+	}
+}
+
 func TestStreamJobTrace_shortContentLengthIsIncomplete(t *testing.T) {
 	var n atomic.Int64
 	var closes atomic.Int64
