@@ -24,7 +24,7 @@ func (m *Manager) OpenCompareDir(ctx context.Context, size int64) (string, func(
 	if size < 0 {
 		size = 0
 	}
-	if size > bounds.MaxScratchBytes {
+	if size > bounds.MaxRetainedOutput {
 		return "", nil, ErrLimit
 	}
 	reserved := uint64(size)

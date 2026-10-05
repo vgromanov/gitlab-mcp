@@ -647,7 +647,7 @@ func parseVersionProof(st objectStream, versionID, mrID int64) (parsedVersion, s
 	state, stateOK := jsonStringExact(env["state"])
 	total, totalOK := jsonCanonicalInt(env["real_size"])
 	if !st.diffsOK {
-		return parsedVersion{head: head}, readmeta.CodeUnknownCount
+		return parsedVersion{head: head, base: base, start: start, reason: readmeta.CodeUnknownCount}, ""
 	}
 	entries := st.entries
 	pv := parsedVersion{entries: entries, head: head, base: base, start: start, total: total}

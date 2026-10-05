@@ -345,6 +345,29 @@ func twoCommitObjects(t *testing.T, name, oldBody, newBody string) (map[plumbing
 	}, base.Hash.String(), head.Hash.String()
 }
 
+func renameCommitObjects(t *testing.T) (map[plumbing.Hash]pack.Object, string, string) {
+	t.Helper()
+	blob := pack.Object{Type: "blob", Data: []byte("rename-me\n")}
+	blob.Hash = pack.HashObject("blob", blob.Data)
+	tb, err := tree.EncodeTree([]tree.TreeEntry{{Mode: tree.ModeFile, Name: "old.txt", Hash: blob.Hash}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	th, err := tree.EncodeTree([]tree.TreeEntry{{Mode: tree.ModeFile, Name: "new.txt", Hash: blob.Hash}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseTree := pack.Object{Type: "tree", Data: tb, Hash: pack.HashObject("tree", tb)}
+	headTree := pack.Object{Type: "tree", Data: th, Hash: pack.HashObject("tree", th)}
+	baseBody := []byte("tree " + baseTree.Hash.String() + "\nauthor A <a@a> 1 +0000\ncommitter A <a@a> 1 +0000\n\nbase\n")
+	base := pack.Object{Type: "commit", Data: baseBody, Hash: pack.HashObject("commit", baseBody)}
+	headBody := []byte("tree " + headTree.Hash.String() + "\nparent " + base.Hash.String() + "\nauthor A <a@a> 1 +0000\ncommitter A <a@a> 1 +0000\n\nhead\n")
+	head := pack.Object{Type: "commit", Data: headBody, Hash: pack.HashObject("commit", headBody)}
+	return map[plumbing.Hash]pack.Object{
+		blob.Hash: blob, baseTree.Hash: baseTree, headTree.Hash: headTree, base.Hash: base, head.Hash: head,
+	}, base.Hash.String(), head.Hash.String()
+}
+
 func TestDiffWindow_completeAPISkipsCache(t *testing.T) {
 	objs, base, head := twoCommitObjects(t, "p.txt", "old\n", "new\n")
 	hold := &gitcache.ObjectHold{
@@ -512,6 +535,116 @@ func TestDiffWindow_incrementalMaxItemsStillRecovers(t *testing.T) {
 	entries, _ := out["entries"].([]any)
 	if len(entries) != 1 || asMap(t, entries[0])["new_path"] != "p.txt" {
 		t.Fatalf("entries=%#v", entries)
+	}
+}
+
+func TestDiffWindow_cacheRecoversMissingDiffsArray(t *testing.T) {
+	if err := gitdiff.LookPath(); err != nil {
+		t.Skip(err.Error())
+	}
+	objs, base, head := twoCommitObjects(t, "p.txt", "old\n", "new\n")
+	hold := &gitcache.ObjectHold{
+		Result: gitcache.AcquireResult{
+			GenerationID: "gen-nodiff",
+			Grant: gitcache.Grant{
+				ProjectID: "42", SourceFork: "42", TargetProjectID: "42",
+				HeadSHA: plumbing.NewHash(head), BaseSHA: plumbing.NewHash(base), StartSHA: plumbing.NewHash(base),
+			},
+		},
+		Objects: objs,
+	}
+	body := `{"id":1,"merge_request_id":5001,"head_commit_sha":"` + head + `","base_commit_sha":"` + base + `","start_commit_sha":"` + base + `","state":"collected","real_size":"1"}`
+	h := serveDiffBase(&pathLog{}, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/versions/1"):
+			_, _ = io.WriteString(w, body)
+		case strings.Contains(r.URL.Path, "/merge_requests/"):
+			_, _ = io.WriteString(w, `{"id":5001,"iid":1,"project_id":42,"source_project_id":42}`)
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	d := diffDeps(t, h)
+	d.cacheHold = &fakeCacheHold{enabled: true, hold: hold}
+	out, err := callDiffWindow(t, d, nil, map[string]any{"project_id": "42", "merge_request_iid": 1, "diff_version_id": 1, "per_page": 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sec := sectionMap(out)
+	if sec["source"] != readmeta.SourceGitCache {
+		t.Fatalf("section=%#v", sec)
+	}
+	entries, _ := out["entries"].([]any)
+	if len(entries) != 1 || asMap(t, entries[0])["new_path"] != "p.txt" {
+		t.Fatalf("entries=%#v", entries)
+	}
+}
+
+func TestPatchPathspecIncludesBothRenameSides(t *testing.T) {
+	old, neu := "old.txt", "new.txt"
+	renamed := true
+	files := []retainedDiffFile{{
+		entry: diffManifestEntry{OldPath: &old, NewPath: &neu, RenamedFile: &renamed},
+	}}
+	for _, side := range []string{old, neu} {
+		got := patchPathspec([]string{side}, files)
+		if len(got) != 2 || got[0] != old || got[1] != neu {
+			t.Fatalf("side %s: %#v", side, got)
+		}
+	}
+}
+
+func TestDiffWindow_cacheRenameOneSidedSelector(t *testing.T) {
+	if err := gitdiff.LookPath(); err != nil {
+		t.Skip(err.Error())
+	}
+	objs, base, head := renameCommitObjects(t)
+	for _, path := range []string{"old.txt", "new.txt"} {
+		t.Run(path, func(t *testing.T) {
+			hold := &gitcache.ObjectHold{
+				Result: gitcache.AcquireResult{
+					GenerationID: "gen-ren",
+					Grant: gitcache.Grant{
+						ProjectID: "42", SourceFork: "42", TargetProjectID: "42",
+						HeadSHA: plumbing.NewHash(head), BaseSHA: plumbing.NewHash(base), StartSHA: plumbing.NewHash(base),
+					},
+				},
+				Objects: objs,
+			}
+			d := diffDeps(t, overflowHandler(head, base))
+			d.cacheHold = &fakeCacheHold{enabled: true, hold: hold}
+			out, err := callDiffWindow(t, d, nil, map[string]any{
+				"project_id": "42", "merge_request_iid": 1, "diff_version_id": 1,
+				"mode": "content", "paths": []string{path},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			sec := sectionMap(out)
+			if sec["source"] != readmeta.SourceGitCache {
+				t.Fatalf("section=%#v", sec)
+			}
+			files := asSlice(t, out["files"])
+			if len(files) != 1 {
+				t.Fatalf("files=%#v", files)
+			}
+			f := asMap(t, files[0])
+			if asString(f["old_path"]) != "old.txt" || asString(f["new_path"]) != "new.txt" {
+				t.Fatalf("paths=%#v", f)
+			}
+			if renamed, _ := f["renamed_file"].(bool); !renamed {
+				t.Fatalf("renamed_file=%#v", f)
+			}
+			if deleted, _ := f["deleted_file"].(bool); deleted {
+				t.Fatalf("one-sided selector collapsed rename to delete: %#v", f)
+			}
+			if added, _ := f["new_file"].(bool); added {
+				t.Fatalf("one-sided selector collapsed rename to add: %#v", f)
+			}
+			if f["status"] != diffFileStatusModeOnly && f["status"] != diffFileStatusText {
+				t.Fatalf("file=%#v", f)
+			}
+		})
 	}
 }
 

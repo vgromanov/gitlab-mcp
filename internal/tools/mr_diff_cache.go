@@ -170,7 +170,7 @@ func recoverCacheContent(ctx context.Context, d Deps, q diffQuery, sec readmeta.
 		files = append(files, f)
 	}
 	patchLim := gitdiff.Limits{MaxBytes: patchByteCap(ctx, opts), Timeout: remainingOrDefault(ctx)}
-	text, partial, command, err := gitdiff.Patch(ctx, dir, from, to, opts.Paths, patchLim)
+	text, partial, command, err := gitdiff.Patch(ctx, dir, from, to, patchPathspec(opts.Paths, files), patchLim)
 	if err != nil && !partial {
 		return diffContentOut{}, false
 	}
@@ -395,6 +395,36 @@ func entryFromGitFile(f gitdiff.File) diffManifestEntry {
 		NewFile: &nf, DeletedFile: &df, RenamedFile: &rf,
 		Binary: &bin, Submodule: &sub, Collapsed: &collapsed, TooLarge: &tooLarge,
 	}
+}
+
+func patchPathspec(requested []string, files []retainedDiffFile) []string {
+	if len(requested) == 0 {
+		return requested
+	}
+	seen := map[string]struct{}{}
+	var out []string
+	add := func(p string) {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			return
+		}
+		if _, ok := seen[p]; ok {
+			return
+		}
+		seen[p] = struct{}{}
+		out = append(out, p)
+	}
+	for _, f := range files {
+		if !pathSelected(requested, f.entry) {
+			continue
+		}
+		add(pathStr(f.entry.OldPath))
+		add(pathStr(f.entry.NewPath))
+	}
+	for _, p := range requested {
+		add(p)
+	}
+	return out
 }
 
 func pathSelected(paths []string, e diffManifestEntry) bool {

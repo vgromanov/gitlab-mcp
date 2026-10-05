@@ -195,7 +195,7 @@ func TestOpenCompareDirUnderRoot(t *testing.T) {
 	if err := cleanup(); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := mgr.OpenCompareDir(context.Background(), bounds.MaxScratchBytes+1); !errors.Is(err, ErrLimit) {
+	if _, _, err := mgr.OpenCompareDir(context.Background(), bounds.MaxRetainedOutput+1); !errors.Is(err, ErrLimit) {
 		t.Fatalf("oversize: %v", err)
 	}
 	if err := mgr.Close(context.Background()); err != nil {
@@ -207,6 +207,25 @@ func TestOpenCompareDirUnderRoot(t *testing.T) {
 	}
 	if err := reopened.Close(context.Background()); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestOpenCompareDirAllowsRetainedObjectBound(t *testing.T) {
+	root := regressionRoot(t)
+	mgr, err := OpenManager(root, bounds.DefaultQuotaBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Close(context.Background())
+	dir, cleanup, err := mgr.OpenCompareDir(context.Background(), bounds.MaxScratchBytes+1)
+	if err != nil {
+		t.Fatalf("retained-object sized scratch: %v", err)
+	}
+	if err := cleanup(); err != nil {
+		t.Fatal(err)
+	}
+	if dir == "" {
+		t.Fatal("empty dir")
 	}
 }
 
