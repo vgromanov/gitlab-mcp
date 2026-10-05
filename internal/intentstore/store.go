@@ -43,6 +43,10 @@ type Store struct {
 	commitBarrier func() error
 }
 
+// beforeCreate runs after a missing database file is observed and before the
+// exclusive create. Tests use it to simulate another process winning the race.
+var beforeCreate func(path string)
+
 type migrateFunc func(tx *sql.Tx, from, to int) error
 
 // PublishingHandlerEnabled reports whether this process registers a publisher.
@@ -81,81 +85,101 @@ func open(ctx context.Context, cfg Config, targetVersion int, migrate migrateFun
 	if targetVersion == 0 {
 		targetVersion = SchemaVersion
 	}
-	s, err := prepare(cfg)
+	s, created, err := prepare(cfg)
 	if err != nil {
 		return nil, err
 	}
 	if err := callBusy(func() error { return s.initialize(ctx, targetVersion, migrate) }); err != nil {
 		_ = s.db.Close()
+		if created {
+			removeStoreFiles(s.path)
+		}
 		return nil, err
 	}
 	return s, nil
 }
 
-func prepare(cfg Config) (*Store, error) {
+func prepare(cfg Config) (store *Store, created bool, err error) {
 	path := cfg.Path
 	if !isAbs(path) || strings.ContainsAny(path, "?\x00") {
-		return nil, errors.New("intent store: path must be absolute")
+		return nil, false, errors.New("intent store: path must be absolute")
 	}
 	if err := rejectSymlinkComponents(path); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	parent := parentDir(path)
 	info, err := os.Lstat(parent)
 	if err != nil {
 		if !os.IsNotExist(err) {
-			return nil, err
+			return nil, false, err
 		}
-		if err := os.MkdirAll(parent, 0o700); err != nil {
-			return nil, err
+		if err := makeParents(parent); err != nil {
+			return nil, false, err
 		}
 		info, err = os.Lstat(parent)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 	}
-	if err := checkDir(info); err != nil {
-		return nil, err
+	if err := checkDir(parent, info); err != nil {
+		return nil, false, err
 	}
 	info, err = os.Lstat(path)
 	switch {
 	case err == nil:
-		if err := checkFileMode(info); err != nil {
-			return nil, err
-		}
-		if err := classifyHeader(path); err != nil {
-			return nil, err
-		}
-		if info.Size() > 0 {
-			if err := refuseUnrelated(path); err != nil {
-				return nil, err
-			}
+		if err := validateExistingFile(path, info); err != nil {
+			return nil, false, err
 		}
 	case os.IsNotExist(err):
-		if err := createExclusive(path); err != nil {
-			return nil, err
+		if beforeCreate != nil {
+			beforeCreate(path)
+		}
+		err := createExclusive(path)
+		if os.IsExist(err) {
+			info, err = os.Lstat(path)
+			if err != nil {
+				return nil, false, err
+			}
+			if err := validateExistingFile(path, info); err != nil {
+				return nil, false, err
+			}
+		} else if err != nil {
+			return nil, false, err
+		} else {
+			created = true
+			if err := establishPrivate(path, false); err != nil {
+				removeStoreFiles(path)
+				return nil, false, err
+			}
 		}
 	default:
-		return nil, err
+		return nil, false, err
+	}
+	if created {
+		defer func() {
+			if store == nil {
+				removeStoreFiles(path)
+			}
+		}()
 	}
 	before, err := existingSidecars(path)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	dsn := sqliteFileURI(path, "_txlock=immediate&_busy_timeout=5000&_journal_mode=WAL&_synchronous=FULL&_foreign_keys=on")
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
-		return nil, mapDriver(err)
+		return nil, false, mapDriver(err)
 	}
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 	if err := callBusy(func() error { return db.Ping() }); err != nil {
 		_ = db.Close()
-		return nil, mapDriver(err)
+		return nil, false, mapDriver(err)
 	}
 	if err := lockDownNewSidecars(path, before); err != nil {
 		_ = db.Close()
-		return nil, err
+		return nil, false, err
 	}
 	maxRows := cfg.MaxRows
 	if maxRows <= 0 {
@@ -181,7 +205,20 @@ func prepare(cfg Config) (*Store, error) {
 		maxBytes:  maxBytes,
 		retention: retention,
 		clock:     clock,
-	}, nil
+	}, created, nil
+}
+
+func validateExistingFile(path string, info os.FileInfo) error {
+	if err := checkFileMode(path, info); err != nil {
+		return err
+	}
+	if err := classifyHeader(path); err != nil {
+		return err
+	}
+	if info.Size() > 0 {
+		return refuseUnrelated(path)
+	}
+	return nil
 }
 
 func (s *Store) initialize(ctx context.Context, targetVersion int, migrate migrateFunc) error {
@@ -236,6 +273,9 @@ func (s *Store) initialize(ctx context.Context, targetVersion int, migrate migra
 			return mapDriver(err)
 		}
 		s.epoch = epoch
+		if err := s.enforceCap(ctx, tx); err != nil {
+			return err
+		}
 	case uint32(appID) != ApplicationID:
 		return ErrUnrelatedDatabase
 	default:
@@ -335,11 +375,22 @@ func (s *Store) Close() error {
 	return err
 }
 
-// Writable reports whether a new dispatch could be attempted.
+// Writable reports whether a new intent could be created.
+// A store that already holds MaxRows or MaxBytes reports ErrFull, matching Begin.
 func (s *Store) Writable() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.writableLocked(true)
+	if err := s.writableLocked(true); err != nil {
+		return err
+	}
+	var n int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM intents`).Scan(&n); err != nil {
+		return mapDriver(err)
+	}
+	if n >= s.maxRows {
+		return ErrFull
+	}
+	return nil
 }
 
 // DisableDispatch stops new intents and claims. Reads, outcome recording,
@@ -375,18 +426,6 @@ func (s *Store) commitWrite(ctx context.Context, requireDispatch bool, fn func(*
 				_ = tx.Rollback()
 			}
 		}()
-		var prevCache int64
-		if err := tx.QueryRowContext(ctx, `PRAGMA cache_size`).Scan(&prevCache); err != nil {
-			return mapDriver(err)
-		}
-		// One cached page forces the other dirty pages into the WAL before
-		// commit, so the byte cap sees every frame except the last.
-		if _, err := tx.ExecContext(ctx, `PRAGMA cache_size = 1`); err != nil {
-			return mapDriver(err)
-		}
-		defer func() {
-			_, _ = tx.ExecContext(context.Background(), fmt.Sprintf("PRAGMA cache_size = %d", prevCache))
-		}()
 		if requireDispatch {
 			if err := s.requireCurrentEpoch(ctx, tx); err != nil {
 				return err
@@ -412,7 +451,6 @@ func (s *Store) commitWrite(ctx context.Context, requireDispatch bool, fn func(*
 				return err
 			}
 		}
-		_, _ = tx.ExecContext(ctx, fmt.Sprintf("PRAGMA cache_size = %d", prevCache))
 		if err := tx.Commit(); err != nil {
 			return mapDriver(err)
 		}
@@ -451,26 +489,29 @@ func readEpoch(ctx context.Context, q rowQuery) (string, error) {
 	return epoch, nil
 }
 
-// guardBytes rejects a write whose spilled WAL already passes the cap.
-// cache_size=1 leaves at most one dirty page unspilled, and commit adds a
-// 24-byte frame, so both are reserved here.
+// guardBytes rejects a write whose flushed db+wal+shm exceeds the cap.
+// Dirty pages stay out of the WAL until they are flushed, so the size is
+// measured after sqlite3_db_cacheflush and before Commit.
 func (s *Store) guardBytes(ctx context.Context, tx *sql.Tx, changesBefore int64) error {
-	var changes, pageSize int64
-	q := `SELECT total_changes(), page_size FROM pragma_page_size()`
-	if err := tx.QueryRowContext(ctx, q).Scan(&changes, &pageSize); err != nil {
+	var changes int64
+	if err := tx.QueryRowContext(ctx, `SELECT total_changes()`).Scan(&changes); err != nil {
 		return mapDriver(err)
 	}
 	if changes == changesBefore {
 		return nil
 	}
-	if pageSize <= 0 {
-		pageSize = 4096
+	return s.enforceCap(ctx, tx)
+}
+
+func (s *Store) enforceCap(ctx context.Context, tx *sql.Tx) error {
+	if err := flushPages(ctx, tx); err != nil {
+		return err
 	}
 	n, err := bytesOnDisk(s.path)
 	if err != nil {
 		return err
 	}
-	if n+pageSize+24+24 > s.maxBytes {
+	if n > s.maxBytes {
 		return ErrFull
 	}
 	return nil
@@ -497,14 +538,14 @@ func (s *Store) writableLocked(requireDispatch bool) error {
 	if err != nil {
 		return err
 	}
-	if err := checkDir(info); err != nil {
+	if err := checkDir(parentDir(s.path), info); err != nil {
 		return err
 	}
 	info, err = os.Lstat(s.path)
 	if err != nil {
 		return err
 	}
-	if err := checkFileMode(info); err != nil {
+	if err := checkFileMode(s.path, info); err != nil {
 		return err
 	}
 	if _, err := existingSidecars(s.path); err != nil {
@@ -514,8 +555,7 @@ func (s *Store) writableLocked(requireDispatch bool) error {
 	if err != nil {
 		return err
 	}
-	// Already over the cap. Growth still inside this transaction is checked
-	// again in guardBytes, after dirty pages have spilled to the WAL.
+	// Current size only. guardBytes measures the flushed transaction before commit.
 	if n >= s.maxBytes {
 		return ErrFull
 	}
@@ -546,6 +586,8 @@ func mapDriver(err error) error {
 	}
 	msg := strings.ToLower(err.Error())
 	switch {
+	case strings.Contains(msg, "stale epoch"):
+		return ErrStaleEpoch
 	case strings.Contains(msg, "full"):
 		return ErrFull
 	case strings.Contains(msg, "readonly"), strings.Contains(msg, "read-only"):

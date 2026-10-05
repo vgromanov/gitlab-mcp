@@ -57,16 +57,24 @@ func (s *Store) Begin(ctx context.Context, id Identity, payloadHash string, opts
 		if opts.ExpectedHead != "" {
 			head = opts.ExpectedHead
 		}
-		_, err = tx.ExecContext(ctx, `INSERT INTO intents (
+		res, err := tx.ExecContext(ctx, `INSERT INTO intents (
 			operation_id, instance_id, actor, project, mr, operation_kind, caller_key,
 			payload_hash, state, expected_head, created_unix_nano, updated_unix_nano, expires_unix_nano,
 			compacted, row_epoch
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`,
+		) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, value
+			FROM meta WHERE key='epoch' AND value=?`,
 			op, id.Instance, id.Actor, id.Project, id.MR, id.Kind, id.CallerKey,
 			payloadHash, string(StatePrepared), head, now.UnixNano(), now.UnixNano(), expires, s.epoch,
 		)
 		if err != nil {
 			return mapDriver(err)
+		}
+		inserted, err := res.RowsAffected()
+		if err != nil {
+			return mapDriver(err)
+		}
+		if inserted != 1 {
+			return ErrStaleEpoch
 		}
 		out, err = getByIDTx(ctx, tx, op, s.epoch)
 		return err
@@ -100,8 +108,10 @@ func (s *Store) ClaimSending(ctx context.Context, operationID string) (Receipt, 
 		}
 		now := s.now()
 		res, err := tx.ExecContext(ctx, `UPDATE intents SET state=?, sending_unix_nano=?, updated_unix_nano=?
-			WHERE operation_id=? AND state=?`,
-			string(StateSending), now.UnixNano(), now.UnixNano(), operationID, string(StatePrepared))
+			WHERE operation_id=? AND state=?
+			  AND row_epoch=(SELECT value FROM meta WHERE key='epoch')
+			  AND row_epoch=?`,
+			string(StateSending), now.UnixNano(), now.UnixNano(), operationID, string(StatePrepared), s.epoch)
 		if err != nil {
 			return mapDriver(err)
 		}
@@ -110,6 +120,13 @@ func (s *Store) ClaimSending(ctx context.Context, operationID string) (Receipt, 
 			return mapDriver(err)
 		}
 		if n != 1 {
+			current, err := getByIDTx(ctx, tx, operationID, s.epoch)
+			if err != nil {
+				return err
+			}
+			if !current.EpochCurrent {
+				return ErrStaleEpoch
+			}
 			return ErrAlreadySending
 		}
 		out, err = getByIDTx(ctx, tx, operationID, s.epoch)
@@ -241,7 +258,10 @@ func (s *Store) Compact(ctx context.Context) (int, error) {
 
 // ResetEpoch records a new epoch. Dispatch must already be disabled.
 // Existing rows, including tombstones, are not deleted. The cached epoch
-// changes only after the meta update commits.
+// changes only after the meta update commits. Begin and ClaimSending reload
+// meta.epoch inside the same immediate transaction and stamp or claim a row
+// only when that value is still this store's epoch. The schema triggers
+// abort a commit that would tag a prepared or sending row with any other epoch.
 func (s *Store) ResetEpoch(ctx context.Context, confirmation string) error {
 	if confirmation != EpochResetConfirmation {
 		return ErrConfirmation

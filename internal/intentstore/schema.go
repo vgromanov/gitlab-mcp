@@ -243,4 +243,17 @@ CREATE TABLE intents (
   row_epoch TEXT NOT NULL,
   UNIQUE (instance_id, actor, project, mr, operation_kind, caller_key)
 );
+CREATE TRIGGER intents_insert_epoch
+BEFORE INSERT ON intents
+WHEN NEW.row_epoch != (SELECT value FROM meta WHERE key = 'epoch')
+BEGIN
+  SELECT RAISE(ABORT, 'stale epoch');
+END;
+CREATE TRIGGER intents_send_epoch
+BEFORE UPDATE OF state ON intents
+WHEN NEW.state = 'sending'
+  AND OLD.row_epoch != (SELECT value FROM meta WHERE key = 'epoch')
+BEGIN
+  SELECT RAISE(ABORT, 'stale epoch');
+END;
 `

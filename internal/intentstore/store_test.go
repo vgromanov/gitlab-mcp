@@ -734,6 +734,136 @@ func TestParentDirIsFilesystemRoot(t *testing.T) {
 	}
 }
 
+func TestNewStoreHonorsByteCap(t *testing.T) {
+	dir := privateDir(t)
+	path := filepath.Join(dir, "intent.db")
+	_, err := Open(Config{Path: path, MaxBytes: 1})
+	if !errors.Is(err, ErrFull) {
+		t.Fatalf("open: %v", err)
+	}
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		if _, statErr := os.Lstat(path + suffix); !os.IsNotExist(statErr) {
+			t.Fatalf("left %s behind: %v", suffix, statErr)
+		}
+	}
+}
+
+func TestBeginStopsAtFlushedSize(t *testing.T) {
+	cfg, _ := fixedNow(t)
+	s := openStore(t, cfg)
+	ctx := context.Background()
+	if _, err := s.db.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		t.Fatal(err)
+	}
+	n, err := bytesOnDisk(s.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.maxBytes = 60000
+	if n >= s.maxBytes {
+		t.Fatalf("fresh store is %d", n)
+	}
+	_, err = s.Begin(ctx, ident("k"), PayloadHash([]byte("a")), BeginOptions{})
+	after, sizeErr := bytesOnDisk(s.path)
+	if sizeErr != nil {
+		t.Fatal(sizeErr)
+	}
+	if after > s.maxBytes {
+		t.Fatalf("begin grew to %d, cap %d, err %v", after, s.maxBytes, err)
+	}
+	if !errors.Is(err, ErrFull) {
+		t.Fatalf("begin %v (%d -> %d)", err, n, after)
+	}
+}
+
+func TestWritableCountsRows(t *testing.T) {
+	cfg, _ := fixedNow(t)
+	cfg.MaxRows = 1
+	s := openStore(t, cfg)
+	ctx := context.Background()
+	if err := s.Writable(); err != nil {
+		t.Fatal(err)
+	}
+	hash := PayloadHash([]byte("a"))
+	if _, err := s.Begin(ctx, ident("k"), hash, BeginOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Writable(); !errors.Is(err, ErrFull) {
+		t.Fatalf("writable at max rows: %v", err)
+	}
+	if _, err := s.Begin(ctx, ident("k"), hash, BeginOptions{}); err != nil {
+		t.Fatalf("replay while full: %v", err)
+	}
+	if _, err := s.Begin(ctx, ident("other"), PayloadHash([]byte("b")), BeginOptions{}); !errors.Is(err, ErrFull) {
+		t.Fatalf("new key while full: %v", err)
+	}
+}
+
+func TestCreateRaceOpensExistingFile(t *testing.T) {
+	cfg, _ := fixedNow(t)
+	beforeCreate = func(path string) {
+		beforeCreate = nil
+		if err := createExclusive(path); err != nil {
+			t.Errorf("hook: %v", err)
+		}
+	}
+	t.Cleanup(func() { beforeCreate = nil })
+	s := openStore(t, cfg)
+	if _, err := s.Begin(context.Background(), ident("k"), PayloadHash([]byte("a")), BeginOptions{}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestNestedParentIsPrivate(t *testing.T) {
+	path := filepath.Join(privateDir(t), "nested", "intent.db")
+	s, err := Open(Config{Path: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	info, err := os.Lstat(filepath.Dir(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o700 {
+		t.Fatalf("parent mode %o", info.Mode().Perm())
+	}
+	if _, err := s.Begin(context.Background(), ident("k"), PayloadHash([]byte("a")), BeginOptions{}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMissingDirThroughSymlinkIsNotCreated(t *testing.T) {
+	base := privateDir(t)
+	real := filepath.Join(base, "real")
+	if err := os.Mkdir(real, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(base, "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(link, "missing", "intent.db")
+	if _, err := Open(Config{Path: path}); !errors.Is(err, ErrSymlink) {
+		t.Fatalf("symlink: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(real, "missing")); !os.IsNotExist(err) {
+		t.Fatal("directory was created through the symlink")
+	}
+}
+
+func TestSchemaTriggerRejectsStaleEpoch(t *testing.T) {
+	cfg, _ := fixedNow(t)
+	s := openStore(t, cfg)
+	_, err := s.db.Exec(`INSERT INTO intents (
+		operation_id, instance_id, actor, project, mr, operation_kind, caller_key,
+		payload_hash, state, created_unix_nano, updated_unix_nano, compacted, row_epoch
+	) VALUES ('x','i','a','p','1','k','c', ?, 'prepared', 1, 1, 0, 'old-epoch')`, PayloadHash([]byte("a")))
+	if err == nil || !errors.Is(mapDriver(err), ErrStaleEpoch) {
+		t.Fatalf("trigger: %v", err)
+	}
+}
+
 func TestSQLiteFileURIEncodesReservedBytes(t *testing.T) {
 	got := sqliteFileURI("/tmp/a#b%23.db", "mode=ro")
 	if strings.Contains(got, "#") || !strings.Contains(got, "a%23b%2523.db") || !strings.Contains(got, "mode=ro") {

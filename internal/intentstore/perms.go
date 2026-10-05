@@ -4,94 +4,35 @@ import (
 	"errors"
 	"io"
 	"os"
-	"path/filepath"
-	"runtime"
-	"strings"
 )
 
 func isSymlink(info os.FileInfo) bool {
 	return info.Mode()&os.ModeSymlink != 0
 }
 
-func checkDir(info os.FileInfo) error {
-	if isSymlink(info) || !info.IsDir() {
-		if isSymlink(info) {
-			return ErrSymlink
-		}
+func checkDir(path string, info os.FileInfo) error {
+	if isSymlink(info) {
+		return ErrSymlink
+	}
+	if !info.IsDir() {
 		return ErrUnsafePermissions
 	}
-	if runtime.GOOS == "windows" {
-		return nil
-	}
-	if info.Mode().Perm() != 0o700 {
-		return ErrUnsafePermissions
-	}
-	return nil
+	return checkDirAccess(path, info)
 }
 
-func checkFileMode(info os.FileInfo) error {
+func checkFileMode(path string, info os.FileInfo) error {
 	if isSymlink(info) {
 		return ErrSymlink
 	}
 	if !info.Mode().IsRegular() {
 		return ErrUnsafePermissions
 	}
-	if runtime.GOOS == "windows" {
-		return nil
-	}
-	perm := info.Mode().Perm()
-	if perm&0o200 == 0 {
-		return ErrReadOnly
-	}
-	if perm != 0o600 {
-		return ErrUnsafePermissions
-	}
-	return nil
+	return checkFileAccess(path, info)
 }
 
-// rejectSymlinkComponents refuses a symlink in any existing component of path.
-// macOS uses /var, /tmp, and /etc as symlinks to /private; those ancestors are
-// the only exception, so a symlink created under them is still rejected.
-func rejectSymlinkComponents(path string) error {
-	clean := filepath.Clean(path)
-	vol := filepath.VolumeName(clean)
-	rest := clean[len(vol):]
-	acc := vol
-	for _, part := range strings.Split(rest, string(filepath.Separator)) {
-		if part == "" {
-			if acc == "" && strings.HasPrefix(clean, string(filepath.Separator)) {
-				acc = string(filepath.Separator)
-			}
-			continue
-		}
-		if acc == "" || acc == string(filepath.Separator) {
-			acc = string(filepath.Separator) + part
-		} else {
-			acc = filepath.Join(acc, part)
-		}
-		info, err := os.Lstat(acc)
-		if err != nil {
-			if os.IsNotExist(err) {
-				return nil
-			}
-			return err
-		}
-		if isSymlink(info) && !macosSystemSymlink(acc) {
-			return ErrSymlink
-		}
-	}
-	return nil
-}
-
-func macosSystemSymlink(path string) bool {
-	if runtime.GOOS != "darwin" && runtime.GOOS != "ios" {
-		return false
-	}
-	switch filepath.Clean(path) {
-	case "/var", "/tmp", "/etc":
-		return true
-	default:
-		return false
+func removeStoreFiles(path string) {
+	for _, p := range sidecarPaths(path) {
+		_ = os.Remove(p)
 	}
 }
 
@@ -146,7 +87,7 @@ func existingSidecars(path string) (map[string]struct{}, error) {
 		if isSymlink(info) {
 			return nil, ErrSymlink
 		}
-		if err := checkFileMode(info); err != nil {
+		if err := checkFileMode(p, info); err != nil {
 			return nil, err
 		}
 		out[p] = struct{}{}
@@ -167,19 +108,19 @@ func lockDownNewSidecars(path string, before map[string]struct{}) error {
 			return ErrSymlink
 		}
 		if _, ok := before[p]; ok {
-			if err := checkFileMode(info); err != nil {
+			if err := checkFileMode(p, info); err != nil {
 				return err
 			}
 			continue
 		}
-		if err := os.Chmod(p, 0o600); err != nil {
+		if err := establishPrivate(p, false); err != nil {
 			return err
 		}
 		info, err = os.Lstat(p)
 		if err != nil {
 			return err
 		}
-		if err := checkFileMode(info); err != nil {
+		if err := checkFileMode(p, info); err != nil {
 			return err
 		}
 	}
@@ -187,7 +128,7 @@ func lockDownNewSidecars(path string, before map[string]struct{}) error {
 	if err != nil {
 		return err
 	}
-	return checkFileMode(info)
+	return checkFileMode(path, info)
 }
 
 func fileSize(path string) (int64, error) {
