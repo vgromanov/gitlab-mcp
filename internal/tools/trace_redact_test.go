@@ -366,6 +366,18 @@ func TestRedactRangeEdges_quotedContinuationWithSpaces(t *testing.T) {
 	}
 }
 
+func TestRedactRangeEdges_mixedQuoteInsideUnknownDelimiter(t *testing.T) {
+	for _, pair := range [][2]string{{`"`, `'`}, {`'`, `"`}} {
+		src := []byte(strings.Repeat("AA BB ", 200) + "SECRET" + pair[1] + "LEAK rest" +
+			strings.Repeat(" CC ", 200) + pair[0] + " next")
+		from := bytes.Index(src, []byte("SECRET"))
+		out, _ := redactRangeEdges(src, from, from+20, "", true, false, false)
+		if strings.Contains(out, "SECRET") || strings.Contains(out, "LEAK") {
+			t.Fatalf("opener %s embedded %s leaked %q", pair[0], pair[1], out)
+		}
+	}
+}
+
 func TestTrimOutputBytes_runeBoundary(t *testing.T) {
 	s := "ok" + string(rune(0x1F600)) + "tail"
 	cut, trimmed := trimOutputBytes(s, len("ok")+1)

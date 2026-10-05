@@ -61,7 +61,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the known object total is rejected, and so is an open-ended `start_byte`
   206 that stops before the known total. A bounded range inside a long
   spaced value with no quote or newline in the fetched buffer is withheld
-  instead of exposing a quoted Authorization continuation, a configured-token
+  instead of exposing a quoted Authorization continuation, a quoted value
+  that contains the other quote character (`"` around an apostrophe, or the
+  reverse) is withheld through its real closer when the opener is outside the
+  fetched context, a configured-token
   fragment of any length at a non-EOF scan cut is withheld, and a request-cap
   failure reports `budget_requests` instead of `budget_bytes`. A suffix-range
   206 that starts after `size - suffix` (for example `bytes 990-999/1000` for

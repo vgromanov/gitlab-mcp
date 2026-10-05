@@ -318,43 +318,60 @@ func quotedHeadContinuation(src []byte, from, to int) (int, int, bool) {
 		if line != 0 {
 			return 0, 0, false
 		}
-		for i := from; i < to; i++ {
+		// The opening delimiter is unknown, so a quote of either kind that is
+		// not followed by a delimiter is ordinary credential content, and a
+		// delimited quote of one kind cannot prove the other kind did not
+		// open the value. Take the first delimited quote of each kind and
+		// withhold through the later of them.
+		var closer [2]int
+		lineEnd := len(src)
+		for i := from; i < len(src); i++ {
 			if src[i] == '\n' || src[i] == '\r' {
-				return 0, 0, false
-			}
-			if src[i] == '\\' && i+1 < to && src[i+1] != '\n' && src[i+1] != '\r' {
-				i++
-				continue
-			}
-			if src[i] == '"' || src[i] == '\'' {
-				if i+1 >= to || src[i+1] <= ' ' {
-					return from, i + 1, true
-				}
-				return 0, 0, false
-			}
-		}
-		// Opening quote sits before src. A closer only in lookahead still
-		// proves this window is a quoted continuation; withhold through to.
-		for i := to; i < len(src); i++ {
-			if src[i] == '\n' || src[i] == '\r' {
-				return 0, 0, false
+				lineEnd = i
+				break
 			}
 			if src[i] == '\\' && i+1 < len(src) && src[i+1] != '\n' && src[i+1] != '\r' {
 				i++
 				continue
 			}
-			if src[i] == '"' || src[i] == '\'' {
-				if i+1 >= len(src) || src[i+1] <= ' ' {
-					return from, to, true
+			if src[i] != '"' && src[i] != '\'' {
+				continue
+			}
+			limit := len(src)
+			if i < to {
+				limit = to
+			}
+			if i+1 < limit && src[i+1] > ' ' {
+				// A quote that starts a new word opens a fresh value, so
+				// nothing past it extends the one that began earlier.
+				if i > from && (src[i-1] == ' ' || src[i-1] == '\t') {
+					lineEnd = i
+					break
 				}
-				return 0, 0, false
+				continue
+			}
+			k := 0
+			if src[i] == '\'' {
+				k = 1
+			}
+			if closer[k] == 0 {
+				closer[k] = i + 1
 			}
 		}
-		// No quote and no newline anywhere in the fetched buffer. A bounded
-		// range deep inside a long quoted value looks exactly like this. A
-		// single unbroken token is handled by leadingUnanchoredToken; spaced
-		// words mid-line are withheld because the closer, and so the opener,
-		// lie beyond the lookbehind and lookahead.
+		if last := max(closer[0], closer[1]); last > 0 {
+			if last > to {
+				last = to
+			}
+			return from, last, true
+		}
+		if lineEnd < len(src) {
+			return 0, 0, false
+		}
+		// No delimited quote and no newline anywhere in the fetched buffer.
+		// A bounded range deep inside a long quoted value looks exactly like
+		// this. A single unbroken token is handled by leadingUnanchoredToken;
+		// spaced words mid-line are withheld because the closer, and so the
+		// opener, lie beyond the lookbehind and lookahead.
 		if multiWordPrefix(src[:from]) {
 			return from, to, true
 		}
