@@ -22,6 +22,23 @@ func TestRedactChunks_splitSecret(t *testing.T) {
 	}
 }
 
+func TestRedactRange_quotedContinuationCloserOutsideWindow(t *testing.T) {
+	lookbehind := []byte(strings.Repeat("A ", 40))
+	window := []byte("SECRET-MARKER more")
+	for _, trailer := range [][]byte{[]byte(`" next`), nil} {
+		src := append(append(append([]byte{}, lookbehind...), window...), trailer...)
+		from := len(lookbehind)
+		to := from + len(window)
+		out, spans := redactRangeEdges(src, from, to, "", true, false, false)
+		if strings.Contains(out, "SECRET") || strings.Contains(out, "more") {
+			t.Fatalf("trailer %q leaked %q spans %v", trailer, out, spans)
+		}
+		if len(spans) < 1 || !strings.Contains(out, redactPlaceholder) {
+			t.Fatalf("trailer %q out %q spans %v", trailer, out, spans)
+		}
+	}
+}
+
 func TestRedactRange_windowBoundary(t *testing.T) {
 	secret := "glpat-" + strings.Repeat("b", 20)
 	src := []byte("xxxx" + secret + "yyyy")

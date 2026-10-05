@@ -269,7 +269,8 @@ func isTraceDelim(c byte) bool {
 // delimiters. When the opening quote is in lookbehind, quote state is
 // tracked from the current line. When the opening quote sits before src,
 // the first quote in the window that is followed by a delimiter or the
-// window end is treated as the closer.
+// window end is treated as the closer. If that closer is only in lookahead
+// or is missing, the whole window is withheld.
 func quotedHeadContinuation(src []byte, from, to int) (int, int, bool) {
 	if from < 0 {
 		from = 0
@@ -322,7 +323,7 @@ func quotedHeadContinuation(src []byte, from, to int) (int, int, bool) {
 				return 0, 0, false
 			}
 		}
-		return 0, 0, false
+		return from, to, true
 	}
 	end := from
 	for end < to {

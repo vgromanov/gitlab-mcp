@@ -1421,6 +1421,47 @@ func TestGetPipelineJobOutput_quotedAuthContinuationAtRangeCut(t *testing.T) {
 	}
 }
 
+func TestGetPipelineJobOutput_quotedAuthCloserAfterRangeEnd(t *testing.T) {
+	prefix := `Authorization: Bearer "`
+	payload := strings.Repeat("A ", 400) + "SECRET-MARKER" + strings.Repeat(" B", 40)
+	raw := []byte(prefix + payload + "\"\n")
+	start := int64(len(prefix) + 700)
+	end := int64(len(prefix) + len(payload))
+	if start-int64(jobTraceLookbehind) <= int64(len(prefix)) || end <= start {
+		t.Fatalf("fixture start=%d end=%d prefix=%d", start, end, len(prefix))
+	}
+	d := authzDeps(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, "/trace") {
+			_, _ = io.WriteString(w, `{"id":42}`)
+			return
+		}
+		var from, to int
+		if _, err := fmt.Sscanf(r.Header.Get("Range"), "bytes=%d-%d", &from, &to); err != nil {
+			t.Fatalf("range %q", r.Header.Get("Range"))
+		}
+		if from < 0 {
+			from = 0
+		}
+		if to >= len(raw) {
+			to = len(raw) - 1
+		}
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", from, to, len(raw)))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(raw[from : to+1])
+	}))
+	d.Config.Token = "fixture-pat"
+	_, out, err := getPipelineJobOutput(context.Background(), nil, getPipelineJobOutputIn{
+		ProjectID: "42", JobID: 8, Selector: "range", StartByte: &start, EndByte: &end, MaxScanBytes: 256, MaxBytes: 1 << 20,
+	}, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := decodeTrace(t, out)["trace"].(string)
+	if strings.Contains(text, "SECRET") {
+		t.Fatalf("quoted continuation leaked %q", text)
+	}
+}
+
 func TestGetPipelineJobOutput_rangeEndNearMaxIntDoesNotCollapse(t *testing.T) {
 	start := int64(0)
 	end := int64(math.MaxInt64 - 10)
