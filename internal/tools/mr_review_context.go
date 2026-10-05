@@ -1209,6 +1209,9 @@ func mergePipelineGraph(dst *pipelineGraphOut, src pipelineGraphOut) {
 	dst.BridgeCapability = src.BridgeCapability
 	dst.Reasons = appendUniqueReasons(dst.Reasons, src.Reasons)
 	if sameRootPipeline(*dst, src) {
+		if src.Pipeline != nil {
+			dst.Pipeline = src.Pipeline
+		}
 		dst.Jobs = append(dst.Jobs, src.Jobs...)
 		dst.Lineage = append(dst.Lineage, src.Lineage...)
 	}

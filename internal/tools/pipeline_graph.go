@@ -344,7 +344,7 @@ func resumePipelineGraph(ctx context.Context, in pipelineGraphIn, sel graphSelec
 		return nil, nil, werr
 	}
 	walk.bindRelation(rel)
-	if err := walk.revalidateAncestors(ctx, d, budget, sel.PerPage); err != nil {
+	if err := walk.revalidateCompleted(ctx, d, sel.PerPage); err != nil {
 		return nil, nil, err
 	}
 	if payload.GraphCont != nil && payload.GraphCont.Phase == cursor.GraphPhaseBridges {

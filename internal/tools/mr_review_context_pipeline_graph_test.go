@@ -354,3 +354,36 @@ func TestReviewContext_childJobPagesStayOffRootJobs(t *testing.T) {
 		t.Fatalf("aggregate graph section head_sha %v, want root %s", got, shaN(1))
 	}
 }
+
+func TestMergePipelineGraph_refreshesRootPipelineMetadata(t *testing.T) {
+	id := int64(100)
+	running, failed := "running", "failed"
+	first := pipelineGraphOut{
+		ProjectID:  "42",
+		PipelineID: &id,
+		Pipeline:   &pipelineView{ID: 100, Status: &running},
+		Nodes:      []graphNodeView{{ProjectID: "42", PipelineID: 100, Pipeline: &pipelineView{ID: 100, Status: &running}}},
+	}
+	second := pipelineGraphOut{
+		ProjectID:  "42",
+		PipelineID: &id,
+		Pipeline:   &pipelineView{ID: 100, Status: &failed},
+		Nodes:      []graphNodeView{{ProjectID: "42", PipelineID: 100, Pipeline: &pipelineView{ID: 100, Status: &failed}}},
+	}
+	merged := pipelineGraphOut{}
+	mergePipelineGraph(&merged, first)
+	mergePipelineGraph(&merged, second)
+	if merged.Pipeline == nil || merged.Pipeline.Status == nil || *merged.Pipeline.Status != failed {
+		t.Fatalf("stale top-level root pipeline %#v", merged.Pipeline)
+	}
+	if got := merged.Nodes[0].Pipeline.Status; got == nil || *got != failed {
+		t.Fatalf("root node pipeline %#v", got)
+	}
+
+	childID := int64(200)
+	child := pipelineGraphOut{ProjectID: "42", PipelineID: &childID, Pipeline: &pipelineView{ID: 200, Status: &running}}
+	mergePipelineGraph(&merged, child)
+	if merged.Pipeline.ID != 100 {
+		t.Fatalf("child page replaced root pipeline %#v", merged.Pipeline)
+	}
+}

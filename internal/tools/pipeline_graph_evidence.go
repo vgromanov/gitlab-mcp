@@ -5,12 +5,19 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"sort"
 
 	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/cursor"
 	igl "gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/gitlab"
 )
 
-const maxAncestorEvidencePages = 64
+const (
+	maxEvidencePages = 64
+	// Revalidation re-reads already-certified work, so it must not draw down the
+	// caller's per-call item and request budget that paged the graph in the first place.
+	evidenceMaxItems    = 2000
+	evidenceMaxRequests = 128
+)
 
 // chainEvidence folds ordered guard tokens into a running page-size-independent digest.
 func chainEvidence(state string, tokens ...string) string {
@@ -46,15 +53,39 @@ func (w *graphWalk) completeNode(k graphNodeKey) {
 	w.jobsEv, w.bridgesEv = "", ""
 }
 
-// revalidateAncestors re-reads every ancestor of the active node and compares
-// it with the evidence recorded when the walk first completed that ancestor.
-func (w *graphWalk) revalidateAncestors(ctx context.Context, d Deps, budget *igl.Budget, perPage int) error {
-	drift := fmt.Errorf("%s: ancestor evidence drift", cursor.ResyncRequired)
+// revalidateCompleted re-reads every node whose jobs and bridges the walk has
+// already completed, ancestors and finished siblings alike, and compares each
+// with the evidence recorded at completion.
+func (w *graphWalk) revalidateCompleted(ctx context.Context, d Deps, perPage int) error {
+	drift := fmt.Errorf("%s: completed node evidence drift", cursor.ResyncRequired)
 	for _, a := range w.ancestors {
-		want, ok := w.evidence[a.String()]
+		if _, ok := w.evidence[a.String()]; !ok {
+			return drift
+		}
+	}
+	if len(w.evidence) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(w.evidence))
+	for k := range w.evidence {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	budget := &igl.Budget{
+		MaxItems:    evidenceMaxItems,
+		MaxBytes:    igl.DefaultMaxBytes,
+		MaxElapsed:  igl.DefaultMaxElapsed,
+		MaxRequests: evidenceMaxRequests,
+	}
+	ctx = igl.WithBudget(ctx, budget)
+	defer budget.Cancel()
+	for _, key := range keys {
+		want := w.evidence[key]
+		project, pipeline, ok := splitVisitKey(key)
 		if !ok {
 			return drift
 		}
+		a := graphNodeKey{Project: project, Pipeline: pipeline}
 		kind, err := w.authorize(ctx, d, a.Project)
 		if err != nil {
 			return err
@@ -64,7 +95,7 @@ func (w *graphWalk) revalidateAncestors(ctx context.Context, d Deps, budget *igl
 		}
 		jobs := ""
 		for page, n := 1, 0; ; n++ {
-			if n >= maxAncestorEvidencePages {
+			if n >= maxEvidencePages {
 				return drift
 			}
 			gp, err := collectJobPage(ctx, d, budget, a.Project, a.Pipeline, page, perPage, nil)
@@ -86,7 +117,7 @@ func (w *graphWalk) revalidateAncestors(ctx context.Context, d Deps, budget *igl
 		}
 		bridges := ""
 		for page, n := 1, 0; ; n++ {
-			if n >= maxAncestorEvidencePages {
+			if n >= maxEvidencePages {
 				return drift
 			}
 			bp, err := collectBridgePage(ctx, d, budget, a.Project, a.Pipeline, page, perPage, nil)

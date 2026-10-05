@@ -885,3 +885,89 @@ func TestPipelineGraph_childCursorStableAncestorsResume(t *testing.T) {
 		t.Fatalf("stable ancestors should resume to completion: %#v", raw)
 	}
 }
+
+func twoChildDriftServer() *walkServer {
+	return &walkServer{
+		pipes: map[string]string{
+			"42/100": walkPipe(100, 42, graphPipeSHA, "feature"),
+			"99/200": walkPipe(200, 99, graphChildSHA, "first"),
+			"99/201": walkPipe(201, 99, graphChildSHA, "second"),
+		},
+		jobs: map[string]string{
+			"42/100/1": "[" + jobJSON(1, "parent", "success", "false") + "]",
+			"99/200/1": "[" + jobJSON(10, "first-a", "success", "false") + "]",
+			"99/201/1": "[" + jobJSON(20, "second-a", "success", "false") + "]",
+			"99/201/2": "[" + jobJSON(21, "second-b", "success", "false") + "]",
+		},
+		bridges: map[string]string{
+			"42/100/1": "[" + bridgeJSON(50, "one", 99, 200, graphChildSHA) + "," + bridgeJSON(51, "two", 99, 201, graphChildSHA) + "]",
+		},
+		mr:      graphMR("feature"),
+		mrPipes: graphPipes("feature"),
+	}
+}
+
+func secondChildContinuation(t *testing.T, h *walkServer) (Deps, pipelineGraphIn, string) {
+	t.Helper()
+	in := pipelineGraphIn{ProjectID: "42", MergeRequestIID: 7, PerPage: 1}
+	clk := &cursor.FakeClock{T: time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)}
+	d := newCursorDeps(t, h, nil, clk)
+	var tok string
+	for i := 0; i < 6; i++ {
+		in.Cursor = tok
+		_, raw, err := getMergeRequestPipelineGraph(context.Background(), nil, in, d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tok, _ = graphSection(t, raw.(map[string]any))["next_cursor"].(string)
+		payload, derr := cursor.Decode(d.Config.CursorKey, tok, clk.Now())
+		if tok != "" && derr == nil && payload.GraphCont != nil && payload.GraphCont.NI == 201 {
+			return d, in, tok
+		}
+	}
+	t.Fatal("never reached a continuation scoped to the second child")
+	return d, in, ""
+}
+
+func TestPipelineGraph_childCursorDetectsCompletedSiblingDrift(t *testing.T) {
+	h := twoChildDriftServer()
+	d, in, tok := secondChildContinuation(t, h)
+	h.jobs["99/200/1"] = "[" + jobJSON(10, "first-a", "failed", "false") + "]"
+	in.Cursor = tok
+	_, _, err := getMergeRequestPipelineGraph(context.Background(), nil, in, d)
+	if err == nil || !strings.Contains(err.Error(), cursor.ResyncRequired) {
+		t.Fatalf("completed sibling drift not detected: %v", err)
+	}
+}
+
+func TestPipelineGraph_revalidationNotChargedToCallBudget(t *testing.T) {
+	h := ancestorDriftServer()
+	h.jobs["42/100/1"] = jobPageJSON(100, 40)
+	h.jobs["42/100/2"] = jobPageJSON(200, 40)
+	h.jobs["42/100/3"] = jobPageJSON(300, 40)
+	h.bridges["42/100/1"] = "[" + bridgeJSON(50, "to-child", 99, 200, graphChildSHA) + "]"
+	in := pipelineGraphIn{ProjectID: "42", MergeRequestIID: 7, PerPage: 40}
+	clk := &cursor.FakeClock{T: time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)}
+	d := newCursorDeps(t, h, nil, clk)
+	var last map[string]any
+	tok := ""
+	sawChild := false
+	for i := 0; i < 8; i++ {
+		in.Cursor = tok
+		_, raw, err := getMergeRequestPipelineGraph(context.Background(), nil, in, d)
+		if err != nil {
+			t.Fatalf("call %d: %v", i, err)
+		}
+		last = raw.(map[string]any)
+		tok, _ = graphSection(t, last)["next_cursor"].(string)
+		if tok == "" {
+			break
+		}
+		if payload, derr := cursor.Decode(d.Config.CursorKey, tok, clk.Now()); derr == nil && payload.GraphCont != nil && payload.GraphCont.NI == 200 {
+			sawChild = true
+		}
+	}
+	if !sawChild || last["downstream_coverage"] != downstreamCoverageComplete {
+		t.Fatalf("large-root graph did not resume through child: child=%v coverage=%v", sawChild, last["downstream_coverage"])
+	}
+}
