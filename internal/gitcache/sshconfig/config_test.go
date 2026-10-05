@@ -201,6 +201,35 @@ func TestRemoteUserUsedWhenConfigUserUnset(t *testing.T) {
 	}
 }
 
+func TestRemotePortUsedWhenConfigPortUnset(t *testing.T) {
+	in := fixture(t, "IdentityFile %d/.ssh/%p_key\n", "")
+	in.RemotePort = 7999
+	c := resolve(t, in)
+	if c.Port != 7999 {
+		t.Fatalf("port %d", c.Port)
+	}
+	want := filepath.Join(in.Home, ".ssh/7999_key")
+	if !reflect.DeepEqual(c.IdentityFiles, []string{want}) {
+		t.Fatalf("%%p expanded from default 22: %v", c.IdentityFiles)
+	}
+	in = fixture(t, "Port 22\nIdentityFile %d/.ssh/%p_key\n", "")
+	in.RemotePort = 7999
+	c = resolve(t, in)
+	if c.Port != 22 {
+		t.Fatalf("configured Port lost: %d", c.Port)
+	}
+	want = filepath.Join(in.Home, ".ssh/22_key")
+	if !reflect.DeepEqual(c.IdentityFiles, []string{want}) {
+		t.Fatalf("%%p did not follow configured Port: %v", c.IdentityFiles)
+	}
+	in = fixture(t, "", "")
+	in.RemotePort = 0
+	c = resolve(t, in)
+	if c.Port != 22 {
+		t.Fatalf("zero remote port: %d", c.Port)
+	}
+}
+
 func TestMissingOptionalConfigAndBounds(t *testing.T) {
 	in := fixture(t, "", "")
 	os.Remove(in.UserConfig)

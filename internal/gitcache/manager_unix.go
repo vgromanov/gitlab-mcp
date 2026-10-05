@@ -123,8 +123,19 @@ func OpenManager(path string, quota int64) (*Manager, error) {
 	if err != nil {
 		return nil, err
 	}
+	// flock follows the directory inode. Replacing root.lock creates a new file
+	// inode and must not admit a second manager while this one is alive.
+	if err := flockExclusive(int(root.Fd())); err != nil {
+		_ = root.Close()
+		return nil, err
+	}
 	lock, err := openRootLock(int(root.Fd()), dev)
 	if err != nil {
+		_ = root.Close()
+		return nil, err
+	}
+	if err := confirmLockFile(int(root.Fd()), int(lock.Fd())); err != nil {
+		_ = lock.Close()
 		_ = root.Close()
 		return nil, err
 	}
@@ -172,6 +183,39 @@ func openRootLock(rootfd int, rootDev uint64) (*os.File, error) {
 		return nil, ErrBusy
 	}
 	return os.NewFile(uintptr(fd), lockName), nil
+}
+
+func flockExclusive(fd int) error {
+	err := syscall.Flock(fd, syscall.LOCK_EX|syscall.LOCK_NB)
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
+		return ErrBusy
+	}
+	return ErrPath
+}
+
+// confirmLockFile fails closed when the held lock inode is no longer the name
+// root.lock. A pathname stat by itself cannot exclude a manager that already
+// opened a replacement inode.
+func confirmLockFile(rootfd, lockfd int) error {
+	held, err := fstat(lockfd)
+	if err != nil {
+		return ErrIntegrity
+	}
+	var current unix.Stat_t
+	if err := unix.Fstatat(rootfd, lockName, &current, unix.AT_SYMLINK_NOFOLLOW); err != nil || uint64(current.Ino) != uint64(held.Ino) || uint64(current.Dev) != uint64(held.Dev) {
+		return ErrIntegrity
+	}
+	return nil
+}
+
+func (m *Manager) confirmLockIdentity() error {
+	if m == nil || m.root == nil || m.lock == nil {
+		return ErrClosed
+	}
+	return confirmLockFile(int(m.root.Fd()), int(m.lock.Fd()))
 }
 
 // Open a fresh directory description: Dup shares the enumeration offset.
@@ -470,6 +514,9 @@ func (m *Manager) writeLedgerContext(ctx context.Context, buf []byte) error {
 
 func (m *Manager) persistSlots() error { return m.persistSlotsContext(context.Background()) }
 func (m *Manager) persistSlotsContext(ctx context.Context) error {
+	if err := m.confirmLockIdentity(); err != nil {
+		return err
+	}
 	h := ledgerHeader{Quota: m.quota}
 	buf, err := encodeLedger(h, m.slots)
 	if err != nil {
@@ -495,6 +542,9 @@ func (m *Manager) ensureControlDir(name string) error {
 }
 
 func (m *Manager) recoverLocked() error {
+	if err := m.confirmLockIdentity(); err != nil {
+		return err
+	}
 	if err := m.ensureControlDir(gensDir); err != nil {
 		return err
 	}
@@ -1402,6 +1452,9 @@ func (m *Manager) EvictGeneration(ctx context.Context, id string) error {
 
 func (m *Manager) deleteGenerationLocked(ctx context.Context, i int) error {
 	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := m.confirmLockIdentity(); err != nil {
 		return err
 	}
 	prior := m.slots[i]

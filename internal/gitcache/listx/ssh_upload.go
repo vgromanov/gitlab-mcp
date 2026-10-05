@@ -409,11 +409,16 @@ func admitPreparedAuth(ctx context.Context, p *preparedSSH) (string, error) {
 // URL user. Configured User still wins inside Resolve; an absent User, including
 // %r, must not fall back to the local OS account.
 func sshInputForTarget(target origin.Target, opt Options) sshconfig.Input {
-	input := sshconfig.Input{Host: target.Host, RemoteUser: target.User}
+	port := 0
+	if n, err := strconv.Atoi(target.Port); err == nil && n >= 1 && n <= 65535 {
+		port = n
+	}
+	input := sshconfig.Input{Host: target.Host, RemoteUser: target.User, RemotePort: port}
 	if opt.SSHConfig != nil {
 		input = *opt.SSHConfig
 		input.Host = target.Host
 		input.RemoteUser = target.User
+		input.RemotePort = port
 	}
 	return input
 }

@@ -76,7 +76,7 @@ decode/tree/cache paths check `context` cooperatively.
 
 - Linux/Darwin: `openat` + `O_NOFOLLOW`, held root/lock descriptors, same-device /
   owner / mode / nlink checks. No `Fchdir` child helper.
-- One exclusive root lock for the manager lifetime.
+- One exclusive root lock for the manager lifetime. Exclusion is the root directory inode plus the lock-file inode; replacing `root.lock` does not admit a second manager, and a changed lock identity fails closed.
 - Root scans are bounded before enumeration and reject unknown storage. The
   current format owns no staging children; recovery never clears arbitrary files.
 - Ledger v2 binds manifest bytes. Warm loads validate exact index bytes regenerated
@@ -137,6 +137,8 @@ CVE-2026-71557 and prior 5.19.1 advisories). Vendored via `go mod vendor`.
 - SSH is a secure supported subset of OpenSSH configuration (same reviewed
   prototype surface): no encrypted unmatched native fallback, certificates/SK,
   proxy/helper/multiplex, or forcing strict host-key policy against configured
-  `StrictHostKeyChecking` / `UpdateHostKeys`.
+  `StrictHostKeyChecking` / `UpdateHostKeys`. The authorized URL port is the
+  default when config has no `Port`, including `%p`. A configured port that
+  differs from that URL is refused before dialing.
 - Logical quota is not a physical filesystem block cap or hard process RSS.
 - Independent Sol review is required before calling this production-safe.

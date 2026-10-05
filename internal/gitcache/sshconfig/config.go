@@ -28,6 +28,7 @@ const (
 type Input struct {
 	Host, LocalUser, Home    string
 	RemoteUser               string // URL user; used when config has no User, including %r
+	RemotePort               int    // URL port; used when config has no Port, including %p. Zero means 22.
 	UserConfig, SystemConfig string
 	LookupEnv                func(string) (string, bool)
 }
@@ -389,7 +390,14 @@ func (r *resolver) bad(key, reason string) error {
 	return problem(v.source, v.line, key, reason)
 }
 func (r *resolver) finish() (Config, error) {
-	c := Config{HostName: r.in.Host, User: r.scalar("user", r.remoteUser()), Port: 22, StrictHostKeyChecking: r.scalar("stricthostkeychecking", "ask"), UpdateHostKeys: r.scalar("updatehostkeys", "yes"), PublicKeyAuthentication: true}
+	port := 22
+	if r.in.RemotePort != 0 {
+		if r.in.RemotePort < 1 || r.in.RemotePort > 65535 {
+			return Config{}, errors.New("ssh config: invalid remote port")
+		}
+		port = r.in.RemotePort
+	}
+	c := Config{HostName: r.in.Host, User: r.scalar("user", r.remoteUser()), Port: port, StrictHostKeyChecking: r.scalar("stricthostkeychecking", "ask"), UpdateHostKeys: r.scalar("updatehostkeys", "yes"), PublicKeyAuthentication: true}
 	if r.scalar("canonicalizehostname", "no") != "no" {
 		return Config{}, r.bad("canonicalizehostname", "canonicalization is unsupported")
 	}
