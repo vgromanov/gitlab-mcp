@@ -819,8 +819,6 @@ func TestGetPipelineJobOutput_rangeShortLookaheadWithheld(t *testing.T) {
 		if to < int(end) {
 			t.Errorf("range stopped at end_byte: %q", r.Header.Get("Range"))
 		}
-		// One byte past end_byte, not enough to finish the token.
-		to = int(end)
 		if from < 0 {
 			from = 0
 		}
