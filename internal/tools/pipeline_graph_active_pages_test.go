@@ -116,6 +116,18 @@ func TestPipelineGraph_activeJobDriftDuringBridgePhase(t *testing.T) {
 	requireResync(t, d, in, tok, "active job drift while paging bridges")
 }
 
+func TestPipelineGraph_bridgeResumeRejectsBoundaryOverlap(t *testing.T) {
+	h := pagedActiveServer()
+	d, in := pagedActiveDeps(t, h)
+	tok := bridgePhaseToken(t, d, &in, 1)
+	h.bridges["42/100/2"] = "[" + bridgeJSON(50, "one", 0, 0, "") + "]"
+	in.Cursor = tok
+	_, _, err := getMergeRequestPipelineGraph(context.Background(), nil, in, d)
+	if err == nil || !strings.Contains(err.Error(), cursor.ResyncRequired) || !strings.Contains(err.Error(), "overlap") {
+		t.Fatalf("boundary bridge overlap not rejected: %v", err)
+	}
+}
+
 func TestPipelineGraph_bridgeRetryLineageAcrossPages(t *testing.T) {
 	failed := strings.Replace(bridgeJSON(51, "dep", 99, 201, graphChildSHA), `"status":"success","allow_failure":false`, `"status":"failed","allow_failure":false`, 1)
 	h := &walkServer{

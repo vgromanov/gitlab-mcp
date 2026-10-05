@@ -747,6 +747,31 @@ func graphNodeDigest(n graphNodeView) string {
 	sort.Slice(jobs, func(i, j int) bool {
 		return bytes.Compare(jobs[i], jobs[j]) < 0
 	})
+	lineage := make([]json.RawMessage, 0, len(n.Lineage))
+	for _, lv := range n.Lineage {
+		latest := append([]int64(nil), lv.LatestIDs...)
+		history := append([]int64(nil), lv.HistoryIDs...)
+		sort.Slice(latest, func(i, j int) bool { return latest[i] < latest[j] })
+		sort.Slice(history, func(i, j int) bool { return history[i] < history[j] })
+		raw, err := json.Marshal(struct {
+			Name        string  `json:"name"`
+			LatestKnown bool    `json:"latest_known"`
+			LatestIDs   []int64 `json:"latest_ids"`
+			HistoryIDs  []int64 `json:"history_ids"`
+		}{
+			Name:        deref(lv.Name),
+			LatestKnown: lv.LatestKnown,
+			LatestIDs:   latest,
+			HistoryIDs:  history,
+		})
+		if err != nil {
+			return ""
+		}
+		lineage = append(lineage, raw)
+	}
+	sort.Slice(lineage, func(i, j int) bool {
+		return bytes.Compare(lineage[i], lineage[j]) < 0
+	})
 	var pipe json.RawMessage
 	if n.Pipeline != nil {
 		raw, err := json.Marshal(struct {
@@ -776,6 +801,7 @@ func graphNodeDigest(n graphNodeView) string {
 		Role       string            `json:"role"`
 		Pipeline   json.RawMessage   `json:"pipeline"`
 		Jobs       []json.RawMessage `json:"jobs"`
+		Lineage    []json.RawMessage `json:"lineage"`
 	}{
 		ProjectID:  n.ProjectID,
 		PipelineID: n.PipelineID,
@@ -783,6 +809,7 @@ func graphNodeDigest(n graphNodeView) string {
 		Role:       n.Role,
 		Pipeline:   pipe,
 		Jobs:       jobs,
+		Lineage:    lineage,
 	})
 	if err != nil {
 		return ""

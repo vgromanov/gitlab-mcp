@@ -573,6 +573,26 @@ func TestEncodeGraphDigestIncludesPipelineMetadata(t *testing.T) {
 	}
 }
 
+func TestEncodeGraphDigestIncludesLineage(t *testing.T) {
+	ok := "success"
+	name := "retry"
+	stage := "test"
+	jobs := []jobView{{ID: 1, Name: &name, Stage: &stage, Status: &ok, AllowFailure: "false", Attempt: attemptLatest, Policy: policyPass}}
+	base := graphNodeView{
+		ProjectID: "42", PipelineID: 100, Role: nodeRoleParent, Jobs: jobs,
+		Lineage: []lineageView{{Name: &name, LatestKnown: true, LatestIDs: []int64{2}, HistoryIDs: []int64{1}}},
+	}
+	alt := graphNodeView{
+		ProjectID: "42", PipelineID: 100, Role: nodeRoleParent, Jobs: jobs,
+		Lineage: []lineageView{{Name: &name, LatestKnown: true, LatestIDs: []int64{1}, HistoryIDs: []int64{2}}},
+	}
+	a := encodeGraphDigest([]graphNodeView{base}, nil, assessReady, downstreamCoverageComplete, nil)
+	b := encodeGraphDigest([]graphNodeView{alt}, nil, assessReady, downstreamCoverageComplete, nil)
+	if a == "" || a == b {
+		t.Fatalf("digest ignored node lineage %s %s", a, b)
+	}
+}
+
 func TestEncodeGraphDigestIncludesReasons(t *testing.T) {
 	ok := "success"
 	name := "bridge"

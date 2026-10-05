@@ -418,7 +418,7 @@ func resumeGraphBridges(ctx context.Context, section *readmeta.Section, pid, pip
 		return nil, nil, err
 	}
 	nextPage := int(payload.PageState.ProviderNextPage)
-	page, err := collectBridgePage(ctx, d, budget, pipePID, pipe.ID, nextPage, sel.PerPage, idSet(ids))
+	page, err := collectBridgePage(ctx, d, budget, pipePID, pipe.ID, nextPage, sel.PerPage, idSet(jobIDStrings(bridgeJobs(guard.Bridges))))
 	if err != nil {
 		return nil, nil, err
 	}
