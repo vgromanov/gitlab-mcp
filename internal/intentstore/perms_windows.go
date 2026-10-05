@@ -69,6 +69,45 @@ func createExclusive(path string) error {
 	return f.Close()
 }
 
+func identifyFile(path string) (fileID, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return fileID{}, err
+	}
+	if isSymlink(info) {
+		return fileID{}, ErrSymlink
+	}
+	name, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return fileID{}, err
+	}
+	h, err := windows.CreateFile(
+		name,
+		windows.GENERIC_READ,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
+		nil,
+		windows.OPEN_EXISTING,
+		windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OPEN_REPARSE_POINT,
+		0,
+	)
+	if err != nil {
+		return fileID{}, err
+	}
+	defer windows.CloseHandle(h)
+	var infoHandle windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(h, &infoHandle); err != nil {
+		return fileID{}, err
+	}
+	if infoHandle.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		return fileID{}, ErrSymlink
+	}
+	return fileID{
+		dev: uint64(infoHandle.VolumeSerialNumber),
+		ino: uint64(infoHandle.FileIndexHigh)<<32 | uint64(infoHandle.FileIndexLow),
+		ok:  true,
+	}, nil
+}
+
 func makeParents(path string) error {
 	clean := filepath.Clean(path)
 	if clean == "" || clean == `\` || (len(clean) == 3 && clean[1] == ':') {

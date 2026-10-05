@@ -56,3 +56,32 @@ func TestOwnerMustMatchEffectiveUser(t *testing.T) {
 		t.Fatalf("wrong stat: %v", err)
 	}
 }
+
+func TestWritableAncestorRejected(t *testing.T) {
+	base := privateDir(t)
+	shared := filepath.Join(base, "shared")
+	if err := os.Mkdir(shared, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(shared, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	priv := filepath.Join(shared, "priv")
+	if err := os.Mkdir(priv, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(priv, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(Config{Path: filepath.Join(priv, "intent.db")}); !errors.Is(err, ErrUnsafePermissions) {
+		t.Fatalf("writable ancestor: %v", err)
+	}
+	if err := os.Chmod(shared, 0o777|os.ModeSticky); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(Config{Path: filepath.Join(priv, "sticky.db")})
+	if err != nil {
+		t.Fatalf("sticky ancestor: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+}

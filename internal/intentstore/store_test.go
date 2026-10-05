@@ -1022,6 +1022,72 @@ func TestWritableCountsRows(t *testing.T) {
 	}
 }
 
+func TestFailedInitDoesNotDeletePeerStore(t *testing.T) {
+	cfg, _ := fixedNow(t)
+	ctx := context.Background()
+	afterPrepare = func(s *Store) error {
+		afterPrepare = nil
+		peer, err := Open(Config{Path: s.path})
+		if err != nil {
+			return err
+		}
+		t.Cleanup(func() { _ = peer.Close() })
+		if _, err := peer.Begin(ctx, ident("k"), PayloadHash([]byte("a")), BeginOptions{}); err != nil {
+			return err
+		}
+		return ErrFull
+	}
+	t.Cleanup(func() { afterPrepare = nil })
+	_, err := Open(cfg)
+	if !errors.Is(err, ErrFull) {
+		t.Fatalf("creator: %v", err)
+	}
+	if _, err := os.Lstat(cfg.Path); err != nil {
+		t.Fatalf("peer database removed: %v", err)
+	}
+	s := openStore(t, cfg)
+	if _, err := s.GetByIdentity(ctx, ident("k")); err != nil {
+		t.Fatalf("peer row: %v", err)
+	}
+}
+
+func TestOpenRejectsAncestorSwap(t *testing.T) {
+	base := privateDir(t)
+	parent := filepath.Join(base, "parent")
+	if err := os.Mkdir(parent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(parent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(parent, "intent.db")
+	evil := filepath.Join(base, "evil")
+	if err := os.Mkdir(evil, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(evil, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	beforeSQLOpen = func(p string) {
+		beforeSQLOpen = nil
+		if err := os.Rename(parent, parent+".bak"); err != nil {
+			t.Errorf("rename: %v", err)
+			return
+		}
+		if err := os.Symlink(evil, parent); err != nil {
+			t.Errorf("symlink: %v", err)
+		}
+	}
+	t.Cleanup(func() { beforeSQLOpen = nil })
+	_, err := Open(Config{Path: path})
+	if !errors.Is(err, ErrSymlink) {
+		t.Fatalf("ancestor swap: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(evil, "intent.db")); err == nil {
+		t.Fatal("opened through the swapped symlink")
+	}
+}
+
 func TestCreateRaceOpensExistingFile(t *testing.T) {
 	cfg, _ := fixedNow(t)
 	beforeCreate = func(path string) {

@@ -91,6 +91,25 @@ func createExclusive(path string) error {
 	return unix.Close(file)
 }
 
+func identifyFile(path string) (fileID, error) {
+	fd, base, err := openParent(path)
+	if err != nil {
+		return fileID{}, err
+	}
+	defer unix.Close(fd)
+	var st unix.Stat_t
+	if err := unix.Fstatat(fd, base, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return fileID{}, err
+	}
+	if st.Mode&unix.S_IFMT == unix.S_IFLNK {
+		return fileID{}, ErrSymlink
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFREG {
+		return fileID{}, ErrUnsafePermissions
+	}
+	return fileID{dev: uint64(st.Dev), ino: uint64(st.Ino), ok: true}, nil
+}
+
 func makeParents(path string) error {
 	clean := filepath.Clean(path)
 	if clean == "/" || clean == "." {
@@ -102,6 +121,9 @@ func makeParents(path string) error {
 		return err
 	}
 	defer func() { _ = unix.Close(fd) }()
+	if err := checkOpenedDir(fd); err != nil {
+		return err
+	}
 	built := "/"
 	for _, part := range parts {
 		full := "/" + part
@@ -144,6 +166,10 @@ func openParent(path string) (int, string, error) {
 	if err != nil {
 		return -1, "", err
 	}
+	if err := checkOpenedDir(fd); err != nil {
+		_ = unix.Close(fd)
+		return -1, "", err
+	}
 	built := "/"
 	for _, part := range parts[:len(parts)-1] {
 		full := "/" + part
@@ -175,9 +201,41 @@ func openComponent(dirfd int, name, full string) (int, error) {
 	} else if st.Mode&unix.S_IFMT != unix.S_IFDIR {
 		return -1, ErrUnsafePermissions
 	} else {
+		if err := checkSharedDirMode(st); err != nil {
+			return -1, err
+		}
 		flags |= unix.O_NOFOLLOW
 	}
-	return unix.Openat(dirfd, name, flags, 0)
+	nfd, err := unix.Openat(dirfd, name, flags, 0)
+	if err != nil {
+		return -1, err
+	}
+	if err := checkOpenedDir(nfd); err != nil {
+		_ = unix.Close(nfd)
+		return -1, err
+	}
+	return nfd, nil
+}
+
+// checkSharedDirMode rejects a non-sticky directory that group or other
+// can write. Such an ancestor can be renamed and replaced with a symlink
+// between the path walk and sql.Open.
+func checkSharedDirMode(st unix.Stat_t) error {
+	if st.Mode&unix.S_IFMT != unix.S_IFDIR {
+		return ErrUnsafePermissions
+	}
+	if st.Mode&0o022 != 0 && st.Mode&unix.S_ISVTX == 0 {
+		return ErrUnsafePermissions
+	}
+	return nil
+}
+
+func checkOpenedDir(fd int) error {
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return err
+	}
+	return checkSharedDirMode(st)
 }
 
 func splitPath(clean string) []string {

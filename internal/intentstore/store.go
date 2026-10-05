@@ -47,6 +47,14 @@ type Store struct {
 // exclusive create. Tests use it to simulate another process winning the race.
 var beforeCreate func(path string)
 
+// afterPrepare runs after the file is opened and before initialize.
+// Tests use it to let another handle finish initialization, then fail.
+var afterPrepare func(*Store) error
+
+// beforeSQLOpen runs after the descriptor walk and before sql.Open.
+// Tests use it to swap an ancestor for a symlink in that gap.
+var beforeSQLOpen func(path string)
+
 type migrateFunc func(tx *sql.Tx, from, to int) error
 
 // PublishingHandlerEnabled reports whether this process registers a publisher.
@@ -89,14 +97,24 @@ func open(ctx context.Context, cfg Config, targetVersion int, migrate migrateFun
 	if err != nil {
 		return nil, err
 	}
-	if err := callBusy(func() error { return s.initialize(ctx, targetVersion, migrate) }); err != nil {
-		_ = s.db.Close()
-		if created {
-			removeStoreFiles(s.path)
+	if afterPrepare != nil {
+		if err := afterPrepare(s); err != nil {
+			return abandonCreated(s, created, err)
 		}
-		return nil, err
+	}
+	if err := callBusy(func() error { return s.initialize(ctx, targetVersion, migrate) }); err != nil {
+		return abandonCreated(s, created, err)
 	}
 	return s, nil
+}
+
+func abandonCreated(s *Store, created bool, err error) (*Store, error) {
+	keep := created && storeInitialized(s.path, s.db)
+	_ = s.db.Close()
+	if created && !keep {
+		removeCreatedStore(s.path)
+	}
+	return nil, err
 }
 
 func prepare(cfg Config) (store *Store, created bool, err error) {
@@ -148,7 +166,7 @@ func prepare(cfg Config) (store *Store, created bool, err error) {
 		} else {
 			created = true
 			if err := establishPrivate(path, false); err != nil {
-				removeStoreFiles(path)
+				removeCreatedStore(path)
 				return nil, false, err
 			}
 		}
@@ -158,13 +176,20 @@ func prepare(cfg Config) (store *Store, created bool, err error) {
 	if created {
 		defer func() {
 			if store == nil {
-				removeStoreFiles(path)
+				removeCreatedStore(path)
 			}
 		}()
 	}
 	before, err := existingSidecars(path)
 	if err != nil {
 		return nil, false, err
+	}
+	ident, err := identifyFile(path)
+	if err != nil {
+		return nil, false, err
+	}
+	if beforeSQLOpen != nil {
+		beforeSQLOpen(path)
 	}
 	dsn := sqliteFileURI(path, writeDSNQuery)
 	db, err := sql.Open("sqlite", dsn)
@@ -176,6 +201,19 @@ func prepare(cfg Config) (store *Store, created bool, err error) {
 	if err := callBusy(func() error { return db.Ping() }); err != nil {
 		_ = db.Close()
 		return nil, false, mapDriver(err)
+	}
+	opened, err := identifyFile(path)
+	if err != nil {
+		_ = db.Close()
+		return nil, false, err
+	}
+	if !sameFile(ident, opened) {
+		_ = db.Close()
+		return nil, false, ErrSymlink
+	}
+	if err := rejectSymlinkComponents(path); err != nil {
+		_ = db.Close()
+		return nil, false, err
 	}
 	if err := lockDownNewSidecars(path, before); err != nil {
 		_ = db.Close()
