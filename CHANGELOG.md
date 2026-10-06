@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Security
+
+- `execute_graphql` is safe to expose: `variables` is declared and handled as a
+  JSON object (the schema used to say array of numbers); a document containing a
+  `mutation` is rejected before any HTTP request when `GITLAB_READ_ONLY_MODE` /
+  `--read-only` is set (a small in-repo scanner, no new dependency); top-level
+  GraphQL `errors` in an HTTP 200 response now return a tool error; the tool is
+  annotated not read-only (RVG-159).
+
 ### Added
 
 - `get_pipeline_job_output` returns a tail window of the trace:
