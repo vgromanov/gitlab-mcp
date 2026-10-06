@@ -694,16 +694,14 @@ func releaseGraphPageBudget(budget *igl.Budget, perPage int) {
 }
 
 // graphActiveReplayCap bounds active-node guard+replay reads separately from the
-// forward page fetch. It covers the signed page plus pages 1..page-1 revalidation.
+// forward page fetch. It covers pages 1..page-1 revalidation plus the guard page
+// (page*perPage items) and is not capped at max_items, which only limits forward fetches.
 func graphActiveReplayCap(budget *igl.Budget, perPage, page int) int {
+	_ = budget
 	if page < 1 || perPage < 1 {
 		return 0
 	}
-	replay := page * perPage
-	if budget != nil && budget.MaxItems > 0 && replay > budget.MaxItems {
-		return budget.MaxItems
-	}
-	return replay
+	return page * perPage
 }
 
 // graphEvidenceReplayCap sizes completed-node certification replay from retained

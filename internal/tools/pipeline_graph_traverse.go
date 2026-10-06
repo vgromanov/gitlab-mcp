@@ -201,6 +201,7 @@ func restoreGraphWalk(pipe *pipelineView, gc *cursor.GraphCont, depth, nodes int
 		reachTruncated:   gc.Rgx,
 		jobsEv:           gc.JD,
 		bridgesEv:        gc.BD,
+		activeNodeItems:  gc.AI,
 		evidence:         map[string][3]string{},
 		evidenceItems:    map[string]int{},
 	}
@@ -421,6 +422,7 @@ func (w *graphWalk) snapshotCont() *cursor.GraphCont {
 		Ei:    ei,
 		JD:    w.jobsEv,
 		BD:    w.bridgesEv,
+		AI:    w.activeNodeItems,
 		N:     w.nodeCount,
 		Block: w.block,
 		Part:  w.partial,

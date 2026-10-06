@@ -206,6 +206,8 @@ type GraphCont struct {
 	Ei    []string `json:"ei,omitempty"`
 	JD    string   `json:"jd,omitempty"`
 	BD    string   `json:"bd,omitempty"`
+	// AI is retained job/bridge items already charged on the active node (JD/BD chain).
+	AI    int      `json:"ai,omitempty"`
 	N     int      `json:"n"`
 	Block bool     `json:"block,omitempty"`
 	Part  bool     `json:"part,omitempty"`
