@@ -1217,6 +1217,15 @@ func TestByteCapStopsGrowthBeforeCommit(t *testing.T) {
 	if full == nil || len(accepted) == 0 {
 		t.Fatalf("cap never reached: accepted %d, full %v", len(accepted), full)
 	}
+	if fileBytes(t, s.path) < s.maxBytes {
+		s.maxBytes = fileBytes(t, s.path)
+	}
+	if err := s.Writable(); !errors.Is(err, ErrFull) {
+		t.Fatalf("writable at cap without spare page: %v", err)
+	}
+	if _, err := s.Begin(ctx, ident("writable-probe"), PayloadHash([]byte("probe")), BeginOptions{ExpectedHead: strings.Repeat("h", 100)}); !errors.Is(err, ErrFull) {
+		t.Fatalf("begin after cap: %v", err)
+	}
 	for _, key := range accepted {
 		if _, err := s.GetByIdentity(ctx, ident(key)); err != nil {
 			t.Fatalf("accepted %s lost: %v", key, err)
@@ -1235,6 +1244,50 @@ func TestByteCapStopsGrowthBeforeCommit(t *testing.T) {
 	s.maxBytes = DefaultMaxBytes
 	if _, err := s.Begin(ctx, ident("after"), PayloadHash([]byte("after")), BeginOptions{}); err != nil {
 		t.Fatalf("begin after the cap was raised: %v", err)
+	}
+}
+
+func TestWritableReservesInsertCapacityAtCap(t *testing.T) {
+	cfg, _ := fixedNow(t)
+	cfg.MaxBytes = 262144
+	cfg.MaxRows = 200000
+	s := openStore(t, cfg)
+	ctx := context.Background()
+	if _, err := s.Begin(ctx, ident("seed"), PayloadHash([]byte("seed")), BeginOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	var rejected bool
+	for i := 0; i < 50000; i++ {
+		key := fmt.Sprintf("probe-%05d", i)
+		_, err := s.Begin(ctx, ident(key), PayloadHash([]byte(key)), BeginOptions{ExpectedHead: strings.Repeat("h", 100)})
+		switch {
+		case err == nil:
+		case errors.Is(err, ErrFull):
+			rejected = true
+			break
+		default:
+			t.Fatalf("begin %s: %v", key, err)
+		}
+		if n := fileBytes(t, s.path); n > s.maxBytes {
+			t.Fatalf("file %d bytes exceeds cap %d", n, s.maxBytes)
+		}
+		if rejected {
+			break
+		}
+	}
+	if !rejected {
+		t.Fatal("new-key begin never returned ErrFull at the byte cap")
+	}
+	if fileBytes(t, s.path) != s.maxBytes {
+		t.Fatalf("file=%d maxBytes=%d", fileBytes(t, s.path), s.maxBytes)
+	}
+	_, berr := s.Begin(ctx, ident("one-more"), PayloadHash([]byte("more")), BeginOptions{ExpectedHead: strings.Repeat("h", 100)})
+	werr := s.Writable()
+	if !errors.Is(berr, ErrFull) {
+		t.Fatalf("begin: %v", berr)
+	}
+	if !errors.Is(werr, ErrFull) {
+		t.Fatalf("writable: %v", werr)
 	}
 }
 
@@ -1269,10 +1322,6 @@ func TestPeerWithHigherCapGrowthIsHonored(t *testing.T) {
 		t.Fatal(err)
 	}
 	low.maxBytes = fileBytes(t, low.path)
-	if err := low.Writable(); err != nil {
-		t.Fatalf("at cap: %v", err)
-	}
-
 	peer := openStore(t, cfg)
 	peer.maxBytes = DefaultMaxBytes
 	for i := 0; i < 40; i++ {

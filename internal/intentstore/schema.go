@@ -224,6 +224,9 @@ var (
 	keySchemaName    = []byte("schema_name")
 	keySchemaVersion = []byte("schema_version")
 	keyEpoch         = []byte("epoch")
+
+	// writableProbeCaller prefixes transient probe identities rolled back by Writable.
+	writableProbeCaller = "\x00intentstore-writable-probe"
 )
 
 const (

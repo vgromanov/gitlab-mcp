@@ -39,6 +39,13 @@ func (s *Store) Begin(ctx context.Context, id Identity, payloadHash string, opts
 		if err := s.overByteCap(); err != nil {
 			return err
 		}
+		n, err := fileSize(s.path)
+		if err != nil {
+			return err
+		}
+		if n >= s.maxBytes {
+			return ErrFull
+		}
 		op, err := newID()
 		if err != nil {
 			return err

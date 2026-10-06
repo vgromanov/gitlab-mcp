@@ -535,20 +535,61 @@ func (s *Store) Close() error {
 // Writable reports whether a new intent could be created.
 // A store that already holds MaxRows or MaxBytes reports ErrFull, matching Begin.
 func (s *Store) Writable() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if err := s.writableLocked(true); err != nil {
-		return err
-	}
-	if err := s.overByteCap(); err != nil {
-		return err
-	}
-	return s.view(context.Background(), func(tx *bolt.Tx) error {
+	return s.writeTx(context.Background(), true, func(tx *bolt.Tx) error {
 		if rowCount(tx) >= s.maxRows {
 			return ErrFull
 		}
+		if err := s.overByteCap(); err != nil {
+			return err
+		}
+		n, err := fileSize(s.path)
+		if err != nil {
+			return err
+		}
+		if n >= s.maxBytes {
+			return ErrFull
+		}
+		free := tx.DB().Stats().FreePageN
+		if free == 0 && s.maxBytes > 0 && n+int64(allocSize) > s.maxBytes {
+			return stageProbeIntent(tx, s, 0)
+		}
 		return nil
 	})
+}
+
+func stageProbeIntent(tx *bolt.Tx, s *Store, seq int) error {
+	op, err := newID()
+	if err != nil {
+		return err
+	}
+	id := Identity{
+		Instance:  "https://gitlab.example/api/v4",
+		Actor:     "probe",
+		Project:   "group/project",
+		MR:        "1",
+		Kind:      "writable-probe",
+		CallerKey: fmt.Sprintf("%s-%d", writableProbeCaller, seq),
+	}
+	now := s.now().UnixNano()
+	r := row{
+		OperationID:     op,
+		Instance:        id.Instance,
+		Actor:           id.Actor,
+		Project:         id.Project,
+		MR:              id.MR,
+		Kind:            id.Kind,
+		CallerKey:       id.CallerKey,
+		PayloadHash:     strings.Repeat("0", 64),
+		State:           StatePrepared,
+		ExpectedHead:    strings.Repeat("h", 100),
+		CreatedUnixNano: now,
+		UpdatedUnixNano: now,
+		RowEpoch:        s.epoch,
+	}
+	if err := putRow(tx, r); err != nil {
+		return err
+	}
+	return tx.Bucket(bucketIdentity).Put(identityKey(id), []byte(op))
 }
 
 // DisableDispatch stops new intents and claims. Reads, outcome recording,
