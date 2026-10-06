@@ -262,6 +262,70 @@ func TestReviewContext_graphFollowsMorePagesThanVisitedCap(t *testing.T) {
 	}
 }
 
+func TestReviewContext_pagedGraphDigestMatchesMergedGraph(t *testing.T) {
+	log := &pathLog{}
+	script := &reviewScript{log: log}
+	graph := &walkServer{
+		pipes: map[string]string{"42/100": walkPipe(100, 42, shaN(1), "feature-1")},
+		jobs: map[string]string{
+			"42/100/1": jobPageJSON(1, 20),
+			"42/100/2": jobPageJSON(21, 1),
+		},
+		mrPipes: `[{"id":100,"project_id":42,"sha":"` + shaN(1) + `","ref":"feature-1","status":"success"}]`,
+	}
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/pipelines") || strings.Contains(r.URL.Path, "/jobs") || strings.Contains(r.URL.Path, "/bridges") {
+			graph.ServeHTTP(w, r)
+			return
+		}
+		script.serve(w, r)
+	})
+	d := newReviewDeps(t, h)
+	out, err := callReviewDirect(t, d, context.Background(), []reviewContextItemIn{
+		{ProjectID: "42", MergeRequestIID: 1, Sections: []string{"metadata", "pipeline_graph"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item := out.Items[0]
+	if item.PipelineGraph == nil || item.pipelineGraphDigest == "" {
+		t.Fatalf("missing merged graph digest cause=%s", item.Cause)
+	}
+	want := encodeGraphDigest(item.PipelineGraph.Nodes, item.PipelineGraph.Edges, item.PipelineGraph.Assessment, item.PipelineGraph.DownstreamCoverage, item.PipelineGraph.Reasons)
+	if want == "" || item.pipelineGraphDigest != want {
+		t.Fatalf("signed digest %q != merged graph %q", item.pipelineGraphDigest, want)
+	}
+	if len(item.PipelineGraph.Jobs) != 21 {
+		t.Fatalf("merged jobs %d", len(item.PipelineGraph.Jobs))
+	}
+	var lastPage pipelineGraphOut
+	tok := ""
+	for i := 0; i < 4; i++ {
+		_, raw, err := getMergeRequestPipelineGraph(context.Background(), nil, pipelineGraphIn{
+			ProjectID: "42", MergeRequestIID: 1, PerPage: 20, ExpectedSourceSHA: shaN(1), Cursor: tok,
+		}, d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		page, ok := decodePipelineGraphOut(raw)
+		if !ok {
+			t.Fatal("decode page")
+		}
+		lastPage = page
+		if page.Section.NextCursor == nil {
+			break
+		}
+		tok = *page.Section.NextCursor
+	}
+	pageOnly := encodeGraphDigest(lastPage.Nodes, lastPage.Edges, lastPage.Assessment, lastPage.DownstreamCoverage, lastPage.Reasons)
+	if pageOnly == want {
+		t.Fatalf("terminal page node view alone must not match merged graph digest")
+	}
+	if lastPage.Digest != nil && *lastPage.Digest == want {
+		t.Fatalf("terminal page digest must not match merged graph")
+	}
+}
+
 func TestReviewContext_internalGraphPagesMarkCoverageFull(t *testing.T) {
 	log := &pathLog{}
 	script := &reviewScript{log: log}

@@ -1087,11 +1087,9 @@ func (rt *reviewRuntime) readPipelineGraph(item reviewContextItemIn, owner Canon
 		merged.Section = sec
 	}
 	if !startedFromCursor && merged.DownstreamCoverage == downstreamCoverageComplete && merged.Section.NextCursor == nil && !sectionHasCode(merged.Section, readmeta.CodePartial) {
-		if merged.Digest == nil || *merged.Digest == "" {
-			dig := encodeGraphDigest(merged.Nodes, merged.Edges, merged.Assessment, merged.DownstreamCoverage, merged.Reasons)
-			if dig != "" {
-				merged.Digest = &dig
-			}
+		dig := encodeGraphDigest(merged.Nodes, merged.Edges, merged.Assessment, merged.DownstreamCoverage, merged.Reasons)
+		if dig != "" {
+			merged.Digest = &dig
 		}
 		if merged.Digest != nil {
 			merged.Section.ContentComplete = readmeta.ContentCompleteTrue
@@ -1192,6 +1190,7 @@ func mergePipelineGraph(dst *pipelineGraphOut, src pipelineGraphOut) {
 	}
 	if dst.ProjectID == "" {
 		*dst = src
+		dst.Digest = nil
 		if dst.Nodes == nil {
 			dst.Nodes = []graphNodeView{}
 		}
@@ -1223,7 +1222,7 @@ func mergePipelineGraph(dst *pipelineGraphOut, src pipelineGraphOut) {
 			dst.Edges = append(dst.Edges, e)
 		}
 	}
-	dst.Digest = src.Digest
+	dst.Digest = nil
 }
 
 func coalesceLineageViews(items []lineageView) []lineageView {
