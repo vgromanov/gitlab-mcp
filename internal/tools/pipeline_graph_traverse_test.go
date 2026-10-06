@@ -35,6 +35,7 @@ type walkServer struct {
 	omitBridgePaging bool
 	bridgeNextPage   string
 	jobNextPage      string
+	jobNextPageByPipe map[string]string
 }
 
 func (s *walkServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -112,8 +113,20 @@ func (s *walkServer) writePaged(w http.ResponseWriter, r *http.Request, pages ma
 		// Missing X-Next-Page must not be treated as exhaustion.
 	} else if strings.Contains(path, "/bridges") && s.bridgeNextPage != "" {
 		w.Header().Set("X-Next-Page", s.bridgeNextPage)
-	} else if strings.HasSuffix(path, "/jobs") && s.jobNextPage != "" {
-		w.Header().Set("X-Next-Page", s.jobNextPage)
+	} else if strings.HasSuffix(path, "/jobs") {
+		if s.jobNextPageByPipe != nil {
+			if override, ok := s.jobNextPageByPipe[pipeKey(path)]; ok {
+				w.Header().Set("X-Next-Page", override)
+			} else if s.jobNextPage != "" {
+				w.Header().Set("X-Next-Page", s.jobNextPage)
+			} else {
+				w.Header().Set("X-Next-Page", next)
+			}
+		} else if s.jobNextPage != "" {
+			w.Header().Set("X-Next-Page", s.jobNextPage)
+		} else {
+			w.Header().Set("X-Next-Page", next)
+		}
 	} else {
 		w.Header().Set("X-Next-Page", next)
 	}
@@ -894,6 +907,79 @@ func TestPipelineGraph_missingBridgeNextPageNotComplete(t *testing.T) {
 	}
 	if graphSection(t, out)["content_complete"] == readmeta.ContentCompleteTrue {
 		t.Fatal("complete evidence without bridge exhaustion")
+	}
+}
+
+func TestPipelineGraph_incompleteSiblingJobsSurvivesLaterSibling(t *testing.T) {
+	h := &walkServer{
+		pipes: map[string]string{
+			"42/100": walkPipe(100, 42, graphPipeSHA, "feature"),
+			"99/200": walkPipe(200, 99, graphChildSHA, "a"),
+			"99/201": walkPipe(201, 99, graphChildSHA, "b"),
+			"99/202": walkPipe(202, 99, graphChildSHA, "c"),
+		},
+		jobs: map[string]string{
+			"42/100/1": "[" + jobJSON(1, "root", "success", "false") + "]",
+			"99/200/1": "[" + jobJSON(10, "a", "success", "false") + "]",
+			"99/201/1": "[" + jobJSON(11, "b1", "success", "false") + "]",
+			"99/202/1": "[" + jobJSON(12, "c", "success", "false") + "]",
+		},
+		bridges: map[string]string{
+			"42/100/1": "[" + bridgeJSON(50, "to-a", 99, 200, graphChildSHA) + "," + bridgeJSON(51, "to-b", 99, 201, graphChildSHA) + "," + bridgeJSON(52, "to-c", 99, 202, graphChildSHA) + "]",
+			"99/200/1": "[" + bridgeJSON(60, "a-to-b", 99, 201, graphChildSHA) + "]",
+			"99/201/1": "[]",
+			"99/202/1": "[]",
+		},
+		mr:      graphMR("feature"),
+		mrPipes: graphPipes("feature"),
+		jobNextPageByPipe: map[string]string{
+			"99/201": "9",
+		},
+	}
+	out, _, err := callWalk(t, h, pipelineGraphIn{ProjectID: "42", MergeRequestIID: 7, MaxRequests: 64}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireNotReady(t, out)
+	if out["assessment"] == assessReady || out["downstream_coverage"] == downstreamCoverageComplete {
+		t.Fatalf("later sibling cleared incomplete B: %#v", out)
+	}
+	if graphSection(t, out)["content_complete"] == readmeta.ContentCompleteTrue {
+		t.Fatal("signed complete graph with incomplete sibling jobs")
+	}
+}
+
+func TestPipelineGraph_childJobsForbiddenPreservesGraph(t *testing.T) {
+	h := &walkServer{
+		pipes: map[string]string{
+			"42/100": walkPipe(100, 42, graphPipeSHA, "feature"),
+			"99/200": walkPipe(200, 99, graphChildSHA, "child"),
+			"99/201": walkPipe(201, 99, graphChildSHA, "sibling"),
+		},
+		jobs: map[string]string{
+			"42/100/1": "[" + jobJSON(1, "root", "success", "false") + "]",
+			"99/201/1": "[" + jobJSON(12, "sibling", "success", "false") + "]",
+		},
+		bridges: map[string]string{
+			"42/100/1": "[" + bridgeJSON(50, "to-child", 99, 200, graphChildSHA) + "," + bridgeJSON(51, "to-sibling", 99, 201, graphChildSHA) + "]",
+			"99/201/1": "[]",
+		},
+		status: map[string]int{
+			"/api/v4/projects/99/pipelines/200/jobs": http.StatusForbidden,
+		},
+		mr:      graphMR("feature"),
+		mrPipes: graphPipes("feature"),
+	}
+	out, _, err := callWalk(t, h, pipelineGraphIn{ProjectID: "42", MergeRequestIID: 7, MaxRequests: 64}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out["pipeline"] == nil {
+		t.Fatal("root pipeline dropped on child jobs 403")
+	}
+	requireNotReady(t, out)
+	if !hasKind(edgeKinds(t, out), edgeKindInaccessible) {
+		t.Fatalf("missing inaccessible edge %#v", out["edges"])
 	}
 }
 

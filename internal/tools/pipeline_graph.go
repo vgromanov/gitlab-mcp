@@ -109,10 +109,11 @@ type graphSelection struct {
 }
 
 type graphPage struct {
-	Jobs    []graphJob
-	Partial bool
-	Reason  string
-	Paging  readmeta.PagingObservation
+	Jobs         []graphJob
+	Partial      bool
+	Reason       string
+	Paging       readmeta.PagingObservation
+	Inaccessible bool
 }
 
 // getMergeRequestPipelineGraph reads a parent pipeline, paginated jobs, and
@@ -987,6 +988,28 @@ func bridgePagingExhausted(page bridgePage) bool {
 	return !page.Partial && page.Paging.ExhaustedObserved
 }
 
+func markIncompleteChildJobs(section *readmeta.Section, walk *graphWalk, page graphPage) {
+	if walk != nil {
+		walk.unseen = true
+		walk.stickyIncomplete = true
+		if page.Paging.PagingKnown {
+			walk.coverage = downstreamCoveragePartial
+		} else {
+			walk.coverage = downstreamCoverageUnknown
+		}
+	}
+	if section == nil {
+		return
+	}
+	if page.Paging.PagingKnown && !page.Paging.ExhaustedObserved {
+		section.AddLimitation(readmeta.CodePartial, "job paging is not exhausted")
+		return
+	}
+	if !page.Paging.PagingKnown {
+		section.AddLimitation(readmeta.CodeUnknownCount, "paging metadata unavailable")
+	}
+}
+
 func markIncompleteBridgePaging(section *readmeta.Section, walk *graphWalk, page bridgePage) {
 	if walk != nil {
 		walk.unseen = true
@@ -1080,6 +1103,10 @@ func walkQueuedChildren(ctx context.Context, section *readmeta.Section, rootPID 
 		if err != nil {
 			return err
 		}
+		if page.Inaccessible {
+			walk.markQueuedFailure(next, edgeKindInaccessible, "child_jobs_403")
+			continue
+		}
 		walk.current = next.Key
 		walk.pipe = child
 		walk.depth = next.Depth
@@ -1123,16 +1150,18 @@ func walkQueuedChildren(ctx context.Context, section *readmeta.Section, rootPID 
 		nextJobs, moreJobs := pagingContinues(page.Paging, 1)
 		childJobsExhausted := !page.Partial && page.Paging.PagingKnown && page.Paging.ExhaustedObserved
 		if !childJobsExhausted {
-			walk.unseen = true
-			walk.coverage = downstreamCoveragePartial
 			if moreJobs && childSHA != "" && len(page.Jobs) > 0 {
 				nextLineage := encodeLineageCarry(mergeLineageCarry(lineageCarry{}, page.Jobs))
 				if tok, err := mintGraphCursor(d, actorID, scope, child.ID, childSHA, sel, upper, expires, 1, jobGuardTokens(page.Jobs), nextJobs, len(page.Jobs), rootPID, nextLineage, walk.snapshotCont()); err == nil {
 					section.NextCursor = &tok
+					walk.unseen = true
+					if walk.coverage == downstreamCoverageComplete {
+						walk.coverage = downstreamCoveragePartial
+					}
+					return nil
 				}
-			} else if page.Paging.PagingKnown && !page.Paging.ExhaustedObserved {
-				section.AddLimitation(readmeta.CodeUnknownCount, "paging metadata unavailable")
 			}
+			markIncompleteChildJobs(section, walk, page)
 			return nil
 		}
 		if err := walkBridgesAndChildren(ctx, section, rootPID, scope, child, childSHA, sel, d, actorID, upper, expires, walk, budget); err != nil {
@@ -1615,6 +1644,14 @@ func collectJobPage(ctx context.Context, d Deps, budget *igl.Budget, pid string,
 		if errors.Is(err, igl.ErrBudgetItems) || errors.Is(err, igl.ErrBudgetBytes) || errors.Is(err, igl.ErrBudgetRequests) || errors.Is(err, igl.ErrBudgetElapsed) {
 			out.Partial = true
 			out.Reason = "budget"
+			return out, nil
+		}
+		switch providerStatus(err) {
+		case http.StatusNotFound:
+			out.Inaccessible = true
+			return out, nil
+		case http.StatusForbidden:
+			out.Inaccessible = true
 			return out, nil
 		}
 		// A later framing error still leaves complete elements in out.Jobs.
