@@ -18,9 +18,10 @@ This document describes the tool surface currently registered by
   `USE_WORK_ITEMS`, `USE_LABELS`, `USE_DRAFTS`, `USE_WEBHOOKS`, `USE_TIMELINE`.
 - `USE_DAILY_TOOLS=true` registers the pinned 41-tool daily census set
   (includes all four search tools below).
-- `GITLAB_TOOL_PROFILE=review` registers the closed 53-tool review set (daily +
+- `GITLAB_TOOL_PROFILE=review` registers the closed 54-tool review set (daily +
   discussion get/reply/resolve + six pipeline reads + `get_review_queue` +
-  `get_review_snapshot` + `batch_get_file_contents`, no pipeline writes); see
+  `get_review_snapshot` + `batch_get_file_contents` + `get_pipeline_status`,
+  no pipeline writes); see
   [`docs/configuration.md`](configuration.md#review-profile-gitlab_tool_profilereview).
 
 ## Projects / namespaces / users
@@ -78,10 +79,30 @@ This document describes the tool surface currently registered by
   `next_page`; system notes only with `include_system: true`). After the
   sections the head is read again: `head_changed` (true when it moved meanwhile,
   with `current_sha` = the new head, or when `expected_sha` differs from `sha`;
-  `head_recheck_error` if the recheck failed). `include` omitted = all
-  implemented sections, `[]` = metadata only (no recheck); `pipeline` is
-  reserved and rejected until implemented. A failing MR or section yields an
-  `error` entry; the rest of the batch returns
+  `head_recheck_error` if the recheck failed). `include` omitted =
+  `changes`, `approvals`, `discussions`; `[]` = metadata only (no recheck);
+  `pipeline` is opt-in (`include: ["pipeline"]`): the `get_pipeline_status`
+  read of the MR's head pipeline with `jobs=problems` (up to 30 upstream
+  requests per MR). A failing MR or section yields an `error` entry; the rest
+  of the batch returns
+- `get_pipeline_status` — CI status in one call (use it instead of `get_pipeline`
+  + `list_pipeline_jobs` + `list_pipeline_trigger_jobs`). `project_id` plus
+  exactly one of `sha` (full 40-character; optional `ref`, e.g. `main` for a
+  post-merge watch) or `mr_iid` (the MR's head pipeline). Reads the pipelines,
+  all their jobs and bridges (paged) and follows each bridge to its downstream
+  pipeline two levels deep, other projects included, with sequential requests
+  under a `max_requests` budget (default 60, max 200). Returns
+  `overall_status` (`failed` > `canceled` > `running` > `pending` > `manual` >
+  `skipped`/`success`; `none` when no pipeline exists yet; `unknown` when the
+  tree is incomplete and would otherwise be success), `complete` +
+  `truncated_reason` (an inaccessible or disallowed child, the depth limit or
+  the request cap make it false), `pipelines` (`{id, project_id, sha, status,
+  source, depth?, parent_pipeline_id?, jobs: [{id, name, stage, status,
+  allow_failure?, manual?, bridge?}], incomplete?}`; the three flags appear only
+  when true), `failed_jobs` (blocking), `allowed_failed_jobs` (`allow_failure`),
+  `manual_jobs` (gates) and `requests`. `jobs: "problems"` lists only jobs that
+  are not success plus `job_counts` per pipeline (under half the size on a
+  typical tree; recommended for polling)
 - `update_merge_request`
 - `approve_merge_request`
 - `unapprove_merge_request`
