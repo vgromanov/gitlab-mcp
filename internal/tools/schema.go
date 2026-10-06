@@ -26,24 +26,33 @@ func ProjectGID(numericID int64) string {
 
 // Pagination holds list pagination with clamped per_page.
 type Pagination struct {
-	Page    int `json:"page" jsonschema:"Page number (1-based)"`
-	PerPage int `json:"per_page" jsonschema:"Items per page (max 100)"`
+	Page    int `json:"page,omitempty" jsonschema:"Page number (1-based, default 1)"`
+	PerPage int `json:"per_page,omitempty" jsonschema:"Items per page (max 100)"`
 }
 
 // ListOpts returns gitlab ListOptions with defaults.
-func (p Pagination) ListOpts() (page, perPage int) {
+func (p Pagination) ListOpts() (page, perPage int) { return p.listOptsDefault(20) }
+
+// listOptsDefault is ListOpts with a caller-chosen per_page default.
+func (p Pagination) listOptsDefault(def int) (page, perPage int) {
 	page = p.Page
 	if page < 1 {
 		page = 1
 	}
 	perPage = p.PerPage
 	if perPage < 1 {
-		perPage = 20
+		perPage = def
 	}
 	if perPage > 100 {
 		perPage = 100
 	}
 	return page, perPage
+}
+
+// pageInfo reports what a single list request returned. complete is true only
+// when GitLab sent no next page; the server never pages past what was asked.
+func pageInfo(page, perPage int, nextPage int64) map[string]any {
+	return map[string]any{"page": page, "per_page": perPage, "next_page": nextPage, "complete": nextPage == 0}
 }
 
 // TruncateLines limits diff/trace text (best-effort line split).
