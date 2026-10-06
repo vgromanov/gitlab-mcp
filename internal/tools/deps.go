@@ -10,4 +10,6 @@ import (
 type Deps struct {
 	Config *config.Config
 	Client *gitlab.Client
+
+	registered *int // tools AddTool actually registered; set by RegisterAll (nil elsewhere: not counted)
 }

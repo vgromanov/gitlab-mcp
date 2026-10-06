@@ -233,6 +233,23 @@ func (c *Config) RestrictedMode() bool {
 		c.Drafts || c.Webhooks || c.Timeline
 }
 
+// ProfileName names the active tool selection: review (GITLAB_TOOL_PROFILE),
+// daily (USE_DAILY_TOOLS alone), default (unrestricted catalog, legacy feature
+// flags included) or custom (any other restricted combination).
+func (c *Config) ProfileName() string {
+	rest := *c
+	rest.UseDailyTools = false
+	switch {
+	case c.ToolProfile == ProfileReview:
+		return ProfileReview
+	case !c.RestrictedMode():
+		return "default"
+	case c.UseDailyTools && !rest.RestrictedMode():
+		return "daily"
+	}
+	return "custom"
+}
+
 // FeatureEnabled reports gated feature flags (legacy + new families).
 func (c *Config) FeatureEnabled(name string) bool {
 	switch name {

@@ -18,9 +18,10 @@ This document describes the tool surface currently registered by
   `USE_WORK_ITEMS`, `USE_LABELS`, `USE_DRAFTS`, `USE_WEBHOOKS`, `USE_TIMELINE`.
 - `USE_DAILY_TOOLS=true` registers the pinned 41-tool daily census set
   (includes all four search tools below).
-- `GITLAB_TOOL_PROFILE=review` registers the closed 54-tool review set (daily +
+- `GITLAB_TOOL_PROFILE=review` registers the closed 55-tool review set (daily +
   discussion get/reply/resolve + six pipeline reads + `get_review_queue` +
-  `get_review_snapshot` + `batch_get_file_contents` + `get_pipeline_status`,
+  `get_review_snapshot` + `batch_get_file_contents` + `get_pipeline_status` +
+  `get_server_info`,
   no pipeline writes); see
   [`docs/configuration.md`](configuration.md#review-profile-gitlab_tool_profilereview).
 
@@ -267,6 +268,15 @@ REST tool call counts alone understate capability: agents often route through
 wrapper. A REST family that looks “unused” in a census may still be covered
 indirectly via GraphQL. Prefer interpreting usage bands with that in mind when
 trimming the daily set.
+
+## Server
+
+- `get_server_info` — the serving build, answered locally with no GitLab request
+  (works offline and with an invalid token): `{version, revision, revision_short,
+  vcs_time, modified, profile, tool_count}`. The supported way to verify the
+  running revision through the mcp-wrapper bridge, which does not forward
+  `serverInfo`. Review profile and default catalog (not in the daily set); see
+  [`docs/configuration.md`](configuration.md#build-revision).
 
 ## Notes
 
