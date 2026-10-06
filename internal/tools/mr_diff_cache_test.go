@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"sort"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -337,6 +338,47 @@ func twoCommitObjects(t *testing.T, name, oldBody, newBody string) (map[plumbing
 	}, base.Hash.String(), head.Hash.String()
 }
 
+func twoCommitObjectsMulti(t *testing.T, files map[string][2]string) (map[plumbing.Hash]pack.Object, string, string) {
+	t.Helper()
+	names := make([]string, 0, len(files))
+	for name := range files {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	var baseEntries, headEntries []tree.TreeEntry
+	objs := map[plumbing.Hash]pack.Object{}
+	for _, name := range names {
+		oldBody, newBody := files[name][0], files[name][1]
+		oldBlob := pack.Object{Type: "blob", Data: []byte(oldBody)}
+		oldBlob.Hash = pack.HashObject("blob", oldBlob.Data)
+		newBlob := pack.Object{Type: "blob", Data: []byte(newBody)}
+		newBlob.Hash = pack.HashObject("blob", newBlob.Data)
+		objs[oldBlob.Hash] = oldBlob
+		objs[newBlob.Hash] = newBlob
+		baseEntries = append(baseEntries, tree.TreeEntry{Mode: tree.ModeFile, Name: name, Hash: oldBlob.Hash})
+		headEntries = append(headEntries, tree.TreeEntry{Mode: tree.ModeFile, Name: name, Hash: newBlob.Hash})
+	}
+	tb, err := tree.EncodeTree(baseEntries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	th, err := tree.EncodeTree(headEntries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseTree := pack.Object{Type: "tree", Data: tb, Hash: pack.HashObject("tree", tb)}
+	headTree := pack.Object{Type: "tree", Data: th, Hash: pack.HashObject("tree", th)}
+	objs[baseTree.Hash] = baseTree
+	objs[headTree.Hash] = headTree
+	baseBody := []byte("tree " + baseTree.Hash.String() + "\nauthor A <a@a> 1 +0000\ncommitter A <a@a> 1 +0000\n\nbase\n")
+	base := pack.Object{Type: "commit", Data: baseBody, Hash: pack.HashObject("commit", baseBody)}
+	headBody := []byte("tree " + headTree.Hash.String() + "\nparent " + base.Hash.String() + "\nauthor A <a@a> 1 +0000\ncommitter A <a@a> 1 +0000\n\nhead\n")
+	head := pack.Object{Type: "commit", Data: headBody, Hash: pack.HashObject("commit", headBody)}
+	objs[base.Hash] = base
+	objs[head.Hash] = head
+	return objs, base.Hash.String(), head.Hash.String()
+}
+
 func renameCommitObjects(t *testing.T) (map[plumbing.Hash]pack.Object, string, string) {
 	t.Helper()
 	blob := pack.Object{Type: "blob", Data: []byte("rename-me\n")}
@@ -563,7 +605,7 @@ func TestPatchPathspecIncludesBothRenameSides(t *testing.T) {
 		entry: diffManifestEntry{OldPath: &old, NewPath: &neu, RenamedFile: &renamed},
 	}}
 	for _, side := range []string{old, neu} {
-		got := patchPathspec([]string{side}, files)
+		got := patchPathspec([]string{side}, files, false)
 		if len(got) != 2 || got[0] != old || got[1] != neu {
 			t.Fatalf("side %s: %#v", side, got)
 		}
@@ -810,9 +852,70 @@ func TestDiffWindow_cacheContentPreservesSelectorWhitespace(t *testing.T) {
 func TestPatchPathspecKeepsWhitespaceBytes(t *testing.T) {
 	p := " a.txt "
 	files := []retainedDiffFile{{entry: diffManifestEntry{OldPath: &p, NewPath: &p}}}
-	got := patchPathspec([]string{p}, files)
+	got := patchPathspec([]string{p}, files, false)
 	if len(got) != 1 || got[0] != p {
 		t.Fatalf("pathspec=%q", got)
+	}
+}
+
+func TestPatchPathspecTruncatedOmitsUnretainedSelectors(t *testing.T) {
+	old, neu := "old.txt", "new.txt"
+	files := []retainedDiffFile{{
+		entry: diffManifestEntry{OldPath: &neu, NewPath: &neu},
+	}}
+	got := patchPathspec([]string{old, neu}, files, true)
+	if len(got) != 1 || got[0] != neu {
+		t.Fatalf("truncated pathspec must not add unretained selectors: %#v", got)
+	}
+}
+
+func TestDiffWindow_cacheTruncatedPatchSkipsUnretainedSelected(t *testing.T) {
+	var hugeOld, hugeNew strings.Builder
+	for i := 0; i < 500; i++ {
+		fmt.Fprintf(&hugeOld, "old line %04d\n", i)
+		fmt.Fprintf(&hugeNew, "new line %04d\n", i)
+	}
+	objs, base, head := twoCommitObjectsMulti(t, map[string][2]string{
+		"small.txt": {"old-s\n", "new-s\n"},
+		"z_big.txt": {hugeOld.String(), hugeNew.String()},
+	})
+	d := diffDeps(t, overflowHandler(head, base))
+	d.cacheHold = cacheHoldFor(objs, base, head)
+	b := igl.DefaultBudget()
+	b.MaxBytes = 1 << 20
+	b.MaxItems = 1
+	ctx := igl.WithBudget(context.Background(), b)
+	out, err := callDiffWindow(t, d, ctx, map[string]any{
+		"project_id": "42", "merge_request_iid": 1, "diff_version_id": 1,
+		"mode": "content", "paths": []string{"z_big.txt", "small.txt"}, "max_items": 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sectionMap(out)["source"] != readmeta.SourceGitCache {
+		t.Fatalf("section=%#v", sectionMap(out))
+	}
+	files := contentFiles(t, out)
+	var small map[string]any
+	for _, f := range files {
+		if asString(f["new_path"]) == "small.txt" {
+			small = f
+			break
+		}
+	}
+	if small == nil || small["status"] != diffFileStatusText {
+		t.Fatalf("retained small.txt must return a patch, not unavailable: %#v", files)
+	}
+	byPath := map[string]string{}
+	for _, raw := range asSlice(t, out["selectors"]) {
+		s := asMap(t, raw)
+		byPath[asString(s["path"])] = asString(s["status"])
+	}
+	if byPath["small.txt"] != diffSelectorMatched {
+		t.Fatalf("selectors=%#v", byPath)
+	}
+	if byPath["z_big.txt"] != diffSelectorUnobserved {
+		t.Fatalf("truncated selector=%#v", byPath)
 	}
 }
 

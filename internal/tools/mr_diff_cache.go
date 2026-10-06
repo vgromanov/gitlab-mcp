@@ -163,7 +163,7 @@ func recoverCacheContent(ctx context.Context, d Deps, q diffQuery, sec readmeta.
 		files = append(files, f)
 	}
 	patchLim := gitdiff.Limits{MaxBytes: patchByteCap(ctx), Timeout: remainingOrDefault(ctx)}
-	pres, err := cmp.Patches(ctx, patchPathspec(opts.Paths, files), patchLim)
+	pres, err := cmp.Patches(ctx, patchPathspec(opts.Paths, files, truncated), patchLim)
 	if ctx.Err() != nil {
 		return diffContentOut{}, false
 	}
@@ -402,7 +402,7 @@ func entryFromGitFile(f gitdiff.File) diffManifestEntry {
 	}
 }
 
-func patchPathspec(requested []string, files []retainedDiffFile) []string {
+func patchPathspec(requested []string, files []retainedDiffFile, truncated bool) []string {
 	if len(requested) == 0 {
 		return requested
 	}
@@ -425,8 +425,10 @@ func patchPathspec(requested []string, files []retainedDiffFile) []string {
 		add(pathStr(f.entry.OldPath))
 		add(pathStr(f.entry.NewPath))
 	}
-	for _, p := range requested {
-		add(p)
+	if !truncated {
+		for _, p := range requested {
+			add(p)
+		}
 	}
 	return out
 }
