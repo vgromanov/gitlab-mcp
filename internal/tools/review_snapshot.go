@@ -17,6 +17,7 @@ const (
 	snapshotChangesPerPage      = 100
 	snapshotChangesPagesDefault = 3
 	snapshotChangesPagesLimit   = 10
+	snapshotDiscussionsPerPage  = 100
 )
 
 type snapshotMRRef struct {
@@ -27,12 +28,18 @@ type snapshotMRRef struct {
 
 type getReviewSnapshotIn struct {
 	MRs             []snapshotMRRef `json:"mrs" jsonschema:"1 to 10 merge requests"`
-	Include         []string        `json:"include,omitempty" jsonschema:"Sections to read: changes, approvals (discussions and pipeline are not implemented yet and are rejected). Omitted = every implemented section; [] = metadata only"`
+	Include         []string        `json:"include,omitempty" jsonschema:"Sections to read: changes, approvals, discussions (pipeline is not implemented yet and is rejected). Omitted = every implemented section; [] = metadata only"`
 	ChangesMaxPages int             `json:"changes_max_pages,omitempty" jsonschema:"changes: pages of 100 files read per MR (default 3, max 10); complete is false when the cap is hit"`
+
+	DiscussionsMaxPages int  `json:"discussions_max_pages,omitempty" jsonschema:"discussions: pages of 100 discussions read per MR (default 3, max 10); complete is false when the cap is hit"`
+	IncludeSystem       bool `json:"include_system,omitempty" jsonschema:"discussions: keep system notes (default false: excluded)"`
 }
 
 // snapshotOpts are the per-call knobs passed to every section reader.
-type snapshotOpts struct{ changesMaxPages int }
+type snapshotOpts struct {
+	changesMaxPages, discussionsMaxPages int
+	includeSystem                        bool
+}
 
 // snapshotSection is one entry of the include enum. A nil read means the
 // section is part of the contract but not implemented yet: asking for it is
@@ -45,7 +52,7 @@ type snapshotSection struct {
 var snapshotSections = []snapshotSection{
 	{"changes", readSnapshotChanges},
 	{"approvals", readSnapshotApprovals},
-	{"discussions", nil},
+	{"discussions", readSnapshotDiscussions},
 	{"pipeline", nil},
 }
 
@@ -87,6 +94,14 @@ func indexSection(name string) int {
 	return -1
 }
 
+// snapshotPagesCap applies the default (n < 1) and the maximum of a *_max_pages input.
+func snapshotPagesCap(n int) int {
+	if n < 1 {
+		n = snapshotChangesPagesDefault
+	}
+	return min(n, snapshotChangesPagesLimit)
+}
+
 // snapshotProjectID accepts a string id/path or a JSON number (queue rows emit numbers).
 func snapshotProjectID(v any, def string) (string, error) {
 	switch x := v.(type) {
@@ -110,11 +125,10 @@ func getReviewSnapshot(ctx context.Context, _ *mcp.CallToolRequest, in getReview
 	if err != nil {
 		return nil, nil, err
 	}
-	opt := snapshotOpts{changesMaxPages: in.ChangesMaxPages}
-	if opt.changesMaxPages < 1 {
-		opt.changesMaxPages = snapshotChangesPagesDefault
+	opt := snapshotOpts{
+		changesMaxPages: snapshotPagesCap(in.ChangesMaxPages), discussionsMaxPages: snapshotPagesCap(in.DiscussionsMaxPages),
+		includeSystem: in.IncludeSystem,
 	}
-	opt.changesMaxPages = min(opt.changesMaxPages, snapshotChangesPagesLimit)
 
 	// Sequential on purpose: at most 10 MRs, each a handful of requests; no workers.
 	mrs := make([]map[string]any, 0, len(in.MRs))
@@ -153,8 +167,9 @@ func snapshotOne(ctx context.Context, d Deps, ref snapshotMRRef, sections []snap
 	out["source_branch"], out["target_branch"] = mr.SourceBranch, mr.TargetBranch
 	out["sha"], out["diff_refs"], out["updated_at"] = mr.SHA, mr.DiffRefs, mr.UpdatedAt
 	out["detailed_merge_status"] = mr.DetailedMergeStatus
+	stale := ref.ExpectedSHA != "" && ref.ExpectedSHA != mr.SHA
 	if ref.ExpectedSHA != "" {
-		out["expected_sha"], out["head_changed"] = ref.ExpectedSHA, ref.ExpectedSHA != mr.SHA
+		out["expected_sha"], out["head_changed"] = ref.ExpectedSHA, stale
 	}
 	for _, s := range sections {
 		sec, serr := s.read(ctx, d, pid, ref.IID, opt)
@@ -162,6 +177,19 @@ func snapshotOne(ctx context.Context, d Deps, ref snapshotMRRef, sections []snap
 			sec = map[string]any{"error": serr.Error()}
 		}
 		out[s.name] = sec
+	}
+	// Head recheck: sha is the head the sections were read for. If the head moved
+	// while they were read, say so and give the new one. No consistency claim beyond that.
+	if len(sections) > 0 {
+		cur, _, rerr := d.Client.MergeRequests.GetMergeRequest(pid, ref.IID, nil, gitlab.WithContext(ctx))
+		switch {
+		case rerr != nil:
+			out["head_recheck_error"] = rerr.Error()
+		case cur.SHA != mr.SHA:
+			out["head_changed"], out["current_sha"] = true, cur.SHA
+		default:
+			out["head_changed"] = stale
+		}
 	}
 	return out
 }
@@ -195,16 +223,89 @@ func readSnapshotChanges(ctx context.Context, d Deps, pid string, iid int64, opt
 				"collapsed": df.Collapsed, "too_large": df.TooLarge,
 			})
 		}
-		if resp.NextPage == 0 {
-			return map[string]any{"files": files, "complete": true, "truncated_reason": nil, "next_page": 0}, nil
-		}
-		if page >= int64(opt.changesMaxPages) {
-			return map[string]any{
-				"files": files, "complete": false, "next_page": resp.NextPage,
-				"truncated_reason": fmt.Sprintf("more pages exist after changes_max_pages=%d (per_page=%d)", opt.changesMaxPages, snapshotChangesPerPage),
-			}, nil
+		if end, done := pageEnd(resp.NextPage, page, "changes_max_pages", opt.changesMaxPages, snapshotChangesPerPage); done {
+			end["files"] = files
+			return end, nil
 		}
 	}
+}
+
+// pageEnd decides whether paging stops after page and returns the honesty
+// fields: complete, truncated_reason (nil when complete) and next_page.
+func pageEnd(next, page int64, capName string, maxPages, perPage int) (map[string]any, bool) {
+	switch {
+	case next == 0:
+		return map[string]any{"complete": true, "truncated_reason": nil, "next_page": 0}, true
+	case page >= int64(maxPages):
+		return map[string]any{
+			"complete": false, "next_page": next,
+			"truncated_reason": fmt.Sprintf("more pages exist after %s=%d (per_page=%d)", capName, maxPages, perPage),
+		}, true
+	}
+	return nil, false
+}
+
+// readSnapshotDiscussions reads discussion pages up to discussionsMaxPages and
+// compacts them. System notes are dropped unless include_system; a discussion
+// left with no notes is dropped too. unresolved_count covers the discussions
+// returned, so it is a lower bound when complete is false.
+func readSnapshotDiscussions(ctx context.Context, d Deps, pid string, iid int64, opt snapshotOpts) (any, error) {
+	discs := []map[string]any{}
+	unresolved := 0
+	for page := int64(1); ; page++ {
+		list, resp, err := d.Client.Discussions.ListMergeRequestDiscussions(pid, iid, &gitlab.ListMergeRequestDiscussionsOptions{
+			ListOptions: gitlab.ListOptions{Page: page, PerPage: snapshotDiscussionsPerPage},
+		}, gitlab.WithContext(ctx))
+		if err != nil {
+			return nil, fmt.Errorf("list discussions (page %d): %w", page, err)
+		}
+		for _, disc := range list {
+			c := compactDiscussion(disc, opt.includeSystem)
+			if c == nil {
+				continue
+			}
+			discs = append(discs, c)
+			if c["resolvable"] == true && c["resolved"] == false {
+				unresolved++
+			}
+		}
+		if end, done := pageEnd(resp.NextPage, page, "discussions_max_pages", opt.discussionsMaxPages, snapshotDiscussionsPerPage); done {
+			end["discussions"], end["unresolved_count"] = discs, unresolved
+			return end, nil
+		}
+	}
+}
+
+// compactDiscussion returns {id, resolvable, resolved, notes[]}, or nil when no note is left.
+func compactDiscussion(disc *gitlab.Discussion, includeSystem bool) map[string]any {
+	if disc == nil {
+		return nil
+	}
+	notes := []map[string]any{}
+	resolvable, resolved := false, true
+	for _, n := range disc.Notes {
+		if n == nil {
+			continue
+		}
+		if n.Resolvable {
+			resolvable, resolved = true, resolved && n.Resolved
+		}
+		if n.System && !includeSystem {
+			continue
+		}
+		note := map[string]any{
+			"id": n.ID, "author": &queueUser{ID: n.Author.ID, Username: n.Author.Username, Name: n.Author.Name},
+			"body": n.Body, "created_at": n.CreatedAt, "updated_at": n.UpdatedAt, "system": n.System,
+		}
+		if n.Position != nil {
+			note["position"] = n.Position
+		}
+		notes = append(notes, note)
+	}
+	if len(notes) == 0 {
+		return nil
+	}
+	return map[string]any{"id": disc.ID, "resolvable": resolvable, "resolved": resolvable && resolved, "notes": notes}
 }
 
 func readSnapshotApprovals(ctx context.Context, d Deps, pid string, iid int64, _ snapshotOpts) (any, error) {

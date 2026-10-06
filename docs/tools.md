@@ -62,13 +62,20 @@ This document describes the tool surface currently registered by
 - `get_review_snapshot` — up to 10 MRs `{project_id, iid, expected_sha?}` in one
   call (`project_id` may be the number from a queue row). Per MR: metadata
   (title, author, reviewers, state, draft, branches, `sha`, `diff_refs`,
-  `detailed_merge_status`, `updated_at`), `head_changed` when `expected_sha` is
-  given, and the `include` sections: `changes` (changed files, no patches,
-  `complete` / `truncated_reason` / `next_page`, `changes_max_pages` default 3 x
-  100 files) and `approvals` (same shape as `get_merge_request_approval_state`).
-  `include` omitted = all implemented sections, `[]` = metadata only;
-  `discussions` and `pipeline` are reserved and rejected until implemented. A
-  failing MR or section yields an `error` entry; the rest of the batch returns
+  `detailed_merge_status`, `updated_at`) and the `include` sections: `changes`
+  (changed files, no patches, `complete` / `truncated_reason` / `next_page`,
+  `changes_max_pages` default 3 x 100 files), `approvals` (same shape as
+  `get_merge_request_approval_state`) and `discussions` (all pages up to
+  `discussions_max_pages`, default 3 x 100, compacted to `{id, resolvable,
+  resolved, notes: [{id, author, body, created_at, updated_at, position?,
+  system}]}` plus `unresolved_count`, `complete` / `truncated_reason` /
+  `next_page`; system notes only with `include_system: true`). After the
+  sections the head is read again: `head_changed` (true when it moved meanwhile,
+  with `current_sha` = the new head, or when `expected_sha` differs from `sha`;
+  `head_recheck_error` if the recheck failed). `include` omitted = all
+  implemented sections, `[]` = metadata only (no recheck); `pipeline` is
+  reserved and rejected until implemented. A failing MR or section yields an
+  `error` entry; the rest of the batch returns
 - `update_merge_request`
 - `approve_merge_request`
 - `unapprove_merge_request`
