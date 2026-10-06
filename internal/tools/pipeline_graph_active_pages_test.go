@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
@@ -126,6 +127,62 @@ func TestPipelineGraph_bridgeResumeRejectsBoundaryOverlap(t *testing.T) {
 	_, _, err := getMergeRequestPipelineGraph(context.Background(), nil, in, d)
 	if err == nil || !strings.Contains(err.Error(), cursor.ResyncRequired) || !strings.Contains(err.Error(), "overlap") {
 		t.Fatalf("boundary bridge overlap not rejected: %v", err)
+	}
+}
+
+func TestPipelineGraph_manySingleJobPagesStayResumable(t *testing.T) {
+	// Verbatim seen_ids for this many single-job pages would exceed MaxPayloadBytes.
+	const nPages = 120
+	jobs := map[string]string{
+		"42/100/1": "[" + jobJSON(1, "j1", "success", "false") + "]",
+	}
+	for p := 2; p <= nPages; p++ {
+		jobs[fmt.Sprintf("42/100/%d", p)] = "[" + jobJSON(p, fmt.Sprintf("j%d", p), "success", "false") + "]"
+	}
+	h := &walkServer{
+		pipes:   map[string]string{"42/100": walkPipe(100, 42, graphPipeSHA, "feature")},
+		jobs:    jobs,
+		bridges: map[string]string{"42/100/1": "[]"},
+		mr:      graphMR("feature"),
+		mrPipes: graphPipes("feature"),
+	}
+	clk := &cursor.FakeClock{T: time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)}
+	d := newCursorDeps(t, h, nil, clk)
+	in := pipelineGraphIn{ProjectID: "42", MergeRequestIID: 7, PerPage: 1, MaxItems: 100, MaxRequests: 2048}
+	tok := ""
+	var last map[string]any
+	for step := 0; step < nPages+3; step++ {
+		tok, last = advanceGraph(t, d, &in, tok)
+		sec := graphSection(t, last)
+		if sectionMessage(sec, "continuation cursor was not issued") {
+			t.Fatalf("step %d: cursor not issued lim=%#v", step, sec["limitations"])
+		}
+		if sectionMessage(sec, "budget_items") {
+			t.Fatalf("step %d: budget_items lim=%#v", step, sec["limitations"])
+		}
+		next, _ := sec["next_cursor"].(string)
+		if next != "" {
+			payload, err := cursor.Decode(d.Config.CursorKey, next, clk.Now())
+			if err != nil {
+				t.Fatalf("step %d decode: %v", step, err)
+			}
+			if len(payload.PageState.SeenIDs) != 0 {
+				t.Fatalf("step %d: seen_ids must stay out of cursor (got %d)", step, len(payload.PageState.SeenIDs))
+			}
+			raw, err := json.Marshal(payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(raw) > cursor.MaxPayloadBytes {
+				t.Fatalf("step %d: payload %d exceeds %d", step, len(raw), cursor.MaxPayloadBytes)
+			}
+		}
+		if next == "" {
+			if step < nPages-1 {
+				t.Fatalf("walk ended early at step %d", step)
+			}
+			break
+		}
 	}
 }
 

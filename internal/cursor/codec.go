@@ -148,8 +148,8 @@ type Filters struct {
 // the greatest id seen for it. A leading "*" means further names were
 // omitted so the payload stays under the size cap. Other tools leave it
 // empty, and omitempty keeps their tokens unchanged.
-// SeenIDs is pipeline_graph only: sorted decimal job ids already returned on
-// the active node (jobs or bridge pages) so later pages cannot repeat them.
+// SeenIDs is a legacy pipeline_graph field; overlap is proven from replayed
+// pages on resume. New cursors omit this list.
 type PageState struct {
 	Page             int      `json:"page"`
 	PerPage          int      `json:"per_page"`

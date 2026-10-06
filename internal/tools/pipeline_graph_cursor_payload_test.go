@@ -55,7 +55,7 @@ func denseReachBridgeCursorFitsAndResumes(t *testing.T) {
 
 	sha, ref, status, source := graphPipeSHA, "feature", "success", "push"
 	pipe := &pipelineView{ID: 100, SHA: &sha, Ref: &ref, Status: &status, StatusKnown: true, Source: &source}
-	jobsEv, err := readJobEvidence(ctx, d, budget, "42", 100, perPage, "", 1, 0)
+	jobsEv, err := readJobEvidence(ctx, d, budget, "42", 100, perPage, "", 1, 0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -95,11 +95,11 @@ func denseReachBridgeCursorFitsAndResumes(t *testing.T) {
 		if err != nil || child == nil {
 			t.Fatal(err)
 		}
-		jd, err := readJobEvidence(ctx, d, budget, "42", int64(i), perPage, "", 1, 0)
+		jd, err := readJobEvidence(ctx, d, budget, "42", int64(i), perPage, "", 1, 0, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
-		bd, err := readBridgeEvidence(ctx, d, budget, "42", int64(i), perPage, "", 1, 0)
+		bd, err := readBridgeEvidence(ctx, d, budget, "42", int64(i), perPage, "", 1, 0, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -127,7 +127,7 @@ func denseReachBridgeCursorFitsAndResumes(t *testing.T) {
 	sel := graphSelection{MRIID: 7, PerPage: perPage, MaxDepth: graphDefaultMaxDepth, MaxNodes: graphDefaultMaxNodes}
 	upper := clk.Now().UTC().Format(time.RFC3339Nano)
 	expires := clk.Now().UTC().Add(d.Config.CursorTTL()).Format(time.RFC3339Nano)
-	if err := mintBridgeCursor(&section, d, 7, "42", 100, graphPipeSHA, sel, upper, expires, 1, bp, "42", walk, next, prior, nil); err != nil {
+	if err := mintBridgeCursor(&section, d, 7, "42", 100, graphPipeSHA, sel, upper, expires, 1, bp, "42", walk, next, prior); err != nil {
 		t.Fatal(err)
 	}
 	if section.NextCursor == nil {

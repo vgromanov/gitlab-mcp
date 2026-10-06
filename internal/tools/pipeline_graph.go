@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -238,7 +237,7 @@ func initialPipelineGraph(ctx context.Context, in pipelineGraphIn, sel graphSele
 	expires := now.UTC().Add(d.Config.CursorTTL()).Format(time.RFC3339Nano)
 	walk := newGraphWalk(chosen, pipePID, sel.MaxDepth, sel.MaxNodes)
 	walk.bindRelation(rel)
-	out, err := finishGraph(ctx, section, pid, pipePID, mrIID, chosen, rel, page, sel, d, actorID, upper, expires, 1, true, lineageCarry{}, nil, walk, budget)
+	out, err := finishGraph(ctx, section, pid, pipePID, mrIID, chosen, rel, page, sel, d, actorID, upper, expires, 1, true, lineageCarry{}, walk, budget)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -389,16 +388,16 @@ func resumePipelineGraph(ctx context.Context, in pipelineGraphIn, sel graphSelec
 		releaseGraphPageBudget(budget, sel.PerPage)
 		releasedReserve = true
 	}
-	seenPrior, err := activeNodeSeenIDs(payload.PageState)
-	if err != nil {
-		return nil, nil, err
+	seenPrior := overlapPriorForResume(walk, payload.PageState)
+	if seenPrior == nil {
+		return nil, nil, fmt.Errorf("%s: previous-page boundary drift", cursor.ResyncRequired)
 	}
 	nextPage := int(payload.PageState.ProviderNextPage)
 	page, err := collectJobPage(ctx, d, budget, pipePID, pipe.ID, nextPage, sel.PerPage, seenPrior)
 	if err != nil {
 		return nil, nil, err
 	}
-	out, err := finishGraph(ctx, section, pid, pipePID, mrIID, pipe, rel, page, sel, d, actorID, payload.UpperBound, payload.ExpiresAt, nextPage, false, prior, payload.PageState.SeenIDs, walk, budget)
+	out, err := finishGraph(ctx, section, pid, pipePID, mrIID, pipe, rel, page, sel, d, actorID, payload.UpperBound, payload.ExpiresAt, nextPage, false, prior, walk, budget)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -447,9 +446,9 @@ func resumeGraphBridges(ctx context.Context, section *readmeta.Section, pid, pip
 		releaseGraphPageBudget(budget, sel.PerPage)
 		releasedReserve = true
 	}
-	seenPrior, err := activeNodeSeenIDs(payload.PageState)
-	if err != nil {
-		return nil, nil, err
+	seenPrior := overlapPriorForResume(walk, payload.PageState)
+	if seenPrior == nil {
+		return nil, nil, fmt.Errorf("%s: previous-page boundary drift", cursor.ResyncRequired)
 	}
 	nextPage := int(payload.PageState.ProviderNextPage)
 	page, err := collectBridgePage(ctx, d, budget, pipePID, pipe.ID, nextPage, sel.PerPage, seenPrior)
@@ -465,7 +464,7 @@ func resumeGraphBridges(ctx context.Context, section *readmeta.Section, pid, pip
 		walk.coverage = downstreamCoveragePartial
 	} else if next, more := pagingContinues(page.Paging, nextPage); more && len(page.Bridges) > 0 {
 		sha, _ := readmeta.ObservedHeadSHA(deref(pipe.SHA))
-		if err := mintBridgeCursor(section, d, actorID, pipePID, pipe.ID, sha, sel, payload.UpperBound, payload.ExpiresAt, nextPage, page, pid, walk, next, prior, payload.PageState.SeenIDs); err != nil {
+		if err := mintBridgeCursor(section, d, actorID, pipePID, pipe.ID, sha, sel, payload.UpperBound, payload.ExpiresAt, nextPage, page, pid, walk, next, prior); err != nil {
 			return nil, nil, err
 		}
 	} else {
@@ -482,7 +481,7 @@ func resumeGraphBridges(ctx context.Context, section *readmeta.Section, pid, pip
 		}
 	}
 	empty := graphPage{Paging: readmeta.PagingObservation{PagingKnown: true, ExhaustedObserved: true}}
-	out, err := finishGraph(ctx, *section, pid, pipePID, mrIID, pipe, rel, empty, sel, d, actorID, payload.UpperBound, payload.ExpiresAt, nextPage, false, lineageCarry{}, nil, walk, budget)
+	out, err := finishGraph(ctx, *section, pid, pipePID, mrIID, pipe, rel, empty, sel, d, actorID, payload.UpperBound, payload.ExpiresAt, nextPage, false, lineageCarry{}, walk, budget)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -771,7 +770,7 @@ func graphWalkCertifiable(exhausted bool, page graphPage, sel graphSelection, co
 		!walk.partial && !walk.block && !walk.reachTruncated
 }
 
-func finishGraph(ctx context.Context, section readmeta.Section, pid, pipePID string, mrIID *int64, pipe *pipelineView, rel relationResult, page graphPage, sel graphSelection, d Deps, actorID int64, upper, expires string, pageNum int, fromStart bool, prior lineageCarry, priorSeen []string, walk *graphWalk, budget *igl.Budget) (pipelineGraphOut, error) {
+func finishGraph(ctx context.Context, section readmeta.Section, pid, pipePID string, mrIID *int64, pipe *pipelineView, rel relationResult, page graphPage, sel graphSelection, d Deps, actorID int64, upper, expires string, pageNum int, fromStart bool, prior lineageCarry, walk *graphWalk, budget *igl.Budget) (pipelineGraphOut, error) {
 	if !rel.Proven {
 		section.AddLimitation(readmeta.CodeUnknownCount, "pipeline relation is unproven")
 	}
@@ -850,8 +849,7 @@ func finishGraph(ctx context.Context, section readmeta.Section, pid, pipePID str
 		walk.coverage = downstreamCoverageUnknown
 		walk.unseen = true
 		nextLineage := encodeLineageCarry(mergeLineageCarry(prior, page.Jobs))
-		seen := mergeSeenIDs(priorSeen, jobIDStrings(page.Jobs))
-		if tok, err := mintGraphCursor(d, actorID, pipePID, pipe.ID, sha, sel, upper, expires, pageNum, jobGuardTokens(page.Jobs), next, len(page.Jobs), pid, nextLineage, seen, walk.snapshotCont()); err == nil {
+		if tok, err := mintGraphCursor(d, actorID, pipePID, pipe.ID, sha, sel, upper, expires, pageNum, jobGuardTokens(page.Jobs), next, len(page.Jobs), pid, nextLineage, walk.snapshotCont()); err == nil {
 			section.NextCursor = &tok
 		} else {
 			section.AddLimitation(readmeta.CodePartial, "continuation cursor was not issued")
@@ -1056,7 +1054,7 @@ func walkBridgesAndChildren(ctx context.Context, section *readmeta.Section, root
 		walk.coverage = downstreamCoveragePartial
 		walk.bridgesOn = true
 		next, _ := pagingContinues(bpage.Paging, 1)
-		return mintBridgeCursor(section, d, actorID, pipePID, pipe.ID, sha, sel, upper, expires, 1, bpage, rootPID, walk, next, lineageCarry{}, nil)
+		return mintBridgeCursor(section, d, actorID, pipePID, pipe.ID, sha, sel, upper, expires, 1, bpage, rootPID, walk, next, lineageCarry{})
 	}
 	if err := walk.ingestBridges(ctx, d, graphNodeKey{Project: pipePID, Pipeline: pipe.ID}, deref(pipe.SHA), bpage, lineageCarry{}); err != nil {
 		return err
@@ -1068,7 +1066,7 @@ func walkBridgesAndChildren(ctx context.Context, section *readmeta.Section, root
 	if moreBridges && len(bpage.Bridges) > 0 {
 		walk.unseen = true
 		walk.coverage = downstreamCoveragePartial
-		return mintBridgeCursor(section, d, actorID, pipePID, pipe.ID, sha, sel, upper, expires, 1, bpage, rootPID, walk, next, lineageCarry{}, nil)
+		return mintBridgeCursor(section, d, actorID, pipePID, pipe.ID, sha, sel, upper, expires, 1, bpage, rootPID, walk, next, lineageCarry{})
 	}
 	if !bridgePagingExhausted(bpage) {
 		markIncompleteBridgePaging(section, walk, bpage)
@@ -1135,7 +1133,7 @@ func markIncompleteBridgePaging(section *readmeta.Section, walk *graphWalk, page
 	section.AddLimitation(readmeta.CodeUnknownCount, "paging metadata unavailable")
 }
 
-func mintBridgeCursor(section *readmeta.Section, d Deps, actorID int64, pipePID string, pipelineID int64, sha string, sel graphSelection, upper, expires string, pageNum int, page bridgePage, mrProject string, walk *graphWalk, nextPage int64, prior lineageCarry, priorSeen []string) error {
+func mintBridgeCursor(section *readmeta.Section, d Deps, actorID int64, pipePID string, pipelineID int64, sha string, sel graphSelection, upper, expires string, pageNum int, page bridgePage, mrProject string, walk *graphWalk, nextPage int64, prior lineageCarry) error {
 	if section == nil || page.Partial || !page.Paging.PagingKnown || len(page.Bridges) == 0 || nextPage < 1 {
 		return nil
 	}
@@ -1144,8 +1142,7 @@ func mintBridgeCursor(section *readmeta.Section, d Deps, actorID int64, pipePID 
 		ids = append(ids, bridgeGuardToken(br))
 	}
 	walk.phase = cursor.GraphPhaseBridges
-	seen := mergeSeenIDs(priorSeen, jobIDStrings(bridgeJobs(page.Bridges)))
-	tok, err := mintGraphCursor(d, actorID, pipePID, pipelineID, sha, sel, upper, expires, pageNum, ids, nextPage, len(page.Bridges), mrProject, encodeLineageCarry(mergeLineageCarry(prior, bridgeJobs(page.Bridges))), seen, walk.snapshotCont())
+	tok, err := mintGraphCursor(d, actorID, pipePID, pipelineID, sha, sel, upper, expires, pageNum, ids, nextPage, len(page.Bridges), mrProject, encodeLineageCarry(mergeLineageCarry(prior, bridgeJobs(page.Bridges))), walk.snapshotCont())
 	if err != nil {
 		section.AddLimitation(readmeta.CodePartial, "continuation cursor was not issued")
 		return nil
@@ -1260,8 +1257,7 @@ func walkQueuedChildren(ctx context.Context, section *readmeta.Section, rootPID 
 		if !childJobsExhausted {
 			if moreJobs && childSHA != "" && len(page.Jobs) > 0 {
 				nextLineage := encodeLineageCarry(mergeLineageCarry(lineageCarry{}, page.Jobs))
-				seen := mergeSeenIDs(nil, jobIDStrings(page.Jobs))
-				if tok, err := mintGraphCursor(d, actorID, scope, child.ID, childSHA, sel, upper, expires, 1, jobGuardTokens(page.Jobs), nextJobs, len(page.Jobs), rootPID, nextLineage, seen, walk.snapshotCont()); err == nil {
+				if tok, err := mintGraphCursor(d, actorID, scope, child.ID, childSHA, sel, upper, expires, 1, jobGuardTokens(page.Jobs), nextJobs, len(page.Jobs), rootPID, nextLineage, walk.snapshotCont()); err == nil {
 					section.NextCursor = &tok
 					walk.unseen = true
 					if walk.coverage == downstreamCoverageComplete {
@@ -1282,7 +1278,7 @@ func walkQueuedChildren(ctx context.Context, section *readmeta.Section, rootPID 
 	}
 }
 
-func mintGraphCursor(d Deps, actorID int64, pid string, pipelineID int64, sha string, sel graphSelection, upper, expires string, pageNum int, ids []string, nextPage int64, itemsOnPage int, mrProject string, lineage []string, seenIDs []string, gc *cursor.GraphCont) (string, error) {
+func mintGraphCursor(d Deps, actorID int64, pid string, pipelineID int64, sha string, sel graphSelection, upper, expires string, pageNum int, ids []string, nextPage int64, itemsOnPage int, mrProject string, lineage []string, gc *cursor.GraphCont) (string, error) {
 	instance, err := cursorInstance(d.Config)
 	if err != nil {
 		return "", err
@@ -1312,8 +1308,7 @@ func mintGraphCursor(d Deps, actorID int64, pid string, pipelineID int64, sha st
 			LastSHA:          last,
 			ItemsOnPage:      itemsOnPage,
 			ProviderNextPage: nextPage,
-			LineageMax:       lineage,
-			SeenIDs:          seenIDs,
+			LineageMax: lineage,
 		},
 	}
 	if err := trimGraphContToPayload(d.Config.CursorKey, &payload); err != nil {
@@ -1977,38 +1972,19 @@ func idSet(ids []string) map[int64]struct{} {
 	return out
 }
 
-// mergeSeenIDs returns sorted unique positive decimal job ids.
-func mergeSeenIDs(prior []string, add []string) []string {
-	if len(prior) == 0 && len(add) == 0 {
+// overlapPriorForResume returns job ids already returned on the active node.
+// Revalidation replay builds the set; legacy cursors may still carry SeenIDs.
+func overlapPriorForResume(walk *graphWalk, ps cursor.PageState) map[int64]struct{} {
+	if walk != nil && len(walk.activeOverlapPrior) > 0 {
+		return walk.activeOverlapPrior
+	}
+	if len(ps.SeenIDs) > 0 {
+		return idSet(ps.SeenIDs)
+	}
+	if ps.Page > 1 {
 		return nil
 	}
-	set := idSet(prior)
-	for _, s := range add {
-		n, err := strconv.ParseInt(s, 10, 64)
-		if err == nil && n > 0 {
-			set[n] = struct{}{}
-		}
-	}
-	if len(set) == 0 {
-		return nil
-	}
-	out := make([]int64, 0, len(set))
-	for id := range set {
-		out = append(out, id)
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
-	seen := make([]string, len(out))
-	for i, id := range out {
-		seen[i] = strconv.FormatInt(id, 10)
-	}
-	return seen
-}
-
-func activeNodeSeenIDs(ps cursor.PageState) (map[int64]struct{}, error) {
-	if ps.Page > 1 && len(ps.SeenIDs) == 0 {
-		return nil, fmt.Errorf("%s: previous-page boundary drift", cursor.ResyncRequired)
-	}
-	return idSet(ps.SeenIDs), nil
+	return map[int64]struct{}{}
 }
 
 func deref(s *string) string {

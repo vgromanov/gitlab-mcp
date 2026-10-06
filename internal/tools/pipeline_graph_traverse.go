@@ -127,6 +127,7 @@ type graphWalk struct {
 	evidence         map[string][3]string
 	evidenceItems    map[string]int
 	activeNodeItems  int
+	activeOverlapPrior map[int64]struct{}
 	reach            []graphEdgeView
 }
 

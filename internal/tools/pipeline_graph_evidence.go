@@ -113,11 +113,11 @@ func (w *graphWalk) revalidateCompleted(ctx context.Context, d Deps, perPage int
 			}
 			return drift
 		}
-		jobs, err := readJobEvidence(ctx, d, budget, a.Project, a.Pipeline, perPage, "", 1, 0)
+		jobs, err := readJobEvidence(ctx, d, budget, a.Project, a.Pipeline, perPage, "", 1, 0, nil)
 		if err != nil {
 			return err
 		}
-		bridges, err := readBridgeEvidence(ctx, d, budget, a.Project, a.Pipeline, perPage, "", 1, 0)
+		bridges, err := readBridgeEvidence(ctx, d, budget, a.Project, a.Pipeline, perPage, "", 1, 0, nil)
 		if err != nil {
 			return err
 		}
@@ -130,7 +130,7 @@ func (w *graphWalk) revalidateCompleted(ctx context.Context, d Deps, perPage int
 
 // readJobEvidence chains guard tokens for job pages from..until-1, or from..end
 // when until is 0. A bounded read requires every page to continue to the next.
-func readJobEvidence(ctx context.Context, d Deps, budget *igl.Budget, project string, pipelineID int64, perPage int, state string, from, until int) (string, error) {
+func readJobEvidence(ctx context.Context, d Deps, budget *igl.Budget, project string, pipelineID int64, perPage int, state string, from, until int, collect map[int64]struct{}) (string, error) {
 	drift := fmt.Errorf("%s: completed node evidence drift", cursor.ResyncRequired)
 	for page := from; until == 0 || page < until; {
 		gp, err := collectJobPage(ctx, d, budget, project, pipelineID, page, perPage, nil)
@@ -143,6 +143,7 @@ func readJobEvidence(ctx context.Context, d Deps, budget *igl.Budget, project st
 		if gp.Partial || !gp.Paging.PagingKnown {
 			return "", drift
 		}
+		recordJobPageIDs(collect, gp.Jobs)
 		state = chainEvidence(state, jobGuardTokens(gp.Jobs)...)
 		next, more := pagingContinues(gp.Paging, page)
 		if !more {
@@ -157,7 +158,7 @@ func readJobEvidence(ctx context.Context, d Deps, budget *igl.Budget, project st
 }
 
 // readBridgeEvidence is the bridge-list counterpart of readJobEvidence.
-func readBridgeEvidence(ctx context.Context, d Deps, budget *igl.Budget, project string, pipelineID int64, perPage int, state string, from, until int) (string, error) {
+func readBridgeEvidence(ctx context.Context, d Deps, budget *igl.Budget, project string, pipelineID int64, perPage int, state string, from, until int, collect map[int64]struct{}) (string, error) {
 	drift := fmt.Errorf("%s: completed node evidence drift", cursor.ResyncRequired)
 	for page := from; until == 0 || page < until; {
 		bp, err := collectBridgePage(ctx, d, budget, project, pipelineID, page, perPage, nil)
@@ -170,6 +171,7 @@ func readBridgeEvidence(ctx context.Context, d Deps, budget *igl.Budget, project
 		if bp.Partial {
 			return "", drift
 		}
+		recordBridgePageIDs(collect, bp.Bridges)
 		state = chainEvidence(state, bridgePageTokens(bp)...)
 		if bp.Unsupported || bp.Inaccessible {
 			if until > 0 {
@@ -195,13 +197,16 @@ func readBridgeEvidence(ctx context.Context, d Deps, budget *igl.Budget, project
 func (w *graphWalk) revalidateActiveJobs(ctx context.Context, d Deps, project string, pipelineID int64, perPage, through int, guard graphPage) error {
 	drift := fmt.Errorf("%s: active node evidence drift", cursor.ResyncRequired)
 	budget := igl.BudgetFromContext(ctx)
-	state, err := readJobEvidence(ctx, d, budget, project, pipelineID, perPage, "", 1, through)
+	overlap := map[int64]struct{}{}
+	state, err := readJobEvidence(ctx, d, budget, project, pipelineID, perPage, "", 1, through, overlap)
 	if err != nil {
 		return err
 	}
 	if chainEvidence(state, jobGuardTokens(guard.Jobs)...) != w.jobsEv {
 		return drift
 	}
+	recordJobPageIDs(overlap, guard.Jobs)
+	w.activeOverlapPrior = overlap
 	return nil
 }
 
@@ -210,21 +215,46 @@ func (w *graphWalk) revalidateActiveJobs(ctx context.Context, d Deps, project st
 func (w *graphWalk) revalidateActiveBridges(ctx context.Context, d Deps, project string, pipelineID int64, perPage, through int, guard bridgePage) error {
 	drift := fmt.Errorf("%s: active node evidence drift", cursor.ResyncRequired)
 	budget := igl.BudgetFromContext(ctx)
-	jobs, err := readJobEvidence(ctx, d, budget, project, pipelineID, perPage, "", 1, 0)
+	overlap := map[int64]struct{}{}
+	jobs, err := readJobEvidence(ctx, d, budget, project, pipelineID, perPage, "", 1, 0, overlap)
 	if err != nil {
 		return err
 	}
 	if jobs != w.jobsEv {
 		return drift
 	}
-	state, err := readBridgeEvidence(ctx, d, budget, project, pipelineID, perPage, "", 1, through)
+	state, err := readBridgeEvidence(ctx, d, budget, project, pipelineID, perPage, "", 1, through, overlap)
 	if err != nil {
 		return err
 	}
 	if chainEvidence(state, bridgePageTokens(guard)...) != w.bridgesEv {
 		return drift
 	}
+	recordBridgePageIDs(overlap, guard.Bridges)
+	w.activeOverlapPrior = overlap
 	return nil
+}
+
+func recordJobPageIDs(collect map[int64]struct{}, jobs []graphJob) {
+	if collect == nil {
+		return
+	}
+	for _, job := range jobs {
+		if job.ID > 0 {
+			collect[job.ID] = struct{}{}
+		}
+	}
+}
+
+func recordBridgePageIDs(collect map[int64]struct{}, bridges []graphBridge) {
+	if collect == nil {
+		return
+	}
+	for _, br := range bridges {
+		if br.Job.ID > 0 {
+			collect[br.Job.ID] = struct{}{}
+		}
+	}
 }
 
 func evidenceBudgetErr(reason string, err error) error {
