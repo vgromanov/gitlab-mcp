@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	gitlab "gitlab.com/gitlab-org/api/client-go/v2"
@@ -12,7 +14,12 @@ import (
 
 // RegisterGraphQLTools registers GraphQL-based work item and utility tools.
 func RegisterGraphQLTools(s *mcp.Server, d Deps) {
-	AddTool(s, d, false, "", &mcp.Tool{Name: "execute_graphql", Description: "Run an arbitrary GitLab GraphQL query or mutation"}, executeGraphQL)
+	yes := true
+	AddTool(s, d, false, "", &mcp.Tool{
+		Name:        "execute_graphql",
+		Description: "Run an arbitrary GitLab GraphQL query or mutation (mutations are rejected in read-only mode). Top-level GraphQL errors are returned as tool errors.",
+		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: false, DestructiveHint: &yes, OpenWorldHint: &yes},
+	}, executeGraphQL)
 	AddTool(s, d, false, "work_items", &mcp.Tool{Name: "get_work_item", Description: "Get a work item by global id"}, getWorkItem)
 	AddTool(s, d, false, "work_items", &mcp.Tool{Name: "list_work_items", Description: "List work items for a project"}, listWorkItems)
 	AddTool(s, d, true, "work_items", &mcp.Tool{Name: "create_work_item", Description: "Create a work item (requires work_item_type_id gid)"}, createWorkItem)
@@ -40,25 +47,115 @@ func runGQL(ctx context.Context, d Deps, query string, variables map[string]any)
 }
 
 type executeGraphQLIn struct {
-	Query     string          `json:"query"`
-	Variables json.RawMessage `json:"variables,omitempty" jsonschema:"JSON object of GraphQL variables; omit or use {}"`
+	Query     string         `json:"query"`
+	Variables map[string]any `json:"variables,omitempty" jsonschema:"JSON object of GraphQL variables; omit or use {}"`
 }
 
 func executeGraphQL(ctx context.Context, _ *mcp.CallToolRequest, in executeGraphQLIn, d Deps) (*mcp.CallToolResult, any, error) {
-	var vars map[string]any
-	if len(bytes.TrimSpace(in.Variables)) > 0 {
-		if err := json.Unmarshal(in.Variables, &vars); err != nil {
-			return nil, nil, fmt.Errorf("variables must be a JSON object: %w", err)
+	if d.Config != nil && d.Config.ReadOnly {
+		mutation, err := gqlHasMutation(in.Query)
+		if err != nil {
+			return nil, nil, fmt.Errorf("read-only mode: cannot verify GraphQL document has no mutation: %w", err)
+		}
+		if mutation {
+			return nil, nil, errors.New("GraphQL mutations are rejected in read-only mode")
 		}
 	}
-	if vars == nil {
-		vars = map[string]any{}
+	if in.Variables == nil {
+		in.Variables = map[string]any{}
 	}
-	out, err := runGQL(ctx, d, in.Query, vars)
+	out, err := runGQL(ctx, d, in.Query, in.Variables)
 	if err != nil {
 		return nil, nil, err
 	}
+	if m, ok := out.(map[string]any); ok {
+		if errs, _ := m["errors"].([]any); len(errs) > 0 {
+			msgs := make([]string, len(errs))
+			for i, e := range errs {
+				msgs[i] = fmt.Sprint(e)
+				if em, ok := e.(map[string]any); ok {
+					if msg, ok := em["message"].(string); ok {
+						msgs[i] = msg
+					}
+				}
+			}
+			return nil, nil, fmt.Errorf("GraphQL errors: %s", strings.Join(msgs, "; "))
+		}
+	}
 	return nil, out, nil
+}
+
+// gqlHasMutation reports whether doc defines a mutation operation anywhere. It
+// is a minimal scanner, not a parser: it skips comments and strings, tracks
+// bracket depth and checks the first name of every top-level definition, so
+// multiple operations, fragments, directives and the word "mutation" inside
+// comments/strings are handled. It errors on an unterminated string.
+func gqlHasMutation(doc string) (bool, error) {
+	depth, defStart := 0, true
+	for i := 0; i < len(doc); {
+		c := doc[i]
+		switch {
+		case c == '#':
+			for i < len(doc) && doc[i] != '\n' && doc[i] != '\r' {
+				i++
+			}
+		case c == '"':
+			end := gqlStringEnd(doc, i)
+			if end < 0 {
+				return false, errors.New("unterminated string")
+			}
+			i = end
+		case c == '_' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z':
+			j := i + 1
+			for j < len(doc) && (doc[j] == '_' || doc[j] >= 'a' && doc[j] <= 'z' || doc[j] >= 'A' && doc[j] <= 'Z' || doc[j] >= '0' && doc[j] <= '9') {
+				j++
+			}
+			if depth == 0 && defStart {
+				if doc[i:j] == "mutation" {
+					return true, nil
+				}
+				defStart = false
+			}
+			i = j
+		default:
+			switch c {
+			case '{', '(', '[':
+				depth++
+			case '}', ')', ']':
+				if depth > 0 {
+					depth--
+				}
+				defStart = defStart || c == '}' && depth == 0
+			}
+			i++
+		}
+	}
+	return false, nil
+}
+
+// gqlStringEnd returns the index after the string literal starting at doc[i],
+// or -1 if it is unterminated.
+func gqlStringEnd(doc string, i int) int {
+	if strings.HasPrefix(doc[i:], `"""`) {
+		for j := i + 3; j < len(doc); j++ {
+			switch {
+			case doc[j] == '\\' && strings.HasPrefix(doc[j:], `\"""`):
+				j += 3
+			case strings.HasPrefix(doc[j:], `"""`):
+				return j + 3
+			}
+		}
+		return -1
+	}
+	for j := i + 1; j < len(doc) && doc[j] != '\n'; j++ {
+		switch doc[j] {
+		case '\\':
+			j++
+		case '"':
+			return j + 1
+		}
+	}
+	return -1
 }
 
 type getWorkItemIn struct {
