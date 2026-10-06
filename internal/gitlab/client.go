@@ -2,6 +2,7 @@
 package gitlab
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 
 	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/config"
 
+	"github.com/hashicorp/go-retryablehttp"
 	gitlab "gitlab.com/gitlab-org/api/client-go/v2"
 )
 
@@ -17,6 +19,7 @@ import (
 func NewClient(cfg *config.Config) (*gitlab.Client, error) {
 	opts := []gitlab.ClientOptionFunc{
 		gitlab.WithBaseURL(cfg.APIURL),
+		gitlab.WithRequestOptions(noWriteRetries),
 	}
 
 	if cfg.HTTPProxy != "" || cfg.HTTPSProxy != "" || cfg.CACertPath != "" || cfg.InsecureSkipVerify {
@@ -42,6 +45,18 @@ func NewClient(cfg *config.Config) (*gitlab.Client, error) {
 	}
 
 	return gitlab.NewClient(cfg.Token, opts...)
+}
+
+// noWriteRetries turns the SDK's automatic retries off for every method except
+// GET and HEAD, so a write that got a 5xx is never sent (and published) twice.
+// Reads keep the SDK's default retry policy.
+func noWriteRetries(req *retryablehttp.Request) error {
+	if req.Method == http.MethodGet || req.Method == http.MethodHead {
+		return nil
+	}
+	return gitlab.WithRequestRetry(func(context.Context, *http.Response, error) (bool, error) {
+		return false, nil
+	})(req)
 }
 
 func tlsConfig(cfg *config.Config) *tls.Config {

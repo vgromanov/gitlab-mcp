@@ -9,12 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Security
 
+- Project outputs are allowlisted (default-deny): `get_project`, `list_projects`,
+  `list_group_projects`, `search_repositories`, `create_repository` and
+  `fork_repository` return only identity, location and state fields (`id`,
+  `name`, `path`, `path_with_namespace`, `description`, `default_branch`,
+  `visibility`, URLs, `topics`, `archived`, `empty_repo`, timestamps, and reduced
+  `namespace` / `forked_from_project`). `runners_token`, `owner`, `permissions`
+  and CI/runner/mirror/registry settings are no longer returned (RVG-160).
+- The GitLab client no longer retries automatically on anything but GET/HEAD, so
+  a write that gets a 502/503 is sent once and cannot be published twice. Read
+  retries are unchanged. GraphQL queries (`POST /api/graphql`) are no longer
+  retried either (RVG-160).
 - `execute_graphql` is safe to expose: `variables` is declared and handled as a
   JSON object (the schema used to say array of numbers); a document containing a
   `mutation` is rejected before any HTTP request when `GITLAB_READ_ONLY_MODE` /
   `--read-only` is set (a small in-repo scanner, no new dependency); top-level
   GraphQL `errors` in an HTTP 200 response now return a tool error; the tool is
   annotated not read-only (RVG-159).
+
+### Fixed
+
+- `get_merge_request_approval_state` falls back to the legacy `/approvals`
+  endpoint only on 404; 403/5xx now surface as errors, and the fallback returns
+  the same shape (`approval_rules_overwritten`, `rules`) as the primary endpoint
+  (RVG-160).
 
 ### Added
 
