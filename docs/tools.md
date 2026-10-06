@@ -18,8 +18,9 @@ This document describes the tool surface currently registered by
   `USE_WORK_ITEMS`, `USE_LABELS`, `USE_DRAFTS`, `USE_WEBHOOKS`, `USE_TIMELINE`.
 - `USE_DAILY_TOOLS=true` registers the pinned 41-tool daily census set
   (includes all four search tools below).
-- `GITLAB_TOOL_PROFILE=review` registers the closed 51-tool review set (daily +
-  discussion get/reply/resolve + six pipeline reads + `get_review_queue`, no pipeline writes); see
+- `GITLAB_TOOL_PROFILE=review` registers the closed 52-tool review set (daily +
+  discussion get/reply/resolve + six pipeline reads + `get_review_queue` +
+  `get_review_snapshot`, no pipeline writes); see
   [`docs/configuration.md`](configuration.md#review-profile-gitlab_tool_profilereview).
 
 ## Projects / namespaces / users
@@ -58,6 +59,16 @@ This document describes the tool surface currently registered by
   author roles, deduplicated, per-role page cap with `complete` /
   `truncated_reason`); row `sha` is a list hint, `get_review_snapshot` is the
   head-SHA authority
+- `get_review_snapshot` — up to 10 MRs `{project_id, iid, expected_sha?}` in one
+  call (`project_id` may be the number from a queue row). Per MR: metadata
+  (title, author, reviewers, state, draft, branches, `sha`, `diff_refs`,
+  `detailed_merge_status`, `updated_at`), `head_changed` when `expected_sha` is
+  given, and the `include` sections: `changes` (changed files, no patches,
+  `complete` / `truncated_reason` / `next_page`, `changes_max_pages` default 3 x
+  100 files) and `approvals` (same shape as `get_merge_request_approval_state`).
+  `include` omitted = all implemented sections, `[]` = metadata only;
+  `discussions` and `pipeline` are reserved and rejected until implemented. A
+  failing MR or section yields an `error` entry; the rest of the batch returns
 - `update_merge_request`
 - `approve_merge_request`
 - `unapprove_merge_request`

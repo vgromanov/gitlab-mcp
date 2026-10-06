@@ -27,6 +27,7 @@ func RegisterMergeRequests(s *mcp.Server, d Deps) {
 	AddTool(s, d, true, "", &mcp.Tool{Name: "update_merge_request", Description: "Update merge request fields"}, updateMergeRequest)
 	AddTool(s, d, false, "", &mcp.Tool{Name: "list_merge_requests", Description: "List merge requests globally or in a project"}, listMergeRequests)
 	AddTool(s, d, false, "", &mcp.Tool{Name: "get_review_queue", Description: "List the current user's MR review queue in a group: open MRs where they are reviewer and/or author, deduplicated into one row per MR with its roles. Reads up to max_pages pages per role; complete is false (with truncated_reason) when the cap is hit. The row sha is a list hint only: get_review_snapshot is the authority for the head SHA"}, getReviewQueue)
+	AddTool(s, d, false, "", &mcp.Tool{Name: "get_review_snapshot", Description: "Read up to 10 MRs in one call for review: metadata (title, author, reviewers, state, draft, branches, head sha, diff_refs, detailed_merge_status, updated_at) plus the include sections changes (changed files, no patches; complete/truncated_reason/next_page) and approvals. sha is the head-SHA authority (queue shas are hints); pass expected_sha per MR to get head_changed. A failing MR or section returns an error entry, the rest of the batch still returns. discussions and pipeline are not implemented yet and are rejected"}, getReviewSnapshot)
 	AddTool(s, d, true, "", &mcp.Tool{Name: "approve_merge_request", Description: "Approve a merge request"}, approveMergeRequest)
 	AddTool(s, d, true, "", &mcp.Tool{Name: "unapprove_merge_request", Description: "Remove your approval from an MR"}, unapproveMergeRequest)
 	AddTool(s, d, false, "", &mcp.Tool{Name: "get_merge_request_approval_state", Description: "Get MR approval state"}, getMergeRequestApprovalState)
@@ -538,19 +539,29 @@ func getMergeRequestApprovalState(ctx context.Context, _ *mcp.CallToolRequest, i
 	if err != nil {
 		return nil, nil, err
 	}
-	st, resp, err := d.Client.MergeRequestApprovals.GetApprovalState(pid, in.MergeRequestIID, gitlab.WithContext(ctx))
-	if err == nil {
-		return nil, Out(st), nil
-	}
-	// Only an unsupported endpoint (404, older GitLab) falls back; 403/5xx etc. surface as-is.
-	if resp == nil || resp.StatusCode != http.StatusNotFound {
+	st, err := readApprovalState(ctx, d, pid, in.MergeRequestIID)
+	if err != nil {
 		return nil, nil, err
 	}
-	app, _, err2 := d.Client.MergeRequests.GetMergeRequestApprovals(pid, in.MergeRequestIID, gitlab.WithContext(ctx))
-	if err2 != nil {
-		return nil, nil, fmt.Errorf("approval_state: %w; approvals: %v", err, err2)
+	return nil, Out(st), nil
+}
+
+// readApprovalState reads /approval_state. Only an unsupported endpoint (404,
+// older GitLab) falls back to the legacy /approvals; 403/5xx etc. surface as-is.
+// Both paths return the same shape.
+func readApprovalState(ctx context.Context, d Deps, pid string, iid int64) (*gitlab.MergeRequestApprovalState, error) {
+	st, resp, err := d.Client.MergeRequestApprovals.GetApprovalState(pid, iid, gitlab.WithContext(ctx))
+	if err == nil {
+		return st, nil
 	}
-	return nil, Out(approvalStateFromLegacy(app)), nil
+	if resp == nil || resp.StatusCode != http.StatusNotFound {
+		return nil, err
+	}
+	app, _, err2 := d.Client.MergeRequests.GetMergeRequestApprovals(pid, iid, gitlab.WithContext(ctx))
+	if err2 != nil {
+		return nil, fmt.Errorf("approval_state: %w; approvals: %v", err, err2)
+	}
+	return approvalStateFromLegacy(app), nil
 }
 
 // approvalStateFromLegacy converts the legacy /approvals response into the
