@@ -394,6 +394,140 @@ func decodeLineageCarry(items []string) (lineageCarry, error) {
 	return out, nil
 }
 
+func lineageGroupMaxID(g lineageGroup) int64 {
+	var max int64
+	for id := range g.Attempts {
+		if id > max {
+			max = id
+		}
+	}
+	return max
+}
+
+func lineageKeyForGroup(g lineageGroup) string {
+	if g.Name != nil {
+		return jobNameKey(*g.Name)
+	}
+	if len(g.LatestIDs) > 0 {
+		return "id:" + strconv.FormatInt(g.LatestIDs[0], 10)
+	}
+	for id := range g.Attempts {
+		return "id:" + strconv.FormatInt(id, 10)
+	}
+	return ""
+}
+
+func isLineagePolicyReason(reason string) bool {
+	switch reason {
+	case "failed_required", "required_manual", "canceled_required", "in_progress", "unknown_policy", "unknown_status":
+		return true
+	default:
+		return false
+	}
+}
+
+func encodeLineageOutcomeState(latest map[string]int64, policy map[string][]policyOutcome) []string {
+	if len(latest) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(latest))
+	for k := range latest {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([]string, 0, len(keys))
+	for _, k := range keys {
+		id := latest[k]
+		os := policy[k]
+		if len(os) == 0 || policyOutcomesArePassOnly(os) || policyOutcomesAreUnknownOnly(os) {
+			continue
+		}
+		for _, o := range os {
+			out = append(out, formatLineageOutcomeItem(k, id, o))
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func policyOutcomesArePassOnly(os []policyOutcome) bool {
+	for _, o := range os {
+		if o.Outcome != policyPass {
+			return false
+		}
+	}
+	return true
+}
+
+func policyOutcomesAreUnknownOnly(os []policyOutcome) bool {
+	if len(os) == 0 {
+		return false
+	}
+	for _, o := range os {
+		if o.Outcome != policyUnknown {
+			return false
+		}
+	}
+	return true
+}
+
+func formatLineageOutcomeItem(key string, id int64, o policyOutcome) string {
+	reason := o.Reason
+	if reason == "" {
+		reason = "-"
+	}
+	return key + "|" + strconv.FormatInt(id, 10) + "|" + o.Outcome + "|" + reason
+}
+
+func restoreLineageOutcomeState(w *graphWalk, items []string) error {
+	if w == nil {
+		return nil
+	}
+	best := map[string]int64{}
+	policy := map[string][]policyOutcome{}
+	for _, item := range items {
+		key, id, outcomes, err := parseLineageOutcomeItem(item)
+		if err != nil {
+			return err
+		}
+		prev, seen := best[key]
+		if !seen || id > prev {
+			best[key] = id
+			policy[key] = outcomes
+			continue
+		}
+		if id == prev {
+			policy[key] = append(policy[key], outcomes...)
+		}
+	}
+	w.lineageLatest = best
+	w.lineagePolicy = policy
+	return nil
+}
+
+func parseLineageOutcomeItem(item string) (string, int64, []policyOutcome, error) {
+	parts := strings.Split(item, "|")
+	if len(parts) != 4 {
+		return "", 0, nil, fmt.Errorf("malformed lineage outcome")
+	}
+	id, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil || id < 1 {
+		return "", 0, nil, fmt.Errorf("malformed lineage outcome")
+	}
+	reason := parts[3]
+	if reason == "-" {
+		reason = ""
+	}
+	switch parts[2] {
+	case policyPass, policyBlock, policyPartial, policyUnknown:
+	default:
+		return "", 0, nil, fmt.Errorf("malformed lineage outcome")
+	}
+	return parts[0], id, []policyOutcome{{Outcome: parts[2], Reason: reason}}, nil
+}
+
 func parseLineageKey(item string) (string, int64, error) {
 	i := strings.IndexByte(item, ' ')
 	if i != 64 || i == len(item)-1 {

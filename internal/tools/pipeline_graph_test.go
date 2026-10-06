@@ -492,6 +492,65 @@ func TestPipelineGraph_forkHeadUsesSourceProject(t *testing.T) {
 	}
 }
 
+func TestPipelineGraph_retryFailThenSuccessAcrossPages(t *testing.T) {
+	jobs := map[string]string{
+		"1": "[" + jobJSON(1, "test", "failed", "false") + "]",
+		"2": "[" + jobJSON(2, "test", "success", "false") + "]",
+	}
+	h := graphHandler(nil, map[int]string{100: graphPipe("feature", "push")}, jobs, graphMR("feature"), graphPipes("feature"), false)
+	clk := &cursor.FakeClock{T: time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)}
+	d := newCursorDeps(t, h, nil, clk)
+	in := pipelineGraphIn{ProjectID: "42", MergeRequestIID: 7, PerPage: 1}
+	_, out, err := getMergeRequestPipelineGraph(context.Background(), nil, in, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	page1 := out.(map[string]any)
+	tok, _ := graphSection(t, page1)["next_cursor"].(string)
+	if tok == "" {
+		t.Fatal("missing cursor")
+	}
+	in.Cursor = tok
+	_, out2, err := getMergeRequestPipelineGraph(context.Background(), nil, in, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	page2 := out2.(map[string]any)
+	requireReadyComplete(t, page2)
+	if page2["assessment"] == assessBlocked {
+		t.Fatal("later successful retry must replace earlier failed attempt")
+	}
+}
+
+func TestPipelineGraph_explicitPipelineMRMembershipRevalidated(t *testing.T) {
+	var hits []graphHit
+	head := graphPipe("feature", "push")
+	historical := fmt.Sprintf(`{"id":200,"project_id":42,"sha":%q,"ref":"old","status":"success","source":"push"}`, graphPipeSHA)
+	jobs := map[string]string{"1": "[" + jobJSON(1, "test", "success", "false") + "]"}
+	listed := fmt.Sprintf(`[{"id":100,"project_id":42,"sha":%q,"ref":"feature","status":"success"},{"id":200,"project_id":42,"sha":%q,"ref":"old","status":"success"}]`, graphPipeSHA, graphPipeSHA)
+	mr := fmt.Sprintf(`{"id":1,"iid":7,"project_id":42,"source_branch":"feature","sha":%q,"head_pipeline":{"id":100,"project_id":42,"sha":%q,"ref":"feature","status":"success"}}`, graphSrcSHA, graphPipeSHA)
+	h := graphHandler(&hits, map[int]string{100: head, 200: historical}, jobs, mr, listed, false)
+	out, err := callGraph(t, h, pipelineGraphIn{ProjectID: "42", MergeRequestIID: 7, PipelineID: 200}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out["pipeline"] == nil || out["pipeline"].(map[string]any)["id"] != float64(200) {
+		t.Fatalf("pipeline %#v", out["pipeline"])
+	}
+	if graphSection(t, out)["content_complete"] != readmeta.ContentCompleteTrue {
+		t.Fatalf("explicit pipeline graph did not complete %#v", graphSection(t, out))
+	}
+	lists := 0
+	for _, hit := range hits {
+		if strings.HasSuffix(hit.path, "/merge_requests/7/pipelines") {
+			lists++
+		}
+	}
+	if lists != 2 {
+		t.Fatalf("expected MR list for selection + closing reconcile, got %d %#v", lists, hits)
+	}
+}
+
 func TestPipelineGraph_retrySplitAcrossPages(t *testing.T) {
 	jobs := map[string]string{
 		"1": "[" + jobJSON(2, "test", "success", "false") + "]",

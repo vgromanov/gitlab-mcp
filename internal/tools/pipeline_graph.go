@@ -100,12 +100,13 @@ type pipelineGraphOut struct {
 }
 
 type graphSelection struct {
-	ExpectedSHA string
-	MRIID       int64
-	Filter      jobFilter
-	PerPage     int
-	MaxDepth    int
-	MaxNodes    int
+	ExpectedSHA     string
+	MRIID           int64
+	BoundPipelineID int64
+	Filter          jobFilter
+	PerPage         int
+	MaxDepth        int
+	MaxNodes        int
 }
 
 type graphPage struct {
@@ -197,7 +198,15 @@ func normalizeGraphSelection(in pipelineGraphIn) (graphSelection, error) {
 	if err != nil {
 		return graphSelection{}, err
 	}
-	return graphSelection{ExpectedSHA: expected, MRIID: in.MergeRequestIID, Filter: filter, PerPage: per, MaxDepth: depth, MaxNodes: nodes}, nil
+	return graphSelection{
+		ExpectedSHA:     expected,
+		MRIID:           in.MergeRequestIID,
+		BoundPipelineID: in.PipelineID,
+		Filter:          filter,
+		PerPage:         per,
+		MaxDepth:        depth,
+		MaxNodes:        nodes,
+	}, nil
 }
 
 func initialPipelineGraph(ctx context.Context, in pipelineGraphIn, sel graphSelection, d Deps, budget *igl.Budget, now time.Time) (*mcp.CallToolResult, any, error) {
@@ -661,7 +670,11 @@ func reconcileGraphMRRoot(ctx context.Context, d Deps, mrProject string, sel gra
 	if sel.MRIID <= 0 {
 		return relationResult{}, nil
 	}
-	chosen, rel, _, err := resolveParentPipeline(ctx, d, mrProject, 0, sel)
+	pipelineID := int64(0)
+	if sel.BoundPipelineID > 0 {
+		pipelineID = sel.BoundPipelineID
+	}
+	chosen, rel, _, err := resolveParentPipeline(ctx, d, mrProject, pipelineID, sel)
 	if err != nil {
 		return relationResult{}, err
 	}
@@ -767,7 +780,7 @@ func graphWalkCertifiable(exhausted bool, page graphPage, sel graphSelection, co
 		return false
 	}
 	return graphWalkFullyRead(exhausted, page, sel, coverage, unseen, section, walk) &&
-		!walk.partial && !walk.block && !walk.reachTruncated
+		!walk.partial && !walk.block && !walk.reachTruncated && !walk.evidenceTruncated
 }
 
 func finishGraph(ctx context.Context, section readmeta.Section, pid, pipePID string, mrIID *int64, pipe *pipelineView, rel relationResult, page graphPage, sel graphSelection, d Deps, actorID int64, upper, expires string, pageNum int, fromStart bool, prior lineageCarry, walk *graphWalk, budget *igl.Budget) (pipelineGraphOut, error) {
@@ -908,7 +921,8 @@ func finishGraph(ctx context.Context, section readmeta.Section, pid, pipePID str
 	}
 	manifestExhausted := graphManifestExhausted(fromStart, exhausted, page, sel, section)
 	graphBound := fromStart || (walk != nil && len(walk.evidence) > 0)
-	revalidateGraph := graphWalkFullyRead(exhausted, page, sel, coverage, unseen, section, walk) && graphBound
+	revalidateGraph := graphWalkFullyRead(exhausted, page, sel, coverage, unseen, section, walk) && graphBound &&
+		(walk == nil || (!walk.reachTruncated && !walk.evidenceTruncated))
 	if revalidateGraph && walk != nil {
 		if sel.MRIID > 0 {
 			root := walk.root
@@ -928,6 +942,9 @@ func finishGraph(ctx context.Context, section readmeta.Section, pid, pipePID str
 		}
 	}
 	graphComplete := manifestExhausted && coverage == downstreamCoverageComplete && !unseen
+	if walk != nil && (walk.reachTruncated || walk.evidenceTruncated) {
+		graphComplete = false
+	}
 	if graphComplete {
 		section.ContentComplete = readmeta.ContentCompleteTrue
 		section.ManifestCoverage = readmeta.CoverageFull
@@ -1365,7 +1382,7 @@ func trimGraphContToPayload(key []byte, p *cursor.Payload) error {
 		return err
 	}
 	finish := func() error {
-		return encodeGraphContPayload(key, p, origRg)
+		return encodeGraphContPayload(key, p, origRg, origEv)
 	}
 	if try(origRg, origEv) == nil {
 		return nil
@@ -1391,7 +1408,7 @@ func trimGraphContToPayload(key []byte, p *cursor.Payload) error {
 	return finish()
 }
 
-func encodeGraphContPayload(key []byte, p *cursor.Payload, origRg []string) error {
+func encodeGraphContPayload(key []byte, p *cursor.Payload, origRg []string, origEv []string) error {
 	if p == nil {
 		return errors.New("nil payload")
 	}
@@ -1406,6 +1423,7 @@ func encodeGraphContPayload(key []byte, p *cursor.Payload, origRg []string) erro
 		gc.Ev = ev
 		graphContSyncReplayEntries(gc)
 		markReachSnapshotTruncated(gc, len(origRg))
+		markEvidenceTruncated(gc, len(origEv))
 		if _, err := cursor.Encode(key, *p); err == nil {
 			return nil
 		}
@@ -1418,6 +1436,18 @@ func markReachSnapshotTruncated(gc *cursor.GraphCont, origReach int) {
 		return
 	}
 	gc.Rgx = true
+	gc.Inc = true
+	if gc.Cov == downstreamCoverageComplete {
+		gc.Cov = downstreamCoveragePartial
+	}
+	gc.Unk = true
+}
+
+func markEvidenceTruncated(gc *cursor.GraphCont, origEvidence int) {
+	if gc == nil || len(gc.Ev) >= origEvidence {
+		return
+	}
+	gc.Evx = true
 	gc.Inc = true
 	if gc.Cov == downstreamCoverageComplete {
 		gc.Cov = downstreamCoveragePartial

@@ -122,6 +122,9 @@ type graphWalk struct {
 	relSHA           string
 	stickyIncomplete bool
 	reachTruncated   bool
+	evidenceTruncated bool
+	lineageLatest    map[string]int64
+	lineagePolicy    map[string][]policyOutcome
 	jobsEv           string
 	bridgesEv        string
 	evidence         map[string][3]string
@@ -170,6 +173,8 @@ func newGraphWalk(pipe *pipelineView, pid string, depth, nodes int) *graphWalk {
 		authz:         map[string]string{},
 		root:          key,
 		evidenceItems: map[string]int{},
+		lineageLatest: map[string]int64{},
+		lineagePolicy: map[string][]policyOutcome{},
 	}
 }
 
@@ -183,9 +188,9 @@ func restoreGraphWalk(pipe *pipelineView, gc *cursor.GraphCont, depth, nodes int
 		depth:            gc.D,
 		phase:            gc.Phase,
 		visited:          map[string]struct{}{},
-		block:            gc.Block,
-		partial:          gc.Part,
-		unknown:          gc.Unk,
+		block:            false,
+		partial:          false,
+		unknown:          false,
 		coverage:         gc.Cov,
 		unseen:           gc.Cov != downstreamCoverageComplete || gc.Inc,
 		cap:              gc.Cap,
@@ -200,6 +205,9 @@ func restoreGraphWalk(pipe *pipelineView, gc *cursor.GraphCont, depth, nodes int
 		relSHA:           gc.RS,
 		stickyIncomplete: gc.Inc,
 		reachTruncated:   gc.Rgx,
+		evidenceTruncated: gc.Evx,
+		lineageLatest:    map[string]int64{},
+		lineagePolicy:    map[string][]policyOutcome{},
 		jobsEv:           gc.JD,
 		bridgesEv:        gc.BD,
 		activeNodeItems:  gc.AI,
@@ -255,7 +263,19 @@ func restoreGraphWalk(pipe *pipelineView, gc *cursor.GraphCont, depth, nodes int
 			Kind:         kind,
 		})
 	}
-	restoreGraphReasons(w, gc.Rsn)
+	if len(gc.Oc) > 0 {
+		if err := restoreLineageOutcomeState(w, gc.Oc); err != nil {
+			return nil, err
+		}
+		w.syncPolicyFlagsFromLineage()
+		restoreGraphReasons(w, gc.Rsn)
+	} else {
+		w.syncPolicyFlagsFromLineage()
+		restoreGraphReasonsLegacy(w, gc.Rsn)
+		w.block = w.block || gc.Block
+		w.partial = w.partial || gc.Part
+		w.unknown = w.unknown || gc.Unk
+	}
 	return w, nil
 }
 
@@ -264,17 +284,34 @@ func restoreGraphReasons(w *graphWalk, reasons []string) {
 		return
 	}
 	for _, r := range reasons {
+		if r == "" || isLineagePolicyReason(r) {
+			continue
+		}
+		w.reasons = append(w.reasons, r)
+	}
+}
+
+func restoreGraphReasonsLegacy(w *graphWalk, reasons []string) {
+	if w == nil {
+		return
+	}
+	for _, r := range reasons {
+		if r == "" {
+			continue
+		}
 		w.reasons = append(w.reasons, r)
 		switch r {
-		case "failed_required", "required_manual":
+		case "failed_required", "required_manual", "canceled_required":
 			w.block = true
 			w.outcomes = append(w.outcomes, policyOutcome{Outcome: policyBlock, Reason: r})
 		case "in_progress":
 			w.partial = true
 			w.outcomes = append(w.outcomes, policyOutcome{Outcome: policyPartial, Reason: r})
 		default:
-			w.unknown = true
-			w.outcomes = append(w.outcomes, policyOutcome{Outcome: policyUnknown, Reason: r})
+			if isLineagePolicyReason(r) {
+				w.unknown = true
+				w.outcomes = append(w.outcomes, policyOutcome{Outcome: policyUnknown, Reason: r})
+			}
 		}
 	}
 }
@@ -345,9 +382,68 @@ func splitVisitKey(item string) (string, int64, bool) {
 }
 
 func (w *graphWalk) recordOutcomes(groups []lineageGroup) {
+	w.applyLineageOutcomes(groups)
+	w.syncPolicyFlagsFromLineage()
+}
+
+func (w *graphWalk) applyLineageOutcomes(groups []lineageGroup) {
+	if w == nil {
+		return
+	}
+	if w.lineageLatest == nil {
+		w.lineageLatest = map[string]int64{}
+	}
+	if w.lineagePolicy == nil {
+		w.lineagePolicy = map[string][]policyOutcome{}
+	}
 	for _, g := range groups {
-		w.outcomes = append(w.outcomes, g.Outcomes...)
-		for _, o := range g.Outcomes {
+		key := lineageKeyForGroup(g)
+		if key == "" {
+			continue
+		}
+		if !g.LatestKnown {
+			if len(g.Outcomes) == 0 {
+				continue
+			}
+			latestID := lineageGroupMaxID(g)
+			if latestID > 0 {
+				if prev, ok := w.lineageLatest[key]; !ok || latestID > prev {
+					w.lineageLatest[key] = latestID
+				}
+			}
+			w.lineagePolicy[key] = append([]policyOutcome(nil), g.Outcomes...)
+			continue
+		}
+		if len(g.LatestIDs) == 0 {
+			continue
+		}
+		latestID := g.LatestIDs[0]
+		if prev, ok := w.lineageLatest[key]; ok && latestID < prev {
+			continue
+		}
+		w.lineageLatest[key] = latestID
+		if len(g.Outcomes) == 0 {
+			w.lineagePolicy[key] = []policyOutcome{{Outcome: policyPass}}
+		} else {
+			w.lineagePolicy[key] = append([]policyOutcome(nil), g.Outcomes...)
+		}
+	}
+}
+
+func (w *graphWalk) syncPolicyFlagsFromLineage() {
+	if w == nil {
+		return
+	}
+	w.block, w.partial, w.unknown = false, false, false
+	keys := make([]string, 0, len(w.lineagePolicy))
+	for k := range w.lineagePolicy {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	outcomes := make([]policyOutcome, 0, len(keys))
+	for _, k := range keys {
+		for _, o := range w.lineagePolicy[k] {
+			outcomes = append(outcomes, o)
 			switch o.Outcome {
 			case policyBlock:
 				w.block = true
@@ -356,11 +452,21 @@ func (w *graphWalk) recordOutcomes(groups []lineageGroup) {
 			case policyUnknown:
 				w.unknown = true
 			}
-			if o.Reason != "" {
-				w.reasons = append(w.reasons, o.Reason)
-			}
 		}
 	}
+	w.outcomes = outcomes
+	edgeReasons := make([]string, 0, len(w.reasons))
+	for _, r := range w.reasons {
+		if r != "" && !isLineagePolicyReason(r) {
+			edgeReasons = append(edgeReasons, r)
+		}
+	}
+	for _, o := range outcomes {
+		if o.Reason != "" {
+			edgeReasons = append(edgeReasons, o.Reason)
+		}
+	}
+	w.reasons = uniqueGraphReasons(edgeReasons)
 }
 
 func (w *graphWalk) snapshotCont() *cursor.GraphCont {
@@ -432,6 +538,8 @@ func (w *graphWalk) snapshotCont() *cursor.GraphCont {
 		Cap:   w.cap,
 		Inc:   w.stickyIncomplete || w.hasIncompleteEdges(),
 		Rgx:   w.reachTruncated,
+		Evx:   w.evidenceTruncated,
+		Oc:    encodeLineageOutcomeState(w.lineageLatest, w.lineagePolicy),
 		Rsn:   rsn,
 		RP:    root.Project,
 		RI:    root.Pipeline,
@@ -765,7 +873,7 @@ func (w *graphWalk) addBridgeEdge(ctx context.Context, d Deps, parent graphNodeK
 			w.unseen = true
 			w.stickyIncomplete = true
 			w.coverage = downstreamCoveragePartial
-		} else if w.reachTruncated {
+		} else if w.reachTruncated || w.evidenceTruncated {
 			base.Kind = edgeKindCycle
 			w.unseen = true
 			w.stickyIncomplete = true

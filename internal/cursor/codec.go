@@ -227,6 +227,10 @@ type GraphCont struct {
 	Rg    []string `json:"rg,omitempty"`
 	// Rgx marks a reachability snapshot shortened to fit the payload cap.
 	Rgx bool `json:"rgx,omitempty"`
+	// Evx marks completed-node evidence shortened to fit the payload cap.
+	Evx bool `json:"evx,omitempty"`
+	// Oc persists latest lineage policy outcomes across pages.
+	Oc []string `json:"oc,omitempty"`
 }
 
 // DiffWindowCont binds one diff-manifest window. It stores no patch text.
