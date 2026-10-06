@@ -42,7 +42,7 @@ func searchRepositories(ctx context.Context, _ *mcp.CallToolRequest, in searchRe
 	if err != nil {
 		return nil, nil, err
 	}
-	return nil, Out(map[string]any{"projects": projects, "pagination": map[string]any{"next_page": resp.NextPage}}), nil
+	return nil, Out(map[string]any{"projects": projectView(projects), "pagination": map[string]any{"next_page": resp.NextPage}}), nil
 }
 
 type createRepositoryIn struct {
@@ -76,7 +76,7 @@ func createRepository(ctx context.Context, _ *mcp.CallToolRequest, in createRepo
 	if err != nil {
 		return nil, nil, err
 	}
-	return nil, Out(p), nil
+	return nil, projectView(p), nil
 }
 
 type forkRepositoryIn struct {
@@ -112,7 +112,7 @@ func forkRepository(ctx context.Context, _ *mcp.CallToolRequest, in forkReposito
 	if err != nil {
 		return nil, nil, err
 	}
-	return nil, Out(p), nil
+	return nil, projectView(p), nil
 }
 
 type getFileContentsIn struct {

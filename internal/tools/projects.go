@@ -73,7 +73,7 @@ func listProjects(ctx context.Context, _ *mcp.CallToolRequest, in listProjectsIn
 		return nil, nil, err
 	}
 	out, err := ToJSONTree(map[string]any{
-		"projects":   projects,
+		"projects":   projectView(projects),
 		"pagination": map[string]any{"page": page, "per_page": perPage, "next_page": resp.NextPage},
 	})
 	if err != nil {
@@ -98,7 +98,7 @@ func getProject(ctx context.Context, _ *mcp.CallToolRequest, in getProjectIn, d 
 	if err != nil {
 		return nil, nil, err
 	}
-	return nil, Out(p), nil
+	return nil, projectView(p), nil
 }
 
 type listProjectMembersIn struct {
@@ -163,7 +163,7 @@ func listGroupProjects(ctx context.Context, _ *mcp.CallToolRequest, in listGroup
 		return nil, nil, err
 	}
 	out, err := ToJSONTree(map[string]any{
-		"projects":   projects,
+		"projects":   projectView(projects),
 		"pagination": map[string]any{"page": page, "per_page": perPage, "next_page": resp.NextPage},
 	})
 	if err != nil {

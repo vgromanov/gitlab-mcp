@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"slices"
 	"strings"
 	"time"
@@ -536,14 +537,32 @@ func getMergeRequestApprovalState(ctx context.Context, _ *mcp.CallToolRequest, i
 	if err != nil {
 		return nil, nil, err
 	}
-	st, _, err := d.Client.MergeRequestApprovals.GetApprovalState(pid, in.MergeRequestIID, gitlab.WithContext(ctx))
-	if err != nil {
-		// Fallback for older GitLab
-		app, _, err2 := d.Client.MergeRequests.GetMergeRequestApprovals(pid, in.MergeRequestIID, gitlab.WithContext(ctx))
-		if err2 != nil {
-			return nil, nil, fmt.Errorf("approval_state: %w; approvals: %v", err, err2)
-		}
-		return nil, Out(app), nil
+	st, resp, err := d.Client.MergeRequestApprovals.GetApprovalState(pid, in.MergeRequestIID, gitlab.WithContext(ctx))
+	if err == nil {
+		return nil, Out(st), nil
 	}
-	return nil, Out(st), nil
+	// Only an unsupported endpoint (404, older GitLab) falls back; 403/5xx etc. surface as-is.
+	if resp == nil || resp.StatusCode != http.StatusNotFound {
+		return nil, nil, err
+	}
+	app, _, err2 := d.Client.MergeRequests.GetMergeRequestApprovals(pid, in.MergeRequestIID, gitlab.WithContext(ctx))
+	if err2 != nil {
+		return nil, nil, fmt.Errorf("approval_state: %w; approvals: %v", err, err2)
+	}
+	return nil, Out(approvalStateFromLegacy(app)), nil
+}
+
+// approvalStateFromLegacy converts the legacy /approvals response into the
+// /approval_state shape (one synthetic rule), so callers get one shape.
+func approvalStateFromLegacy(a *gitlab.MergeRequestApprovals) *gitlab.MergeRequestApprovalState {
+	rule := &gitlab.MergeRequestApprovalRule{
+		Name: "All Members", RuleType: "any_approver", ApprovalsRequired: a.ApprovalsRequired,
+		Approved: a.Approved, ApprovedBy: []*gitlab.BasicUser{},
+	}
+	for _, u := range a.ApprovedBy {
+		if u != nil && u.User != nil {
+			rule.ApprovedBy = append(rule.ApprovedBy, u.User)
+		}
+	}
+	return &gitlab.MergeRequestApprovalState{Rules: []*gitlab.MergeRequestApprovalRule{rule}}
 }
