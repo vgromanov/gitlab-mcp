@@ -28,7 +28,7 @@ type snapshotMRRef struct {
 
 type getReviewSnapshotIn struct {
 	MRs             []snapshotMRRef `json:"mrs" jsonschema:"1 to 10 merge requests"`
-	Include         []string        `json:"include,omitempty" jsonschema:"Sections to read: changes, approvals, discussions (pipeline is not implemented yet and is rejected). Omitted = every implemented section; [] = metadata only"`
+	Include         []string        `json:"include,omitempty" jsonschema:"Sections to read: changes, approvals, discussions, pipeline (the same read as get_pipeline_status with jobs=problems for the head pipeline; opt-in, as it costs several requests per MR). Omitted = changes, approvals and discussions; [] = metadata only"`
 	ChangesMaxPages int             `json:"changes_max_pages,omitempty" jsonschema:"changes: pages of 100 files read per MR (default 3, max 10); complete is false when the cap is hit"`
 
 	DiscussionsMaxPages int  `json:"discussions_max_pages,omitempty" jsonschema:"discussions: pages of 100 discussions read per MR (default 3, max 10); complete is false when the cap is hit"`
@@ -41,44 +41,37 @@ type snapshotOpts struct {
 	includeSystem                        bool
 }
 
-// snapshotSection is one entry of the include enum. A nil read means the
-// section is part of the contract but not implemented yet: asking for it is
-// rejected. Later tickets add a reader here and nothing else.
+// snapshotSection is one entry of the include enum. optIn sections are read
+// only when include names them; an omitted include reads the others.
 type snapshotSection struct {
-	name string
-	read func(ctx context.Context, d Deps, pid string, iid int64, opt snapshotOpts) (any, error)
+	name  string
+	optIn bool
+	read  func(ctx context.Context, d Deps, pid string, iid int64, opt snapshotOpts) (any, error)
 }
 
 var snapshotSections = []snapshotSection{
-	{"changes", readSnapshotChanges},
-	{"approvals", readSnapshotApprovals},
-	{"discussions", readSnapshotDiscussions},
-	{"pipeline", nil},
+	{"changes", false, readSnapshotChanges},
+	{"approvals", false, readSnapshotApprovals},
+	{"discussions", false, readSnapshotDiscussions},
+	{"pipeline", true, readSnapshotPipeline},
 }
 
 // parseSnapshotInclude resolves include to the sections to read, in table order.
 func parseSnapshotInclude(include []string) ([]snapshotSection, error) {
-	var all, ready []string
+	all := make([]string, 0, len(snapshotSections))
 	for _, s := range snapshotSections {
 		all = append(all, s.name)
-		if s.read != nil {
-			ready = append(ready, s.name)
-		}
 	}
 	want := map[string]bool{}
 	for _, name := range include {
-		i := indexSection(name)
-		switch {
-		case i < 0:
+		if indexSection(name) < 0 {
 			return nil, errInvalid(fmt.Sprintf("invalid include %q: must be one of %s", name, strings.Join(all, ", ")))
-		case snapshotSections[i].read == nil:
-			return nil, errInvalid(fmt.Sprintf("include %q is not implemented yet (available: %s)", name, strings.Join(ready, ", ")))
 		}
 		want[name] = true
 	}
 	var out []snapshotSection
 	for _, s := range snapshotSections {
-		if s.read != nil && (include == nil || want[s.name]) {
+		if want[s.name] || (include == nil && !s.optIn) {
 			out = append(out, s)
 		}
 	}

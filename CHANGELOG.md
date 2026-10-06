@@ -101,6 +101,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   is flagged `binary` and its content is not returned. Registered in the review
   profile only (now 53 tools; the daily set is unchanged) and in the default
   catalog (RVG-165).
+- `get_pipeline_status(project_id, sha | mr_iid, ref?, jobs?, max_requests?)`:
+  the CI status of a commit (or of an MR's head pipeline) in one call, as a
+  compact replacement for `get_pipeline` + `list_pipeline_jobs` +
+  `list_pipeline_trigger_jobs` (~122 KB and 3+ calls per poll in M2). It reads
+  the pipelines, all their jobs and bridges (pages of 100) and follows each
+  bridge to its downstream pipeline two levels deep, other projects included
+  (sequential requests, no cache; `max_requests` default 60, max 200).
+  Returns `overall_status` (`failed` > `canceled` > `running` > `pending` >
+  `manual` > `skipped`/`success`; `none` when no pipeline exists yet), `complete`
+  + `truncated_reason`, `pipelines[{id, project_id, sha, status, source, depth?,
+  parent_pipeline_id?, jobs[{id, name, stage, status, allow_failure?, manual?,
+  bridge?}], incomplete?}]` (the flags appear only when true), `failed_jobs`
+  (blocking failures), `allowed_failed_jobs`, `manual_jobs` and `requests`. An
+  incomplete graph (a child that is inaccessible, not in
+  `GITLAB_ALLOWED_PROJECT_IDS` or hidden, the depth limit, the request cap)
+  sets `complete=false` and never reports `success` (`unknown`); a visibly
+  failed child still fails the whole. `jobs: "problems"` lists only the jobs
+  that are not success plus `job_counts` (the compact mode for polling). The
+  tool is registered in the review profile (now 54 tools; the daily set is
+  unchanged) and in the default catalog (RVG-167).
+- `get_review_snapshot`: the `pipeline` section is implemented (the same read as
+  `get_pipeline_status` for the MR's head pipeline with `jobs=problems`, at most
+  30 upstream requests per MR). It is opt-in: an omitted `include` keeps
+  reading `changes`, `approvals` and `discussions` (RVG-167).
 - `get_pipeline_job_output` returns a tail window of the trace:
   `tail_lines` (default 200) and `max_bytes` (default 64 KiB, max 1 MiB) select
   the last lines, and the result is `{trace, truncated, total_bytes}`. The trace

@@ -419,10 +419,10 @@ func TestGetReviewSnapshot_include(t *testing.T) {
 	f := newSnapFixture(t, &config.Config{}, map[string]snapMR{"42/1": {sha: "a", files: 1}})
 	ref := []any{map[string]any{"project_id": "42", "iid": 1}}
 
-	// unknown and not-yet-implemented sections reject the call before any request
+	// an unknown section rejects the call before any request
 	for _, tc := range []struct{ include, want string }{
 		{"bogus", `invalid include "bogus": must be one of changes, approvals, discussions, pipeline`},
-		{"pipeline", `include "pipeline" is not implemented yet (available: changes, approvals, discussions)`},
+		{"Pipeline", `invalid include "Pipeline": must be one of changes, approvals, discussions, pipeline`},
 	} {
 		_, errText := f.call(t, map[string]any{"mrs": ref, "include": []any{"changes", tc.include}})
 		if !strings.Contains(errText, tc.want) {
