@@ -36,6 +36,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `get_review_queue(group_id, roles?, state?, updated_after?, per_page?,
+  max_pages?)`: the current user's review queue in a group. It resolves the
+  current user, pages the group MR list per role (`reviewer_id` / `author_id`,
+  newest first, `max_pages` default 5 / max 20 pages of `per_page` default 100),
+  deduplicates by `(project_id, iid)` and returns one row
+  `{project_id, iid, title, web_url, author, reviewers, sha, updated_at, roles}`
+  plus `complete`, `truncated_reason` (null when complete) and `current_user`.
+  `complete` is false when a role still had a next page at the cap. The row
+  `sha` is a list hint; `get_review_snapshot` is the authority for the head SHA.
+  `updated_after` (RFC3339 or `YYYY-MM-DD`) is sent at whole-second
+  granularity. Registered in the review profile only (now 51 tools; the daily
+  set is unchanged) and in the default catalog (RVG-162).
 - `get_pipeline_job_output` returns a tail window of the trace:
   `tail_lines` (default 200) and `max_bytes` (default 64 KiB, max 1 MiB) select
   the last lines, and the result is `{trace, truncated, total_bytes}`. The trace

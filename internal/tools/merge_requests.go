@@ -26,6 +26,7 @@ func RegisterMergeRequests(s *mcp.Server, d Deps) {
 	AddTool(s, d, false, "", &mcp.Tool{Name: "get_merge_request_version", Description: "Get a single MR diff version"}, getMergeRequestVersion)
 	AddTool(s, d, true, "", &mcp.Tool{Name: "update_merge_request", Description: "Update merge request fields"}, updateMergeRequest)
 	AddTool(s, d, false, "", &mcp.Tool{Name: "list_merge_requests", Description: "List merge requests globally or in a project"}, listMergeRequests)
+	AddTool(s, d, false, "", &mcp.Tool{Name: "get_review_queue", Description: "List the current user's MR review queue in a group: open MRs where they are reviewer and/or author, deduplicated into one row per MR with its roles. Reads up to max_pages pages per role; complete is false (with truncated_reason) when the cap is hit. The row sha is a list hint only: get_review_snapshot is the authority for the head SHA"}, getReviewQueue)
 	AddTool(s, d, true, "", &mcp.Tool{Name: "approve_merge_request", Description: "Approve a merge request"}, approveMergeRequest)
 	AddTool(s, d, true, "", &mcp.Tool{Name: "unapprove_merge_request", Description: "Remove your approval from an MR"}, unapproveMergeRequest)
 	AddTool(s, d, false, "", &mcp.Tool{Name: "get_merge_request_approval_state", Description: "Get MR approval state"}, getMergeRequestApprovalState)

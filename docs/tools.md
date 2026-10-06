@@ -18,8 +18,8 @@ This document describes the tool surface currently registered by
   `USE_WORK_ITEMS`, `USE_LABELS`, `USE_DRAFTS`, `USE_WEBHOOKS`, `USE_TIMELINE`.
 - `USE_DAILY_TOOLS=true` registers the pinned 41-tool daily census set
   (includes all four search tools below).
-- `GITLAB_TOOL_PROFILE=review` registers the closed 50-tool review set (daily +
-  discussion get/reply/resolve + six pipeline reads, no pipeline writes); see
+- `GITLAB_TOOL_PROFILE=review` registers the closed 51-tool review set (daily +
+  discussion get/reply/resolve + six pipeline reads + `get_review_queue`, no pipeline writes); see
   [`docs/configuration.md`](configuration.md#review-profile-gitlab_tool_profilereview).
 
 ## Projects / namespaces / users
@@ -54,6 +54,10 @@ This document describes the tool surface currently registered by
 - `create_merge_request`
 - `get_merge_request`
 - `list_merge_requests`
+- `get_review_queue` — the current user's review queue in a group (reviewer and/or
+  author roles, deduplicated, per-role page cap with `complete` /
+  `truncated_reason`); row `sha` is a list hint, `get_review_snapshot` is the
+  head-SHA authority
 - `update_merge_request`
 - `approve_merge_request`
 - `unapprove_merge_request`
