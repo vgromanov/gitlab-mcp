@@ -127,6 +127,14 @@ gitlab-mcp
 # -> POST/GET MCP frames at http://127.0.0.1:3002/mcp
 ```
 
+### Which build is running?
+
+`gitlab-mcp -version` and the MCP `serverInfo.version` (returned by `initialize`)
+report `<version>+<revision>`: the first 12 characters of the commit the binary
+was built from, plus `-dirty` for a build from a modified tree, for example
+`0.1.0+bf02f09afdad`. A binary built without VCS information reports
+`0.1.0+unknown`. See [`docs/configuration.md`](docs/configuration.md#build-revision).
+
 ### `.env` file
 
 A `.env` in the working directory is auto-loaded (via `joho/godotenv`). See
