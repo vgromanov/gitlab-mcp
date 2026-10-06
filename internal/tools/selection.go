@@ -65,6 +65,7 @@ var dailyTools = []string{
 // reviewExtraTools are added to dailyTools by GITLAB_TOOL_PROFILE=review.
 // Pipeline reads only: create/retry/cancel/play stay out of the profile.
 var reviewExtraTools = []string{
+	"get_review_queue",
 	"get_merge_request_discussion",
 	"create_merge_request_discussion_note",
 	"resolve_merge_request_thread",
