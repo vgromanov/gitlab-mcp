@@ -36,7 +36,7 @@ func approvalSessionLegacy(t *testing.T, stateStatus int, stateBody string, lega
 		case "/api/v4/projects/42/merge_requests/3/approval_state":
 			state.Add(1)
 			w.WriteHeader(stateStatus)
-			_, _ = fmt.Fprint(w, stateBody)
+			writeFixture(w, stateBody)
 		case "/api/v4/projects/42/merge_requests/3/approvals":
 			legacy.Add(1)
 			w.WriteHeader(legacyStatus)

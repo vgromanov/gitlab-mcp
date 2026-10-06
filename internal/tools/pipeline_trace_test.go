@@ -1,7 +1,6 @@
 package tools
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"net/http"
@@ -40,7 +39,7 @@ func traceCall(t *testing.T, cs *mcp.ClientSession, args map[string]any) map[str
 }
 
 func serveText(s string) http.HandlerFunc {
-	return func(w http.ResponseWriter, _ *http.Request) { _, _ = fmt.Fprint(w, s) }
+	return func(w http.ResponseWriter, _ *http.Request) { writeFixture(w, s) }
 }
 
 func TestTailBuffer(t *testing.T) {
@@ -144,11 +143,11 @@ func TestGetPipelineJobOutput_50MBStreamed(t *testing.T) {
 	const size = 50 << 20
 	var written atomic.Int64
 	cs := traceSession(t, func(w http.ResponseWriter, _ *http.Request) {
-		chunk := bytes.Repeat([]byte(strings.Repeat("x", 63)+"\n"), 1024) // 64 KiB of 64-byte lines
+		chunk := strings.Repeat(strings.Repeat("x", 63)+"\n", 1024) // 64 KiB of 64-byte lines
 		n, _ := w.Write([]byte("FIRST LINE\n"))
 		written.Store(int64(n))
 		for written.Load() < size {
-			n, _ = w.Write(chunk)
+			n = writeFixture(w, chunk)
 			written.Add(int64(n))
 		}
 		n, _ = fmt.Fprint(w, "ERROR: job failed\n")
