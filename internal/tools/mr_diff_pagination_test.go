@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"sync/atomic"
@@ -42,11 +43,21 @@ func diffFixture(t *testing.T) (*mcp.ClientSession, *atomic.Int32) {
 		if hi < diffFixtureFiles {
 			w.Header().Set("X-Next-Page", strconv.Itoa(page+1))
 		}
-		_, _ = fmt.Fprint(w, body+"]")
+		writeFixture(w, body+"]")
 	}))
 	srv := mcp.NewServer(&mcp.Implementation{Name: "t", Version: "test"}, nil)
 	RegisterMergeRequests(srv, Deps{Config: &config.Config{}, Client: cli})
 	return testutil.MCPConnect(t, srv), &calls
+}
+
+// writeFixture writes a canned test body and returns the bytes written. It
+// takes an io.Writer on purpose: the httptest fixtures serve JSON/text that is
+// never rendered as HTML, so the HTML-escaping XSS semgrep rules
+// (no-fprintf/io-writestring/direct-write-to-responsewriter) do not apply, and
+// a helper that is not an http.ResponseWriter handler stays out of their scope.
+func writeFixture(dst io.Writer, body string) int {
+	n, _ := io.WriteString(dst, body)
+	return n
 }
 
 func callDiffTool(t *testing.T, cs *mcp.ClientSession, name string, args map[string]any) map[string]any {

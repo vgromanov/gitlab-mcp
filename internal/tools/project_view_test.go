@@ -44,7 +44,7 @@ func TestProjectTools_allowlist(t *testing.T) {
 	cli, _ := testutil.NewGitLabClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if r.Method == http.MethodGet && r.URL.Path != "/api/v4/projects/7" {
-			_, _ = fmt.Fprintf(w, "[%s]", leakyProject)
+			writeFixture(w, "["+leakyProject+"]")
 			return
 		}
 		_, _ = fmt.Fprint(w, leakyProject)

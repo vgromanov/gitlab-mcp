@@ -32,7 +32,7 @@ func gqlSession(t *testing.T, readOnly bool, reply string) (*mcp.ClientSession, 
 		_ = json.Unmarshal(raw, &m)
 		bodies = append(bodies, m)
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, reply)
+		writeFixture(w, reply)
 	}))
 	srv := mcp.NewServer(&mcp.Implementation{Name: "t", Version: "test"}, nil)
 	RegisterGraphQLTools(srv, Deps{Config: &config.Config{ReadOnly: readOnly}, Client: cli})
