@@ -351,9 +351,12 @@ func resumePipelineGraph(ctx context.Context, in pipelineGraphIn, sel graphSelec
 		return resumeGraphBridges(ctx, &section, pid, pipePID, mrIID, pipe, rel, sel, d, actorID, &payload, walk, budget)
 	}
 	reserved := reserveGraphPageBudget(budget, sel.PerPage)
-	if reserved {
-		defer releaseGraphPageBudget(budget, sel.PerPage)
-	}
+	releasedReserve := false
+	defer func() {
+		if reserved && !releasedReserve {
+			releaseGraphPageBudget(budget, sel.PerPage)
+		}
+	}()
 	replayCap := graphActiveReplayCap(budget, sel.PerPage, payload.PageState.Page)
 	rctx := igl.WithReplayBudget(ctx, replayCap)
 	guard, err := collectJobPage(rctx, d, budget, pipePID, pipe.ID, payload.PageState.Page, sel.PerPage, nil)
@@ -382,6 +385,10 @@ func resumePipelineGraph(ctx context.Context, in pipelineGraphIn, sel graphSelec
 	if err := walk.revalidateActiveJobs(rctx, d, pipePID, pipe.ID, sel.PerPage, payload.PageState.Page, guard); err != nil {
 		return nil, nil, err
 	}
+	if reserved {
+		releaseGraphPageBudget(budget, sel.PerPage)
+		releasedReserve = true
+	}
 	nextPage := int(payload.PageState.ProviderNextPage)
 	page, err := collectJobPage(ctx, d, budget, pipePID, pipe.ID, nextPage, sel.PerPage, idSet(ids))
 	if err != nil {
@@ -399,9 +406,12 @@ func resumeGraphBridges(ctx context.Context, section *readmeta.Section, pid, pip
 		return nil, nil, fmt.Errorf("%s: graph continuation missing", cursor.ResyncRequired)
 	}
 	reserved := reserveGraphPageBudget(budget, sel.PerPage)
-	if reserved {
-		defer releaseGraphPageBudget(budget, sel.PerPage)
-	}
+	releasedReserve := false
+	defer func() {
+		if reserved && !releasedReserve {
+			releaseGraphPageBudget(budget, sel.PerPage)
+		}
+	}()
 	replayCap := graphBridgeActiveReplayCap(budget, sel.PerPage, payload.PageState.Page)
 	rctx := igl.WithReplayBudget(ctx, replayCap)
 	guard, err := collectBridgePage(rctx, d, budget, pipePID, pipe.ID, payload.PageState.Page, sel.PerPage, nil)
@@ -428,6 +438,10 @@ func resumeGraphBridges(ctx context.Context, section *readmeta.Section, pid, pip
 	}
 	if err := walk.revalidateActiveBridges(rctx, d, pipePID, pipe.ID, sel.PerPage, payload.PageState.Page, guard); err != nil {
 		return nil, nil, err
+	}
+	if reserved {
+		releaseGraphPageBudget(budget, sel.PerPage)
+		releasedReserve = true
 	}
 	nextPage := int(payload.PageState.ProviderNextPage)
 	page, err := collectBridgePage(ctx, d, budget, pipePID, pipe.ID, nextPage, sel.PerPage, idSet(jobIDStrings(bridgeJobs(guard.Bridges))))

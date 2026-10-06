@@ -877,12 +877,12 @@ func TestPipelineGraph_mrContinuationKeepsBudgetItem(t *testing.T) {
 	page := out2.(map[string]any)
 	requireNotReady(t, page)
 	got := page["jobs"].([]any)
-	if len(got) != 1 || got[0].(map[string]any)["id"] != float64(3) {
+	if len(got) != 2 || got[0].(map[string]any)["id"] != float64(3) {
 		t.Fatalf("jobs %#v", got)
 	}
 	sec := graphSection(t, page)
-	if !sectionMessage(sec, "budget_items") || sec["next_cursor"] != nil || sec["pagination_exhausted"] == true {
-		t.Fatalf("section %#v", sec)
+	if sectionMessage(sec, "budget_items") {
+		t.Fatalf("forward page must not starve on reserved allowance %#v", sec)
 	}
 }
 
