@@ -402,10 +402,7 @@ func resumeGraphBridges(ctx context.Context, section *readmeta.Section, pid, pip
 	if reserved {
 		defer releaseGraphPageBudget(budget, sel.PerPage)
 	}
-	replayCap := graphActiveReplayCap(budget, sel.PerPage, payload.PageState.Page)
-	if budget != nil && budget.MaxItems > 0 && replayCap < budget.MaxItems {
-		replayCap = budget.MaxItems
-	}
+	replayCap := graphBridgeActiveReplayCap(budget, sel.PerPage, payload.PageState.Page)
 	rctx := igl.WithReplayBudget(ctx, replayCap)
 	guard, err := collectBridgePage(rctx, d, budget, pipePID, pipe.ID, payload.PageState.Page, sel.PerPage, nil)
 	if err != nil || guard.Partial || guard.Unsupported || guard.Inaccessible {
@@ -705,6 +702,12 @@ func graphEvidenceReplayCap(budget *igl.Budget, perPage int) int {
 		perPage = 1
 	}
 	return budget.MaxItems + perPage
+}
+
+// graphBridgeActiveReplayCap sizes bridge-page resume replay for revalidateActiveBridges,
+// which re-reads every completed job page plus bridge pages 1..through-1 and the guard page.
+func graphBridgeActiveReplayCap(budget *igl.Budget, perPage, bridgePage int) int {
+	return graphEvidenceReplayCap(budget, perPage) + graphActiveReplayCap(budget, perPage, bridgePage)
 }
 
 func graphManifestExhausted(fromStart, exhausted bool, page graphPage, sel graphSelection, section readmeta.Section) bool {

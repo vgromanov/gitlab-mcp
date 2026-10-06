@@ -230,6 +230,87 @@ func TestPipelineGraph_hundredOneJobsResumePageSixUnderDefaultBudget(t *testing.
 	}
 }
 
+func bridgePageJSON(startID, n int) string {
+	parts := make([]string, n)
+	for i := 0; i < n; i++ {
+		id := startID + i
+		parts[i] = bridgeJSON(id, "b"+fmt.Sprint(id), 0, 0, "")
+	}
+	return "[" + strings.Join(parts, ",") + "]"
+}
+
+func TestPipelineGraph_hundredOneJobsTwentyOneBridgesResumeBridgePageTwo(t *testing.T) {
+	const perPage = 20
+	jobs := map[string]string{
+		"42/100/1": jobPageJSON(1, perPage),
+		"42/100/2": jobPageJSON(21, perPage),
+		"42/100/3": jobPageJSON(41, perPage),
+		"42/100/4": jobPageJSON(61, perPage),
+		"42/100/5": jobPageJSON(81, perPage),
+		"42/100/6": "[" + jobJSON(101, "last", "success", "false") + "]",
+	}
+	bridges := map[string]string{
+		"42/100/1": bridgePageJSON(1000, perPage),
+		"42/100/2": "[" + bridgeJSON(1020, "last-bridge", 0, 0, "") + "]",
+	}
+	h := &walkServer{
+		pipes:   map[string]string{"42/100": walkPipe(100, 42, graphPipeSHA, "feature")},
+		jobs:    jobs,
+		bridges: bridges,
+		mr:      graphMR("feature"),
+		mrPipes: graphPipes("feature"),
+	}
+	in := pipelineGraphIn{ProjectID: "42", MergeRequestIID: 7, PerPage: perPage, MaxItems: 100, MaxRequests: 128}
+	clk := &cursor.FakeClock{T: time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)}
+	d := newCursorDeps(t, h, nil, clk)
+	tok := ""
+	var last map[string]any
+	for i := 0; i < 24; i++ {
+		in.Cursor = tok
+		_, raw, err := getMergeRequestPipelineGraph(context.Background(), nil, in, d)
+		if err != nil {
+			t.Fatalf("call %d: %v", i, err)
+		}
+		last = raw.(map[string]any)
+		sec := graphSection(t, last)
+		if sec["next_cursor"] == nil {
+			break
+		}
+		tok, _ = sec["next_cursor"].(string)
+		payload, err := cursor.Decode(d.Config.CursorKey, tok, clk.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if payload.GraphCont != nil && payload.GraphCont.Phase == cursor.GraphPhaseBridges &&
+			payload.PageState.Page == 1 && payload.PageState.ProviderNextPage == 2 {
+			break
+		}
+	}
+	if tok == "" {
+		t.Fatalf("need bridge page-2 cursor %#v", graphSection(t, last))
+	}
+	in.Cursor = tok
+	_, raw, err := getMergeRequestPipelineGraph(context.Background(), nil, in, d)
+	if err != nil {
+		t.Fatalf("bridge resume err: %v", err)
+	}
+	out := raw.(map[string]any)
+	sec := graphSection(t, out)
+	if sectionMessage(sec, "budget_items") {
+		t.Fatalf("bridge page 2 resume hit item budget lim=%#v", sec["limitations"])
+	}
+	for _, raw := range out["edges"].([]any) {
+		e := raw.(map[string]any)
+		if e["bridge_id"] == float64(1020) {
+			return
+		}
+	}
+	if sec["next_cursor"] != nil || out["downstream_coverage"] == downstreamCoverageComplete {
+		return
+	}
+	t.Fatalf("bridge page 2 resume did not advance bridges %#v", out)
+}
+
 func TestPipelineGraph_manyParentJobPagesResumeIntoChild(t *testing.T) {
 	const jobsPerPage = 25
 	const apiPages = 3 // 75 jobs (>64) across paged parent job lists
