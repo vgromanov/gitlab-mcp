@@ -36,6 +36,10 @@ func runWithConfig(parent context.Context, cfg *config.Config) int {
 		slog.Error("GITLAB_PERSONAL_ACCESS_TOKEN or --token is required")
 		return 1
 	}
+	if !cfg.ValidToolProfile() {
+		slog.Error("unknown GITLAB_TOOL_PROFILE (supported: review)", "profile", cfg.ToolProfile)
+		return 1
+	}
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
 	client, err := glclient.NewClient(cfg)

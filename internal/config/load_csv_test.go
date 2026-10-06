@@ -20,6 +20,7 @@ func TestLoad_fromEnv(t *testing.T) {
 	t.Setenv("USE_MILESTONE", "true")
 	t.Setenv("USE_PIPELINE", "true")
 	t.Setenv("USE_DAILY_TOOLS", "true")
+	t.Setenv("GITLAB_TOOL_PROFILE", "REVIEW")
 	t.Setenv("USE_ISSUES", "true")
 	t.Setenv("USE_WORK_ITEMS", "true")
 	t.Setenv("USE_LABELS", "true")
@@ -49,6 +50,9 @@ func TestLoad_fromEnv(t *testing.T) {
 	}
 	if !c.ReadOnly || !c.Wiki || !c.RestrictedMode() {
 		t.Fatalf("flags not loaded: %#v", c)
+	}
+	if c.ToolProfile != ProfileReview {
+		t.Fatalf("tool profile = %q", c.ToolProfile)
 	}
 	if len(c.AllowedProjectIDs) != 2 {
 		t.Fatalf("allowed: %#v", c.AllowedProjectIDs)

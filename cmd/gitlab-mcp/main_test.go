@@ -27,6 +27,17 @@ func TestRunWithConfig_missingToken(t *testing.T) {
 	}
 }
 
+func TestRunWithConfig_unknownToolProfile(t *testing.T) {
+	code := runWithConfig(context.Background(), &config.Config{
+		Token:       "tok",
+		APIURL:      "https://gitlab.example.invalid/api/v4",
+		ToolProfile: "bogus",
+	})
+	if code != 1 {
+		t.Fatalf("code %d", code)
+	}
+}
+
 func TestRunWithConfig_badClient(t *testing.T) {
 	code := runWithConfig(context.Background(), &config.Config{
 		Token:  "tok",

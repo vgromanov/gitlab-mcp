@@ -8,6 +8,9 @@ import (
 	"strings"
 )
 
+// ProfileReview is the GITLAB_TOOL_PROFILE value for the MR review tool set.
+const ProfileReview = "review"
+
 // Config holds runtime configuration (env + CLI; CLI wins when set).
 type Config struct {
 	Token              string
@@ -17,6 +20,7 @@ type Config struct {
 	Milestone          bool
 	Pipeline           bool
 	UseDailyTools      bool
+	ToolProfile        string
 	Issues             bool
 	WorkItems          bool
 	Labels             bool
@@ -79,6 +83,7 @@ func Load() *Config {
 		Milestone:          envBool("USE_MILESTONE", false),
 		Pipeline:           envBool("USE_PIPELINE", false),
 		UseDailyTools:      envBool("USE_DAILY_TOOLS", false),
+		ToolProfile:        strings.ToLower(envString("GITLAB_TOOL_PROFILE", "")),
 		Issues:             envBool("USE_ISSUES", false),
 		WorkItems:          envBool("USE_WORK_ITEMS", false),
 		Labels:             envBool("USE_LABELS", false),
@@ -108,6 +113,7 @@ func Load() *Config {
 		flagMilestone  = flag.Bool("use-milestone", false, "Enable milestone tools")
 		flagPipeline   = flag.Bool("use-pipeline", false, "Enable pipeline tools")
 		flagDaily      = flag.Bool("use-daily-tools", false, "Restricted mode: register Aug-2026 daily census tools")
+		flagProfile    = flag.String("tool-profile", "", "Named tool profile (review); overrides GITLAB_TOOL_PROFILE")
 		flagIssues     = flag.Bool("use-issues", false, "Restricted mode: enable issues family (also enters restricted mode)")
 		flagWorkItems  = flag.Bool("use-work-items", false, "Restricted mode: enable work items family")
 		flagLabels     = flag.Bool("use-labels", false, "Restricted mode: enable labels family")
@@ -145,6 +151,9 @@ func Load() *Config {
 	}
 	if flagVisited("use-daily-tools") {
 		c.UseDailyTools = *flagDaily
+	}
+	if flagVisited("tool-profile") {
+		c.ToolProfile = strings.ToLower(strings.TrimSpace(*flagProfile))
 	}
 	if flagVisited("use-issues") {
 		c.Issues = *flagIssues
@@ -205,14 +214,20 @@ func flagVisited(name string) bool {
 	return visited
 }
 
-// RestrictedMode is on when USE_DAILY_TOOLS, any new family flag, or a non-empty
+// ValidToolProfile reports whether ToolProfile is empty or a known profile.
+func (c *Config) ValidToolProfile() bool {
+	return c.ToolProfile == "" || c.ToolProfile == ProfileReview
+}
+
+// RestrictedMode is on when a tool profile, USE_DAILY_TOOLS, any new family flag, or a non-empty
 // GITLAB_ENABLED_TOOLS list is set. Legacy USE_PIPELINE / USE_MILESTONE /
 // USE_GITLAB_WIKI alone do not enter restricted mode.
 func (c *Config) RestrictedMode() bool {
 	if c == nil {
 		return false
 	}
-	return c.UseDailyTools ||
+	return c.ToolProfile != "" ||
+		c.UseDailyTools ||
 		len(c.EnabledTools) > 0 ||
 		c.Issues || c.WorkItems || c.Labels ||
 		c.Drafts || c.Webhooks || c.Timeline

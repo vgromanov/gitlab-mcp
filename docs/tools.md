@@ -18,6 +18,9 @@ This document describes the tool surface currently registered by
   `USE_WORK_ITEMS`, `USE_LABELS`, `USE_DRAFTS`, `USE_WEBHOOKS`, `USE_TIMELINE`.
 - `USE_DAILY_TOOLS=true` registers the pinned 41-tool daily census set
   (includes all four search tools below).
+- `GITLAB_TOOL_PROFILE=review` registers the closed 50-tool review set (daily +
+  discussion get/reply/resolve + six pipeline reads, no pipeline writes); see
+  [`docs/configuration.md`](configuration.md#review-profile-gitlab_tool_profilereview).
 
 ## Projects / namespaces / users
 
