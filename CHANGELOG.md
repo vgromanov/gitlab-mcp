@@ -48,6 +48,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `updated_after` (RFC3339 or `YYYY-MM-DD`) is sent at whole-second
   granularity. Registered in the review profile only (now 51 tools; the daily
   set is unchanged) and in the default catalog (RVG-162).
+- `get_review_snapshot(mrs, include?, changes_max_pages?)`: reads up to 10 MRs
+  `{project_id, iid, expected_sha?}` in one call (sequential upstream requests,
+  no cache). Per MR it returns metadata (title, web_url, author, reviewers,
+  state, draft, source/target branch, `sha`, `diff_refs`,
+  `detailed_merge_status`, `updated_at`; the deprecated `merge_status` is not
+  modelled by the SDK), `head_changed` (+ `expected_sha`) when `expected_sha`
+  was given, `changes` (changed files with new/renamed/deleted/collapsed/
+  too_large flags, no patches; `changes_max_pages` default 3, max 10 pages of
+  100; `complete`, `truncated_reason`, `next_page`) and `approvals` (the
+  `get_merge_request_approval_state` read, with its 404-only legacy fallback).
+  `include` accepts `changes`, `approvals`, `discussions`, `pipeline`; omitted
+  means every implemented section, `[]` metadata only, and the not yet
+  implemented `discussions` / `pipeline` are rejected. A failing MR (e.g. 404)
+  or section is reported as an `error` entry; the rest of the batch still
+  returns. Registered in the review profile only (now 52 tools; the daily set is
+  unchanged) and in the default catalog (RVG-163).
 - `get_pipeline_job_output` returns a tail window of the trace:
   `tail_lines` (default 200) and `max_bytes` (default 64 KiB, max 1 MiB) select
   the last lines, and the result is `{trace, truncated, total_bytes}`. The trace

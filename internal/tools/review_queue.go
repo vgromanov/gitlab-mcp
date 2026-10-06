@@ -59,14 +59,21 @@ func toQueueUser(u *gitlab.BasicUser) *queueUser {
 func newQueueRow(mr *gitlab.BasicMergeRequest) *queueRow {
 	r := &queueRow{
 		ProjectID: mr.ProjectID, IID: mr.IID, Title: mr.Title, WebURL: mr.WebURL,
-		Author: toQueueUser(mr.Author), Reviewers: []queueUser{}, SHA: mr.SHA, UpdatedAt: mr.UpdatedAt,
+		Author: toQueueUser(mr.Author), SHA: mr.SHA, UpdatedAt: mr.UpdatedAt,
 	}
-	for _, u := range mr.Reviewers {
+	r.Reviewers = queueUsers(mr.Reviewers)
+	return r
+}
+
+// queueUsers compacts users, skipping nils; the result is never nil.
+func queueUsers(us []*gitlab.BasicUser) []queueUser {
+	out := []queueUser{}
+	for _, u := range us {
 		if u != nil {
-			r.Reviewers = append(r.Reviewers, *toQueueUser(u))
+			out = append(out, *toQueueUser(u))
 		}
 	}
-	return r
+	return out
 }
 
 // parseQueueInput validates the input and returns the roles (canonical order),

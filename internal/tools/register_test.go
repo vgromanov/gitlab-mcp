@@ -149,7 +149,7 @@ func TestRegisterAll_reviewProfileExactSet(t *testing.T) {
 	want := []string{
 		"get_merge_request_discussion", "create_merge_request_discussion_note", "resolve_merge_request_thread",
 		"list_pipelines", "get_pipeline", "list_pipeline_jobs", "list_pipeline_trigger_jobs",
-		"get_pipeline_job", "get_pipeline_job_output", "get_review_queue",
+		"get_pipeline_job", "get_pipeline_job_output", "get_review_queue", "get_review_snapshot",
 	}
 	want = append(want, DailyTools()...)
 	sort.Strings(want)
@@ -163,8 +163,8 @@ func TestRegisterAll_reviewProfileExactSet(t *testing.T) {
 	if !slices.Equal(got, want) {
 		t.Fatalf("review tools/list mismatch\n got: %v\nwant: %v", got, want)
 	}
-	if len(got) != 51 {
-		t.Fatalf("review catalog size = %d, want 51", len(got))
+	if len(got) != 52 {
+		t.Fatalf("review catalog size = %d, want 52", len(got))
 	}
 	if !slices.Equal(sortedKeysOf(ReviewTools()), want) {
 		t.Fatal("ReviewTools() must match the registered review set")
@@ -217,7 +217,7 @@ func TestRegisterAll_dailyAndDefaultUnchangedByProfileWork(t *testing.T) {
 			t.Fatalf("default catalog must keep pipeline family off, got %q", n)
 		}
 	}
-	for _, n := range []string{"get_merge_request_discussion", "resolve_merge_request_thread", "list_issues", "get_review_queue"} {
+	for _, n := range []string{"get_merge_request_discussion", "resolve_merge_request_thread", "list_issues", "get_review_queue", "get_review_snapshot"} {
 		if !def[n] {
 			t.Fatalf("default catalog lost %q", n)
 		}

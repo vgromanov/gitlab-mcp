@@ -56,14 +56,14 @@ Recommended Cursor profile for ship/MR work: `USE_DAILY_TOOLS=true` alone
 ### Review profile (`GITLAB_TOOL_PROFILE=review`)
 
 A named, **closed** tool set for MR review automation. It enters restricted
-mode and registers exactly the 41 daily tools plus these 10 tools
-(51 total):
+mode and registers exactly the 41 daily tools plus these 11 tools
+(52 total):
 
 - `get_merge_request_discussion`, `create_merge_request_discussion_note`
   (reply), `resolve_merge_request_thread`
 - `list_pipelines`, `get_pipeline`, `list_pipeline_jobs`,
   `list_pipeline_trigger_jobs`, `get_pipeline_job`, `get_pipeline_job_output`
-- `get_review_queue` (review profile only; not in the daily set)
+- `get_review_queue`, `get_review_snapshot` (review profile only; not in the daily set)
 
 Pipeline writes (`create_pipeline`, `retry_pipeline`, `cancel_pipeline`,
 `play_pipeline_job`, `retry_pipeline_job`, `cancel_pipeline_job`) are never
@@ -93,7 +93,7 @@ means today's behavior; `USE_DAILY_TOOLS` is unchanged.
 | Variable | Flag | Default | Restricted? | Notes |
 |---|---|---|---|---|
 | `USE_DAILY_TOOLS` | `--use-daily-tools` | `false` | Yes | 41-tool daily set. |
-| `GITLAB_TOOL_PROFILE` | `--tool-profile` | empty | Yes | `review`: closed 51-tool review set (see above). |
+| `GITLAB_TOOL_PROFILE` | `--tool-profile` | empty | Yes | `review`: closed 52-tool review set (see above). |
 | `USE_ISSUES` | `--use-issues` | `false` | Yes | Issues + issue notes/links. |
 | `USE_WORK_ITEMS` | `--use-work-items` | `false` | Yes | Work-item GraphQL tools (not `execute_graphql`). |
 | `USE_LABELS` | `--use-labels` | `false` | Yes | Label CRUD. |
