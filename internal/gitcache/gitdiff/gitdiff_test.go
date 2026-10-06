@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/filemode"
 	fdiff "github.com/go-git/go-git/v5/plumbing/format/diff"
 	"github.com/go-git/go-git/v5/plumbing/object"
 
@@ -794,5 +795,54 @@ func TestCompareRenameLimitIsPartial(t *testing.T) {
 	cmp, err := Compare(bg(), base, head, SemanticsStraight, s, Limits{})
 	if !errors.Is(err, ErrPartial) || !cmp.Partial {
 		t.Fatalf("want partial rename limit, got %#v %v", cmp.Result, err)
+	}
+}
+
+func TestMergeExecutableRenamesStopsOnCancelledContext(t *testing.T) {
+	body := strings.Repeat("line\n", 20)
+	s := store{}
+	var adds, dels []*object.Change
+	for i := 0; i < 50; i++ {
+		h := s.put("blob", []byte(body+fmt.Sprintf("x%d\n", i)))
+		dels = append(dels, &object.Change{From: object.ChangeEntry{Name: fmt.Sprintf("old%d.sh", i), TreeEntry: object.TreeEntry{Mode: filemode.Executable, Hash: h}}})
+		adds = append(adds, &object.Change{To: object.ChangeEntry{Name: fmt.Sprintf("new%d.sh", i), TreeEntry: object.TreeEntry{Mode: filemode.Executable, Hash: h}}})
+	}
+	changes := make(object.Changes, 0, len(adds)+len(dels))
+	changes = append(changes, dels...)
+	changes = append(changes, adds...)
+	ctx, cancel := context.WithCancel(bg())
+	cancel()
+	start := time.Now()
+	out := mergeExecutableRenames(ctx, changes, s, renameScore, renameLimit)
+	if time.Since(start) > 200*time.Millisecond {
+		t.Fatalf("cancelled executable pass took too long: %v", time.Since(start))
+	}
+	if len(out) != len(changes) {
+		t.Fatalf("cancelled pass must not rewrite changes")
+	}
+}
+
+func TestCompareSkipsExecutablePassWhenRenameLimitPartial(t *testing.T) {
+	s := store{}
+	oldFiles, newFiles := map[string]fileSpec{}, map[string]fileSpec{}
+	body := strings.Repeat("#!/bin/sh\n", 20)
+	for i := 0; i < 201; i++ {
+		oldFiles[fmt.Sprintf("old-%03d.sh", i)] = exec(body + fmt.Sprintf("o%d\n", i))
+		newFiles[fmt.Sprintf("new-%03d.sh", i)] = exec(body + fmt.Sprintf("o%d\n", i) + "tail\n")
+	}
+	base := s.snapshot(t, "", oldFiles)
+	head := s.snapshot(t, base, newFiles)
+	cmp, err := Compare(bg(), base, head, SemanticsStraight, s, Limits{})
+	if !errors.Is(err, ErrPartial) || !cmp.Partial {
+		t.Fatalf("want partial rename limit, got %#v %v", cmp.Result, err)
+	}
+	renames := 0
+	for _, f := range cmp.Files {
+		if f.RenamedFile {
+			renames++
+		}
+	}
+	if renames > 0 {
+		t.Fatalf("executable merge must not run when rename limit already partial (renames=%d)", renames)
 	}
 }

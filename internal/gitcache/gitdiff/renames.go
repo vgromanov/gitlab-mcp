@@ -32,7 +32,9 @@ func diffWithRenames(ctx context.Context, from, to *object.Tree, score uint, lim
 	if err != nil {
 		return nil, partial, err
 	}
-	changes = mergeExecutableRenames(changes, objs, int(score))
+	if !partial {
+		changes = mergeExecutableRenames(ctx, changes, objs, int(score), int(limit))
+	}
 	return changes, partial, nil
 }
 
@@ -52,7 +54,10 @@ func countAddsDeletes(changes object.Changes) (added, deleted []*object.Change) 
 	return added, deleted
 }
 
-func mergeExecutableRenames(changes object.Changes, objs map[plumbing.Hash]pack.Object, minScore int) object.Changes {
+func mergeExecutableRenames(ctx context.Context, changes object.Changes, objs map[plumbing.Hash]pack.Object, minScore int, limit int) object.Changes {
+	if ctx != nil && ctx.Err() != nil {
+		return changes
+	}
 	var adds, dels, mods []*object.Change
 	for _, ch := range changes {
 		action, err := ch.Action()
@@ -69,14 +74,34 @@ func mergeExecutableRenames(changes object.Changes, objs map[plumbing.Hash]pack.
 			mods = append(mods, ch)
 		}
 	}
+	exeAdds, exeDels := 0, 0
+	for _, ch := range adds {
+		if ch.To.TreeEntry.Mode == filemode.Executable {
+			exeAdds++
+		}
+	}
+	for _, ch := range dels {
+		if ch.From.TreeEntry.Mode == filemode.Executable {
+			exeDels++
+		}
+	}
+	if limit > 0 && exeAdds > 0 && exeDels > 0 && maxInt(exeAdds, exeDels) > limit {
+		return changes
+	}
 	usedAdd := make(map[int]bool)
 	usedDel := make(map[int]bool)
 	for di, del := range dels {
+		if ctx != nil && ctx.Err() != nil {
+			return changes
+		}
 		if usedDel[di] || del.From.TreeEntry.Mode != filemode.Executable {
 			continue
 		}
 		bestAI, bestScore := -1, minScore-1
 		for ai, add := range adds {
+			if ctx != nil && ctx.Err() != nil {
+				return changes
+			}
 			if usedAdd[ai] || add.To.TreeEntry.Mode != filemode.Executable {
 				continue
 			}
