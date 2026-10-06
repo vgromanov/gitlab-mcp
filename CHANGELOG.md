@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Honest MR diff pagination: `get_merge_request_diffs`,
+  `list_merge_request_changed_files` and `get_merge_request_file_diff` accept
+  `page`/`per_page` and return `pagination: {page, per_page, next_page,
+  complete}` (also on `list_merge_request_diffs`); each call makes one request
+  and never pages on. `list_merge_request_changed_files` adds
+  `collapsed_files` / `too_large_files`. `page`/`per_page` are now optional in
+  every paged tool's input schema (RVG-157).
 - `list_merge_requests` accepts `reviewer_id`, `scope`, `updated_after`,
   `updated_before`, `order_by` and `sort` on project, group and global lists;
   invalid `scope` / `order_by` / `sort` / timestamps return a clear input error

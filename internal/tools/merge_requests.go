@@ -16,11 +16,11 @@ func RegisterMergeRequests(s *mcp.Server, d Deps) {
 	AddTool(s, d, true, "", &mcp.Tool{Name: "merge_merge_request", Description: "Accept / merge a merge request"}, mergeMergeRequest)
 	AddTool(s, d, true, "", &mcp.Tool{Name: "create_merge_request", Description: "Create a merge request"}, createMergeRequest)
 	AddTool(s, d, false, "", &mcp.Tool{Name: "get_merge_request", Description: "Get merge request details"}, getMergeRequest)
-	AddTool(s, d, false, "", &mcp.Tool{Name: "get_merge_request_diffs", Description: "Get MR diffs (structured list, first page)"}, getMergeRequestDiffs)
+	AddTool(s, d, false, "", &mcp.Tool{Name: "get_merge_request_diffs", Description: "Get one page of MR diffs (default 100 per page); pagination.complete is false when more pages exist"}, getMergeRequestDiffs)
 	AddTool(s, d, false, "", &mcp.Tool{Name: "list_merge_request_diffs", Description: "List MR diffs with pagination"}, listMergeRequestDiffs)
 	AddTool(s, d, false, "", &mcp.Tool{Name: "get_merge_request_conflicts", Description: "Summarize MR conflicts from diffs and MR flags"}, getMergeRequestConflicts)
-	AddTool(s, d, false, "", &mcp.Tool{Name: "list_merge_request_changed_files", Description: "List changed file paths for an MR"}, listMergeRequestChangedFiles)
-	AddTool(s, d, false, "", &mcp.Tool{Name: "get_merge_request_file_diff", Description: "Get diffs for specific files in an MR"}, getMergeRequestFileDiff)
+	AddTool(s, d, false, "", &mcp.Tool{Name: "list_merge_request_changed_files", Description: "List one page of changed file paths for an MR, plus collapsed_files / too_large_files; pagination.complete is false when more pages exist"}, listMergeRequestChangedFiles)
+	AddTool(s, d, false, "", &mcp.Tool{Name: "get_merge_request_file_diff", Description: "Get diffs for specific files in one page of an MR diff list; pagination.complete is false when more pages exist"}, getMergeRequestFileDiff)
 	AddTool(s, d, false, "", &mcp.Tool{Name: "list_merge_request_versions", Description: "List MR diff versions"}, listMergeRequestVersions)
 	AddTool(s, d, false, "", &mcp.Tool{Name: "get_merge_request_version", Description: "Get a single MR diff version"}, getMergeRequestVersion)
 	AddTool(s, d, true, "", &mcp.Tool{Name: "update_merge_request", Description: "Update merge request fields"}, updateMergeRequest)
@@ -132,6 +132,7 @@ func getMergeRequest(ctx context.Context, _ *mcp.CallToolRequest, in getMergeReq
 
 type getMergeRequestDiffsIn struct {
 	pidMR
+	Pagination
 	TruncateLines int `json:"truncate_lines,omitempty"`
 }
 
@@ -140,8 +141,9 @@ func getMergeRequestDiffs(ctx context.Context, _ *mcp.CallToolRequest, in getMer
 	if err != nil {
 		return nil, nil, err
 	}
-	diffs, _, err := d.Client.MergeRequests.ListMergeRequestDiffs(pid, in.MergeRequestIID, &gitlab.ListMergeRequestDiffsOptions{
-		ListOptions: gitlab.ListOptions{PerPage: 100},
+	page, perPage := in.listOptsDefault(100)
+	diffs, resp, err := d.Client.MergeRequests.ListMergeRequestDiffs(pid, in.MergeRequestIID, &gitlab.ListMergeRequestDiffsOptions{
+		ListOptions: gitlab.ListOptions{Page: int64(page), PerPage: int64(perPage)},
 	}, gitlab.WithContext(ctx))
 	if err != nil {
 		return nil, nil, err
@@ -153,7 +155,7 @@ func getMergeRequestDiffs(ctx context.Context, _ *mcp.CallToolRequest, in getMer
 			}
 		}
 	}
-	return nil, Out(map[string]any{"diffs": diffs}), nil
+	return nil, Out(map[string]any{"diffs": diffs, "pagination": pageInfo(page, perPage, resp.NextPage)}), nil
 }
 
 type listMergeRequestDiffsIn struct {
@@ -176,7 +178,7 @@ func listMergeRequestDiffs(ctx context.Context, _ *mcp.CallToolRequest, in listM
 	if err != nil {
 		return nil, nil, err
 	}
-	return nil, Out(map[string]any{"diffs": diffs, "pagination": map[string]any{"next_page": resp.NextPage}}), nil
+	return nil, Out(map[string]any{"diffs": diffs, "pagination": pageInfo(page, perPage, resp.NextPage)}), nil
 }
 
 type getMergeRequestConflictsIn struct {
@@ -233,7 +235,7 @@ func listMergeRequestChangedFiles(ctx context.Context, _ *mcp.CallToolRequest, i
 	if err != nil {
 		return nil, nil, err
 	}
-	var paths []string
+	var paths, collapsed, tooLarge []string
 outer:
 	for _, df := range diffs {
 		if df == nil {
@@ -249,8 +251,17 @@ outer:
 			}
 		}
 		paths = append(paths, p)
+		if df.Collapsed {
+			collapsed = append(collapsed, p)
+		}
+		if df.TooLarge {
+			tooLarge = append(tooLarge, p)
+		}
 	}
-	return nil, Out(map[string]any{"files": paths, "pagination": map[string]any{"next_page": resp.NextPage}}), nil
+	return nil, Out(map[string]any{
+		"files": paths, "collapsed_files": collapsed, "too_large_files": tooLarge,
+		"pagination": pageInfo(page, perPage, resp.NextPage),
+	}), nil
 }
 
 // minimal glob: * suffix
@@ -267,8 +278,9 @@ func pathMatch(pattern, path string) (bool, error) {
 
 type getMergeRequestFileDiffIn struct {
 	pidMR
-	Files         []string `json:"files" jsonschema:"Paths relative to repo (new_path)"`
+	Files         []string `json:"files" jsonschema:"Paths relative to repo (new_path); matched within the requested page only, so check pagination.complete"`
 	TruncateLines int      `json:"truncate_lines,omitempty"`
+	Pagination
 }
 
 func getMergeRequestFileDiff(ctx context.Context, _ *mcp.CallToolRequest, in getMergeRequestFileDiffIn, d Deps) (*mcp.CallToolResult, any, error) {
@@ -276,8 +288,9 @@ func getMergeRequestFileDiff(ctx context.Context, _ *mcp.CallToolRequest, in get
 	if err != nil {
 		return nil, nil, err
 	}
-	diffs, _, err := d.Client.MergeRequests.ListMergeRequestDiffs(pid, in.MergeRequestIID, &gitlab.ListMergeRequestDiffsOptions{
-		ListOptions: gitlab.ListOptions{PerPage: 200},
+	page, perPage := in.listOptsDefault(100)
+	diffs, resp, err := d.Client.MergeRequests.ListMergeRequestDiffs(pid, in.MergeRequestIID, &gitlab.ListMergeRequestDiffsOptions{
+		ListOptions: gitlab.ListOptions{Page: int64(page), PerPage: int64(perPage)},
 	}, gitlab.WithContext(ctx))
 	if err != nil {
 		return nil, nil, err
@@ -300,7 +313,7 @@ func getMergeRequestFileDiff(ctx context.Context, _ *mcp.CallToolRequest, in get
 			out = append(out, df)
 		}
 	}
-	return nil, Out(map[string]any{"diffs": out}), nil
+	return nil, Out(map[string]any{"diffs": out, "pagination": pageInfo(page, perPage, resp.NextPage)}), nil
 }
 
 type listMergeRequestVersionsIn struct {
