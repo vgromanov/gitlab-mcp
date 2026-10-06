@@ -127,18 +127,29 @@ func classifyHeader(path string) error {
 		return err
 	}
 	defer f.Close()
-	buf := make([]byte, headerLen)
-	n, err := io.ReadFull(f, buf)
+	want := int(pageSize) + headerMagicOffset + 4
+	buf := make([]byte, want)
+	n, err := io.ReadAtLeast(f, buf, headerLen)
 	if n == 0 && errors.Is(err, io.EOF) {
 		return nil
 	}
-	if err != nil {
+	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) {
 		return ErrCorrupt
 	}
-	if binary.LittleEndian.Uint32(buf[headerMagicOffset:]) != containerMagic {
+	if n < headerLen {
 		return ErrCorrupt
 	}
-	return nil
+	if boltMagicAt(buf, headerMagicOffset) || boltMagicAt(buf, int(pageSize)+headerMagicOffset) {
+		return nil
+	}
+	return ErrCorrupt
+}
+
+func boltMagicAt(buf []byte, off int) bool {
+	if off < 0 || off+4 > len(buf) {
+		return false
+	}
+	return binary.LittleEndian.Uint32(buf[off:]) == containerMagic
 }
 
 func fileSize(path string) (int64, error) {

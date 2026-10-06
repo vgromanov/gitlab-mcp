@@ -1291,6 +1291,84 @@ func TestWritableReservesInsertCapacityAtCap(t *testing.T) {
 	}
 }
 
+func TestWritableProbeIsRolledBack(t *testing.T) {
+	cfg, _ := fixedNow(t)
+	cfg.MaxBytes = 64 << 10
+	cfg.MaxRows = 200000
+	s := openStore(t, cfg)
+	ctx := context.Background()
+	if _, err := s.Begin(ctx, ident("seed"), PayloadHash([]byte("seed")), BeginOptions{ExpectedHead: strings.Repeat("h", 100)}); err != nil {
+		t.Fatal(err)
+	}
+	before := intentRowCount(t, s.path)
+	if err := s.Writable(); err != nil {
+		t.Fatalf("writable: %v", err)
+	}
+	if intentRowCount(t, s.path) != before {
+		t.Fatalf("writable probe changed row count")
+	}
+	probeSeen := false
+	rawView(t, s.path, func(tx *bolt.Tx) error {
+		return tx.Bucket(bucketIdentity).ForEach(func(k, _ []byte) error {
+			if strings.Contains(string(k), writableProbeCaller) {
+				probeSeen = true
+			}
+			return nil
+		})
+	})
+	if probeSeen {
+		t.Fatal("writable probe identity persisted")
+	}
+}
+
+func TestSecondMetaPageHeaderAccepted(t *testing.T) {
+	cfg, _ := fixedNow(t)
+	s := openStore(t, cfg)
+	ctx := context.Background()
+	rec, err := s.Begin(ctx, ident("k"), PayloadHash([]byte("payload")), BeginOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := cfg.Path
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt([]byte{0, 0, 0, 0}, headerMagicOffset); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := classifyHeader(path); err != nil {
+		t.Fatalf("classify: %v", err)
+	}
+	s, err = Open(cfg)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	got, err := s.Get(ctx, rec.OperationID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.OperationID != rec.OperationID {
+		t.Fatalf("receipt lost")
+	}
+}
+
+func intentRowCount(t *testing.T, path string) int {
+	var n int
+	rawView(t, path, func(tx *bolt.Tx) error {
+		n = rowCount(tx)
+		return nil
+	})
+	return n
+}
+
 func TestOverCapStoreRejectsNewRowsOnly(t *testing.T) {
 	cfg, _ := fixedNow(t)
 	s := openStore(t, cfg)

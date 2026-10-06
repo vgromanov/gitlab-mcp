@@ -551,9 +551,12 @@ func (s *Store) Writable() error {
 		}
 		free := tx.DB().Stats().FreePageN
 		if free == 0 && s.maxBytes > 0 && n+int64(allocSize) > s.maxBytes {
-			return stageProbeIntent(tx, s, 0)
+			if err := stageProbeIntent(tx, s, 0); err != nil {
+				return err
+			}
+			return errNoCommit
 		}
-		return nil
+		return errNoCommit
 	})
 }
 
