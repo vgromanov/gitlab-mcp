@@ -38,6 +38,7 @@ make build
 | `make test` | `go test ./...` |
 | `make race` | `go test -race -count=1 ./...` |
 | `make cover` | `go test ./...` with `coverage.out` |
+| `make cover-gate` | `go test -race` with coverage; fails below `COVER_MIN` (default 80%). CI runs this |
 | `make test-integration` | `go test -tags=integration` (needs `.env`) |
 | `make lint` | `go vet ./...` + gofmt check |
 | `make fmt` | `gofmt -w .` |
