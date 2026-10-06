@@ -492,6 +492,97 @@ func TestPipelineGraph_forkHeadUsesSourceProject(t *testing.T) {
 	}
 }
 
+func TestPipelineGraph_manyFailuresPageStillIssuesCursor(t *testing.T) {
+	const n = 48
+	page1 := make([]string, n)
+	for i := 0; i < n; i++ {
+		page1[i] = jobJSON(i+1, fmt.Sprintf("fail-%03d", i), "failed", "false")
+	}
+	jobs := map[string]string{
+		"1": "[" + strings.Join(page1, ",") + "]",
+		"2": "[" + jobJSON(100, "tail", "success", "false") + "]",
+	}
+	h := graphHandler(nil, map[int]string{100: graphPipe("feature", "push")}, jobs, graphMR("feature"), graphPipes("feature"), false)
+	clk := &cursor.FakeClock{T: time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)}
+	d := newCursorDeps(t, h, nil, clk)
+	in := pipelineGraphIn{ProjectID: "42", MergeRequestIID: 7, PerPage: 50, MaxItems: 250}
+	_, out, err := getMergeRequestPipelineGraph(context.Background(), nil, in, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := out.(map[string]any)
+	sec := graphSection(t, page)
+	tok, _ := sec["next_cursor"].(string)
+	if tok == "" {
+		t.Fatalf("expected continuation cursor, limitations %#v", sec["limitations"])
+	}
+	payload, err := cursor.Decode(d.Config.CursorKey, tok, clk.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) > cursor.MaxPayloadBytes {
+		t.Fatalf("payload %d exceeds cap", len(raw))
+	}
+}
+
+func TestPipelineGraph_unknownOutcomeSurvivesOcResume(t *testing.T) {
+	unk := `{"id":1,"name":"pol","stage":"test","status":"failed"}`
+	jobs := map[string]string{
+		"1": "[" + unk + "]",
+		"2": "[" + jobJSON(2, "run", "running", "false") + "]",
+		"3": "[" + jobJSON(3, "run", "success", "false") + "]",
+	}
+	h := graphHandler(nil, map[int]string{100: graphPipe("feature", "push")}, jobs, graphMR("feature"), graphPipes("feature"), false)
+	clk := &cursor.FakeClock{T: time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)}
+	d := newCursorDeps(t, h, nil, clk)
+	in := pipelineGraphIn{ProjectID: "42", MergeRequestIID: 7, PerPage: 1}
+	_, out, err := getMergeRequestPipelineGraph(context.Background(), nil, in, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tok, _ := graphSection(t, out.(map[string]any))["next_cursor"].(string)
+	if tok == "" {
+		t.Fatal("missing page-1 cursor")
+	}
+	payload, err := cursor.Decode(d.Config.CursorKey, tok, clk.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	hasUnknown := false
+	for _, item := range payload.GraphCont.Oc {
+		if strings.Contains(item, policyUnknown) {
+			hasUnknown = true
+			break
+		}
+	}
+	if !hasUnknown {
+		t.Fatalf("page-1 cursor must retain unknown policy in Oc: %#v", payload.GraphCont.Oc)
+	}
+	in.Cursor = tok
+	for i := 0; i < 4; i++ {
+		_, out, err := getMergeRequestPipelineGraph(context.Background(), nil, in, d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		last := out.(map[string]any)
+		sec := graphSection(t, last)
+		next, _ := sec["next_cursor"].(string)
+		if next == "" {
+			requireNotReady(t, last)
+			if last["assessment"] == assessReady {
+				t.Fatal("unknown policy job must not become ready after unrelated job succeeds")
+			}
+			return
+		}
+		in.Cursor = next
+	}
+	t.Fatal("graph did not finish")
+}
+
 func TestPipelineGraph_retryFailThenSuccessAcrossPages(t *testing.T) {
 	jobs := map[string]string{
 		"1": "[" + jobJSON(1, "test", "failed", "false") + "]",

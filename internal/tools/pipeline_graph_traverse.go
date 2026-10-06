@@ -123,8 +123,9 @@ type graphWalk struct {
 	stickyIncomplete bool
 	reachTruncated   bool
 	evidenceTruncated bool
-	lineageLatest    map[string]int64
-	lineagePolicy    map[string][]policyOutcome
+	lineageLatest         map[string]int64
+	lineagePolicy         map[string][]policyOutcome
+	lineageCarryUnknown   map[string]bool
 	jobsEv           string
 	bridgesEv        string
 	evidence         map[string][3]string
@@ -173,8 +174,9 @@ func newGraphWalk(pipe *pipelineView, pid string, depth, nodes int) *graphWalk {
 		authz:         map[string]string{},
 		root:          key,
 		evidenceItems: map[string]int{},
-		lineageLatest: map[string]int64{},
-		lineagePolicy: map[string][]policyOutcome{},
+		lineageLatest:       map[string]int64{},
+		lineagePolicy:       map[string][]policyOutcome{},
+		lineageCarryUnknown: map[string]bool{},
 	}
 }
 
@@ -206,9 +208,10 @@ func restoreGraphWalk(pipe *pipelineView, gc *cursor.GraphCont, depth, nodes int
 		stickyIncomplete: gc.Inc,
 		reachTruncated:   gc.Rgx,
 		evidenceTruncated: gc.Evx,
-		lineageLatest:    map[string]int64{},
-		lineagePolicy:    map[string][]policyOutcome{},
-		jobsEv:           gc.JD,
+		lineageLatest:       map[string]int64{},
+		lineagePolicy:       map[string][]policyOutcome{},
+		lineageCarryUnknown: map[string]bool{},
+		jobsEv:              gc.JD,
 		bridgesEv:        gc.BD,
 		activeNodeItems:  gc.AI,
 		evidence:         map[string][3]string{},
@@ -284,10 +287,27 @@ func restoreGraphReasons(w *graphWalk, reasons []string) {
 		return
 	}
 	for _, r := range reasons {
-		if r == "" || isLineagePolicyReason(r) {
+		if r == "" {
+			continue
+		}
+		if isLineagePolicyReason(r) {
+			restoreOcPathPolicyReason(w, r)
 			continue
 		}
 		w.reasons = append(w.reasons, r)
+	}
+}
+
+// restoreOcPathPolicyReason keeps unknown lineage policy in walk state when Oc
+// omits unknown-only rows but Rsn still carries the reason.
+func restoreOcPathPolicyReason(w *graphWalk, reason string) {
+	switch reason {
+	case "unknown_policy", "unknown_status":
+		w.unknown = true
+		if !hasPolicyOutcome(w.outcomes, policyUnknown) {
+			w.outcomes = append(w.outcomes, policyOutcome{Outcome: policyUnknown, Reason: reason})
+		}
+	default:
 	}
 }
 
@@ -397,7 +417,7 @@ func (w *graphWalk) applyLineageOutcomes(groups []lineageGroup) {
 		w.lineagePolicy = map[string][]policyOutcome{}
 	}
 	for _, g := range groups {
-		key := lineageKeyForGroup(g)
+		key := scopedLineageKey(w.current, g)
 		if key == "" {
 			continue
 		}
@@ -412,6 +432,9 @@ func (w *graphWalk) applyLineageOutcomes(groups []lineageGroup) {
 				}
 			}
 			w.lineagePolicy[key] = append([]policyOutcome(nil), g.Outcomes...)
+			if policyOutcomesAreUnknownOnly(g.Outcomes) {
+				w.lineageCarryUnknown[key] = true
+			}
 			continue
 		}
 		if len(g.LatestIDs) == 0 {
@@ -539,7 +562,7 @@ func (w *graphWalk) snapshotCont() *cursor.GraphCont {
 		Inc:   w.stickyIncomplete || w.hasIncompleteEdges(),
 		Rgx:   w.reachTruncated,
 		Evx:   w.evidenceTruncated,
-		Oc:    encodeLineageOutcomeState(w.lineageLatest, w.lineagePolicy),
+		Oc: encodeLineageOutcomeState(w.lineageLatest, w.lineagePolicy, w.lineageCarryUnknown),
 		Rsn:   rsn,
 		RP:    root.Project,
 		RI:    root.Pipeline,

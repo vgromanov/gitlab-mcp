@@ -253,6 +253,30 @@ func TestParseGraphJobPresence(t *testing.T) {
 	}
 }
 
+func TestScopedLineagePolicyDoesNotCrossPipelines(t *testing.T) {
+	sha, ref, status, source := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "feature", "success", "push"
+	pipe := &pipelineView{ID: 100, SHA: &sha, Ref: &ref, Status: &status, StatusKnown: true, Source: &source}
+	w := newGraphWalk(pipe, "42", graphDefaultMaxDepth, graphDefaultMaxNodes)
+	rootFail := []graphJob{{
+		ID: 1, Name: "test", NameKnown: true,
+		Status: "failed", StatusKnown: true,
+		Allow: readmeta.PresenceFalse, AllowValid: true,
+	}}
+	w.current = graphNodeKey{Project: "42", Pipeline: 100}
+	w.applyLineageOutcomes(buildLineage(rootFail, lineageCarry{}))
+	childOK := []graphJob{{
+		ID: 9, Name: "test", NameKnown: true,
+		Status: "success", StatusKnown: true,
+		Allow: readmeta.PresenceFalse, AllowValid: true,
+	}}
+	w.current = graphNodeKey{Project: "99", Pipeline: 200}
+	w.applyLineageOutcomes(buildLineage(childOK, lineageCarry{}))
+	w.syncPolicyFlagsFromLineage()
+	if !w.block {
+		t.Fatal("root required failure must stay blocked after child success with same job name")
+	}
+}
+
 func TestBridgeLineageDistinctNamesAcrossCarry(t *testing.T) {
 	carry := lineageCarry{max: map[string]int64{jobNameKey("deploy-success"): 10}}
 	failed := []graphJob{{

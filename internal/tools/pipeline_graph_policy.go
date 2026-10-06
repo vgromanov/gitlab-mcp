@@ -364,6 +364,13 @@ func encodeLineageCarry(in lineageCarry) []string {
 	return out
 }
 
+func applyLineageMaxTruncFlag(carry lineageCarry, truncated bool) lineageCarry {
+	if truncated {
+		carry.saturated = true
+	}
+	return carry
+}
+
 func decodeLineageCarry(items []string) (lineageCarry, error) {
 	if len(items) == 0 {
 		return lineageCarry{}, nil
@@ -404,7 +411,11 @@ func lineageGroupMaxID(g lineageGroup) int64 {
 	return max
 }
 
-func lineageKeyForGroup(g lineageGroup) string {
+func lineageScopePrefix(k graphNodeKey) string {
+	return k.Project + ":" + strconv.FormatInt(k.Pipeline, 10)
+}
+
+func lineageInnerKey(g lineageGroup) string {
 	if g.Name != nil {
 		return jobNameKey(*g.Name)
 	}
@@ -417,6 +428,26 @@ func lineageKeyForGroup(g lineageGroup) string {
 	return ""
 }
 
+func scopedLineageKey(scope graphNodeKey, g lineageGroup) string {
+	inner := lineageInnerKey(g)
+	if inner == "" {
+		return ""
+	}
+	return lineageScopePrefix(scope) + "#" + inner
+}
+
+func splitScopedLineageKey(key string) (graphNodeKey, string, bool) {
+	i := strings.IndexByte(key, '#')
+	if i <= 0 || i == len(key)-1 {
+		return graphNodeKey{}, "", false
+	}
+	proj, pipe, ok := splitVisitKey(key[:i])
+	if !ok {
+		return graphNodeKey{}, "", false
+	}
+	return graphNodeKey{Project: proj, Pipeline: pipe}, key[i+1:], true
+}
+
 func isLineagePolicyReason(reason string) bool {
 	switch reason {
 	case "failed_required", "required_manual", "canceled_required", "in_progress", "unknown_policy", "unknown_status":
@@ -426,7 +457,7 @@ func isLineagePolicyReason(reason string) bool {
 	}
 }
 
-func encodeLineageOutcomeState(latest map[string]int64, policy map[string][]policyOutcome) []string {
+func encodeLineageOutcomeState(latest map[string]int64, policy map[string][]policyOutcome, omitCarryUnknown map[string]bool) []string {
 	if len(latest) == 0 {
 		return nil
 	}
@@ -439,7 +470,10 @@ func encodeLineageOutcomeState(latest map[string]int64, policy map[string][]poli
 	for _, k := range keys {
 		id := latest[k]
 		os := policy[k]
-		if len(os) == 0 || policyOutcomesArePassOnly(os) || policyOutcomesAreUnknownOnly(os) {
+		if len(os) == 0 || policyOutcomesArePassOnly(os) {
+			continue
+		}
+		if policyOutcomesAreUnknownOnly(os) && omitCarryUnknown != nil && omitCarryUnknown[k] {
 			continue
 		}
 		for _, o := range os {

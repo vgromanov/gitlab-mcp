@@ -352,9 +352,11 @@ func resumePipelineGraph(ctx context.Context, in pipelineGraphIn, sel graphSelec
 		return nil, nil, werr
 	}
 	walk.bindRelation(rel)
-	certCtx := igl.WithReplayBudget(ctx, graphEvidenceReplayCap(budget, sel.PerPage, walk))
-	if err := walk.revalidateCompleted(certCtx, d, sel.PerPage); err != nil {
-		return nil, nil, err
+	if !walk.evidenceTruncated {
+		certCtx := igl.WithReplayBudget(ctx, graphEvidenceReplayCap(budget, sel.PerPage, walk))
+		if err := walk.revalidateCompleted(certCtx, d, sel.PerPage); err != nil {
+			return nil, nil, err
+		}
 	}
 	if payload.GraphCont != nil && payload.GraphCont.Phase == cursor.GraphPhaseBridges {
 		return resumeGraphBridges(ctx, &section, pid, pipePID, mrIID, pipe, rel, sel, d, actorID, &payload, walk, budget)
@@ -387,6 +389,7 @@ func resumePipelineGraph(ctx context.Context, in pipelineGraphIn, sel graphSelec
 	if err != nil {
 		return nil, nil, fmt.Errorf("%s: previous-page boundary drift", cursor.ResyncRequired)
 	}
+	prior = applyLineageMaxTruncFlag(prior, payload.GraphCont != nil && payload.GraphCont.Lmx)
 	if !lineageCarryCovers(prior, guard.Jobs) {
 		return nil, nil, fmt.Errorf("%s: previous-page boundary drift", cursor.ResyncRequired)
 	}
@@ -445,7 +448,11 @@ func resumeGraphBridges(ctx context.Context, section *readmeta.Section, pid, pip
 		return nil, nil, fmt.Errorf("%s: previous-page boundary drift", cursor.ResyncRequired)
 	}
 	prior, err := decodeLineageCarry(payload.PageState.LineageMax)
-	if err != nil || !lineageCarryCovers(prior, bridgeJobs(guard.Bridges)) {
+	if err != nil {
+		return nil, nil, fmt.Errorf("%s: previous-page boundary drift", cursor.ResyncRequired)
+	}
+	prior = applyLineageMaxTruncFlag(prior, payload.GraphCont != nil && payload.GraphCont.Lmx)
+	if !lineageCarryCovers(prior, bridgeJobs(guard.Bridges)) {
 		return nil, nil, fmt.Errorf("%s: previous-page boundary drift", cursor.ResyncRequired)
 	}
 	if err := walk.revalidateActiveBridges(rctx, d, pipePID, pipe.ID, sel.PerPage, payload.PageState.Page, guard); err != nil {
@@ -1371,6 +1378,9 @@ func trimGraphContToPayload(key []byte, p *cursor.Payload) error {
 	gc := p.GraphCont
 	if gc == nil {
 		return nil
+	}
+	if err := trimGraphPolicyState(key, p); err != nil {
+		return err
 	}
 	origRg := append([]string(nil), gc.Rg...)
 	origEv := append([]string(nil), gc.Ev...)

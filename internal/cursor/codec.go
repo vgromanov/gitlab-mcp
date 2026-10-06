@@ -231,6 +231,10 @@ type GraphCont struct {
 	Evx bool `json:"evx,omitempty"`
 	// Oc persists latest lineage policy outcomes across pages.
 	Oc []string `json:"oc,omitempty"`
+	// Ocx marks lineage policy outcomes shortened to fit the payload cap.
+	Ocx bool `json:"ocx,omitempty"`
+	// Lmx marks lineage_max shortened to fit the payload cap.
+	Lmx bool `json:"lmx,omitempty"`
 }
 
 // DiffWindowCont binds one diff-manifest window. It stores no patch text.

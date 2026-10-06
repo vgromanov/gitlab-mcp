@@ -1401,3 +1401,43 @@ func TestRestoreGraphReachabilityNotInEmittedEdges(t *testing.T) {
 	}
 }
 
+func TestPipelineGraph_childSuccessDoesNotClearRootBlock(t *testing.T) {
+	h := &walkServer{
+		pipes: map[string]string{
+			"42/100": walkPipe(100, 42, graphPipeSHA, "feature"),
+			"99/200": walkPipe(200, 99, graphChildSHA, "child"),
+		},
+		jobs: map[string]string{
+			"42/100/1": "[" + jobJSON(1, "test", "failed", "false") + "]",
+			"99/200/1": "[" + jobJSON(2, "test", "success", "false") + "]",
+		},
+		bridges: map[string]string{
+			"42/100/1": "[" + bridgeJSON(50, "dep", 99, 200, graphChildSHA) + "]",
+		},
+		mr:      graphMR("feature"),
+		mrPipes: graphPipes("feature"),
+	}
+	clk := &cursor.FakeClock{T: time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)}
+	d := newCursorDeps(t, h, nil, clk)
+	in := pipelineGraphIn{ProjectID: "42", MergeRequestIID: 7, PerPage: 20}
+	tok := ""
+	var last map[string]any
+	for i := 0; i < 8; i++ {
+		in.Cursor = tok
+		_, out, err := getMergeRequestPipelineGraph(context.Background(), nil, in, d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		last = out.(map[string]any)
+		sec := graphSection(t, last)
+		next, _ := sec["next_cursor"].(string)
+		if next == "" {
+			break
+		}
+		tok = next
+	}
+	if last["assessment"] != assessBlocked {
+		t.Fatalf("expected blocked graph, got %#v", last)
+	}
+}
+
