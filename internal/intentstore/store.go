@@ -156,6 +156,22 @@ func prepare(cfg Config) (*Store, error) {
 	if err := checkDir(parent, info); err != nil {
 		return nil, err
 	}
+	maxRows := cfg.MaxRows
+	if maxRows <= 0 {
+		maxRows = DefaultMaxRows
+	}
+	maxBytes := cfg.MaxBytes
+	if maxBytes <= 0 {
+		maxBytes = DefaultMaxBytes
+	}
+	retention := cfg.Retention
+	if retention <= 0 {
+		retention = DefaultRetention
+	}
+	clock := cfg.Now
+	if clock == nil {
+		clock = time.Now
+	}
 	info, err = os.Lstat(path)
 	switch {
 	case err == nil:
@@ -163,6 +179,9 @@ func prepare(cfg Config) (*Store, error) {
 			return nil, err
 		}
 	case os.IsNotExist(err):
+		if maxBytes < minContainerBytes {
+			return nil, ErrFull
+		}
 		if beforeCreate != nil {
 			beforeCreate(path)
 		}
@@ -182,22 +201,6 @@ func prepare(cfg Config) (*Store, error) {
 		}
 	default:
 		return nil, err
-	}
-	maxRows := cfg.MaxRows
-	if maxRows <= 0 {
-		maxRows = DefaultMaxRows
-	}
-	maxBytes := cfg.MaxBytes
-	if maxBytes <= 0 {
-		maxBytes = DefaultMaxBytes
-	}
-	retention := cfg.Retention
-	if retention <= 0 {
-		retention = DefaultRetention
-	}
-	clock := cfg.Now
-	if clock == nil {
-		clock = time.Now
 	}
 	return &Store{
 		path:      path,
@@ -401,6 +404,14 @@ func probeWritable(path string) error {
 }
 
 func (s *Store) initializeWrite(ctx context.Context, targetVersion int, migrate migrateFunc) error {
+	size, err := fileSize(s.path)
+	if err != nil {
+		return err
+	}
+	if size == 0 && s.maxBytes < minContainerBytes {
+		_ = os.Remove(s.path)
+		return ErrFull
+	}
 	db, err := openChecked(ctx, s.path, true, s.maxBytes)
 	if err != nil {
 		return err
@@ -487,6 +498,29 @@ func builtinMigrate(_ *bolt.Tx, from, to int) error {
 	return ErrMigration
 }
 
+// muLock serializes operations on one handle. Waiting respects the caller's
+// context so a short deadline is not blocked behind another call on the same
+// store that is waiting for the file lock.
+func (s *Store) muLock(ctx context.Context) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if s.mu.TryLock() {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(lockSlice):
+		}
+	}
+}
+
+func (s *Store) muUnlock() {
+	s.mu.Unlock()
+}
+
 // Close marks the handle unusable. No file stays open between operations.
 func (s *Store) Close() error {
 	if s == nil {
@@ -534,11 +568,10 @@ func (s *Store) writeTx(ctx context.Context, requireDispatch bool, fn func(*bolt
 // itself: a write that needs the file to grow past MaxBytes fails before
 // anything is committed, so a rejected write is never durable.
 func (s *Store) commitWrite(ctx context.Context, requireDispatch bool, fn func(*bolt.Tx) error, afterCommit func()) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if err := ctx.Err(); err != nil {
+	if err := s.muLock(ctx); err != nil {
 		return err
 	}
+	defer s.muUnlock()
 	if err := s.writableLocked(requireDispatch); err != nil {
 		return err
 	}

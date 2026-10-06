@@ -236,6 +236,9 @@ const (
 
 	// pageSize is fixed so the file format does not depend on the host page size.
 	pageSize = 4096
+	// minContainerBytes is the smallest on-disk size bbolt needs to initialize
+	// an empty database. Limits below this are rejected before opening.
+	minContainerBytes int64 = 4 * pageSize
 	// allocSize bounds how far the data file grows past the pages in use.
 	allocSize = 256 << 10
 )

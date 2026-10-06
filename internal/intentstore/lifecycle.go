@@ -159,8 +159,10 @@ func (s *Store) RecordOutcome(ctx context.Context, operationID string, outcome O
 
 // Get loads one receipt by operation id.
 func (s *Store) Get(ctx context.Context, operationID string) (Receipt, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	if err := s.muLock(ctx); err != nil {
+		return Receipt{}, err
+	}
+	defer s.muUnlock()
 	return s.receiptSnapshot(ctx, func(tx *bolt.Tx) (row, error) {
 		return rowByID(tx, operationID)
 	})
@@ -171,8 +173,10 @@ func (s *Store) GetByIdentity(ctx context.Context, id Identity) (Receipt, error)
 	if err := id.validate(); err != nil {
 		return Receipt{}, err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	if err := s.muLock(ctx); err != nil {
+		return Receipt{}, err
+	}
+	defer s.muUnlock()
 	return s.receiptSnapshot(ctx, func(tx *bolt.Tx) (row, error) {
 		return rowByIdentity(tx, id)
 	})

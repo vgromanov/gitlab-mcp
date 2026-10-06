@@ -652,6 +652,9 @@ func TestNewStoreHonorsByteCap(t *testing.T) {
 	if !errors.Is(err, ErrFull) {
 		t.Fatalf("open: %v", err)
 	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("over-cap container left on disk: %v", err)
+	}
 	s, err := Open(Config{Path: path})
 	if err != nil {
 		t.Fatalf("reopen after failed init: %v", err)
@@ -1285,6 +1288,40 @@ func TestPeerWithHigherCapGrowthIsHonored(t *testing.T) {
 	}
 	if _, err := low.Begin(ctx, ident("next"), PayloadHash([]byte("n")), BeginOptions{}); !errors.Is(err, ErrFull) {
 		t.Fatalf("begin after peer growth: %v", err)
+	}
+}
+
+func TestSameHandleLockWaitHonorsContext(t *testing.T) {
+	cfg, _ := fixedNow(t)
+	s := openStore(t, cfg)
+	bg := context.Background()
+	rec, err := s.Begin(bg, ident("held"), PayloadHash([]byte("h")), BeginOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	holder, err := bolt.Open(s.path, 0o600, &bolt.Options{Timeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = holder.Close() })
+
+	blocking := make(chan struct{})
+	go func() {
+		close(blocking)
+		_, _ = s.Get(bg, rec.OperationID)
+	}()
+	<-blocking
+	time.Sleep(10 * time.Millisecond)
+
+	ctx, cancel := context.WithTimeout(bg, 20*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err = s.Get(ctx, rec.OperationID)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("second get: %v", err)
+	}
+	if d := time.Since(start); d > time.Second {
+		t.Fatalf("returned after %v, want well under the lock timeout", d)
 	}
 }
 
