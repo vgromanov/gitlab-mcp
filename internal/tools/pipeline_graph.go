@@ -1273,7 +1273,7 @@ func lineageCarryCovers(prior lineageCarry, jobs []graphJob) bool {
 		if !job.NameKnown {
 			continue
 		}
-		maxID, ok := prior.max[jobNameFP(job.Name)]
+		maxID, ok := prior.max[jobNameKey(job.Name)]
 		if ok {
 			if job.ID > maxID {
 				return false

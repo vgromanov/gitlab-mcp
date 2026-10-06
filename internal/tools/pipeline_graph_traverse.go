@@ -124,6 +124,7 @@ type graphWalk struct {
 	jobsEv           string
 	bridgesEv        string
 	evidence         map[string][3]string
+	reach            []graphEdgeView
 }
 
 var errPipelineForbidden = errors.New("pipeline forbidden")
@@ -231,13 +232,12 @@ func restoreGraphWalk(pipe *pipelineView, gc *cursor.GraphCont, depth, nodes int
 		if !fok || !tok {
 			return nil, fmt.Errorf("%s: graph continuation missing", cursor.ResyncRequired)
 		}
-		w.edges = append(w.edges, graphEdgeView{
+		w.recordReachEdge(graphEdgeView{
 			FromProject:  fp,
 			FromPipeline: fpi,
 			ToProject:    tp,
 			ToPipeline:   tpi,
 			Kind:         kind,
-			Provenance:   []string{"graph_resume"},
 		})
 	}
 	restoreGraphReasons(w, gc.Rsn)
@@ -380,7 +380,7 @@ func (w *graphWalk) snapshotCont() *cursor.GraphCont {
 		}
 	}
 	sort.Strings(ev)
-	rg := graphReachSnapshot(w.edges)
+	rg := graphReachSnapshot(w.reach)
 	var anc []string
 	for _, a := range w.ancestors {
 		anc = append(anc, a.String())
@@ -412,6 +412,25 @@ func (w *graphWalk) snapshotCont() *cursor.GraphCont {
 		RS:    w.relSHA,
 		Rg:    rg,
 	}
+}
+
+func (w *graphWalk) recordReachEdge(e graphEdgeView) {
+	if w == nil {
+		return
+	}
+	if e.Kind != edgeKindBridge && e.Kind != edgeKindShared {
+		return
+	}
+	if e.ToPipeline < 1 {
+		return
+	}
+	for _, got := range w.reach {
+		if got.FromProject == e.FromProject && got.FromPipeline == e.FromPipeline &&
+			got.ToProject == e.ToProject && got.ToPipeline == e.ToPipeline && got.Kind == e.Kind {
+			return
+		}
+	}
+	w.reach = append(w.reach, e)
 }
 
 func graphReachSnapshot(edges []graphEdgeView) []string {
@@ -711,6 +730,7 @@ func (w *graphWalk) addBridgeEdge(ctx context.Context, d Deps, parent graphNodeK
 		}
 		base.Provenance = append(base.Provenance, base.Kind)
 		w.edges = append(w.edges, base)
+		w.recordReachEdge(base)
 		return nil
 	}
 	if w.nodeCount >= w.maxNodes {
@@ -723,6 +743,7 @@ func (w *graphWalk) addBridgeEdge(ctx context.Context, d Deps, parent graphNodeK
 	}
 	base.Kind = edgeKindBridge
 	w.edges = append(w.edges, base)
+	w.recordReachEdge(base)
 	w.nodeCount++
 	w.queue = append(w.queue, queuedGraphNode{
 		Key:       child,
@@ -743,10 +764,7 @@ func (w *graphWalk) reachableViaBridges(from, to graphNodeKey) bool {
 	for len(queue) > 0 {
 		n := queue[0]
 		queue = queue[1:]
-		for _, e := range w.edges {
-			if e.Kind != edgeKindBridge && e.Kind != edgeKindShared {
-				continue
-			}
+		for _, e := range w.reach {
 			if e.FromProject != n.Project || e.FromPipeline != n.Pipeline {
 				continue
 			}

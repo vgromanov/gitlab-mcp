@@ -229,7 +229,7 @@ func TestLineageKeepsHistory(t *testing.T) {
 	olderPage := []graphJob{
 		{ID: 1, Name: "test", NameKnown: true, Status: "failed", StatusKnown: true, Allow: readmeta.PresenceFalse, AllowValid: true},
 	}
-	groups = buildLineage(olderPage, lineageCarry{max: map[uint64]int64{jobNameFP("test"): 2}})
+	groups = buildLineage(olderPage, lineageCarry{max: map[string]int64{jobNameKey("test"): 2}})
 	if groups[0].LatestKnown || groups[0].Attempts[1] != attemptHistory {
 		t.Fatalf("older page treated as latest: %+v", groups[0])
 	}
@@ -250,6 +250,23 @@ func TestParseGraphJobPresence(t *testing.T) {
 	}
 	if _, err := parseGraphJob([]byte(`{"name":"x"}`)); err == nil {
 		t.Fatal("missing id")
+	}
+}
+
+func TestBridgeLineageDistinctNamesAcrossCarry(t *testing.T) {
+	carry := lineageCarry{max: map[string]int64{jobNameKey("deploy-success"): 10}}
+	failed := []graphJob{{
+		ID: 5, Name: "deploy-fail", NameKnown: true,
+		Status: "failed", StatusKnown: true,
+		Allow: readmeta.PresenceFalse, AllowValid: true,
+	}}
+	groups := buildLineage(failed, carry)
+	if len(groups) != 1 || !groups[0].LatestKnown {
+		t.Fatalf("distinct name treated as history: %+v", groups[0])
+	}
+	assessment, _ := assessParent(assessInput{RelationProven: true, Outcomes: groups[0].Outcomes})
+	if assessment != assessBlocked {
+		t.Fatalf("required failed bridge must block: %s", assessment)
 	}
 }
 

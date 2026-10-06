@@ -1195,3 +1195,29 @@ func TestPipelineGraph_childCursorDetectsSiblingStatusOnlyDrift(t *testing.T) {
 		t.Fatalf("sibling status-only drift not detected: %v", err)
 	}
 }
+
+func TestRestoreGraphReachabilityNotInEmittedEdges(t *testing.T) {
+	item, err := cursor.FormatGraphReachEdge("42:100", "42:200", edgeKindBridge)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gc := &cursor.GraphCont{
+		V:     cursor.GraphContSchemaG1,
+		Phase: cursor.GraphPhaseBridges,
+		NP:    "42",
+		NI:    100,
+		Rg:    []string{item},
+	}
+	pipe := &pipelineView{ID: 100}
+	w, err := restoreGraphWalk(pipe, gc, graphDefaultMaxDepth, graphDefaultMaxNodes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(w.edges) != 0 {
+		t.Fatalf("restored reachability leaked into emitted edges: %#v", w.edges)
+	}
+	if len(w.reach) != 1 || w.reach[0].ToPipeline != 200 {
+		t.Fatalf("reach %#v", w.reach)
+	}
+}
+
