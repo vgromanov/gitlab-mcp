@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -882,5 +883,42 @@ func TestDiffWindow_cacheRecoveryPropagatesDeadline(t *testing.T) {
 				t.Fatalf("expired invocation looked like a successful response: %v", out["section"])
 			}
 		})
+	}
+}
+
+func TestCacheHoldAffordableDeclinesWhenRequestsExhausted(t *testing.T) {
+	b := igl.DefaultBudget()
+	b.MaxRequests = 1
+	ctx := igl.WithBudget(context.Background(), b)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{}`)
+	}))
+	defer ts.Close()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &http.Client{Transport: igl.BudgetInterceptor()(http.DefaultTransport)}
+	if _, err := client.Do(req); err != nil {
+		t.Fatal(err)
+	}
+	if cacheHoldAffordable(ctx) {
+		t.Fatal("expected decline when request budget is exhausted")
+	}
+}
+
+func TestResolveGrantChargesInvocationBudget(t *testing.T) {
+	ts, hits := gitcacheAuthzServer(t, nil)
+	d := gitcacheAuthzDeps(t, ts)
+	b := igl.DefaultBudget()
+	b.MaxRequests = 1
+	ctx := igl.WithBudget(context.Background(), b)
+	intent := gitcache.AcquireIntent{AllowLoopback: true, ProjectID: "1", MRIID: 7, Depth: 1, Token: "tok"}
+	if _, err := NewGitCacheAuthorizer(d).ResolveGrant(ctx, intent); err != nil && hits.Load() == 0 {
+		t.Fatalf("ResolveGrant: %v", err)
+	}
+	reqs, _, _ := b.Stats()
+	if reqs == 0 {
+		t.Fatalf("reauthorization HTTP must charge the caller budget, not a child")
 	}
 }

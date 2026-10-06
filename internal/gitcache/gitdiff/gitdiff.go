@@ -164,14 +164,13 @@ func Compare(ctx context.Context, from, to, semantics string, objs map[plumbing.
 		}
 		return c, err
 	}
-	changes, err := object.DiffTreeWithOptions(ctx, fromTree, toTree, &object.DiffTreeOptions{
-		DetectRenames: true,
-		RenameScore:   renameScore,
-		RenameLimit:   renameLimit,
-	})
+	changes, renamePartial, err := diffWithRenames(ctx, fromTree, toTree, renameScore, renameLimit, objs)
 	store.live = nil
 	if err != nil {
 		return c, c.boundOrObject(ctx, err)
+	}
+	if renamePartial {
+		c.Partial, c.Reason = true, "rename limit"
 	}
 	c.Files = []File{}
 	for _, ch := range changes {
@@ -190,6 +189,9 @@ func Compare(ctx context.Context, from, to, semantics string, objs map[plumbing.
 		c.RawBytes += size
 		c.Files = append(c.Files, f)
 		c.changes = append(c.changes, ch)
+	}
+	if renamePartial {
+		return c, ErrPartial
 	}
 	return c, nil
 }

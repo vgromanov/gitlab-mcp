@@ -766,3 +766,33 @@ func TestInvalidUTF8BlobMarkedBinaryWithoutMangling(t *testing.T) {
 		t.Fatalf("want binary framing: %q", res.Patches[0].Text)
 	}
 }
+
+func TestCompareDetectsExecutableRename(t *testing.T) {
+	body := strings.Repeat("shared shell line\n", 20)
+	s := store{}
+	base := s.snapshot(t, "", map[string]fileSpec{"old.sh": exec(body)})
+	head := s.snapshot(t, base, map[string]fileSpec{"new.sh": exec(body + "extra\n")})
+	cmp, err := Compare(bg(), base, head, SemanticsStraight, s, Limits{})
+	if err != nil || cmp.Partial {
+		t.Fatalf("compare %#v %v", cmp.Result, err)
+	}
+	if len(cmp.Files) != 1 || !cmp.Files[0].RenamedFile {
+		t.Fatalf("want one rename, got %#v", cmp.Files)
+	}
+}
+
+func TestCompareRenameLimitIsPartial(t *testing.T) {
+	s := store{}
+	oldFiles, newFiles := map[string]fileSpec{}, map[string]fileSpec{}
+	body := strings.Repeat("rename body line\n", 20)
+	for i := 0; i < 201; i++ {
+		oldFiles[fmt.Sprintf("old-%03d.txt", i)] = reg(body + fmt.Sprintf("o%d\n", i))
+		newFiles[fmt.Sprintf("new-%03d.txt", i)] = reg(body + fmt.Sprintf("o%d\n", i) + "x\n")
+	}
+	base := s.snapshot(t, "", oldFiles)
+	head := s.snapshot(t, base, newFiles)
+	cmp, err := Compare(bg(), base, head, SemanticsStraight, s, Limits{})
+	if !errors.Is(err, ErrPartial) || !cmp.Partial {
+		t.Fatalf("want partial rename limit, got %#v %v", cmp.Result, err)
+	}
+}

@@ -37,7 +37,6 @@ func (d Deps) cacheAvailable() bool {
 
 func (d Deps) holdCache(ctx context.Context, intent gitcache.AcquireIntent) (*gitcache.ObjectHold, error) {
 	auth := NewGitCacheAuthorizer(d)
-	ctx = cacheHoldCtx(ctx)
 	if d.cacheHold != nil {
 		return d.cacheHold.Hold(ctx, intent, auth)
 	}
@@ -47,21 +46,25 @@ func (d Deps) holdCache(ctx context.Context, intent gitcache.AcquireIntent) (*gi
 	return d.GitCache.Hold(ctx, intent, auth)
 }
 
-func cacheHoldCtx(ctx context.Context) context.Context {
-	b := igl.DefaultBudget()
-	b.MaxRequests = 64
-	if parent := igl.BudgetFromContext(ctx); parent != nil && parent.MaxElapsed > 0 {
-		left := parent.MaxElapsed
-		if !parent.ElapsedExceeded() {
-			if dl, ok := parent.OriginalDeadline(); ok {
-				if rem := time.Until(dl); rem > 0 && rem < left {
-					left = rem
-				}
-			}
-		}
-		b.MaxElapsed = left
+// cacheHoldAffordable reports whether the invocation budget can still fund a
+// fresh ResolveGrant before cache recovery starts.
+func cacheHoldAffordable(ctx context.Context) bool {
+	b := igl.BudgetFromContext(ctx)
+	if b == nil {
+		return true
 	}
-	return igl.WithBudget(ctx, b)
+	if b.ElapsedExceeded() || ctx.Err() != nil {
+		return false
+	}
+	reqs, _, _ := b.Stats()
+	_, maxBytes, maxReqs, _ := b.LimitsSnapshot()
+	if maxReqs > 0 && maxReqs-reqs < 1 {
+		return false
+	}
+	if maxBytes > 0 && b.RemainingBytes() == 0 {
+		return false
+	}
+	return true
 }
 
 func recoverCacheManifest(ctx context.Context, d Deps, q diffQuery, sec readmeta.Section, proved provedManifest) (diffWindowOut, bool) {
@@ -274,6 +277,9 @@ func prepareCacheCompare(ctx context.Context, d Deps, q diffQuery, proved proved
 				intent.ExpectedStart = plumbing.NewHash(s)
 			}
 		}
+	}
+	if !cacheHoldAffordable(ctx) {
+		return nil, "", "", "", diffCacheProvenance{}, false
 	}
 	hold, err := d.holdCache(ctx, intent)
 	if err != nil || hold == nil || hold.Objects == nil {
