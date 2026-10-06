@@ -22,6 +22,7 @@ Catalog membership is decided in `internal/tools/selection.go` after the
 read-only filter. **Restricted mode** turns on when any of these is set:
 
 - `USE_DAILY_TOOLS=true`
+- `GITLAB_TOOL_PROFILE=review`
 - any **new** family flag (`USE_ISSUES`, `USE_WORK_ITEMS`, `USE_LABELS`,
   `USE_DRAFTS`, `USE_WEBHOOKS`, `USE_TIMELINE`)
 - non-empty `GITLAB_ENABLED_TOOLS`
@@ -52,11 +53,46 @@ enable/disable lists log a startup warning and are ignored.
 Recommended Cursor profile for ship/MR work: `USE_DAILY_TOOLS=true` alone
 (MR tools + the four search tools).
 
+### Review profile (`GITLAB_TOOL_PROFILE=review`)
+
+A named, **closed** tool set for MR review automation. It enters restricted
+mode and registers exactly the 41 daily tools plus these 9 existing tools
+(50 total):
+
+- `get_merge_request_discussion`, `create_merge_request_discussion_note`
+  (reply), `resolve_merge_request_thread`
+- `list_pipelines`, `get_pipeline`, `list_pipeline_jobs`,
+  `list_pipeline_trigger_jobs`, `get_pipeline_job`, `get_pipeline_job_output`
+
+Pipeline writes (`create_pipeline`, `retry_pipeline`, `cancel_pipeline`,
+`play_pipeline_job`, `retry_pipeline_job`, `cancel_pipeline_job`) are never
+exposed. Other enable sources (`USE_PIPELINE`, family flags,
+`GITLAB_ENABLED_TOOLS`) do **not** widen the profile; `GITLAB_DISABLED_TOOLS`
+and `GITLAB_READ_ONLY_MODE` still subtract (read-only also hides the reply and
+resolve tools). An unknown profile value stops the server at startup. Unset
+means today's behavior; `USE_DAILY_TOOLS` is unchanged.
+
+```json
+{
+  "mcpServers": {
+    "go-gitlab-review": {
+      "command": "gitlab-mcp",
+      "env": {
+        "GITLAB_PERSONAL_ACCESS_TOKEN": "${env:GITLAB_PERSONAL_ACCESS_TOKEN}",
+        "GITLAB_API_URL": "https://gitlab.example.com/api/v4",
+        "GITLAB_TOOL_PROFILE": "review"
+      }
+    }
+  }
+}
+```
+
 ### Env / flag matrix
 
 | Variable | Flag | Default | Restricted? | Notes |
 |---|---|---|---|---|
 | `USE_DAILY_TOOLS` | `--use-daily-tools` | `false` | Yes | 41-tool daily set. |
+| `GITLAB_TOOL_PROFILE` | `--tool-profile` | empty | Yes | `review`: closed 50-tool review set (see above). |
 | `USE_ISSUES` | `--use-issues` | `false` | Yes | Issues + issue notes/links. |
 | `USE_WORK_ITEMS` | `--use-work-items` | `false` | Yes | Work-item GraphQL tools (not `execute_graphql`). |
 | `USE_LABELS` | `--use-labels` | `false` | Yes | Label CRUD. |

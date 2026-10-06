@@ -62,6 +62,20 @@ var dailyTools = []string{
 	"push_files",
 }
 
+// reviewExtraTools are added to dailyTools by GITLAB_TOOL_PROFILE=review.
+// Pipeline reads only: create/retry/cancel/play stay out of the profile.
+var reviewExtraTools = []string{
+	"get_merge_request_discussion",
+	"create_merge_request_discussion_note",
+	"resolve_merge_request_thread",
+	"list_pipelines",
+	"get_pipeline",
+	"list_pipeline_jobs",
+	"list_pipeline_trigger_jobs",
+	"get_pipeline_job",
+	"get_pipeline_job_output",
+}
+
 // familyTools maps gated family ids to their tool names (mirrors AddTool tags).
 var familyTools = map[string][]string{
 	"issues": {
@@ -133,6 +147,11 @@ func DailyTools() []string {
 	return slices.Clone(dailyTools)
 }
 
+// ReviewTools returns the full GITLAB_TOOL_PROFILE=review catalog (daily + review extras).
+func ReviewTools() []string {
+	return append(slices.Clone(dailyTools), reviewExtraTools...)
+}
+
 // FamilyTools returns tool names tagged with the given family id.
 func FamilyTools(name string) []string {
 	if tools, ok := familyTools[name]; ok {
@@ -167,6 +186,11 @@ func ShouldRegister(cfg *config.Config, toolName, family string) bool {
 			return cfg.FeatureEnabled(family)
 		}
 		return true
+	}
+
+	// The review profile is a closed, pinned set: other enable sources never widen it.
+	if cfg.ToolProfile == config.ProfileReview {
+		return toolNameInList(dailyTools, toolName) || toolNameInList(reviewExtraTools, toolName)
 	}
 
 	// Restricted: empty base, then union of enable sources.

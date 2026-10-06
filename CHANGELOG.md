@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `GITLAB_TOOL_PROFILE=review` (`--tool-profile`): closed 50-tool MR review
+  profile (daily set + discussion get/reply/resolve + six pipeline reads, no
+  pipeline writes). Daily and default catalogs are unchanged (RVG-155).
 - Corp GitLab home `skunk-works/tools/gitlab-mcp` with shared
   `ci-pipelines` `/pipelines/golang.yml`, committed `vendor/`, and
   `.golangci.yml` vendor mode (SW-148).

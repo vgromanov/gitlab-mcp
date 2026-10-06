@@ -3,6 +3,8 @@ package tools
 import (
 	"io"
 	"net/http"
+	"slices"
+	"sort"
 	"testing"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -134,6 +136,91 @@ func TestRegisterAll_legacyPipelineAlone(t *testing.T) {
 	}
 	if names["list_wiki_pages"] {
 		t.Fatal("wiki should stay off")
+	}
+}
+
+func sortedKeys(m map[string]bool) []string {
+	out := keys(m)
+	sort.Strings(out)
+	return out
+}
+
+func TestRegisterAll_reviewProfileExactSet(t *testing.T) {
+	want := []string{
+		"get_merge_request_discussion", "create_merge_request_discussion_note", "resolve_merge_request_thread",
+		"list_pipelines", "get_pipeline", "list_pipeline_jobs", "list_pipeline_trigger_jobs",
+		"get_pipeline_job", "get_pipeline_job_output",
+	}
+	want = append(want, DailyTools()...)
+	sort.Strings(want)
+
+	// Other enable sources must not widen the closed profile.
+	cfg := &config.Config{
+		Token: "x", ToolProfile: config.ProfileReview,
+		Pipeline: true, Issues: true, EnabledTools: []string{"create_pipeline", "list_issues"},
+	}
+	got := sortedKeys(registerNames(t, cfg))
+	if !slices.Equal(got, want) {
+		t.Fatalf("review tools/list mismatch\n got: %v\nwant: %v", got, want)
+	}
+	if len(got) != 50 {
+		t.Fatalf("review catalog size = %d, want 50", len(got))
+	}
+	if !slices.Equal(sortedKeysOf(ReviewTools()), want) {
+		t.Fatal("ReviewTools() must match the registered review set")
+	}
+	names := registerNames(t, cfg)
+	for _, w := range []string{
+		"create_pipeline", "retry_pipeline", "cancel_pipeline", "play_pipeline_job",
+		"retry_pipeline_job", "cancel_pipeline_job",
+	} {
+		if names[w] {
+			t.Fatalf("pipeline write tool %q exposed in review profile", w)
+		}
+	}
+}
+
+func sortedKeysOf(in []string) []string {
+	out := slices.Clone(in)
+	sort.Strings(out)
+	return out
+}
+
+func TestRegisterAll_reviewProfileReadOnlyAndDisable(t *testing.T) {
+	names := registerNames(t, &config.Config{
+		Token: "x", ToolProfile: config.ProfileReview, ReadOnly: true,
+		DisabledTools: []string{"get_pipeline_job_output"},
+	})
+	for _, n := range []string{"create_merge_request_discussion_note", "resolve_merge_request_thread", "get_pipeline_job_output"} {
+		if names[n] {
+			t.Fatalf("%q must be subtracted by read-only / disabled list", n)
+		}
+	}
+	if !names["get_merge_request_discussion"] || !names["list_pipelines"] {
+		t.Fatal("read tools must remain")
+	}
+}
+
+func TestRegisterAll_dailyAndDefaultUnchangedByProfileWork(t *testing.T) {
+	daily := registerNames(t, &config.Config{Token: "x", UseDailyTools: true})
+	if !slices.Equal(sortedKeys(daily), sortedKeysOf(DailyTools())) {
+		t.Fatal("USE_DAILY_TOOLS must register exactly DailyTools()")
+	}
+	for _, n := range reviewExtraTools {
+		if daily[n] {
+			t.Fatalf("review-only tool %q leaked into daily set", n)
+		}
+	}
+	def := registerNames(t, &config.Config{Token: "x"})
+	for _, n := range []string{"list_pipelines", "create_pipeline", "get_pipeline_job_output"} {
+		if def[n] {
+			t.Fatalf("default catalog must keep pipeline family off, got %q", n)
+		}
+	}
+	for _, n := range []string{"get_merge_request_discussion", "resolve_merge_request_thread", "list_issues"} {
+		if !def[n] {
+			t.Fatalf("default catalog lost %q", n)
+		}
 	}
 }
 

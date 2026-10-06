@@ -34,6 +34,17 @@ func TestRestrictedMode(t *testing.T) {
 	if (&Config{DisabledTools: []string{"list_projects"}}).RestrictedMode() {
 		t.Fatal("disable-only must stay unrestricted")
 	}
+	if !(&Config{ToolProfile: ProfileReview}).RestrictedMode() {
+		t.Fatal("GITLAB_TOOL_PROFILE must enter restricted mode")
+	}
+}
+
+func TestValidToolProfile(t *testing.T) {
+	for profile, want := range map[string]bool{"": true, ProfileReview: true, "daily": false, "bogus": false} {
+		if got := (&Config{ToolProfile: profile}).ValidToolProfile(); got != want {
+			t.Fatalf("ValidToolProfile(%q) = %v, want %v", profile, got, want)
+		}
+	}
 }
 
 func TestEnvBool(t *testing.T) {
