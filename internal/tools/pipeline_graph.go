@@ -343,13 +343,20 @@ func resumePipelineGraph(ctx context.Context, in pipelineGraphIn, sel graphSelec
 		return nil, nil, werr
 	}
 	walk.bindRelation(rel)
-	if err := walk.revalidateCompleted(ctx, d, sel.PerPage); err != nil {
+	certCtx := igl.WithReplayBudget(ctx, graphEvidenceReplayCap(budget, sel.PerPage))
+	if err := walk.revalidateCompleted(certCtx, d, sel.PerPage); err != nil {
 		return nil, nil, err
 	}
 	if payload.GraphCont != nil && payload.GraphCont.Phase == cursor.GraphPhaseBridges {
 		return resumeGraphBridges(ctx, &section, pid, pipePID, mrIID, pipe, rel, sel, d, actorID, &payload, walk, budget)
 	}
-	guard, err := collectJobPage(ctx, d, budget, pipePID, pipe.ID, payload.PageState.Page, sel.PerPage, nil)
+	reserved := reserveGraphPageBudget(budget, sel.PerPage)
+	if reserved {
+		defer releaseGraphPageBudget(budget, sel.PerPage)
+	}
+	replayCap := graphActiveReplayCap(budget, sel.PerPage, payload.PageState.Page)
+	rctx := igl.WithReplayBudget(ctx, replayCap)
+	guard, err := collectJobPage(rctx, d, budget, pipePID, pipe.ID, payload.PageState.Page, sel.PerPage, nil)
 	if err != nil || guard.Partial {
 		return nil, nil, fmt.Errorf("%s: previous-page guard failed", cursor.ResyncRequired)
 	}
@@ -372,7 +379,7 @@ func resumePipelineGraph(ctx context.Context, in pipelineGraphIn, sel graphSelec
 	if !lineageCarryCovers(prior, guard.Jobs) {
 		return nil, nil, fmt.Errorf("%s: previous-page boundary drift", cursor.ResyncRequired)
 	}
-	if err := walk.revalidateActiveJobs(ctx, d, pipePID, pipe.ID, sel.PerPage, payload.PageState.Page, guard); err != nil {
+	if err := walk.revalidateActiveJobs(rctx, d, pipePID, pipe.ID, sel.PerPage, payload.PageState.Page, guard); err != nil {
 		return nil, nil, err
 	}
 	nextPage := int(payload.PageState.ProviderNextPage)
@@ -391,7 +398,16 @@ func resumeGraphBridges(ctx context.Context, section *readmeta.Section, pid, pip
 	if section == nil {
 		return nil, nil, fmt.Errorf("%s: graph continuation missing", cursor.ResyncRequired)
 	}
-	guard, err := collectBridgePage(ctx, d, budget, pipePID, pipe.ID, payload.PageState.Page, sel.PerPage, nil)
+	reserved := reserveGraphPageBudget(budget, sel.PerPage)
+	if reserved {
+		defer releaseGraphPageBudget(budget, sel.PerPage)
+	}
+	replayCap := graphActiveReplayCap(budget, sel.PerPage, payload.PageState.Page)
+	if budget != nil && budget.MaxItems > 0 && replayCap < budget.MaxItems {
+		replayCap = budget.MaxItems
+	}
+	rctx := igl.WithReplayBudget(ctx, replayCap)
+	guard, err := collectBridgePage(rctx, d, budget, pipePID, pipe.ID, payload.PageState.Page, sel.PerPage, nil)
 	if err != nil || guard.Partial || guard.Unsupported || guard.Inaccessible {
 		return nil, nil, fmt.Errorf("%s: previous-page guard failed", cursor.ResyncRequired)
 	}
@@ -413,7 +429,7 @@ func resumeGraphBridges(ctx context.Context, section *readmeta.Section, pid, pip
 	if err != nil || !lineageCarryCovers(prior, bridgeJobs(guard.Bridges)) {
 		return nil, nil, fmt.Errorf("%s: previous-page boundary drift", cursor.ResyncRequired)
 	}
-	if err := walk.revalidateActiveBridges(ctx, d, pipePID, pipe.ID, sel.PerPage, payload.PageState.Page, guard); err != nil {
+	if err := walk.revalidateActiveBridges(rctx, d, pipePID, pipe.ID, sel.PerPage, payload.PageState.Page, guard); err != nil {
 		return nil, nil, err
 	}
 	nextPage := int(payload.PageState.ProviderNextPage)
@@ -646,6 +662,51 @@ func reconcileGraphMRRoot(ctx context.Context, d Deps, mrProject string, sel gra
 	return rel, nil
 }
 
+func reserveGraphPageBudget(budget *igl.Budget, perPage int) bool {
+	if budget == nil {
+		return false
+	}
+	if perPage < 1 {
+		perPage = 1
+	}
+	return budget.ReserveItems(perPage) == nil
+}
+
+func releaseGraphPageBudget(budget *igl.Budget, perPage int) {
+	if budget == nil {
+		return
+	}
+	if perPage < 1 {
+		perPage = 1
+	}
+	budget.ReleaseItems(perPage)
+}
+
+// graphActiveReplayCap bounds active-node guard+replay reads separately from the
+// forward page fetch. It covers the signed page plus pages 1..page-1 revalidation.
+func graphActiveReplayCap(budget *igl.Budget, perPage, page int) int {
+	if page < 1 || perPage < 1 {
+		return 0
+	}
+	replay := page * perPage
+	if budget != nil && budget.MaxItems > 0 && replay > budget.MaxItems {
+		return budget.MaxItems
+	}
+	return replay
+}
+
+// graphEvidenceReplayCap bounds completed-node certification replays while leaving
+// room for one forward page on the main item counter (max_items + per_page).
+func graphEvidenceReplayCap(budget *igl.Budget, perPage int) int {
+	if budget == nil || budget.MaxItems <= 0 {
+		return 0
+	}
+	if perPage < 1 {
+		perPage = 1
+	}
+	return budget.MaxItems + perPage
+}
+
 func graphManifestExhausted(fromStart, exhausted bool, page graphPage, sel graphSelection, section readmeta.Section) bool {
 	jobsPartial := page.Partial || !page.Paging.PagingKnown || !page.Paging.ExhaustedObserved
 	return fromStart && exhausted && !jobsPartial && !sel.Filter.active() && !page.Partial && page.Paging.PagingKnown &&
@@ -820,7 +881,8 @@ func finishGraph(ctx context.Context, section readmeta.Section, pid, pipePID str
 			rel = fresh
 			walk.bindRelation(fresh)
 		}
-		if err := walk.revalidateCompleted(ctx, d, sel.PerPage); err != nil {
+		certCtx := igl.WithReplayBudget(ctx, graphEvidenceReplayCap(budget, sel.PerPage))
+		if err := walk.revalidateCompleted(certCtx, d, sel.PerPage); err != nil {
 			return pipelineGraphOut{}, err
 		}
 	}
@@ -1622,7 +1684,7 @@ func collectJobPage(ctx context.Context, d Deps, budget *igl.Budget, pid string,
 			out.Reason = "previous-page overlap"
 			return fmt.Errorf("%s: previous-page overlap", readmeta.CodePartial)
 		}
-		if err := budget.AddItem(); err != nil {
+		if err := igl.ChargeItem(ctx, budget); err != nil {
 			out.Partial = true
 			out.Reason = "budget_items"
 			return err

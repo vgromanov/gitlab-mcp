@@ -168,6 +168,68 @@ func TestPipelineGraph_bridgeRetryLineageAcrossPages(t *testing.T) {
 	}
 }
 
+func TestPipelineGraph_hundredOneJobsResumePageSixUnderDefaultBudget(t *testing.T) {
+	const perPage = 20
+	jobs := map[string]string{
+		"42/100/1": jobPageJSON(1, perPage),
+		"42/100/2": jobPageJSON(21, perPage),
+		"42/100/3": jobPageJSON(41, perPage),
+		"42/100/4": jobPageJSON(61, perPage),
+		"42/100/5": jobPageJSON(81, perPage),
+		"42/100/6": "[" + jobJSON(101, "last", "success", "false") + "]",
+	}
+	h := &walkServer{
+		pipes:   map[string]string{"42/100": walkPipe(100, 42, graphPipeSHA, "feature")},
+		jobs:    jobs,
+		bridges: map[string]string{"42/100/1": "[]"},
+		mr:      graphMR("feature"),
+		mrPipes: graphPipes("feature"),
+	}
+	in := pipelineGraphIn{ProjectID: "42", MergeRequestIID: 7, PerPage: perPage, MaxItems: 100, MaxRequests: 128}
+	clk := &cursor.FakeClock{T: time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)}
+	d := newCursorDeps(t, h, nil, clk)
+	tok := ""
+	var last map[string]any
+	for i := 0; i < 12; i++ {
+		in.Cursor = tok
+		_, raw, err := getMergeRequestPipelineGraph(context.Background(), nil, in, d)
+		if err != nil {
+			t.Fatalf("call %d: %v", i, err)
+		}
+		last = raw.(map[string]any)
+		sec := graphSection(t, last)
+		if sec["next_cursor"] == nil {
+			break
+		}
+		tok, _ = sec["next_cursor"].(string)
+		payload, err := cursor.Decode(d.Config.CursorKey, tok, clk.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if payload.PageState.Page == 5 && payload.PageState.ProviderNextPage == 6 {
+			break
+		}
+	}
+	if tok == "" {
+		t.Fatalf("need cursor before page 6 %#v", graphSection(t, last))
+	}
+	in.Cursor = tok
+	_, raw, err := getMergeRequestPipelineGraph(context.Background(), nil, in, d)
+	if err != nil {
+		t.Fatalf("resume err: %v", err)
+	}
+	out := raw.(map[string]any)
+	sec := graphSection(t, out)
+	if sectionMessage(sec, "budget_items") {
+		payload, _ := cursor.Decode(d.Config.CursorKey, tok, clk.Now())
+		t.Fatalf("page 6 resume hit item budget page=%d next=%d jobs=%#v lim=%#v", payload.PageState.Page, payload.PageState.ProviderNextPage, out["jobs"], sec["limitations"])
+	}
+	jobsOut, _ := out["jobs"].([]any)
+	if len(jobsOut) != 1 || jobsOut[0].(map[string]any)["id"] != float64(101) {
+		t.Fatalf("page 6 jobs %#v", jobsOut)
+	}
+}
+
 func TestPipelineGraph_manyParentJobPagesResumeIntoChild(t *testing.T) {
 	const jobsPerPage = 25
 	const apiPages = 3 // 75 jobs (>64) across paged parent job lists

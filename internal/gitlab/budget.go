@@ -26,6 +26,14 @@ var (
 
 type budgetKey struct{}
 
+type replayBudgetKey struct{}
+
+// replayBudget counts evidence-replay items separately from forward page fetches.
+type replayBudget struct {
+	max  int
+	used int
+}
+
 // Budget tracks invocation limits across all RoundTrips and body reads.
 type Budget struct {
 	MaxItems    int
@@ -38,6 +46,7 @@ type Budget struct {
 	bytesRead int64
 	requests  int
 	items     int
+	reserved  int
 	cancel    context.CancelFunc
 }
 
@@ -174,14 +183,70 @@ func (b *Budget) RemainingBytes() int64 {
 	return left
 }
 
+// WithReplayBudget attaches a bounded replay allowance to ctx. Replay charges
+// do not count toward the forward page item cap.
+func WithReplayBudget(ctx context.Context, max int) context.Context {
+	if ctx == nil || max <= 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, replayBudgetKey{}, &replayBudget{max: max})
+}
+
+// ReserveItems holds forward page allowance so active-node replay cannot consume
+// the next page fetch under the default item cap.
+func (b *Budget) ReserveItems(n int) error {
+	if b == nil || n <= 0 {
+		return nil
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.MaxItems <= 0 {
+		return nil
+	}
+	if b.items+b.reserved+n > b.MaxItems {
+		return ErrBudgetItems
+	}
+	b.reserved += n
+	return nil
+}
+
+// ReleaseItems returns a prior ReserveItems hold.
+func (b *Budget) ReleaseItems(n int) {
+	if b == nil || n <= 0 {
+		return
+	}
+	b.mu.Lock()
+	b.reserved -= n
+	if b.reserved < 0 {
+		b.reserved = 0
+	}
+	b.mu.Unlock()
+}
+
+// ChargeItem applies one retained-item charge from ctx, using replay budget when set.
+func ChargeItem(ctx context.Context, b *Budget) error {
+	if rb, _ := ctx.Value(replayBudgetKey{}).(*replayBudget); rb != nil {
+		rb.used++
+		if rb.max > 0 && rb.used > rb.max {
+			return ErrBudgetItems
+		}
+		return nil
+	}
+	return b.addItem()
+}
+
 // AddItem increments retained item count; returns ErrBudgetItems if already at max.
 func (b *Budget) AddItem() error {
+	return ChargeItem(context.Background(), b)
+}
+
+func (b *Budget) addItem() error {
 	if b == nil {
 		return nil
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.MaxItems > 0 && b.items >= b.MaxItems {
+	if b.MaxItems > 0 && b.items+b.reserved >= b.MaxItems {
 		return ErrBudgetItems
 	}
 	b.items++

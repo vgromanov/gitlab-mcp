@@ -506,7 +506,7 @@ func collectBridgePage(ctx context.Context, d Deps, budget *igl.Budget, pid stri
 			out.Reason = "previous-page overlap"
 			return fmt.Errorf("%s: previous-page overlap", readmeta.CodePartial)
 		}
-		if err := budget.AddItem(); err != nil {
+		if err := igl.ChargeItem(ctx, budget); err != nil {
 			out.Partial = true
 			out.Reason = "budget_items"
 			return err
