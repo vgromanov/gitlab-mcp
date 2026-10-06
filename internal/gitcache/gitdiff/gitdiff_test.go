@@ -782,6 +782,37 @@ func TestCompareDetectsExecutableRename(t *testing.T) {
 	}
 }
 
+func TestCompareRejectsDissimilarExecutableRename(t *testing.T) {
+	oldBody := strings.Repeat("old executable payload ", 200) + "\n"
+	newBody := strings.Repeat("different implementation ", 200) + "\n"
+	s := store{}
+	base := s.snapshot(t, "", map[string]fileSpec{"old.sh": exec(oldBody)})
+	head := s.snapshot(t, base, map[string]fileSpec{"new.sh": exec(newBody)})
+	cmp, err := Compare(bg(), base, head, SemanticsStraight, s, Limits{})
+	if err != nil || cmp.Partial {
+		t.Fatalf("compare %#v %v", cmp.Result, err)
+	}
+	if len(cmp.Files) != 2 {
+		t.Fatalf("want separate add/delete rows, got %#v", cmp.Files)
+	}
+	for _, f := range cmp.Files {
+		if f.RenamedFile {
+			t.Fatalf("dissimilar executables must not pair as rename: %#v", cmp.Files)
+		}
+	}
+}
+
+func TestBlobSimilarityIgnoresTrailingEmptySplit(t *testing.T) {
+	s := store{}
+	oldH := s.put("blob", []byte("only line\n"))
+	newH := s.put("blob", []byte("other line\n"))
+	a := object.TreeEntry{Mode: filemode.Executable, Hash: oldH}
+	b := object.TreeEntry{Mode: filemode.Executable, Hash: newH}
+	if blobSimilarityScore(s, a, b) >= renameScore {
+		t.Fatalf("single-line mismatch must stay below rename threshold")
+	}
+}
+
 func TestCompareRenameLimitIsPartial(t *testing.T) {
 	s := store{}
 	oldFiles, newFiles := map[string]fileSpec{}, map[string]fileSpec{}

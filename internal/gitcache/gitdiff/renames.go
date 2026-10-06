@@ -1,7 +1,6 @@
 package gitdiff
 
 import (
-	"bytes"
 	"context"
 	"strings"
 
@@ -141,25 +140,36 @@ func blobSimilarityScore(objs map[plumbing.Hash]pack.Object, a, b object.TreeEnt
 	if la == nil || lb == nil {
 		return 0
 	}
-	common := 0
+	var totalA, totalB, common int64
 	seen := map[string]int{}
 	for _, ln := range la {
+		totalA += lineRegionBytes(ln)
 		seen[ln]++
 	}
 	for _, ln := range lb {
+		totalB += lineRegionBytes(ln)
 		if seen[ln] > 0 {
-			common++
+			common += lineRegionBytes(ln)
 			seen[ln]--
 		}
 	}
-	max := len(la)
-	if len(lb) > max {
-		max = len(lb)
+	maxTotal := totalA
+	if totalB > maxTotal {
+		maxTotal = totalB
 	}
-	if max == 0 {
+	if maxTotal == 0 {
 		return 100
 	}
-	return common * 100 / max
+	return int(common * 100 / maxTotal)
+}
+
+// lineRegionBytes is the byte weight of one text region, matching Git/JGit line
+// hashing (content bytes plus the terminating newline when present).
+func lineRegionBytes(ln string) int64 {
+	if ln == "" {
+		return 1
+	}
+	return int64(len(ln) + 1)
 }
 
 func blobLines(objs map[plumbing.Hash]pack.Object, h plumbing.Hash, mode filemode.FileMode) (lines []string, ok bool) {
@@ -170,11 +180,19 @@ func blobLines(objs map[plumbing.Hash]pack.Object, h plumbing.Hash, mode filemod
 	if blobBinary(objs, object.TreeEntry{Hash: h, Mode: mode}) {
 		return nil, false
 	}
-	data := obj.Data
-	if len(data) > 0 && !bytes.Contains(data, []byte{0}) {
-		// invalid UTF-8 is handled elsewhere; line split is for similarity only.
+	return blobContentLines(obj.Data), true
+}
+
+func blobContentLines(data []byte) []string {
+	if len(data) == 0 {
+		return nil
 	}
-	return strings.Split(string(data), "\n"), true
+	s := string(data)
+	lines := strings.Split(s, "\n")
+	if len(lines) > 0 && lines[len(lines)-1] == "" && strings.HasSuffix(s, "\n") {
+		lines = lines[:len(lines)-1]
+	}
+	return lines
 }
 
 func maxInt(a, b int) int {
