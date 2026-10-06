@@ -47,8 +47,8 @@ func runGQL(ctx context.Context, d Deps, query string, variables map[string]any)
 }
 
 type executeGraphQLIn struct {
-	Query     string         `json:"query"`
-	Variables map[string]any `json:"variables,omitempty" jsonschema:"JSON object of GraphQL variables; omit or use {}"`
+	Query     string          `json:"query"`
+	Variables *map[string]any `json:"variables,omitempty" jsonschema:"JSON object of GraphQL variables; omit or use {}"`
 }
 
 func executeGraphQL(ctx context.Context, _ *mcp.CallToolRequest, in executeGraphQLIn, d Deps) (*mcp.CallToolResult, any, error) {
@@ -61,10 +61,11 @@ func executeGraphQL(ctx context.Context, _ *mcp.CallToolRequest, in executeGraph
 			return nil, nil, errors.New("GraphQL mutations are rejected in read-only mode")
 		}
 	}
-	if in.Variables == nil {
-		in.Variables = map[string]any{}
+	vars := map[string]any{}
+	if in.Variables != nil && *in.Variables != nil {
+		vars = *in.Variables
 	}
-	out, err := runGQL(ctx, d, in.Query, in.Variables)
+	out, err := runGQL(ctx, d, in.Query, vars)
 	if err != nil {
 		return nil, nil, err
 	}

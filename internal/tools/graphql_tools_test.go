@@ -97,11 +97,15 @@ func TestExecuteGraphQL_objectVariables(t *testing.T) {
 	if res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{Name: "execute_graphql", Arguments: map[string]any{"query": "{a}", "variables": []any{1}}}); err == nil && !res.IsError {
 		t.Fatal("array variables accepted")
 	}
-	// Omitted variables are sent as an empty object.
-	gqlCall(t, cs, map[string]any{"query": "{ a }"})
-	if v, ok := (*bodies)[len(*bodies)-1]["variables"]; ok {
-		if m, _ := v.(map[string]any); len(m) != 0 {
-			t.Fatalf("omitted variables = %v", v)
+	// Omitted or null variables are accepted and sent as an empty object (or not at all).
+	for _, args := range []map[string]any{{"query": "{ a }"}, {"query": "{ a }", "variables": nil}} {
+		if res := gqlCall(t, cs, args); res.IsError {
+			t.Fatalf("%v: %s", args, contentText(res))
+		}
+		if v, ok := (*bodies)[len(*bodies)-1]["variables"]; ok {
+			if m, _ := v.(map[string]any); len(m) != 0 {
+				t.Fatalf("empty variables sent as %v", v)
+			}
 		}
 	}
 }

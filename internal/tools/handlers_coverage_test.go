@@ -432,7 +432,7 @@ func TestHandlers_coverageHappyPaths(t *testing.T) {
 	_, _, err = getWebhookEvent(ctx, nil, getWebhookEventIn{ProjectID: "42", HookID: 1, EventID: 2}, d)
 	fail("getWebhookEvent", err)
 
-	_, _, err = executeGraphQL(ctx, nil, executeGraphQLIn{Query: "{ ok }", Variables: map[string]any{"a": 1}}, d)
+	_, _, err = executeGraphQL(ctx, nil, executeGraphQLIn{Query: "{ ok }", Variables: &map[string]any{"a": 1}}, d)
 	ok("executeGraphQL", err)
 	_, _, err = executeGraphQL(ctx, nil, executeGraphQLIn{Query: "{ ok }"}, d)
 	ok("executeGraphQL no vars", err)
