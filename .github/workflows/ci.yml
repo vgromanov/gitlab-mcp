@@ -37,8 +37,8 @@ jobs:
       - name: Build
         run: go build -o /tmp/gitlab-mcp ./cmd/gitlab-mcp
 
-      - name: Test
-        run: go test -race -count=1 ./...
+      - name: Test + coverage gate
+        run: make cover-gate
 
   integration:
     if: github.event_name == 'workflow_dispatch'

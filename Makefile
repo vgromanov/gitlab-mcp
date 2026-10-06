@@ -1,9 +1,10 @@
-.PHONY: all prep-dist build build-all dist install clean test test-integration test-all cover race fmt fmt-check vet lint tidy docker run-stdio run-http help
+.PHONY: all prep-dist build build-all dist install clean test test-integration test-all cover cover-gate race fmt fmt-check vet lint tidy docker run-stdio run-http help
 
 BINARY := gitlab-mcp
 PKG := ./cmd/gitlab-mcp
 MODULE := gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp
 DIST_DIR := dist
+COVER_MIN ?= 80
 OUT_DIR := bin
 
 GOOS_LIST := linux darwin windows
@@ -57,6 +58,10 @@ cover:
 	go test -mod=vendor ./... -coverprofile=coverage.out -covermode=atomic
 	go tool cover -func=coverage.out | tail -8
 
+cover-gate:
+	go test -mod=vendor -race -count=1 -covermode=atomic -coverprofile=coverage.out ./...
+	@go tool cover -func=coverage.out | awk -v min=$(COVER_MIN) '/^total:/ { gsub("%", "", $$NF); found = 1; printf "total coverage %s%% (min %s%%)\n", $$NF, min; if ($$NF + 0 < min + 0) { print "coverage below minimum"; exit 1 } } END { if (!found) { print "no total coverage line"; exit 1 } }'
+
 race:
 	go test -mod=vendor -race -count=1 ./...
 
@@ -92,5 +97,5 @@ clean:
 	rm -rf $(OUT_DIR) $(DIST_DIR) coverage.out
 
 help:
-	@echo "Targets: all build build-all dist install clean test test-integration test-all cover race fmt fmt-check vet lint tidy docker run-stdio run-http help"
+	@echo "Targets: all build build-all dist install clean test test-integration test-all cover cover-gate race fmt fmt-check vet lint tidy docker run-stdio run-http help"
 	@echo "Module: $(MODULE)"
