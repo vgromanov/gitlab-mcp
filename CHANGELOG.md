@@ -60,10 +60,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `get_merge_request_approval_state` read, with its 404-only legacy fallback).
   `include` accepts `changes`, `approvals`, `discussions`, `pipeline`; omitted
   means every implemented section, `[]` metadata only, and the not yet
-  implemented `discussions` / `pipeline` are rejected. A failing MR (e.g. 404)
+  implemented `pipeline` is rejected. A failing MR (e.g. 404)
   or section is reported as an `error` entry; the rest of the batch still
   returns. Registered in the review profile only (now 52 tools; the daily set is
   unchanged) and in the default catalog (RVG-163).
+- `get_review_snapshot` gains the `discussions` section and an end-of-snapshot
+  head recheck (RVG-164). `discussions` reads pages of 100 discussions up to
+  `discussions_max_pages` (default 3, max 10) and returns `{discussions:
+  [{id, resolvable, resolved, notes: [{id, author {id, username, name}, body,
+  created_at, updated_at, position?, system}]}], unresolved_count, complete,
+  truncated_reason, next_page}`; system notes (and discussions that only hold
+  them) are left out unless `include_system` is true; a failed page makes the
+  section an `error`, never a half list; `unresolved_count` is a lower bound
+  when `complete` is false. After all sections are read the MR head is read
+  again: `head_changed` is true when it moved meanwhile (`current_sha` is the new
+  head; `sha` stays the head the sections were read for) or when `expected_sha`
+  differs from `sha`, and false once the recheck confirmed a stable head, so
+  it is now present on every snapshot that read a section (it used to need
+  `expected_sha`); a failed recheck is reported as `head_recheck_error`.
+  `include` omitted now also reads `discussions`.
 - `get_pipeline_job_output` returns a tail window of the trace:
   `tail_lines` (default 200) and `max_bytes` (default 64 KiB, max 1 MiB) select
   the last lines, and the result is `{trace, truncated, total_bytes}`. The trace

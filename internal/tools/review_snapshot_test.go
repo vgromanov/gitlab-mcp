@@ -25,6 +25,10 @@ type snapMR struct {
 	diffsStatus    int // status of the diffs endpoint
 	approvalStatus int // status of /approval_state; 404 makes the legacy /approvals answer
 	legacyStatus   int
+	discs          int    // discussions served, 100 per page (see snapDiscussionsBody)
+	discFailPage   int    // discussions page answering 500
+	shaAfter       string // sha the MR reports from its 2nd read on (a push mid-snapshot)
+	recheckFails   bool   // the 2nd MR read answers 500
 }
 
 type snapFixture struct {
@@ -74,6 +78,34 @@ func snapDiffsBody(page, per, total int) string {
 	return "[" + strings.Join(items, ",") + "]"
 }
 
+// snapDiscussionsBody serves discussion i by kind i%4: 0 = unresolved diff
+// thread (diff note with a position, a reply, a trailing system note); 1 =
+// resolved thread; 2 = plain individual note; 3 = system-only discussion.
+func snapDiscussionsBody(page, per, total int) string {
+	const author = `{"id":7,"username":"me","name":"Me","email":"leak@x","avatar_url":"https://x/a.png"}`
+	note := func(id int, body string, system, resolvable, resolved bool, pos string) string {
+		return fmt.Sprintf(`{"id":%d,"type":"DiscussionNote","body":%q,"author":%s,"system":%t,"resolvable":%t,"resolved":%t,
+		"created_at":"2026-10-06T10:00:00Z","updated_at":"2026-10-06T11:00:00Z"%s}`, id, body, author, system, resolvable, resolved, pos)
+	}
+	const pos = `,"position":{"base_sha":"b","start_sha":"s","head_sha":"h","position_type":"text","new_path":"f.go","new_line":3}`
+	items := []string{}
+	for i := (page - 1) * per; i < min(page*per, total); i++ {
+		var notes []string
+		switch i % 4 {
+		case 0:
+			notes = []string{note(i*10, "thread", false, true, false, pos), note(i*10+1, "reply", false, true, false, ""), note(i*10+2, "pushed a commit", true, false, false, "")}
+		case 1:
+			notes = []string{note(i*10, "fixed", false, true, true, pos), note(i*10+1, "ok", false, true, true, "")}
+		case 2:
+			notes = []string{note(i*10, "plain", false, false, false, "")}
+		default:
+			notes = []string{note(i*10, "added 1 commit", true, false, false, "")}
+		}
+		items = append(items, fmt.Sprintf(`{"id":"d%03d","individual_note":%t,"notes":[%s]}`, i, i%4 >= 2, strings.Join(notes, ",")))
+	}
+	return "[" + strings.Join(items, ",") + "]"
+}
+
 func newSnapFixture(t *testing.T, cfg *config.Config, mrs map[string]snapMR) *snapFixture {
 	t.Helper()
 	f := &snapFixture{byPath: map[string]int{}}
@@ -81,6 +113,7 @@ func newSnapFixture(t *testing.T, cfg *config.Config, mrs map[string]snapMR) *sn
 		f.mu.Lock()
 		f.paths = append(f.paths, r.URL.Path)
 		f.byPath[r.URL.Path]++
+		reads := f.byPath[r.URL.Path]
 		f.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		m := snapPath.FindStringSubmatch(r.URL.Path)
@@ -96,7 +129,33 @@ func newSnapFixture(t *testing.T, cfg *config.Config, mrs map[string]snapMR) *sn
 		}
 		switch m[3] {
 		case "":
-			writeFixture(w, snapMRBody(m[1], m[2], mr.sha))
+			if reads >= 2 && mr.recheckFails {
+				w.WriteHeader(http.StatusForbidden) // not retried by the client, unlike 5xx
+				writeFixture(w, `{"message":"nope"}`)
+				return
+			}
+			sha := mr.sha
+			if reads >= 2 && mr.shaAfter != "" {
+				sha = mr.shaAfter
+			}
+			writeFixture(w, snapMRBody(m[1], m[2], sha))
+		case "/discussions":
+			page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+			per, _ := strconv.Atoi(r.URL.Query().Get("per_page"))
+			if page < 1 || per != 100 {
+				w.WriteHeader(http.StatusBadRequest)
+				writeFixture(w, `{"message":"page and per_page=100 must be sent"}`)
+				return
+			}
+			if page == mr.discFailPage {
+				w.WriteHeader(http.StatusForbidden) // not retried by the client, unlike 5xx
+				writeFixture(w, `{"message":"nope"}`)
+				return
+			}
+			if page*per < mr.discs {
+				w.Header().Set("X-Next-Page", strconv.Itoa(page+1))
+			}
+			writeFixture(w, snapDiscussionsBody(page, per, mr.discs))
 		case "/diffs":
 			if mr.diffsStatus != 0 {
 				w.WriteHeader(mr.diffsStatus)
@@ -191,8 +250,8 @@ func TestGetReviewSnapshot_batchPartialFailure(t *testing.T) {
 	if !slices.Equal(sortedMapKeys(map[string]any{"include": 0, "merge_requests": 0}), sortedMapKeys(out)) {
 		t.Fatalf("top-level keys = %v", sortedMapKeys(out))
 	}
-	if inc := fmt.Sprint(out["include"]); inc != "[changes approvals]" {
-		t.Fatalf("include = %s, want [changes approvals]", inc)
+	if inc := fmt.Sprint(out["include"]); inc != "[changes approvals discussions]" {
+		t.Fatalf("include = %s, want [changes approvals discussions]", inc)
 	}
 	es := snapEntries(t, out)
 	if len(es) != 3 {
@@ -202,7 +261,7 @@ func TestGetReviewSnapshot_batchPartialFailure(t *testing.T) {
 	if !slices.Equal(sortedMapKeys(es[1]), []string{"error", "iid", "project_id"}) || !strings.Contains(es[1]["error"].(string), "404") {
 		t.Fatalf("404 entry = %v", es[1])
 	}
-	wantKeys := []string{"approvals", "author", "changes", "detailed_merge_status", "diff_refs", "draft", "iid", "project_id",
+	wantKeys := []string{"approvals", "author", "changes", "detailed_merge_status", "diff_refs", "discussions", "draft", "head_changed", "iid", "project_id",
 		"reviewers", "sha", "source_branch", "state", "target_branch", "title", "updated_at", "web_url"}
 	for _, i := range []int{0, 2} {
 		if !slices.Equal(sortedMapKeys(es[i]), wantKeys) {
@@ -252,8 +311,7 @@ func TestGetReviewSnapshot_batchPartialFailure(t *testing.T) {
 	}
 }
 
-// AC2: expected_sha mismatch sets head_changed; a match says false; no
-// expected_sha leaves the key out. Sections are still returned for the new head.
+// AC2 (expected_sha part): a mismatch sets head_changed; a match says false. Sections are still returned for the new head.
 func TestGetReviewSnapshot_expectedSHA(t *testing.T) {
 	f := newSnapFixture(t, &config.Config{}, map[string]snapMR{"42/1": {sha: "new", files: 1}})
 	out, errText := f.call(t, map[string]any{"include": []any{"changes"}, "mrs": []any{
@@ -274,8 +332,9 @@ func TestGetReviewSnapshot_expectedSHA(t *testing.T) {
 	if es[1]["head_changed"] != false || es[1]["expected_sha"] != "new" {
 		t.Fatalf("match entry = %v", es[1])
 	}
-	if _, has := es[2]["head_changed"]; has {
-		t.Fatalf("head_changed must be absent without expected_sha: %v", es[2])
+	// no expected_sha: the end-of-snapshot recheck still reports a stable head
+	if es[2]["head_changed"] != false || es[2]["expected_sha"] != nil || es[2]["current_sha"] != nil {
+		t.Fatalf("no-expected entry = %v", es[2])
 	}
 }
 
@@ -363,8 +422,7 @@ func TestGetReviewSnapshot_include(t *testing.T) {
 	// unknown and not-yet-implemented sections reject the call before any request
 	for _, tc := range []struct{ include, want string }{
 		{"bogus", `invalid include "bogus": must be one of changes, approvals, discussions, pipeline`},
-		{"discussions", `include "discussions" is not implemented yet (available: changes, approvals)`},
-		{"pipeline", `include "pipeline" is not implemented yet`},
+		{"pipeline", `include "pipeline" is not implemented yet (available: changes, approvals, discussions)`},
 	} {
 		_, errText := f.call(t, map[string]any{"mrs": ref, "include": []any{"changes", tc.include}})
 		if !strings.Contains(errText, tc.want) {
@@ -439,5 +497,186 @@ func TestGetReviewSnapshot_defaultProjectRequired(t *testing.T) {
 	out, _ := f.call(t, map[string]any{"mrs": []any{map[string]any{"iid": 1}}})
 	if got, _ := snapEntries(t, out)[0]["error"].(string); !strings.Contains(got, "project_id is required") || f.total() != 0 {
 		t.Fatalf("error = %q, requests %d", got, f.total())
+	}
+}
+
+func snapDiscussions(t *testing.T, f *snapFixture, extra map[string]any) map[string]any {
+	t.Helper()
+	args := map[string]any{"include": []any{"discussions"}, "mrs": []any{map[string]any{"project_id": "42", "iid": 1}}}
+	for k, v := range extra {
+		args[k] = v
+	}
+	out, errText := f.call(t, args)
+	if errText != "" {
+		t.Fatal(errText)
+	}
+	return snapEntries(t, out)[0]["discussions"].(map[string]any)
+}
+
+// AC1: 250 discussions on three pages are compacted; the default cap (3 pages)
+// covers them, so complete is true. System notes and system-only threads are out.
+func TestGetReviewSnapshot_discussionsCompaction(t *testing.T) {
+	f := newSnapFixture(t, &config.Config{}, map[string]snapMR{"42/1": {sha: "a", discs: 250}})
+	ds := snapDiscussions(t, f, nil)
+	list := ds["discussions"].([]any)
+	// kinds 0, 1, 2 survive (63 + 63 + 62 of 250); the 62 system-only threads are dropped
+	if len(list) != 188 || ds["complete"] != true || ds["truncated_reason"] != nil || ds["next_page"] != float64(0) ||
+		ds["unresolved_count"] != float64(63) || f.count("/discussions") != 3 {
+		t.Fatalf("discussions=%d complete=%v unresolved=%v next=%v requests=%d", len(list), ds["complete"], ds["unresolved_count"], ds["next_page"], f.count("/discussions"))
+	}
+	if !slices.Equal(sortedMapKeys(ds), []string{"complete", "discussions", "next_page", "truncated_reason", "unresolved_count"}) {
+		t.Fatalf("section keys = %v", sortedMapKeys(ds))
+	}
+	byID := map[string]map[string]any{}
+	for _, x := range list {
+		byID[x.(map[string]any)["id"].(string)] = x.(map[string]any)
+	}
+	open, done, plain := byID["d000"], byID["d001"], byID["d002"]
+	if byID["d003"] != nil {
+		t.Fatal("system-only discussion must be dropped")
+	}
+	if !slices.Equal(sortedMapKeys(open), []string{"id", "notes", "resolvable", "resolved"}) ||
+		open["resolvable"] != true || open["resolved"] != false || done["resolvable"] != true || done["resolved"] != true ||
+		plain["resolvable"] != false || plain["resolved"] != false {
+		t.Fatalf("states: open=%v done=%v plain=%v", open, done, plain)
+	}
+	notes := open["notes"].([]any)
+	if len(notes) != 2 { // the trailing system note is excluded
+		t.Fatalf("open notes = %d, want 2", len(notes))
+	}
+	n0 := notes[0].(map[string]any)
+	if want := []string{"author", "body", "created_at", "id", "position", "system", "updated_at"}; !slices.Equal(sortedMapKeys(n0), want) {
+		t.Fatalf("note keys = %v, want %v", sortedMapKeys(n0), want)
+	}
+	pos := n0["position"].(map[string]any)
+	if n0["id"] != float64(0) || n0["body"] != "thread" || n0["system"] != false || n0["created_at"] != "2026-10-06T10:00:00Z" ||
+		n0["updated_at"] != "2026-10-06T11:00:00Z" || pos["new_path"] != "f.go" || pos["new_line"] != float64(3) || pos["head_sha"] != "h" {
+		t.Fatalf("note = %v", n0)
+	}
+	if !slices.Equal(sortedMapKeys(n0["author"].(map[string]any)), []string{"id", "name", "username"}) {
+		t.Fatalf("author not compacted: %v", n0["author"])
+	}
+	if _, has := notes[1].(map[string]any)["position"]; has {
+		t.Fatalf("reply must not carry a position: %v", notes[1])
+	}
+	if raw := fmt.Sprint(ds); strings.Contains(raw, "leak@x") || strings.Contains(raw, "x/a.png") {
+		t.Fatal("discussions leaked author fields outside the contract")
+	}
+}
+
+// AC1: complete is false, with next_page and a reason, when the cap cuts the list.
+func TestGetReviewSnapshot_discussionsCap(t *testing.T) {
+	f := newSnapFixture(t, &config.Config{}, map[string]snapMR{"42/1": {sha: "a", discs: 250}})
+	before := f.count("/discussions")
+	ds := snapDiscussions(t, f, map[string]any{"discussions_max_pages": 1})
+	if ds["complete"] != false || ds["next_page"] != float64(2) || !strings.Contains(ds["truncated_reason"].(string), "discussions_max_pages=1") ||
+		len(ds["discussions"].([]any)) != 75 || ds["unresolved_count"] != float64(25) || f.count("/discussions")-before != 1 {
+		t.Fatalf("capped at 1 page: %v (requests %d)", ds, f.count("/discussions")-before)
+	}
+	// the cap equal to the pages needed is still complete; an absurd cap is clamped
+	for _, n := range []int{3, 500} {
+		if ds = snapDiscussions(t, f, map[string]any{"discussions_max_pages": n}); ds["complete"] != true || ds["next_page"] != float64(0) {
+			t.Fatalf("cap %d: complete=%v", n, ds["complete"])
+		}
+	}
+}
+
+// AC3: system notes are excluded by default and kept with include_system.
+func TestGetReviewSnapshot_discussionsSystemNotes(t *testing.T) {
+	f := newSnapFixture(t, &config.Config{}, map[string]snapMR{"42/1": {sha: "a", discs: 4}})
+	count := func(ds map[string]any) (discs, notes, system int) {
+		for _, x := range ds["discussions"].([]any) {
+			discs++
+			for _, n := range x.(map[string]any)["notes"].([]any) {
+				notes++
+				if n.(map[string]any)["system"] == true {
+					system++
+				}
+			}
+		}
+		return
+	}
+	for _, extra := range []map[string]any{nil, {"include_system": false}} {
+		if d, n, s := count(snapDiscussions(t, f, extra)); d != 3 || n != 5 || s != 0 {
+			t.Fatalf("default %v: discussions=%d notes=%d system=%d", extra, d, n, s)
+		}
+	}
+	ds := snapDiscussions(t, f, map[string]any{"include_system": true})
+	if d, n, s := count(ds); d != 4 || n != 7 || s != 2 || ds["unresolved_count"] != float64(1) {
+		t.Fatalf("include_system: discussions=%d notes=%d system=%d unresolved=%v", d, n, s, ds["unresolved_count"])
+	}
+}
+
+// A failed discussions page is a section error, never a half list; the rest survives.
+func TestGetReviewSnapshot_discussionsPageError(t *testing.T) {
+	f := newSnapFixture(t, &config.Config{}, map[string]snapMR{"42/1": {sha: "a", files: 1, discs: 250, discFailPage: 2}})
+	out, errText := f.call(t, map[string]any{"mrs": []any{map[string]any{"project_id": "42", "iid": 1}}})
+	if errText != "" {
+		t.Fatal(errText)
+	}
+	e := snapEntries(t, out)[0]
+	ds := e["discussions"].(map[string]any)
+	if got, _ := ds["error"].(string); !strings.Contains(got, "page 2") || ds["discussions"] != nil || ds["complete"] != nil {
+		t.Fatalf("discussions section = %v", ds)
+	}
+	if e["changes"].(map[string]any)["complete"] != true || e["approvals"].(map[string]any)["error"] != nil || e["sha"] != "a" {
+		t.Fatalf("other sections lost: %v", sortedMapKeys(e))
+	}
+}
+
+// AC2: the head is read again after the sections; a push in between sets
+// head_changed and returns the new sha, with or without expected_sha.
+func TestGetReviewSnapshot_headMovedDuringSnapshot(t *testing.T) {
+	one := func(t *testing.T, mr snapMR, ref map[string]any, include []any) map[string]any {
+		t.Helper()
+		f := newSnapFixture(t, &config.Config{}, map[string]snapMR{"42/1": mr})
+		ref["project_id"], ref["iid"] = "42", 1
+		out, errText := f.call(t, map[string]any{"include": include, "mrs": []any{ref}})
+		if errText != "" {
+			t.Fatal(errText)
+		}
+		return snapEntries(t, out)[0]
+	}
+	changes := []any{"changes"}
+	moved := snapMR{sha: "old", shaAfter: "new", files: 1}
+
+	// moved, no expected_sha: sections describe sha, current_sha is the new head
+	e := one(t, moved, map[string]any{}, changes)
+	if e["sha"] != "old" || e["head_changed"] != true || e["current_sha"] != "new" || e["expected_sha"] != nil || e["changes"] == nil {
+		t.Fatalf("moved entry = %v", e)
+	}
+	// moved and expected_sha matched the start: still changed
+	if e = one(t, moved, map[string]any{"expected_sha": "old"}, changes); e["head_changed"] != true || e["current_sha"] != "new" || e["expected_sha"] != "old" {
+		t.Fatalf("moved with expected_sha = %v", e)
+	}
+	// every section counts: a discussions-only snapshot is rechecked as well
+	if e = one(t, moved, map[string]any{}, []any{"discussions"}); e["head_changed"] != true || e["current_sha"] != "new" {
+		t.Fatalf("moved, discussions only = %v", e)
+	}
+
+	stable := snapMR{sha: "same", files: 1}
+	if e = one(t, stable, map[string]any{"expected_sha": "same"}, changes); e["head_changed"] != false || e["current_sha"] != nil {
+		t.Fatalf("stable entry = %v", e)
+	}
+	// stable head that differs from expected_sha: changed, but no current_sha (sha is the head)
+	if e = one(t, stable, map[string]any{"expected_sha": "other"}, changes); e["head_changed"] != true || e["current_sha"] != nil || e["sha"] != "same" {
+		t.Fatalf("stale expected_sha = %v", e)
+	}
+
+	// a failed recheck is reported, never read as "stable"
+	broken := snapMR{sha: "old", shaAfter: "new", files: 1, recheckFails: true}
+	e = one(t, broken, map[string]any{}, changes)
+	if got, _ := e["head_recheck_error"].(string); !strings.Contains(got, "403") || e["head_changed"] != nil || e["current_sha"] != nil || e["changes"] == nil {
+		t.Fatalf("recheck failure entry = %v", e)
+	}
+	if e = one(t, broken, map[string]any{"expected_sha": "other"}, changes); e["head_changed"] != true || e["head_recheck_error"] == nil {
+		t.Fatalf("recheck failure with expected_sha = %v", e)
+	}
+
+	// metadata only: nothing is read after the metadata, so there is no recheck
+	f := newSnapFixture(t, &config.Config{}, map[string]snapMR{"42/1": moved})
+	out, _ := f.call(t, map[string]any{"include": []any{}, "mrs": []any{map[string]any{"project_id": "42", "iid": 1}}})
+	if e = snapEntries(t, out)[0]; e["head_changed"] != nil || e["current_sha"] != nil || e["head_recheck_error"] != nil || f.total() != 1 {
+		t.Fatalf("metadata-only entry = %v, requests %d", e, f.total())
 	}
 }
