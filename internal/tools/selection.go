@@ -67,6 +67,7 @@ var dailyTools = []string{
 var reviewExtraTools = []string{
 	"get_review_queue",
 	"get_review_snapshot",
+	"batch_get_file_contents",
 	"get_merge_request_discussion",
 	"create_merge_request_discussion_note",
 	"resolve_merge_request_thread",

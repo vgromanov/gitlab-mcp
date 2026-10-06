@@ -18,9 +18,9 @@ This document describes the tool surface currently registered by
   `USE_WORK_ITEMS`, `USE_LABELS`, `USE_DRAFTS`, `USE_WEBHOOKS`, `USE_TIMELINE`.
 - `USE_DAILY_TOOLS=true` registers the pinned 41-tool daily census set
   (includes all four search tools below).
-- `GITLAB_TOOL_PROFILE=review` registers the closed 52-tool review set (daily +
+- `GITLAB_TOOL_PROFILE=review` registers the closed 53-tool review set (daily +
   discussion get/reply/resolve + six pipeline reads + `get_review_queue` +
-  `get_review_snapshot`, no pipeline writes); see
+  `get_review_snapshot` + `batch_get_file_contents`, no pipeline writes); see
   [`docs/configuration.md`](configuration.md#review-profile-gitlab_tool_profilereview).
 
 ## Projects / namespaces / users
@@ -40,6 +40,12 @@ This document describes the tool surface currently registered by
 - `create_repository`
 - `fork_repository`
 - `get_file_contents`
+- `batch_get_file_contents` — up to 20 `paths` at one exact `sha` (a full
+  40-character commit SHA; branch and tag names are rejected). Per path
+  `{path, blob_id, size, binary, truncated, content}` or `{path, error}`; a
+  missing or unreadable path fails only its own entry. `size` is the full blob
+  size, `content` is cut at `max_bytes_per_file` (default 32 KiB, max 256 KiB)
+  and flagged `truncated`, a binary file is flagged `binary` with no content
 - `create_or_update_file`
 - `push_files`
 - `get_repository_tree`
