@@ -1280,8 +1280,8 @@ func TestPipelineGraph_childCursorDetectsCompletedSiblingDrift(t *testing.T) {
 
 func TestPipelineGraph_revalidationChargesCallBudget(t *testing.T) {
 	h := ancestorDriftServer()
-	h.jobs["42/100/1"] = jobPageJSON(1, 12)
 	d, in, tok := childContinuation(t, h)
+	h.jobs["42/100/1"] = jobPageJSON(1, 12)
 	in.Cursor = tok
 	in.MaxItems = 3
 	_, _, err := getMergeRequestPipelineGraph(context.Background(), nil, in, d)

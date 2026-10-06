@@ -343,7 +343,7 @@ func resumePipelineGraph(ctx context.Context, in pipelineGraphIn, sel graphSelec
 		return nil, nil, werr
 	}
 	walk.bindRelation(rel)
-	certCtx := igl.WithReplayBudget(ctx, graphEvidenceReplayCap(budget, sel.PerPage))
+	certCtx := igl.WithReplayBudget(ctx, graphEvidenceReplayCap(budget, sel.PerPage, walk))
 	if err := walk.revalidateCompleted(certCtx, d, sel.PerPage); err != nil {
 		return nil, nil, err
 	}
@@ -412,7 +412,7 @@ func resumeGraphBridges(ctx context.Context, section *readmeta.Section, pid, pip
 			releaseGraphPageBudget(budget, sel.PerPage)
 		}
 	}()
-	replayCap := graphBridgeActiveReplayCap(budget, sel.PerPage, payload.PageState.Page)
+	replayCap := graphBridgeActiveReplayCap(budget, sel.PerPage, payload.PageState.Page, walk)
 	rctx := igl.WithReplayBudget(ctx, replayCap)
 	guard, err := collectBridgePage(rctx, d, budget, pipePID, pipe.ID, payload.PageState.Page, sel.PerPage, nil)
 	if err != nil || guard.Partial || guard.Unsupported || guard.Inaccessible {
@@ -706,22 +706,40 @@ func graphActiveReplayCap(budget *igl.Budget, perPage, page int) int {
 	return replay
 }
 
-// graphEvidenceReplayCap bounds completed-node certification replays while leaving
-// room for one forward page on the main item counter (max_items + per_page).
-func graphEvidenceReplayCap(budget *igl.Budget, perPage int) int {
+// graphEvidenceReplayCap sizes completed-node certification replay from retained
+// per-node item counts, with a legacy fallback when counts are absent.
+func graphEvidenceReplayCap(budget *igl.Budget, perPage int, walk *graphWalk) int {
 	if budget == nil || budget.MaxItems <= 0 {
 		return 0
 	}
 	if perPage < 1 {
 		perPage = 1
 	}
-	return budget.MaxItems + perPage
+	fallback := budget.MaxItems + perPage
+	if walk == nil || len(walk.evidence) == 0 {
+		return fallback
+	}
+	total := 0
+	for key := range walk.evidence {
+		node := fallback
+		if n, ok := walk.evidenceItems[key]; ok && n > 0 {
+			node = n
+		}
+		if node < fallback {
+			node = fallback
+		}
+		total += node
+	}
+	if total < fallback {
+		return fallback
+	}
+	return total
 }
 
 // graphBridgeActiveReplayCap sizes bridge-page resume replay for revalidateActiveBridges,
 // which re-reads every completed job page plus bridge pages 1..through-1 and the guard page.
-func graphBridgeActiveReplayCap(budget *igl.Budget, perPage, bridgePage int) int {
-	return graphEvidenceReplayCap(budget, perPage) + graphActiveReplayCap(budget, perPage, bridgePage)
+func graphBridgeActiveReplayCap(budget *igl.Budget, perPage, bridgePage int, walk *graphWalk) int {
+	return graphEvidenceReplayCap(budget, perPage, walk) + graphActiveReplayCap(budget, perPage, bridgePage)
 }
 
 func graphManifestExhausted(fromStart, exhausted bool, page graphPage, sel graphSelection, section readmeta.Section) bool {
@@ -764,6 +782,7 @@ func finishGraph(ctx context.Context, section readmeta.Section, pid, pipePID str
 	groups := buildLineage(page.Jobs, prior)
 	if walk != nil {
 		walk.recordOutcomes(groups)
+		walk.noteReplayItems(len(page.Jobs))
 		walk.jobsEv = chainEvidence(walk.jobsEv, jobGuardTokens(page.Jobs)...)
 	}
 	attemptOf := map[int64]string{}
@@ -898,7 +917,7 @@ func finishGraph(ctx context.Context, section readmeta.Section, pid, pipePID str
 			rel = fresh
 			walk.bindRelation(fresh)
 		}
-		certCtx := igl.WithReplayBudget(ctx, graphEvidenceReplayCap(budget, sel.PerPage))
+		certCtx := igl.WithReplayBudget(ctx, graphEvidenceReplayCap(budget, sel.PerPage, walk))
 		if err := walk.revalidateCompleted(certCtx, d, sel.PerPage); err != nil {
 			return pipelineGraphOut{}, err
 		}
@@ -1145,6 +1164,7 @@ func walkQueuedChildren(ctx context.Context, section *readmeta.Section, rootPID 
 		walk.depth = next.Depth
 		walk.ancestors = next.Ancestors
 		walk.jobsEv, walk.bridgesEv = "", ""
+		walk.activeNodeItems = 0
 		kind, err := walk.authorize(ctx, d, next.Key.Project)
 		if err != nil {
 			return err
@@ -1191,6 +1211,7 @@ func walkQueuedChildren(ctx context.Context, section *readmeta.Section, rootPID 
 		walk.depth = next.Depth
 		walk.phase = cursor.GraphPhaseJobs
 		walk.jobsEv = chainEvidence("", jobGuardTokens(page.Jobs)...)
+		walk.noteReplayItems(len(page.Jobs))
 		groups := buildLineage(page.Jobs, lineageCarry{})
 		walk.recordOutcomes(groups)
 		attemptOf := map[int64]string{}

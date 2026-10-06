@@ -63,7 +63,13 @@ func (w *graphWalk) completeNode(k graphNodeKey, pipe *pipelineView) {
 	if w.evidence == nil {
 		w.evidence = map[string][3]string{}
 	}
-	w.evidence[k.String()] = [3]string{w.jobsEv, w.bridgesEv, pipelineMetaDigest(pipe)}
+	key := k.String()
+	w.evidence[key] = [3]string{w.jobsEv, w.bridgesEv, pipelineMetaDigest(pipe)}
+	if w.evidenceItems == nil {
+		w.evidenceItems = map[string]int{}
+	}
+	w.evidenceItems[key] = w.activeNodeItems
+	w.activeNodeItems = 0
 	w.jobsEv, w.bridgesEv = "", ""
 }
 

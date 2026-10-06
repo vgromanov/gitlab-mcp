@@ -125,6 +125,8 @@ type graphWalk struct {
 	jobsEv           string
 	bridgesEv        string
 	evidence         map[string][3]string
+	evidenceItems    map[string]int
+	activeNodeItems  int
 	reach            []graphEdgeView
 }
 
@@ -164,8 +166,9 @@ func newGraphWalk(pipe *pipelineView, pid string, depth, nodes int) *graphWalk {
 		nodeCount: 1,
 		maxDepth:  depth,
 		maxNodes:  nodes,
-		authz:     map[string]string{},
-		root:      key,
+		authz:         map[string]string{},
+		root:          key,
+		evidenceItems: map[string]int{},
 	}
 }
 
@@ -199,6 +202,7 @@ func restoreGraphWalk(pipe *pipelineView, gc *cursor.GraphCont, depth, nodes int
 		jobsEv:           gc.JD,
 		bridgesEv:        gc.BD,
 		evidence:         map[string][3]string{},
+		evidenceItems:    map[string]int{},
 	}
 	for _, item := range gc.Ev {
 		key, jd, bd, md, ok := cursor.ParseGraphEvidence(item)
@@ -206,6 +210,13 @@ func restoreGraphWalk(pipe *pipelineView, gc *cursor.GraphCont, depth, nodes int
 			return nil, fmt.Errorf("%s: graph continuation missing", cursor.ResyncRequired)
 		}
 		w.evidence[key] = [3]string{jd, bd, md}
+	}
+	for _, item := range gc.Ei {
+		key, n, ok := cursor.ParseGraphEvidenceReplay(item)
+		if !ok {
+			return nil, fmt.Errorf("%s: graph continuation missing", cursor.ResyncRequired)
+		}
+		w.evidenceItems[key] = n
 	}
 	for _, a := range gc.Anc {
 		p, id, ok := splitVisitKey(a)
@@ -382,6 +393,16 @@ func (w *graphWalk) snapshotCont() *cursor.GraphCont {
 		}
 	}
 	sort.Strings(ev)
+	ei := make([]string, 0, len(w.evidenceItems))
+	for key, n := range w.evidenceItems {
+		if _, ok := w.evidence[key]; !ok {
+			continue
+		}
+		if item, err := cursor.FormatGraphEvidenceReplay(key, n); err == nil {
+			ei = append(ei, item)
+		}
+	}
+	sort.Strings(ei)
 	rg := graphReachSnapshot(w.reach)
 	var anc []string
 	for _, a := range w.ancestors {
@@ -397,6 +418,7 @@ func (w *graphWalk) snapshotCont() *cursor.GraphCont {
 		Q:     q,
 		Anc:   anc,
 		Ev:    ev,
+		Ei:    ei,
 		JD:    w.jobsEv,
 		BD:    w.bridgesEv,
 		N:     w.nodeCount,
@@ -585,8 +607,16 @@ func parseGraphBridge(raw json.RawMessage) (graphBridge, error) {
 	return br, nil
 }
 
+func (w *graphWalk) noteReplayItems(n int) {
+	if w == nil || n <= 0 {
+		return
+	}
+	w.activeNodeItems += n
+}
+
 func (w *graphWalk) ingestBridges(ctx context.Context, d Deps, parent graphNodeKey, parentSHA string, page bridgePage, prior lineageCarry) error {
 	w.bridgesOn = true
+	w.noteReplayItems(len(page.Bridges))
 	w.bridgesEv = chainEvidence(w.bridgesEv, bridgePageTokens(page)...)
 	if page.Unsupported {
 		w.cap = bridgeCapabilityUnknown

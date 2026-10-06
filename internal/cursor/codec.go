@@ -69,6 +69,8 @@ const (
 	// MaxGraphReachEdges caps bridge/shared reachability entries for a walk
 	// that stays within MaxGraphVisited nodes.
 	MaxGraphReachEdges = MaxGraphVisited * MaxGraphVisited
+	// MaxGraphEvidenceReplayItems caps retained-item replay per completed node.
+	MaxGraphEvidenceReplayItems = 1 << 20
 	// ReviewWriteFresh is the absolute write-freshness window from retrieved_at.
 	ReviewWriteFresh = 5 * time.Minute
 	// ResyncRequired is the uniform fail-closed continuation error token.
@@ -201,6 +203,7 @@ type GraphCont struct {
 	Q     []string `json:"q,omitempty"`
 	Anc   []string `json:"anc,omitempty"`
 	Ev    []string `json:"ev,omitempty"`
+	Ei    []string `json:"ei,omitempty"`
 	JD    string   `json:"jd,omitempty"`
 	BD    string   `json:"bd,omitempty"`
 	N     int      `json:"n"`
@@ -1336,6 +1339,29 @@ func FormatGraphEvidence(key, jobs, bridges, meta string) (string, error) {
 	return key + "=" + jobs + "=" + bridges + "=" + meta, nil
 }
 
+// FormatGraphEvidenceReplay records how many retained items certification must
+// re-read for one completed node.
+func FormatGraphEvidenceReplay(key string, items int) (string, error) {
+	if !validGraphVisitKey(key) || items < 0 || items > MaxGraphEvidenceReplayItems {
+		return "", ErrResyncRequired
+	}
+	return key + "=" + strconv.Itoa(items), nil
+}
+
+// ParseGraphEvidenceReplay decodes a FormatGraphEvidenceReplay item.
+func ParseGraphEvidenceReplay(item string) (key string, items int, ok bool) {
+	j := strings.LastIndexByte(item, '=')
+	if j < 0 {
+		return "", 0, false
+	}
+	key = item[:j]
+	n, err := strconv.Atoi(item[j+1:])
+	if err != nil || !validGraphVisitKey(key) || n < 0 || n > MaxGraphEvidenceReplayItems {
+		return "", 0, false
+	}
+	return key, n, true
+}
+
 // ParseGraphEvidence decodes a FormatGraphEvidence item.
 func ParseGraphEvidence(item string) (key, jobs, bridges, meta string, ok bool) {
 	rest := item
@@ -1414,6 +1440,23 @@ func validateGraphEvidence(c *GraphCont) error {
 			return ErrResyncRequired
 		}
 		seen[key] = struct{}{}
+	}
+	if len(c.Ei) > len(c.Ev) {
+		return ErrResyncRequired
+	}
+	replay := map[string]int{}
+	for _, item := range c.Ei {
+		key, n, ok := ParseGraphEvidenceReplay(item)
+		if !ok {
+			return ErrResyncRequired
+		}
+		if _, ok := seen[key]; !ok {
+			return ErrResyncRequired
+		}
+		if _, dup := replay[key]; dup {
+			return ErrResyncRequired
+		}
+		replay[key] = n
 	}
 	return nil
 }

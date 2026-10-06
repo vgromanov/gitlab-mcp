@@ -6,6 +6,17 @@ import (
 	"testing"
 )
 
+func TestGraphEvidenceReplayRoundTrip(t *testing.T) {
+	item, err := FormatGraphEvidenceReplay("42:100", 203)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, n, ok := ParseGraphEvidenceReplay(item)
+	if !ok || key != "42:100" || n != 203 {
+		t.Fatalf("round trip %q %d %v", key, n, ok)
+	}
+}
+
 func TestGraphEvidenceRoundTrip(t *testing.T) {
 	jd := strings.Repeat("a", 32)
 	item, err := FormatGraphEvidence("42:100", jd, "", jd)

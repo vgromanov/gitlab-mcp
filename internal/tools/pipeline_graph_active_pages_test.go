@@ -465,3 +465,94 @@ func TestPipelineGraph_manyParentJobPagesResumeIntoChild(t *testing.T) {
 		t.Fatalf("graph with %d parent job pages did not finish: cursor=%q child=%v coverage=%v", apiPages, tok, sawChild, last["downstream_coverage"])
 	}
 }
+
+func hundredOneJobPages(pathPrefix string, firstJobID int) map[string]string {
+	const perPage = 20
+	out := map[string]string{}
+	for p := 1; p <= 5; p++ {
+		out[fmt.Sprintf("%s/%d", pathPrefix, p)] = jobPageJSON(firstJobID+(p-1)*perPage, perPage)
+	}
+	out[fmt.Sprintf("%s/6", pathPrefix)] = "[" + jobJSON(firstJobID+100, "last", "success", "false") + "]"
+	return out
+}
+
+func TestPipelineGraph_hundredOneRootChildEvidenceReplayBudget(t *testing.T) {
+	const perPage = 20
+	jobs := hundredOneJobPages("42/100", 1)
+	for k, v := range hundredOneJobPages("99/200", 10001) {
+		jobs[k] = v
+	}
+	h := &walkServer{
+		pipes: map[string]string{
+			"42/100": walkPipe(100, 42, graphPipeSHA, "feature"),
+			"99/200": walkPipe(200, 99, graphChildSHA, "child"),
+		},
+		jobs: jobs,
+		bridges: map[string]string{
+			"42/100/1": "[" + bridgeJSON(50, "to-child", 99, 200, graphChildSHA) + "]",
+			"99/200/1": "[]",
+		},
+		mr:      graphMR("feature"),
+		mrPipes: graphPipes("feature"),
+	}
+	in := pipelineGraphIn{ProjectID: "42", MergeRequestIID: 7, PerPage: perPage, MaxRequests: 256}
+	clk := &cursor.FakeClock{T: time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)}
+	d := newCursorDeps(t, h, nil, clk)
+	tok := ""
+	var childFinalTok string
+	var out map[string]any
+	for i := 0; i < 40; i++ {
+		in.Cursor = tok
+		_, raw, err := getMergeRequestPipelineGraph(context.Background(), nil, in, d)
+		if err != nil {
+			t.Fatalf("call %d: %v", i, err)
+		}
+		out = raw.(map[string]any)
+		sec := graphSection(t, out)
+		if sectionMessage(sec, "budget_items") {
+			t.Fatalf("call %d hit budget_items cursor=%q lim=%#v", i, tok, sec["limitations"])
+		}
+		next, _ := sec["next_cursor"].(string)
+		if next != "" {
+			payload, derr := cursor.Decode(d.Config.CursorKey, next, clk.Now())
+			if derr == nil && payload.GraphCont != nil && payload.GraphCont.NI == 200 &&
+				payload.PageState.Page == 5 && payload.PageState.ProviderNextPage == 6 {
+				childFinalTok = next
+			}
+		}
+		if next == "" {
+			break
+		}
+		tok = next
+	}
+	if childFinalTok == "" {
+		t.Fatalf("never reached child final job continuation")
+	}
+	in.Cursor = childFinalTok
+	_, raw, err := getMergeRequestPipelineGraph(context.Background(), nil, in, d)
+	if err != nil {
+		t.Fatalf("child final continuation: %v", err)
+	}
+	out = raw.(map[string]any)
+	sec := graphSection(t, out)
+	if sectionMessage(sec, "budget_items") {
+		t.Fatalf("child final continuation hit budget_items lim=%#v", sec["limitations"])
+	}
+	tok, _ = sec["next_cursor"].(string)
+	for i := 0; i < 20 && tok != ""; i++ {
+		in.Cursor = tok
+		_, raw, err := getMergeRequestPipelineGraph(context.Background(), nil, in, d)
+		if err != nil {
+			t.Fatalf("finish call %d: %v", i, err)
+		}
+		out = raw.(map[string]any)
+		sec = graphSection(t, out)
+		if sectionMessage(sec, "budget_items") {
+			t.Fatalf("finish call %d budget_items lim=%#v", i, sec["limitations"])
+		}
+		tok, _ = sec["next_cursor"].(string)
+	}
+	if out["downstream_coverage"] != downstreamCoverageComplete {
+		t.Fatalf("graph did not complete: coverage=%v", out["downstream_coverage"])
+	}
+}
