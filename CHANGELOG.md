@@ -79,6 +79,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   it is now present on every snapshot that read a section (it used to need
   `expected_sha`); a failed recheck is reported as `head_recheck_error`.
   `include` omitted now also reads `discussions`.
+- `batch_get_file_contents(project_id, sha, paths, max_bytes_per_file?)`: reads
+  up to 20 files at one exact commit in one call (one sequential `GET
+  /repository/files` per path, no cache). `sha` must be a full 40-character
+  commit SHA; branch and tag names (and short or 64-character ids) are rejected
+  before any request. Per path it returns `{path, blob_id, size, binary,
+  truncated, content}` or `{path, error}`: a missing or unreadable path (404,
+  403, ...) is an error for that file only. `size` is the full blob size;
+  `content` is cut at `max_bytes_per_file` (default 32 KiB, max 256 KiB,
+  clamped; the effective value is echoed) on a character boundary and flagged
+  `truncated`; a binary file (NUL in the first 8000 bytes, or not valid UTF-8)
+  is flagged `binary` and its content is not returned. Registered in the review
+  profile only (now 53 tools; the daily set is unchanged) and in the default
+  catalog (RVG-165).
 - `get_pipeline_job_output` returns a tail window of the trace:
   `tail_lines` (default 200) and `max_bytes` (default 64 KiB, max 1 MiB) select
   the last lines, and the result is `{trace, truncated, total_bytes}`. The trace

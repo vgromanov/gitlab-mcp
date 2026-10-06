@@ -145,7 +145,7 @@ win when explicitly passed.
 | `GITLAB_API_URL` | `--api-url` | `https://gitlab.com/api/v4` | API base URL. |
 | `GITLAB_READ_ONLY_MODE` | `--read-only` | `false` | Hide all mutating tools. |
 | `USE_DAILY_TOOLS` | `--use-daily-tools` | `false` | Restricted mode: register the 41-tool daily census set (includes search). |
-| `GITLAB_TOOL_PROFILE` | `--tool-profile` | — | `review`: closed 52-tool MR review set (daily + discussion reply/resolve + pipeline reads + `get_review_queue` + `get_review_snapshot`; no pipeline writes). |
+| `GITLAB_TOOL_PROFILE` | `--tool-profile` | — | `review`: closed 53-tool MR review set (daily + discussion reply/resolve + pipeline reads + `get_review_queue` + `get_review_snapshot` + `batch_get_file_contents`; no pipeline writes). |
 | `USE_ISSUES` / `USE_WORK_ITEMS` / `USE_LABELS` / `USE_DRAFTS` / `USE_WEBHOOKS` / `USE_TIMELINE` | `--use-issues` etc. | `false` | Restricted-mode family enables (also enter restricted mode). |
 | `GITLAB_ENABLED_TOOLS` | `--enabled-tools` | — | CSV tool names to add (enters restricted mode when set). |
 | `GITLAB_DISABLED_TOOLS` | `--disabled-tools` | — | CSV tool names to remove (both modes). |
@@ -226,7 +226,7 @@ TLS-terminating reverse proxy in front.
 | Group | Examples |
 |---|---|
 | Projects / namespaces / users | `list_projects`, `get_project`, `list_namespaces`, `get_users` |
-| Repository | `get_file_contents`, `get_repository_tree`, `list_commits`, `get_branch_diffs`, `create_branch`, `push_files` |
+| Repository | `get_file_contents`, `batch_get_file_contents`, `get_repository_tree`, `list_commits`, `get_branch_diffs`, `create_branch`, `push_files` |
 | Merge requests | `list_merge_requests`, `get_merge_request`, `get_merge_request_diffs`, `create_merge_request`, `merge_merge_request`, `*_merge_request_note(s)`, draft notes, threads |
 | Issues | `list_issues`, `my_issues`, `create_issue`, `update_issue`, `*_issue_link`, `*_issue_note` |
 | Labels / milestones | `list_labels`, `create_label`, `list_milestones`, `*_milestone` (gated) |

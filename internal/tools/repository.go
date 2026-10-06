@@ -17,6 +17,7 @@ func RegisterRepository(s *mcp.Server, d Deps) {
 	AddTool(s, d, true, "", &mcp.Tool{Name: "create_repository", Description: "Create a new GitLab project"}, createRepository)
 	AddTool(s, d, true, "", &mcp.Tool{Name: "fork_repository", Description: "Fork a project"}, forkRepository)
 	AddTool(s, d, false, "", &mcp.Tool{Name: "get_file_contents", Description: "Get file or directory from a project repository"}, getFileContents)
+	AddTool(s, d, false, "", &mcp.Tool{Name: "batch_get_file_contents", Description: "Read up to 20 files at one exact commit in a single call. sha must be a full 40-character commit SHA (branch and tag names are rejected). Per path: {path, blob_id, size, binary, truncated, content} or {path, error}; a missing or unreadable path fails only that entry. size is the full blob size; content is cut at max_bytes_per_file (default 32768, max 262144) and flagged truncated; a binary file is flagged binary and its content is not returned"}, batchGetFileContents)
 	AddTool(s, d, true, "", &mcp.Tool{Name: "create_or_update_file", Description: "Create or update a single file on a branch"}, createOrUpdateFile)
 	AddTool(s, d, true, "", &mcp.Tool{Name: "push_files", Description: "Create a commit with multiple file actions"}, pushFiles)
 	AddTool(s, d, false, "", &mcp.Tool{Name: "get_repository_tree", Description: "List files and directories in repository"}, getRepositoryTree)
