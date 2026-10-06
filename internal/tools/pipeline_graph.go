@@ -1271,7 +1271,67 @@ func mintGraphCursor(d Deps, actorID int64, pid string, pipelineID int64, sha st
 			LineageMax:       lineage,
 		},
 	}
+	if err := trimGraphContToPayload(d.Config.CursorKey, &payload); err != nil {
+		return "", err
+	}
 	return cursor.Encode(d.Config.CursorKey, payload)
+}
+
+// trimGraphContToPayload drops trailing reachability and completed-node evidence
+// entries until the signed payload fits the cursor byte cap.
+func trimGraphContToPayload(key []byte, p *cursor.Payload) error {
+	if p == nil {
+		return errors.New("nil payload")
+	}
+	gc := p.GraphCont
+	if gc == nil {
+		return nil
+	}
+	origRg := append([]string(nil), gc.Rg...)
+	origEv := append([]string(nil), gc.Ev...)
+	try := func(rg, ev []string) error {
+		gc.Rg = rg
+		gc.Ev = ev
+		_, err := cursor.Encode(key, *p)
+		return err
+	}
+	if try(origRg, origEv) == nil {
+		return nil
+	}
+	bestRg := maxPrefixThatFits(len(origRg), func(n int) bool { return try(origRg[:n], origEv) == nil })
+	gc.Rg = origRg[:bestRg]
+	if try(gc.Rg, origEv) == nil {
+		return nil
+	}
+	bestEv := maxPrefixThatFits(len(origEv), func(n int) bool { return try(gc.Rg, origEv[:n]) == nil })
+	gc.Ev = origEv[:bestEv]
+	if try(gc.Rg, gc.Ev) == nil {
+		return nil
+	}
+	bestEv = maxPrefixThatFits(len(origEv), func(n int) bool { return try(origRg[:0], origEv[:n]) == nil })
+	gc.Rg = origRg[:0]
+	gc.Ev = origEv[:bestEv]
+	if try(gc.Rg, gc.Ev) == nil {
+		return nil
+	}
+	bestRg = maxPrefixThatFits(len(origRg), func(n int) bool { return try(origRg[:n], gc.Ev) == nil })
+	gc.Rg = origRg[:bestRg]
+	_, err := cursor.Encode(key, *p)
+	return err
+}
+
+func maxPrefixThatFits(max int, fits func(n int) bool) int {
+	lo, hi, best := 0, max, 0
+	for lo <= hi {
+		mid := (lo + hi) / 2
+		if fits(mid) {
+			best = mid
+			lo = mid + 1
+		} else {
+			hi = mid - 1
+		}
+	}
+	return best
 }
 
 func graphFilters(sel graphSelection, upper, mrProject string) cursor.Filters {
