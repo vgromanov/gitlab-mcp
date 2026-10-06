@@ -137,6 +137,9 @@ func TestPipelineGraph_denseReachBridgeCursorFitsAndResumes(t *testing.T) {
 	if len(payload.GraphCont.Rg) >= cursor.MaxGraphReachEdges {
 		t.Fatalf("expected trimmed reach snapshot, got %d entries", len(payload.GraphCont.Rg))
 	}
+	if !payload.GraphCont.Rgx {
+		t.Fatal("expected reach snapshot truncation flag")
+	}
 
 	in := pipelineGraphIn{ProjectID: "42", MergeRequestIID: 7, PerPage: perPage, MaxItems: 100, MaxRequests: 256}
 	in.Cursor = *section.NextCursor

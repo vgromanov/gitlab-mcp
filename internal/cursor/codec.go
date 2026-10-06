@@ -217,6 +217,8 @@ type GraphCont struct {
 	Prv   bool     `json:"prv,omitempty"`
 	RS    string   `json:"rs,omitempty"`
 	Rg    []string `json:"rg,omitempty"`
+	// Rgx marks a reachability snapshot shortened to fit the payload cap.
+	Rgx bool `json:"rgx,omitempty"`
 }
 
 // DiffWindowCont binds one diff-manifest window. It stores no patch text.

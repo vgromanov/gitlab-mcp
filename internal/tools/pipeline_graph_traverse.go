@@ -121,6 +121,7 @@ type graphWalk struct {
 	relProven        bool
 	relSHA           string
 	stickyIncomplete bool
+	reachTruncated   bool
 	jobsEv           string
 	bridgesEv        string
 	evidence         map[string][3]string
@@ -194,6 +195,7 @@ func restoreGraphWalk(pipe *pipelineView, gc *cursor.GraphCont, depth, nodes int
 		relProven:        gc.Prv,
 		relSHA:           gc.RS,
 		stickyIncomplete: gc.Inc,
+		reachTruncated:   gc.Rgx,
 		jobsEv:           gc.JD,
 		bridgesEv:        gc.BD,
 		evidence:         map[string][3]string{},
@@ -404,6 +406,7 @@ func (w *graphWalk) snapshotCont() *cursor.GraphCont {
 		Cov:   cov,
 		Cap:   w.cap,
 		Inc:   w.stickyIncomplete || w.hasIncompleteEdges(),
+		Rgx:   w.reachTruncated,
 		Rsn:   rsn,
 		RP:    root.Project,
 		RI:    root.Pipeline,
@@ -725,6 +728,11 @@ func (w *graphWalk) addBridgeEdge(ctx context.Context, d Deps, parent graphNodeK
 	}
 	if _, seen := w.visited[child.String()]; seen || w.queued(child) || w.isAncestor(child) {
 		if w.isAncestor(child) || child == w.current || w.reachableViaBridges(child, w.current) {
+			base.Kind = edgeKindCycle
+			w.unseen = true
+			w.stickyIncomplete = true
+			w.coverage = downstreamCoveragePartial
+		} else if w.reachTruncated {
 			base.Kind = edgeKindCycle
 			w.unseen = true
 			w.stickyIncomplete = true

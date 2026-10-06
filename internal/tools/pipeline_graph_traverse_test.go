@@ -1312,6 +1312,70 @@ func TestPipelineGraph_childCursorDetectsSiblingStatusOnlyDrift(t *testing.T) {
 	}
 }
 
+func TestPipelineGraph_restoredTrimmedReachClosingEdgeIsCycle(t *testing.T) {
+	h := &walkServer{
+		pipes: map[string]string{
+			"42/100": walkPipe(100, 42, graphPipeSHA, "feature"),
+			"99/200": walkPipe(200, 99, graphChildSHA, "a"),
+			"99/201": walkPipe(201, 99, graphChildSHA, "b"),
+		},
+		jobs: map[string]string{
+			"42/100/1": "[" + jobJSON(1, "test", "success", "false") + "]",
+			"99/200/1": "[" + jobJSON(10, "a", "success", "false") + "]",
+			"99/201/1": "[" + jobJSON(11, "b", "success", "false") + "]",
+		},
+		bridges: map[string]string{
+			"99/201/1": "[" + bridgeJSON(61, "b-to-a", 99, 200, graphChildSHA) + "]",
+		},
+		mr:      graphMR("feature"),
+		mrPipes: graphPipes("feature"),
+	}
+	d := newCursorDeps(t, h, nil, &cursor.FakeClock{T: time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)})
+	childSHA, ref, status, source := graphChildSHA, "b", "success", "push"
+	pipe := &pipelineView{ID: 201, SHA: &childSHA, Ref: &ref, Status: &status, StatusKnown: true, Source: &source}
+	gc := &cursor.GraphCont{
+		V:     cursor.GraphContSchemaG1,
+		Phase: cursor.GraphPhaseBridges,
+		NP:    "99",
+		NI:    201,
+		D:     1,
+		N:     3,
+		Cov:   downstreamCoveragePartial,
+		Cap:   bridgeCapabilityBridges,
+		Inc:   true,
+		Rgx:   true,
+		RP:    "42",
+		RI:    100,
+		RK:    relBranch,
+		Prv:   true,
+		RS:    shaUnknown,
+	}
+	walk, err := restoreGraphWalk(pipe, gc, graphDefaultMaxDepth, graphDefaultMaxNodes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	walk.visited["99:200"] = struct{}{}
+	walk.visited["99:201"] = struct{}{}
+	walk.cap = bridgeCapabilityBridges
+	br := graphBridge{
+		Job:           graphJob{ID: 61, Name: "b-to-a", NameKnown: true, Status: "success", StatusKnown: true},
+		ChildProject:  99,
+		ChildPipeline: 200,
+		ChildSHA:      graphChildSHA,
+		ChildPresent:  true,
+	}
+	parent := graphNodeKey{Project: "99", Pipeline: 201}
+	if err := walk.addBridgeEdge(context.Background(), d, parent, graphChildSHA, br); err != nil {
+		t.Fatal(err)
+	}
+	if len(walk.edges) != 1 {
+		t.Fatalf("edges %#v", walk.edges)
+	}
+	if walk.edges[0].Kind != edgeKindCycle {
+		t.Fatalf("trimmed reach must not certify shared sibling edge: %#v", walk.edges[0])
+	}
+}
+
 func TestRestoreGraphReachabilityNotInEmittedEdges(t *testing.T) {
 	item, err := cursor.FormatGraphReachEdge("42:100", "42:200", edgeKindBridge)
 	if err != nil {

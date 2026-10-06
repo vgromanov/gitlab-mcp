@@ -730,7 +730,7 @@ func graphWalkCertifiable(exhausted bool, page graphPage, sel graphSelection, co
 		return false
 	}
 	return graphWalkFullyRead(exhausted, page, sel, coverage, unseen, section, walk) &&
-		!walk.partial && !walk.block
+		!walk.partial && !walk.block && !walk.reachTruncated
 }
 
 func finishGraph(ctx context.Context, section readmeta.Section, pid, pipePID string, mrIID *int64, pipe *pipelineView, rel relationResult, page graphPage, sel graphSelection, d Deps, actorID int64, upper, expires string, pageNum int, fromStart bool, prior lineageCarry, walk *graphWalk, budget *igl.Budget) (pipelineGraphOut, error) {
@@ -1295,29 +1295,64 @@ func trimGraphContToPayload(key []byte, p *cursor.Payload) error {
 		_, err := cursor.Encode(key, *p)
 		return err
 	}
+	finish := func() error {
+		return encodeGraphContPayload(key, p, origRg)
+	}
 	if try(origRg, origEv) == nil {
 		return nil
 	}
 	bestRg := maxPrefixThatFits(len(origRg), func(n int) bool { return try(origRg[:n], origEv) == nil })
 	gc.Rg = origRg[:bestRg]
 	if try(gc.Rg, origEv) == nil {
-		return nil
+		return finish()
 	}
 	bestEv := maxPrefixThatFits(len(origEv), func(n int) bool { return try(gc.Rg, origEv[:n]) == nil })
 	gc.Ev = origEv[:bestEv]
 	if try(gc.Rg, gc.Ev) == nil {
-		return nil
+		return finish()
 	}
 	bestEv = maxPrefixThatFits(len(origEv), func(n int) bool { return try(origRg[:0], origEv[:n]) == nil })
 	gc.Rg = origRg[:0]
 	gc.Ev = origEv[:bestEv]
 	if try(gc.Rg, gc.Ev) == nil {
-		return nil
+		return finish()
 	}
 	bestRg = maxPrefixThatFits(len(origRg), func(n int) bool { return try(origRg[:n], gc.Ev) == nil })
 	gc.Rg = origRg[:bestRg]
-	_, err := cursor.Encode(key, *p)
-	return err
+	return finish()
+}
+
+func encodeGraphContPayload(key []byte, p *cursor.Payload, origRg []string) error {
+	if p == nil {
+		return errors.New("nil payload")
+	}
+	gc := p.GraphCont
+	if gc == nil {
+		_, err := cursor.Encode(key, *p)
+		return err
+	}
+	ev := append([]string(nil), gc.Ev...)
+	for n := len(gc.Rg); n >= 0; n-- {
+		gc.Rg = origRg[:n]
+		gc.Ev = ev
+		markReachSnapshotTruncated(gc, len(origRg))
+		if _, err := cursor.Encode(key, *p); err == nil {
+			return nil
+		}
+	}
+	return cursor.ErrResyncRequired
+}
+
+func markReachSnapshotTruncated(gc *cursor.GraphCont, origReach int) {
+	if gc == nil || len(gc.Rg) >= origReach {
+		return
+	}
+	gc.Rgx = true
+	gc.Inc = true
+	if gc.Cov == downstreamCoverageComplete {
+		gc.Cov = downstreamCoveragePartial
+	}
+	gc.Unk = true
 }
 
 func maxPrefixThatFits(max int, fits func(n int) bool) int {
