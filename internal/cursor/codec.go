@@ -148,6 +148,8 @@ type Filters struct {
 // the greatest id seen for it. A leading "*" means further names were
 // omitted so the payload stays under the size cap. Other tools leave it
 // empty, and omitempty keeps their tokens unchanged.
+// SeenIDs is pipeline_graph only: sorted decimal job ids already returned on
+// the active node (jobs or bridge pages) so later pages cannot repeat them.
 type PageState struct {
 	Page             int      `json:"page"`
 	PerPage          int      `json:"per_page"`
@@ -156,6 +158,7 @@ type PageState struct {
 	ItemsOnPage      int      `json:"items_on_page"`
 	ProviderNextPage int64    `json:"provider_next_page"`
 	LineageMax       []string `json:"lineage_max,omitempty"`
+	SeenIDs          []string `json:"seen_ids,omitempty"`
 }
 
 // Scope binds project/optional MR, group queue, or project/pipeline.

@@ -129,6 +129,84 @@ func TestPipelineGraph_bridgeResumeRejectsBoundaryOverlap(t *testing.T) {
 	}
 }
 
+func TestPipelineGraph_jobResumeRejectsCrossPageOverlap(t *testing.T) {
+	h := &walkServer{
+		pipes: map[string]string{"42/100": walkPipe(100, 42, graphPipeSHA, "feature")},
+		jobs: map[string]string{
+			"42/100/1": "[" + jobJSON(1, "ok", "success", "false") + "]",
+			"42/100/2": "[" + jobJSON(2, "fail", "failed", "false") + "]",
+			"42/100/3": "[" + jobJSON(1, "ok", "success", "false") + "]",
+		},
+		bridges: map[string]string{"42/100/1": "[]"},
+		mr:      graphMR("feature"),
+		mrPipes: graphPipes("feature"),
+	}
+	d, in := pagedActiveDeps(t, h)
+	tok, _ := advanceGraph(t, d, &in, "")
+	tok, _ = advanceGraph(t, d, &in, tok)
+	if tok == "" {
+		t.Fatal("expected page-3 continuation")
+	}
+	in.Cursor = tok
+	_, _, err := getMergeRequestPipelineGraph(context.Background(), nil, in, d)
+	if err == nil || !strings.Contains(err.Error(), cursor.ResyncRequired) || !strings.Contains(err.Error(), "overlap") {
+		t.Fatalf("cross-page job overlap not rejected: %v", err)
+	}
+}
+
+func TestPipelineGraph_jobPageThreeRepeatOmitsFailedNotReady(t *testing.T) {
+	h := &walkServer{
+		pipes: map[string]string{"42/100": walkPipe(100, 42, graphPipeSHA, "feature")},
+		jobs: map[string]string{
+			"42/100/1": "[" + jobJSON(1, "ok", "success", "false") + "]",
+			"42/100/2": "[" + jobJSON(2, "fail", "failed", "false") + "]",
+			"42/100/3": "[" + jobJSON(1, "ok", "success", "false") + "]",
+		},
+		bridges: map[string]string{"42/100/1": "[]"},
+		mr:      graphMR("feature"),
+		mrPipes: graphPipes("feature"),
+	}
+	d, in := pagedActiveDeps(t, h)
+	tok, last := advanceGraph(t, d, &in, "")
+	tok, last = advanceGraph(t, d, &in, tok)
+	if tok == "" {
+		t.Fatal("expected page-3 continuation")
+	}
+	in.Cursor = tok
+	_, raw, err := getMergeRequestPipelineGraph(context.Background(), nil, in, d)
+	if err == nil {
+		requireNotReady(t, raw.(map[string]any))
+		if raw.(map[string]any)["assessment"] == assessReady {
+			t.Fatal("repeated page-1 job on page 3 must not certify ready")
+		}
+		return
+	}
+	if !strings.Contains(err.Error(), "overlap") {
+		t.Fatalf("expected overlap resync, got %v last=%#v", err, graphSection(t, last))
+	}
+}
+
+func TestPipelineGraph_bridgeResumeRejectsCrossPageOverlap(t *testing.T) {
+	h := &walkServer{
+		pipes:   map[string]string{"42/100": walkPipe(100, 42, graphPipeSHA, "feature")},
+		jobs:    map[string]string{"42/100/1": "[" + jobJSON(1, "root", "success", "false") + "]"},
+		bridges: map[string]string{
+			"42/100/1": "[" + bridgeJSON(50, "one", 0, 0, "") + "]",
+			"42/100/2": "[" + bridgeJSON(51, "two", 0, 0, "") + "]",
+			"42/100/3": "[" + bridgeJSON(50, "one", 0, 0, "") + "]",
+		},
+		mr:      graphMR("feature"),
+		mrPipes: graphPipes("feature"),
+	}
+	d, in := pagedActiveDeps(t, h)
+	tok := bridgePhaseToken(t, d, &in, 2)
+	in.Cursor = tok
+	_, _, err := getMergeRequestPipelineGraph(context.Background(), nil, in, d)
+	if err == nil || !strings.Contains(err.Error(), cursor.ResyncRequired) || !strings.Contains(err.Error(), "overlap") {
+		t.Fatalf("cross-page bridge overlap not rejected: %v", err)
+	}
+}
+
 func TestPipelineGraph_bridgeRetryLineageAcrossPages(t *testing.T) {
 	failed := strings.Replace(bridgeJSON(51, "dep", 99, 201, graphChildSHA), `"status":"success","allow_failure":false`, `"status":"failed","allow_failure":false`, 1)
 	h := &walkServer{

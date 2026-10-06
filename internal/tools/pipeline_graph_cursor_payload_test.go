@@ -127,7 +127,7 @@ func denseReachBridgeCursorFitsAndResumes(t *testing.T) {
 	sel := graphSelection{MRIID: 7, PerPage: perPage, MaxDepth: graphDefaultMaxDepth, MaxNodes: graphDefaultMaxNodes}
 	upper := clk.Now().UTC().Format(time.RFC3339Nano)
 	expires := clk.Now().UTC().Add(d.Config.CursorTTL()).Format(time.RFC3339Nano)
-	if err := mintBridgeCursor(&section, d, 7, "42", 100, graphPipeSHA, sel, upper, expires, 1, bp, "42", walk, next, prior); err != nil {
+	if err := mintBridgeCursor(&section, d, 7, "42", 100, graphPipeSHA, sel, upper, expires, 1, bp, "42", walk, next, prior, nil); err != nil {
 		t.Fatal(err)
 	}
 	if section.NextCursor == nil {
