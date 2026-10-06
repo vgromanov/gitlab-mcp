@@ -6,11 +6,13 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
 	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/config"
 	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/testutil"
+	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/version"
 )
 
 func TestNewServer(t *testing.T) {
@@ -25,6 +27,28 @@ func TestNewServer(t *testing.T) {
 	srv2 := NewServer(cfg, cli, slog.Default())
 	if srv2 == nil {
 		t.Fatal("nil2")
+	}
+}
+
+func TestNewServer_serverInfoCarriesBuildRevision(t *testing.T) {
+	// initialize never calls GitLab, so the fixture handler has no body to write.
+	cli, _ := testutil.NewGitLabClient(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	srv := NewServer(&config.Config{Token: "t"}, cli, slog.Default())
+	cs := testutil.MCPConnect(t, srv)
+	info := cs.InitializeResult().ServerInfo
+	if info == nil {
+		t.Fatal("no serverInfo after initialize")
+	}
+	if info.Name != version.Name {
+		t.Fatalf("name = %q", info.Name)
+	}
+	if info.Version != version.String() {
+		t.Fatalf("version = %q, want %q", info.Version, version.String())
+	}
+	// The bare link-time constant is no longer what a client sees: the build
+	// revision (or an explicit "unknown" without VCS info) follows the "+".
+	if !strings.HasPrefix(info.Version, version.Version+"+") || strings.HasSuffix(info.Version, "+") {
+		t.Fatalf("version %q lacks the build revision", info.Version)
 	}
 }
 

@@ -18,7 +18,7 @@ func NewServer(cfg *config.Config, client *gitlab.Client, logger *slog.Logger) *
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	}
-	s := mcp.NewServer(&mcp.Implementation{Name: version.Name, Version: version.Version}, &mcp.ServerOptions{
+	s := mcp.NewServer(&mcp.Implementation{Name: version.Name, Version: version.String()}, &mcp.ServerOptions{
 		Logger:       logger,
 		Instructions: "GitLab MCP: PAT-authenticated tools for projects, MRs, issues, CI, wiki, releases, and GraphQL.",
 	})

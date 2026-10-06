@@ -36,6 +36,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- The build revision is visible at runtime: MCP `serverInfo.version` (read after
+  `initialize`), `gitlab-mcp -version` and a startup log line now report
+  `<version>+<revision>`, where `<revision>` is the first 12 characters of the
+  commit the binary was built from (Go's embedded `vcs.revision`), with `-dirty`
+  appended when the tree had uncommitted changes, for example
+  `0.1.0+bf02f09afdad` or `0.1.0+bf02f09afdad-dirty`. A build without VCS
+  information (outside a git checkout, a linked `git worktree`, `-buildvcs=false`,
+  a Docker build without `.git`) reports `0.1.0+unknown` and starts normally. No tool, profile or
+  dependency change (RVG-176).
 - `get_review_queue(group_id, roles?, state?, updated_after?, per_page?,
   max_pages?)`: the current user's review queue in a group. It resolves the
   current user, pages the group MR list per role (`reviewer_id` / `author_id`,

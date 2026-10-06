@@ -2,6 +2,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"log/slog"
@@ -23,7 +24,7 @@ func main() {
 func run(args []string) int {
 	for _, a := range args {
 		if a == "-version" || a == "--version" {
-			fmt.Printf("%s %s\n", version.Name, version.Version)
+			fmt.Printf("%s %s\n", version.Name, version.String())
 			return 0
 		}
 	}
@@ -41,6 +42,8 @@ func runWithConfig(parent context.Context, cfg *config.Config) int {
 		return 1
 	}
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	log.Info("starting", "version", version.String(), "vcs_time", cmp.Or(version.Build().Time, "unknown"))
 
 	client, err := glclient.NewClient(cfg)
 	if err != nil {

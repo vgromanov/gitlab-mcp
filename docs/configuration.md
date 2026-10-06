@@ -214,6 +214,22 @@ Example query: `ShouldRegister filename:selection.go path:internal/tools/`.
 
 See also [`docs/tools.md`](tools.md#search--events--markdown--webhooks).
 
+## Build revision
+
+`serverInfo.version` in the MCP `initialize` result, `gitlab-mcp -version` and the
+`starting` log line (stderr, with the commit time as `vcs_time`) all report
+`<version>+<revision>[-dirty]`:
+
+| Build | Reported version |
+|---|---|
+| `go build` / `go install` from a clean git checkout | `0.1.0+bf02f09afdad` (first 12 characters of the commit id; compare by prefix with `git rev-parse HEAD`) |
+| same, with uncommitted changes | `0.1.0+bf02f09afdad-dirty` |
+| no VCS information (not a git checkout, a linked `git worktree` (Go 1.25 does not stamp those), `-buildvcs=false`, Docker build without `.git`) | `0.1.0+unknown` |
+
+The part before `+` is the link-time `version.Version` (GoReleaser sets it from the
+tag); the revision is read at runtime from the build info the Go toolchain embeds,
+so it needs no build flag. There is no separate tool: clients read `serverInfo`.
+
 ## HTTP transport
 
 | Variable | Flag | Default | Notes |
