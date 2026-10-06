@@ -39,6 +39,24 @@ func TestRestrictedMode(t *testing.T) {
 	}
 }
 
+func TestProfileName(t *testing.T) {
+	for want, c := range map[string]*Config{
+		"review":  {ToolProfile: ProfileReview, UseDailyTools: true},
+		"default": {Pipeline: true, DisabledTools: []string{"list_projects"}},
+		"daily":   {UseDailyTools: true},
+		"custom":  {UseDailyTools: true, Issues: true},
+	} {
+		if got := c.ProfileName(); got != want {
+			t.Fatalf("ProfileName(%+v) = %q, want %q", c, got, want)
+		}
+	}
+	for _, c := range []*Config{{EnabledTools: []string{"get_project"}}, {Drafts: true}, {UseDailyTools: true, EnabledTools: []string{"x"}}} {
+		if got := c.ProfileName(); got != "custom" {
+			t.Fatalf("ProfileName(%+v) = %q, want custom", c, got)
+		}
+	}
+}
+
 func TestValidToolProfile(t *testing.T) {
 	for profile, want := range map[string]bool{"": true, ProfileReview: true, "daily": false, "bogus": false} {
 		if got := (&Config{ToolProfile: profile}).ValidToolProfile(); got != want {

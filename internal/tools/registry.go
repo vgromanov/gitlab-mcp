@@ -19,6 +19,9 @@ func AddTool[In, Out any](s *mcp.Server, d Deps, mutating bool, feature string, 
 	if d.Config == nil || !ShouldRegister(d.Config, tool.Name, feature) {
 		return
 	}
+	if d.registered != nil {
+		*d.registered++
+	}
 	mcp.AddTool(s, tool, func(ctx context.Context, req *mcp.CallToolRequest, in In) (*mcp.CallToolResult, Out, error) {
 		return h(ctx, req, in, d)
 	})

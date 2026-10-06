@@ -68,3 +68,13 @@ func TestString_usesLinkTimeBase(t *testing.T) {
 		t.Fatalf("String = %q", String())
 	}
 }
+
+func TestShort(t *testing.T) {
+	for rev, want := range map[string]string{
+		"": "unknown", "bf02f09": "bf02f09", "bf02f09afdadf019544e6628f3febc9acf0e946b": "bf02f09afdad",
+	} {
+		if got := (VCS{Revision: rev}).Short(); got != want {
+			t.Fatalf("Short(%q) = %q, want %q", rev, got, want)
+		}
+	}
+}

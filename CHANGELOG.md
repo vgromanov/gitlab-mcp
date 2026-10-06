@@ -36,6 +36,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `get_server_info`: a read-only, idempotent tool that returns the serving
+  build, `{version, revision, revision_short, vcs_time, modified, profile,
+  tool_count}`, for clients that cannot read `serverInfo` (the mcp-wrapper bridge
+  does not forward the child's). It makes no GitLab request (works offline and
+  with an invalid token); build info the binary lacks is reported as `unknown`.
+  `profile` is `review`, `daily`, `default` or `custom`, and `tool_count` is the
+  number of tools this instance registered (itself included). Registered in the
+  review profile (now 55 tools) and in the default catalog; the daily set is
+  unchanged at 41 (RVG-177).
 - The build revision is visible at runtime: MCP `serverInfo.version` (read after
   `initialize`), `gitlab-mcp -version` and a startup log line now report
   `<version>+<revision>`, where `<revision>` is the first 12 characters of the

@@ -56,15 +56,15 @@ Recommended Cursor profile for ship/MR work: `USE_DAILY_TOOLS=true` alone
 ### Review profile (`GITLAB_TOOL_PROFILE=review`)
 
 A named, **closed** tool set for MR review automation. It enters restricted
-mode and registers exactly the 41 daily tools plus these 13 tools
-(54 total):
+mode and registers exactly the 41 daily tools plus these 14 tools
+(55 total):
 
 - `get_merge_request_discussion`, `create_merge_request_discussion_note`
   (reply), `resolve_merge_request_thread`
 - `list_pipelines`, `get_pipeline`, `list_pipeline_jobs`,
   `list_pipeline_trigger_jobs`, `get_pipeline_job`, `get_pipeline_job_output`
 - `get_review_queue`, `get_review_snapshot`, `batch_get_file_contents`,
-  `get_pipeline_status` (review profile only; not in the daily set)
+  `get_pipeline_status`, `get_server_info` (review profile only; not in the daily set)
 
 Pipeline writes (`create_pipeline`, `retry_pipeline`, `cancel_pipeline`,
 `play_pipeline_job`, `retry_pipeline_job`, `cancel_pipeline_job`) are never
@@ -94,7 +94,7 @@ means today's behavior; `USE_DAILY_TOOLS` is unchanged.
 | Variable | Flag | Default | Restricted? | Notes |
 |---|---|---|---|---|
 | `USE_DAILY_TOOLS` | `--use-daily-tools` | `false` | Yes | 41-tool daily set. |
-| `GITLAB_TOOL_PROFILE` | `--tool-profile` | empty | Yes | `review`: closed 54-tool review set (see above). |
+| `GITLAB_TOOL_PROFILE` | `--tool-profile` | empty | Yes | `review`: closed 55-tool review set (see above). |
 | `USE_ISSUES` | `--use-issues` | `false` | Yes | Issues + issue notes/links. |
 | `USE_WORK_ITEMS` | `--use-work-items` | `false` | Yes | Work-item GraphQL tools (not `execute_graphql`). |
 | `USE_LABELS` | `--use-labels` | `false` | Yes | Label CRUD. |
@@ -229,7 +229,26 @@ See also [`docs/tools.md`](tools.md#search--events--markdown--webhooks).
 
 The part before `+` is the link-time `version.Version` (GoReleaser sets it from the
 tag); the revision is read at runtime from the build info the Go toolchain embeds,
-so it needs no build flag. There is no separate tool: clients read `serverInfo`.
+so it needs no build flag.
+
+Clients that cannot see `serverInfo` (the mcp-wrapper bridge answers `initialize`
+with its own info and does not forward the child's) call the `get_server_info`
+tool instead. It makes no GitLab request, so it also works offline and with an
+invalid token, and returns:
+
+```json
+{"version": "0.1.0+bf02f09afdad", "revision": "bf02f09afdadf019544e6628f3febc9acf0e946b",
+ "revision_short": "bf02f09afdad", "vcs_time": "2026-10-06T13:28:00Z", "modified": false,
+ "profile": "review", "tool_count": 55}
+```
+
+`revision` and `vcs_time` are `unknown` (and `modified` is `false`) when the
+binary has no VCS information. `profile` is `review`, `daily` (`USE_DAILY_TOOLS`
+alone), `default` (unrestricted catalog) or `custom` (any other restricted
+selection); `tool_count` is the number of tools this instance registered after
+all selection, disable and read-only rules, the tool itself included. The tool is
+in the review profile and the default catalog; the daily set stays at 41 (add it
+with `GITLAB_ENABLED_TOOLS=get_server_info`).
 
 ## HTTP transport
 

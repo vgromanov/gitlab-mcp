@@ -37,14 +37,19 @@ func ParseVCS(settings []debug.BuildSetting) VCS {
 	return v
 }
 
+// Short is the first revisionLen characters of the commit id, or "unknown".
+func (v VCS) Short() string {
+	if v.Revision == "" {
+		return "unknown"
+	}
+	return v.Revision[:min(len(v.Revision), revisionLen)]
+}
+
 // Format returns base+<revision>, with "-dirty" appended for a modified tree
 // and "unknown" instead of the revision when there is none.
 func (v VCS) Format(base string) string {
-	if v.Revision == "" {
-		return base + "+unknown"
-	}
-	rev := v.Revision[:min(len(v.Revision), revisionLen)]
-	if v.Modified {
+	rev := v.Short()
+	if v.Modified && v.Revision != "" {
 		rev += "-dirty"
 	}
 	return base + "+" + rev

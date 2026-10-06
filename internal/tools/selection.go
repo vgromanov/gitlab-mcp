@@ -69,6 +69,7 @@ var reviewExtraTools = []string{
 	"get_review_snapshot",
 	"get_pipeline_status",
 	"batch_get_file_contents",
+	"get_server_info",
 	"get_merge_request_discussion",
 	"create_merge_request_discussion_note",
 	"resolve_merge_request_thread",
