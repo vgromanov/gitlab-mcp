@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `list_merge_requests` accepts `reviewer_id`, `scope`, `updated_after`,
+  `updated_before`, `order_by` and `sort` on project, group and global lists;
+  invalid `scope` / `order_by` / `sort` / timestamps return a clear input error
+  (RVG-156).
 - `GITLAB_TOOL_PROFILE=review` (`--tool-profile`): closed 50-tool MR review
   profile (daily set + discussion get/reply/resolve + six pipeline reads, no
   pipeline writes). Daily and default catalogs are unchanged (RVG-155).
@@ -54,6 +58,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `.gitignore` expanded for editor metadata, coverage artifacts, and `.env.*`.
 - Lint-driven cleanups: explicit `Close` error handling, embedded `Pagination`
   call sites, and a few revive/staticcheck nits surfaced by `golangci-lint`.
+
+### Fixed
+
+- `list_merge_requests` on a group ignored `author_id`; it now reaches GitLab
+  (RVG-156).
 
 ## [0.1.0] - 2025-10-12
 

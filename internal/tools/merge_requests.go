@@ -3,7 +3,9 @@ package tools
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	gitlab "gitlab.com/gitlab-org/api/client-go/v2"
@@ -372,55 +374,103 @@ func updateMergeRequest(ctx context.Context, _ *mcp.CallToolRequest, in updateMe
 }
 
 type listMergeRequestsIn struct {
-	ProjectID *string `json:"project_id,omitempty"`
-	GroupID   *string `json:"group_id,omitempty"`
-	State     *string `json:"state,omitempty"`
-	AuthorID  *int64  `json:"author_id,omitempty"`
+	ProjectID     *string `json:"project_id,omitempty"`
+	GroupID       *string `json:"group_id,omitempty"`
+	State         *string `json:"state,omitempty"`
+	AuthorID      *int64  `json:"author_id,omitempty"`
+	ReviewerID    *int64  `json:"reviewer_id,omitempty" jsonschema:"Only MRs assigned to this user id as reviewer"`
+	Scope         *string `json:"scope,omitempty" jsonschema:"created_by_me, assigned_to_me or all"`
+	UpdatedAfter  *string `json:"updated_after,omitempty" jsonschema:"Only MRs updated at or after this time (RFC3339 or YYYY-MM-DD)"`
+	UpdatedBefore *string `json:"updated_before,omitempty" jsonschema:"Only MRs updated at or before this time (RFC3339 or YYYY-MM-DD)"`
+	OrderBy       *string `json:"order_by,omitempty" jsonschema:"created_at, title or updated_at"`
+	Sort          *string `json:"sort,omitempty" jsonschema:"asc or desc"`
 	Pagination
+}
+
+// mrListFilters holds the validated review filters shared by the project,
+// group and global merge request lists.
+type mrListFilters struct {
+	reviewer      *gitlab.ReviewerIDValue
+	scope         *string
+	orderBy, sort *string
+	after, before *time.Time
+}
+
+func oneOf(field string, v *string, allowed ...string) error {
+	if v == nil || slices.Contains(allowed, *v) {
+		return nil
+	}
+	return errInvalid(fmt.Sprintf("invalid %s %q: must be one of %s", field, *v, strings.Join(allowed, ", ")))
+}
+
+func parseMRListFilters(in listMergeRequestsIn) (f mrListFilters, err error) {
+	for _, c := range []struct {
+		field   string
+		v       *string
+		allowed []string
+	}{
+		{"scope", in.Scope, []string{"created_by_me", "assigned_to_me", "all"}},
+		{"order_by", in.OrderBy, []string{"created_at", "title", "updated_at"}},
+		{"sort", in.Sort, []string{"asc", "desc"}},
+	} {
+		if err = oneOf(c.field, c.v, c.allowed...); err != nil {
+			return f, err
+		}
+	}
+	f.scope, f.orderBy, f.sort = in.Scope, in.OrderBy, in.Sort
+	if in.ReviewerID != nil {
+		f.reviewer = gitlab.ReviewerID(*in.ReviewerID)
+	}
+	for _, c := range []struct {
+		field string
+		v     *string
+		dst   **time.Time
+	}{{"updated_after", in.UpdatedAfter, &f.after}, {"updated_before", in.UpdatedBefore, &f.before}} {
+		if c.v == nil {
+			continue
+		}
+		t, perr := parseCommitTime(*c.v)
+		if perr != nil {
+			return f, errInvalid(fmt.Sprintf("invalid %s %q: use RFC3339 or YYYY-MM-DD", c.field, *c.v))
+		}
+		*c.dst = &t
+	}
+	return f, nil
 }
 
 func listMergeRequests(ctx context.Context, _ *mcp.CallToolRequest, in listMergeRequestsIn, d Deps) (*mcp.CallToolResult, any, error) {
 	page, perPage := in.ListOpts()
-	if in.ProjectID != nil && *in.ProjectID != "" {
-		pid, err := ResolveProjectID(*in.ProjectID, d.Config.DefaultProjectID)
-		if err != nil {
+	lo := gitlab.ListOptions{Page: int64(page), PerPage: int64(perPage)}
+	f, err := parseMRListFilters(in)
+	if err != nil {
+		return nil, nil, err
+	}
+	var mrs []*gitlab.BasicMergeRequest
+	var resp *gitlab.Response
+	switch {
+	case in.ProjectID != nil && *in.ProjectID != "":
+		var pid string
+		if pid, err = ResolveProjectID(*in.ProjectID, d.Config.DefaultProjectID); err != nil {
 			return nil, nil, err
 		}
-		if err := checkAllowedProject(d.Config, pid); err != nil {
+		if err = checkAllowedProject(d.Config, pid); err != nil {
 			return nil, nil, err
 		}
-		opt := &gitlab.ListProjectMergeRequestsOptions{ListOptions: gitlab.ListOptions{Page: int64(page), PerPage: int64(perPage)}}
-		if in.State != nil {
-			opt.State = in.State
-		}
-		if in.AuthorID != nil {
-			opt.AuthorID = in.AuthorID
-		}
-		mrs, resp, err := d.Client.MergeRequests.ListProjectMergeRequests(pid, opt, gitlab.WithContext(ctx))
-		if err != nil {
-			return nil, nil, err
-		}
-		return nil, Out(map[string]any{"merge_requests": mrs, "pagination": map[string]any{"next_page": resp.NextPage}}), nil
+		mrs, resp, err = d.Client.MergeRequests.ListProjectMergeRequests(pid, &gitlab.ListProjectMergeRequestsOptions{
+			ListOptions: lo, State: in.State, AuthorID: in.AuthorID, ReviewerID: f.reviewer, Scope: f.scope,
+			UpdatedAfter: f.after, UpdatedBefore: f.before, OrderBy: f.orderBy, Sort: f.sort,
+		}, gitlab.WithContext(ctx))
+	case in.GroupID != nil && *in.GroupID != "":
+		mrs, resp, err = d.Client.MergeRequests.ListGroupMergeRequests(*in.GroupID, &gitlab.ListGroupMergeRequestsOptions{
+			ListOptions: lo, State: in.State, AuthorID: in.AuthorID, ReviewerID: f.reviewer, Scope: f.scope,
+			UpdatedAfter: f.after, UpdatedBefore: f.before, OrderBy: f.orderBy, Sort: f.sort,
+		}, gitlab.WithContext(ctx))
+	default:
+		mrs, resp, err = d.Client.MergeRequests.ListMergeRequests(&gitlab.ListMergeRequestsOptions{
+			ListOptions: lo, State: in.State, AuthorID: in.AuthorID, ReviewerID: f.reviewer, Scope: f.scope,
+			UpdatedAfter: f.after, UpdatedBefore: f.before, OrderBy: f.orderBy, Sort: f.sort,
+		}, gitlab.WithContext(ctx))
 	}
-	if in.GroupID != nil && *in.GroupID != "" {
-		opt := &gitlab.ListGroupMergeRequestsOptions{ListOptions: gitlab.ListOptions{Page: int64(page), PerPage: int64(perPage)}}
-		if in.State != nil {
-			opt.State = in.State
-		}
-		mrs, resp, err := d.Client.MergeRequests.ListGroupMergeRequests(*in.GroupID, opt, gitlab.WithContext(ctx))
-		if err != nil {
-			return nil, nil, err
-		}
-		return nil, Out(map[string]any{"merge_requests": mrs, "pagination": map[string]any{"next_page": resp.NextPage}}), nil
-	}
-	opt := &gitlab.ListMergeRequestsOptions{ListOptions: gitlab.ListOptions{Page: int64(page), PerPage: int64(perPage)}}
-	if in.State != nil {
-		opt.State = in.State
-	}
-	if in.AuthorID != nil {
-		opt.AuthorID = in.AuthorID
-	}
-	mrs, resp, err := d.Client.MergeRequests.ListMergeRequests(opt, gitlab.WithContext(ctx))
 	if err != nil {
 		return nil, nil, err
 	}
