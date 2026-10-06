@@ -618,8 +618,12 @@ func (w *graphWalk) ingestBridges(ctx context.Context, d Deps, parent graphNodeK
 		w.unseen = false
 	}
 	groups := buildLineage(bridgeJobs(page.Bridges), prior)
+	attempts := lineageAttempts(groups)
 	w.recordOutcomes(groups)
 	for _, br := range page.Bridges {
+		if attempts[br.Job.ID] == attemptHistory {
+			continue
+		}
 		if err := w.addBridgeEdge(ctx, d, parent, parentSHA, br); err != nil {
 			return err
 		}

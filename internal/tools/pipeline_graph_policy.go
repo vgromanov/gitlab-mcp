@@ -255,6 +255,16 @@ func buildLineage(jobs []graphJob, prior lineageCarry) []lineageGroup {
 	return out
 }
 
+func lineageAttempts(groups []lineageGroup) map[int64]string {
+	out := map[int64]string{}
+	for _, g := range groups {
+		for id, attempt := range g.Attempts {
+			out[id] = attempt
+		}
+	}
+	return out
+}
+
 func lineageOne(jobs []graphJob, prior lineageCarry) lineageGroup {
 	g := lineageGroup{Attempts: map[int64]string{}, LatestIDs: []int64{}, HistoryIDs: []int64{}}
 	if len(jobs) == 0 {

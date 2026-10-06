@@ -140,7 +140,7 @@ func TestPipelineGraph_bridgeRetryLineageAcrossPages(t *testing.T) {
 		jobs: map[string]string{
 			"42/100/1": "[" + jobJSON(1, "parent", "success", "false") + "]",
 			"99/200/1": "[" + jobJSON(10, "child-a", "success", "false") + "]",
-			"99/201/1": "[" + jobJSON(20, "old-a", "success", "false") + "]",
+			"99/201/1": "[" + jobJSON(20, "old-a", "failed", "false") + "]",
 		},
 		bridges: map[string]string{
 			"42/100/1": "[" + bridgeJSON(52, "dep", 99, 200, graphChildSHA) + "]",
