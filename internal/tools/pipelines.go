@@ -1,8 +1,10 @@
 package tools
 
 import (
+	"bytes"
 	"context"
-	"io"
+	"fmt"
+	"net/http"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	gitlab "gitlab.com/gitlab-org/api/client-go/v2"
@@ -15,7 +17,7 @@ func RegisterPipelines(s *mcp.Server, d Deps) {
 	AddTool(s, d, false, "pipeline", &mcp.Tool{Name: "list_pipeline_jobs", Description: "List jobs in a pipeline"}, listPipelineJobs)
 	AddTool(s, d, false, "pipeline", &mcp.Tool{Name: "list_pipeline_trigger_jobs", Description: "List bridge/trigger jobs in a pipeline"}, listPipelineTriggerJobs)
 	AddTool(s, d, false, "pipeline", &mcp.Tool{Name: "get_pipeline_job", Description: "Get a pipeline job"}, getPipelineJob)
-	AddTool(s, d, false, "pipeline", &mcp.Tool{Name: "get_pipeline_job_output", Description: "Get job trace/log output"}, getPipelineJobOutput)
+	AddTool(s, d, false, "pipeline", &mcp.Tool{Name: "get_pipeline_job_output", Description: "Get the tail of a job trace/log: the last tail_lines lines (default 200) within max_bytes (default 65536, max 1048576), streamed so large traces stay memory-bounded. Returns trace, truncated, total_bytes. truncate_lines is deprecated: it is now an alias for tail_lines and keeps the last N lines (it used to keep the first N)."}, getPipelineJobOutput)
 	AddTool(s, d, true, "pipeline", &mcp.Tool{Name: "create_pipeline", Description: "Create a pipeline for a ref"}, createPipeline)
 	AddTool(s, d, true, "pipeline", &mcp.Tool{Name: "retry_pipeline", Description: "Retry failed/canceled jobs in a pipeline"}, retryPipeline)
 	AddTool(s, d, true, "pipeline", &mcp.Tool{Name: "cancel_pipeline", Description: "Cancel a pipeline"}, cancelPipeline)
@@ -142,7 +144,61 @@ func getPipelineJob(ctx context.Context, _ *mcp.CallToolRequest, in getPipelineJ
 type getPipelineJobOutputIn struct {
 	ProjectID     string `json:"project_id"`
 	JobID         int64  `json:"job_id"`
-	TruncateLines int    `json:"truncate_lines,omitempty"`
+	TailLines     int    `json:"tail_lines,omitempty" jsonschema:"Last N lines to return (default 200)"`
+	MaxBytes      int    `json:"max_bytes,omitempty" jsonschema:"Max trace bytes to return (default 65536, max 1048576)"`
+	TruncateLines int    `json:"truncate_lines,omitempty" jsonschema:"Deprecated alias for tail_lines"`
+}
+
+const (
+	defaultTraceTailLines = 200
+	defaultTraceMaxBytes  = 64 << 10
+	maxTraceMaxBytes      = 1 << 20
+)
+
+// tailBuffer is an io.Writer that keeps only the last max bytes written
+// (memory stays below 2*max) and counts every byte it saw.
+type tailBuffer struct {
+	max   int
+	buf   []byte
+	total int64
+}
+
+func (t *tailBuffer) Write(p []byte) (int, error) {
+	t.total += int64(len(p))
+	if len(p) >= t.max {
+		t.buf = append(t.buf[:0], p[len(p)-t.max:]...)
+		return len(p), nil
+	}
+	t.buf = append(t.buf, p...)
+	if len(t.buf) > 2*t.max {
+		t.buf = append(t.buf[:0], t.buf[len(t.buf)-t.max:]...)
+	}
+	return len(p), nil
+}
+
+// window returns the last max retained bytes.
+func (t *tailBuffer) window() []byte {
+	if len(t.buf) > t.max {
+		return t.buf[len(t.buf)-t.max:]
+	}
+	return t.buf
+}
+
+// lastLines returns the last n lines of b (ignoring one trailing newline) and
+// whether earlier lines were dropped.
+func lastLines(b []byte, n int) ([]byte, bool) {
+	end := len(b)
+	if end > 0 && b[end-1] == '\n' {
+		end--
+	}
+	for i := 0; i < n; i++ {
+		j := bytes.LastIndexByte(b[:end], '\n')
+		if j < 0 {
+			return b, false
+		}
+		end = j
+	}
+	return b[end+1:], true
 }
 
 func getPipelineJobOutput(ctx context.Context, _ *mcp.CallToolRequest, in getPipelineJobOutputIn, d Deps) (*mcp.CallToolResult, any, error) {
@@ -150,19 +206,35 @@ func getPipelineJobOutput(ctx context.Context, _ *mcp.CallToolRequest, in getPip
 	if err != nil {
 		return nil, nil, err
 	}
-	r, _, err := d.Client.Jobs.GetTraceFile(pid, in.JobID, gitlab.WithContext(ctx))
+	lines, maxBytes := in.TailLines, in.MaxBytes
+	if lines <= 0 {
+		lines = in.TruncateLines
+	}
+	if lines <= 0 {
+		lines = defaultTraceTailLines
+	}
+	if maxBytes <= 0 {
+		maxBytes = defaultTraceMaxBytes
+	}
+	maxBytes = min(maxBytes, maxTraceMaxBytes)
+	// Jobs.GetTraceFile buffers the whole body inside the client, so stream the
+	// raw response into a bounded tail buffer instead.
+	path := fmt.Sprintf("projects/%s/jobs/%d/trace", gitlab.PathEscape(pid), in.JobID)
+	req, err := d.Client.NewRequest(http.MethodGet, path, nil, []gitlab.RequestOptionFunc{gitlab.WithContext(ctx)})
 	if err != nil {
 		return nil, nil, err
 	}
-	b, err := io.ReadAll(r)
-	if err != nil {
+	tb := &tailBuffer{max: maxBytes}
+	if _, err := d.Client.Do(req, tb); err != nil {
 		return nil, nil, err
 	}
-	out := string(b)
-	if in.TruncateLines > 0 {
-		out = TruncateLines(out, in.TruncateLines)
+	b := tb.window()
+	truncated := tb.total > int64(len(b))
+	if i := bytes.IndexByte(b, '\n'); truncated && i >= 0 && i+1 < len(b) {
+		b = b[i+1:] // the byte window may start mid-line
 	}
-	return nil, Out(map[string]any{"trace": out}), nil
+	b, cut := lastLines(b, lines)
+	return nil, Out(map[string]any{"trace": string(b), "truncated": truncated || cut, "total_bytes": tb.total}), nil
 }
 
 type createPipelineIn struct {

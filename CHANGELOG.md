@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `get_pipeline_job_output` returns a tail window of the trace:
+  `tail_lines` (default 200) and `max_bytes` (default 64 KiB, max 1 MiB) select
+  the last lines, and the result is `{trace, truncated, total_bytes}`. The trace
+  is streamed through a bounded buffer instead of being read whole. `truncate_lines`
+  still works but is deprecated: it is now an alias for `tail_lines` and keeps the
+  **last** N lines (it used to keep the first N) without the old `... truncated`
+  marker line (RVG-158).
 - Honest MR diff pagination: `get_merge_request_diffs`,
   `list_merge_request_changed_files` and `get_merge_request_file_diff` accept
   `page`/`per_page` and return `pagination: {page, per_page, next_page,
