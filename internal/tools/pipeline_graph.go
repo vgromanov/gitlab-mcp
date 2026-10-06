@@ -1312,6 +1312,34 @@ func mintGraphCursor(d Deps, actorID int64, pid string, pipelineID int64, sha st
 	return cursor.Encode(d.Config.CursorKey, payload)
 }
 
+// graphContSyncReplayEntries drops replay counts that no longer have matching
+// completed-node evidence after payload trimming.
+func graphContSyncReplayEntries(gc *cursor.GraphCont) {
+	if gc == nil {
+		return
+	}
+	keys := map[string]struct{}{}
+	for _, item := range gc.Ev {
+		key, _, _, _, ok := cursor.ParseGraphEvidence(item)
+		if ok {
+			keys[key] = struct{}{}
+		}
+	}
+	if len(gc.Ei) == 0 {
+		return
+	}
+	out := make([]string, 0, len(gc.Ei))
+	for _, item := range gc.Ei {
+		key, _, ok := cursor.ParseGraphEvidenceReplay(item)
+		if ok {
+			if _, keep := keys[key]; keep {
+				out = append(out, item)
+			}
+		}
+	}
+	gc.Ei = out
+}
+
 // trimGraphContToPayload drops trailing reachability and completed-node evidence
 // entries until the signed payload fits the cursor byte cap.
 func trimGraphContToPayload(key []byte, p *cursor.Payload) error {
@@ -1327,6 +1355,7 @@ func trimGraphContToPayload(key []byte, p *cursor.Payload) error {
 	try := func(rg, ev []string) error {
 		gc.Rg = rg
 		gc.Ev = ev
+		graphContSyncReplayEntries(gc)
 		_, err := cursor.Encode(key, *p)
 		return err
 	}
@@ -1370,6 +1399,7 @@ func encodeGraphContPayload(key []byte, p *cursor.Payload, origRg []string) erro
 	for n := len(gc.Rg); n >= 0; n-- {
 		gc.Rg = origRg[:n]
 		gc.Ev = ev
+		graphContSyncReplayEntries(gc)
 		markReachSnapshotTruncated(gc, len(origRg))
 		if _, err := cursor.Encode(key, *p); err == nil {
 			return nil

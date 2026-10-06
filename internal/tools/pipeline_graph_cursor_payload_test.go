@@ -12,7 +12,15 @@ import (
 	igl "gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/gitlab"
 )
 
+func TestPipelineGraph_trimmedEvidenceReplayStaysResumable(t *testing.T) {
+	denseReachBridgeCursorFitsAndResumes(t)
+}
+
 func TestPipelineGraph_denseReachBridgeCursorFitsAndResumes(t *testing.T) {
+	denseReachBridgeCursorFitsAndResumes(t)
+}
+
+func denseReachBridgeCursorFitsAndResumes(t *testing.T) {
 	const perPage = 20
 	bridges := map[string]string{
 		"42/100/1": bridgePageJSON(1000, perPage),
@@ -62,6 +70,7 @@ func TestPipelineGraph_denseReachBridgeCursorFitsAndResumes(t *testing.T) {
 
 	walk := newGraphWalk(pipe, "42", graphDefaultMaxDepth, graphDefaultMaxNodes)
 	walk.evidence = map[string][3]string{}
+	walk.evidenceItems = map[string]int{}
 	walk.jobsEv = jobsEv
 	walk.bridgesEv = chainEvidence("", bridgePageTokens(bp)...)
 	walk.phase = cursor.GraphPhaseBridges
@@ -95,6 +104,7 @@ func TestPipelineGraph_denseReachBridgeCursorFitsAndResumes(t *testing.T) {
 			t.Fatal(err)
 		}
 		walk.evidence[key] = [3]string{jd, bd, pipelineMetaDigest(child)}
+		walk.evidenceItems[key] = 2
 		walk.visited[key] = struct{}{}
 	}
 
@@ -139,6 +149,22 @@ func TestPipelineGraph_denseReachBridgeCursorFitsAndResumes(t *testing.T) {
 	}
 	if !payload.GraphCont.Rgx {
 		t.Fatal("expected reach snapshot truncation flag")
+	}
+	evKeys := map[string]struct{}{}
+	for _, item := range payload.GraphCont.Ev {
+		k, _, _, _, ok := cursor.ParseGraphEvidence(item)
+		if ok {
+			evKeys[k] = struct{}{}
+		}
+	}
+	for _, item := range payload.GraphCont.Ei {
+		k, _, ok := cursor.ParseGraphEvidenceReplay(item)
+		if !ok {
+			t.Fatalf("bad ei %q", item)
+		}
+		if _, ok := evKeys[k]; !ok {
+			t.Fatalf("ei key %q missing from trimmed ev", k)
+		}
 	}
 
 	in := pipelineGraphIn{ProjectID: "42", MergeRequestIID: 7, PerPage: perPage, MaxItems: 100, MaxRequests: 256}
