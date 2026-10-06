@@ -1037,6 +1037,36 @@ func TestPipelineGraph_cycleEdgeNeverReady(t *testing.T) {
 	}
 }
 
+func blockedRootDriftServer() *walkServer {
+	return &walkServer{
+		pipes: map[string]string{
+			"42/100": walkPipe(100, 42, graphPipeSHA, "feature"),
+			"99/200": walkPipe(200, 99, graphChildSHA, "child"),
+		},
+		jobs: map[string]string{
+			"42/100/1": "[" + jobJSON(1, "parent", "failed", "false") + "]",
+			"99/200/1": "[" + jobJSON(10, "child-a", "success", "false") + "]",
+			"99/200/2": "[" + jobJSON(11, "child-b", "success", "false") + "]",
+		},
+		bridges: map[string]string{
+			"42/100/1": "[" + bridgeJSON(50, "to-child", 99, 200, graphChildSHA) + "]",
+		},
+		mr:      graphMR("feature"),
+		mrPipes: graphPipes("feature"),
+	}
+}
+
+func TestPipelineGraph_blockedCompleteDetectsRootJobDrift(t *testing.T) {
+	h := blockedRootDriftServer()
+	d, in, tok := childContinuation(t, h)
+	h.jobs["42/100/1"] = "[" + jobJSON(1, "parent", "success", "false") + "]"
+	in.Cursor = tok
+	_, _, err := getMergeRequestPipelineGraph(context.Background(), nil, in, d)
+	if err == nil || !strings.Contains(err.Error(), cursor.ResyncRequired) {
+		t.Fatalf("blocked complete graph must revalidate root jobs: %v", err)
+	}
+}
+
 func ancestorDriftServer() *walkServer {
 	return &walkServer{
 		pipes: map[string]string{

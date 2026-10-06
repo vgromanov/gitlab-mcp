@@ -651,13 +651,20 @@ func graphManifestExhausted(fromStart, exhausted bool, page graphPage, sel graph
 		section.NextCursor == nil
 }
 
-func graphWalkCertifiable(exhausted bool, page graphPage, sel graphSelection, coverage string, unseen bool, section readmeta.Section, walk *graphWalk) bool {
+func graphWalkFullyRead(exhausted bool, page graphPage, sel graphSelection, coverage string, unseen bool, section readmeta.Section, walk *graphWalk) bool {
 	if walk == nil {
 		return false
 	}
 	jobsPartial := page.Partial || !page.Paging.PagingKnown || !page.Paging.ExhaustedObserved
 	return exhausted && !jobsPartial && !sel.Filter.active() && !page.Partial && page.Paging.PagingKnown &&
-		coverage == downstreamCoverageComplete && !unseen && section.NextCursor == nil &&
+		coverage == downstreamCoverageComplete && !unseen && section.NextCursor == nil
+}
+
+func graphWalkCertifiable(exhausted bool, page graphPage, sel graphSelection, coverage string, unseen bool, section readmeta.Section, walk *graphWalk) bool {
+	if walk == nil {
+		return false
+	}
+	return graphWalkFullyRead(exhausted, page, sel, coverage, unseen, section, walk) &&
 		!walk.partial && !walk.block
 }
 
@@ -796,10 +803,10 @@ func finishGraph(ctx context.Context, section readmeta.Section, pid, pipePID str
 	if walk != nil {
 		reasons = appendUniqueReasons(append([]string(nil), walk.reasons...), reasons)
 	}
-	certifiable := graphWalkCertifiable(exhausted, page, sel, coverage, unseen, section, walk)
 	manifestExhausted := graphManifestExhausted(fromStart, exhausted, page, sel, section)
-	signGraph := certifiable && (fromStart || (walk != nil && len(walk.evidence) > 0))
-	if signGraph && walk != nil {
+	graphBound := fromStart || (walk != nil && len(walk.evidence) > 0)
+	revalidateGraph := graphWalkFullyRead(exhausted, page, sel, coverage, unseen, section, walk) && graphBound
+	if revalidateGraph && walk != nil {
 		if sel.MRIID > 0 {
 			root := walk.root
 			if root.Pipeline < 1 {

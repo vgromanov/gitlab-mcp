@@ -66,6 +66,9 @@ const (
 	GraphPhaseBridges = "bridges"
 	// MaxGraphVisited caps signed visited+queue entries.
 	MaxGraphVisited = 16
+	// MaxGraphReachEdges caps bridge/shared reachability entries for a walk
+	// that stays within MaxGraphVisited nodes.
+	MaxGraphReachEdges = MaxGraphVisited * MaxGraphVisited
 	// ReviewWriteFresh is the absolute write-freshness window from retrieved_at.
 	ReviewWriteFresh = 5 * time.Minute
 	// ResyncRequired is the uniform fail-closed continuation error token.
@@ -1373,7 +1376,7 @@ func ParseGraphReachEdge(item string) (from, to, kind string, ok bool) {
 }
 
 func validateGraphReach(items []string) error {
-	if len(items) > MaxGraphVisited*2 {
+	if len(items) > MaxGraphReachEdges {
 		return ErrResyncRequired
 	}
 	seen := map[string]struct{}{}

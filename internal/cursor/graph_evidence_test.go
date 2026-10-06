@@ -1,6 +1,7 @@
 package cursor
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -14,6 +15,20 @@ func TestGraphEvidenceRoundTrip(t *testing.T) {
 	key, gotJD, gotBD, gotMD, ok := ParseGraphEvidence(item)
 	if !ok || key != "42:100" || gotJD != jd || gotBD != "" || gotMD != jd {
 		t.Fatalf("round trip %q %q %q %q %v", key, gotJD, gotBD, gotMD, ok)
+	}
+}
+
+func TestValidateGraphReachWithinNodeBound(t *testing.T) {
+	rg := make([]string, 0, 33)
+	for i := 0; i < 33; i++ {
+		item, err := FormatGraphReachEdge("42:100", "42:"+strconv.Itoa(200+i), "bridge")
+		if err != nil {
+			t.Fatal(err)
+		}
+		rg = append(rg, item)
+	}
+	if err := validateGraphReach(rg); err != nil {
+		t.Fatalf("dense reach within node bound: %v", err)
 	}
 }
 
