@@ -7,17 +7,24 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	gitlab "gitlab.com/gitlab-org/api/client-go/v2"
+
+	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/config"
 )
 
 // RegisterGraphQLTools registers GraphQL-based work item and utility tools.
 func RegisterGraphQLTools(s *mcp.Server, d Deps) {
 	yes := true
+	desc := "Run an arbitrary GitLab GraphQL query or mutation (mutations are rejected in read-only mode). Top-level GraphQL errors are returned as tool errors."
+	if d.Config != nil && d.Config.ToolProfile == config.ProfileReview {
+		desc = "Run a GitLab GraphQL query. This profile allows queries only. Top-level GraphQL errors are returned as tool errors."
+	}
 	AddTool(s, d, false, "", &mcp.Tool{
 		Name:        "execute_graphql",
-		Description: "Run an arbitrary GitLab GraphQL query or mutation (mutations are rejected in read-only mode). Top-level GraphQL errors are returned as tool errors.",
+		Description: desc,
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: false, DestructiveHint: &yes, OpenWorldHint: &yes},
 	}, executeGraphQL)
 	AddTool(s, d, false, "work_items", &mcp.Tool{Name: "get_work_item", Description: "Get a work item by global id"}, getWorkItem)
@@ -52,7 +59,12 @@ type executeGraphQLIn struct {
 }
 
 func executeGraphQL(ctx context.Context, _ *mcp.CallToolRequest, in executeGraphQLIn, d Deps) (*mcp.CallToolResult, any, error) {
-	if d.Config != nil && d.Config.ReadOnly {
+	if d.Config != nil && d.Config.ToolProfile == config.ProfileReview {
+		// Review profile (RVG-175): allow-list, independent of --read-only, before any request.
+		if !gqlQueryOnly(in.Query) {
+			return nil, nil, errors.New(gqlQueryOnlyMsg)
+		}
+	} else if d.Config != nil && d.Config.ReadOnly {
 		mutation, err := gqlHasMutation(in.Query)
 		if err != nil {
 			return nil, nil, fmt.Errorf("read-only mode: cannot verify GraphQL document has no mutation: %w", err)
@@ -132,6 +144,81 @@ func gqlHasMutation(doc string) (bool, error) {
 		}
 	}
 	return false, nil
+}
+
+const (
+	gqlQueryOnlyMsg = "graphql_mutations_not_permitted: this profile allows queries only"
+	gqlMaxDocBytes  = 256 << 10
+	gqlMaxDepth     = 64
+)
+
+// gqlQueryOnly is the review-profile allow-list (RVG-175): true only when every
+// top-level definition of doc is an anonymous selection set "{...}", a "query"
+// operation or a "fragment". Anything else (mutation, subscription, type-system
+// definitions, stray tokens) and any ambiguity (unterminated string, comment or
+// bracket, mismatched brackets, a string with a raw line break, non-ASCII or
+// control bytes outside strings and comments, oversized or deeply nested input,
+// no definition) is false. Only top-level keywords are judged, so a field or an
+// operation named "mutation" inside a query is a query. Whitespace is space, tab,
+// CR, LF and comma; # comments end at CR or LF.
+func gqlQueryOnly(doc string) bool {
+	if len(doc) > gqlMaxDocBytes || !utf8.ValidString(doc) {
+		return false
+	}
+	var stack []byte // expected closers of the open brackets
+	defs, expectDef := 0, true
+	for i := 0; i < len(doc); {
+		c := doc[i]
+		switch {
+		case c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == ',':
+			i++
+		case c == '#':
+			for i < len(doc) && doc[i] != '\n' && doc[i] != '\r' {
+				i++
+			}
+		case c == '"':
+			end := gqlStringEnd(doc, i)
+			if end < 0 || len(stack) == 0 || !strings.HasPrefix(doc[i:], `"""`) && strings.ContainsAny(doc[i:end], "\r\n") {
+				return false
+			}
+			i = end
+		case c == '_' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z':
+			j := i + 1
+			for j < len(doc) && (doc[j] == '_' || doc[j] >= 'a' && doc[j] <= 'z' || doc[j] >= 'A' && doc[j] <= 'Z' || doc[j] >= '0' && doc[j] <= '9') {
+				j++
+			}
+			if len(stack) == 0 && expectDef {
+				if kw := doc[i:j]; kw != "query" && kw != "fragment" {
+					return false
+				}
+				defs++
+				expectDef = false
+			}
+			i = j
+		case c == '{' || c == '(' || c == '[':
+			if len(stack) >= gqlMaxDepth || len(stack) == 0 && expectDef && c != '{' {
+				return false
+			}
+			if len(stack) == 0 && expectDef {
+				defs++
+			}
+			expectDef = false
+			stack = append(stack, "})]"[strings.IndexByte("{([", c)])
+			i++
+		case c == '}' || c == ')' || c == ']':
+			if len(stack) == 0 || stack[len(stack)-1] != c {
+				return false
+			}
+			stack = stack[:len(stack)-1]
+			expectDef = len(stack) == 0 && c == '}'
+			i++
+		case strings.IndexByte("!$&.:=@|+-0123456789", c) >= 0 && (len(stack) > 0 || !expectDef):
+			i++
+		default:
+			return false
+		}
+	}
+	return defs > 0 && len(stack) == 0 && expectDef
 }
 
 // gqlStringEnd returns the index after the string literal starting at doc[i],
