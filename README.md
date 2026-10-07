@@ -153,7 +153,7 @@ win when explicitly passed.
 | `GITLAB_API_URL` | `--api-url` | `https://gitlab.com/api/v4` | API base URL. |
 | `GITLAB_READ_ONLY_MODE` | `--read-only` | `false` | Hide all mutating tools. |
 | `USE_DAILY_TOOLS` | `--use-daily-tools` | `false` | Restricted mode: register the 41-tool daily census set (includes search). |
-| `GITLAB_TOOL_PROFILE` | `--tool-profile` | — | `review`: closed 55-tool MR review set (daily + discussion reply/resolve + pipeline reads + `get_review_queue` + `get_review_snapshot` + `batch_get_file_contents` + `get_pipeline_status` + `get_server_info`; no pipeline writes). |
+| `GITLAB_TOOL_PROFILE` | `--tool-profile` | — | `review`: closed 47-tool MR review set (reads, in-thread comment / reply / resolve, approve, merge of the current user's own MRs only, pipeline reads, `get_review_queue`, `get_review_snapshot`, `batch_get_file_contents`, `get_pipeline_status`, `get_server_info`; no pipeline writes and none of the raw daily-set writers such as `create_merge_request_note`, `push_files` or `update_merge_request`). |
 | `USE_ISSUES` / `USE_WORK_ITEMS` / `USE_LABELS` / `USE_DRAFTS` / `USE_WEBHOOKS` / `USE_TIMELINE` | `--use-issues` etc. | `false` | Restricted-mode family enables (also enter restricted mode). |
 | `GITLAB_ENABLED_TOOLS` | `--enabled-tools` | — | CSV tool names to add (enters restricted mode when set). |
 | `GITLAB_DISABLED_TOOLS` | `--disabled-tools` | — | CSV tool names to remove (both modes). |

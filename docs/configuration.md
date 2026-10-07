@@ -56,15 +56,43 @@ Recommended Cursor profile for ship/MR work: `USE_DAILY_TOOLS=true` alone
 ### Review profile (`GITLAB_TOOL_PROFILE=review`)
 
 A named, **closed** tool set for MR review automation. It enters restricted
-mode and registers exactly the 41 daily tools plus these 14 tools
-(55 total):
+mode and registers exactly this explicit list of 47 tools (it is no longer
+derived as "daily plus extras", so a change to the daily set does not move it):
 
-- `get_merge_request_discussion`, `create_merge_request_discussion_note`
-  (reply), `resolve_merge_request_thread`
-- `list_pipelines`, `get_pipeline`, `list_pipeline_jobs`,
-  `list_pipeline_trigger_jobs`, `get_pipeline_job`, `get_pipeline_job_output`
-- `get_review_queue`, `get_review_snapshot`, `batch_get_file_contents`,
-  `get_pipeline_status`, `get_server_info` (review profile only; not in the daily set)
+- **Writes (5):** `create_merge_request_thread`,
+  `create_merge_request_discussion_note` (reply),
+  `resolve_merge_request_thread`, `approve_merge_request`,
+  `merge_merge_request` (only for MRs authored by the current user, see below)
+- **Reads shared with the daily set (30):** `execute_graphql`,
+  `search_repositories`, `get_file_contents`, `get_project`,
+  `get_merge_request`, `list_group_projects`, `list_project_members`,
+  `search_code`, `list_merge_requests`, `list_projects`, `get_namespace`,
+  `get_repository_tree`, `search_group_code`, `search_project_code`,
+  `get_users`, `get_commit`, `get_merge_request_approval_state`,
+  `get_project_events`, `list_commits`, `mr_discussions`,
+  `get_merge_request_notes`, `get_merge_request_conflicts`, `list_namespaces`,
+  `list_releases`, `get_merge_request_file_diff`,
+  `list_merge_request_changed_files`, `get_commit_diff`,
+  `get_merge_request_diffs`, `get_merge_request_version`,
+  `list_merge_request_versions`
+- **Review reads (12, not in the daily set):** `get_merge_request_discussion`,
+  `list_pipelines`, `get_pipeline`, `list_pipeline_jobs`,
+  `list_pipeline_trigger_jobs`, `get_pipeline_job`, `get_pipeline_job_output`,
+  `get_review_queue`, `get_review_snapshot`, `batch_get_file_contents`,
+  `get_pipeline_status`, `get_server_info`
+
+The raw writers of the daily set are **not** in the review profile:
+`create_merge_request_note`, `create_or_update_file`, `push_files`,
+`create_branch`, `create_release`, `create_repository`, `create_merge_request`
+and `update_merge_request` (a raw body or description runs quick actions as the
+token's user, and the rest change code, refs or releases). They stay in the daily
+set and the default catalog. `execute_graphql` stays (read-only GraphQL; its
+server-side mutation block is a separate ticket).
+
+In the review profile `merge_merge_request` refuses unless the merge request is
+authored by the current user (`merge_not_permitted: MR is not authored by the
+current user`, nothing written): one MR read and one current-user lookup before
+the single merge request. Other profiles are unchanged.
 
 Pipeline writes (`create_pipeline`, `retry_pipeline`, `cancel_pipeline`,
 `play_pipeline_job`, `retry_pipeline_job`, `cancel_pipeline_job`) are never
@@ -112,7 +140,7 @@ requested state. Other profiles keep today's behaviour.
 | Variable | Flag | Default | Restricted? | Notes |
 |---|---|---|---|---|
 | `USE_DAILY_TOOLS` | `--use-daily-tools` | `false` | Yes | 41-tool daily set. |
-| `GITLAB_TOOL_PROFILE` | `--tool-profile` | empty | Yes | `review`: closed 55-tool review set (see above). |
+| `GITLAB_TOOL_PROFILE` | `--tool-profile` | empty | Yes | `review`: closed 47-tool review set (see above). |
 | `USE_ISSUES` | `--use-issues` | `false` | Yes | Issues + issue notes/links. |
 | `USE_WORK_ITEMS` | `--use-work-items` | `false` | Yes | Work-item GraphQL tools (not `execute_graphql`). |
 | `USE_LABELS` | `--use-labels` | `false` | Yes | Label CRUD. |
@@ -257,7 +285,7 @@ invalid token, and returns:
 ```json
 {"version": "0.1.0+bf02f09afdad", "revision": "bf02f09afdadf019544e6628f3febc9acf0e946b",
  "revision_short": "bf02f09afdad", "vcs_time": "2026-10-06T13:28:00Z", "modified": false,
- "profile": "review", "tool_count": 55}
+ "profile": "review", "tool_count": 47}
 ```
 
 `revision` and `vcs_time` are `unknown` (and `modified` is `false`) when the

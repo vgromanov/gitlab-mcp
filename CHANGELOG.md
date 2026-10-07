@@ -34,6 +34,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the same shape (`approval_rules_overwritten`, `rules`) as the primary endpoint
   (RVG-160).
 
+### Changed
+
+- **Tools removed from the review profile** (`GITLAB_TOOL_PROFILE=review`, 55 -> 47
+  tools): `create_merge_request_note`, `create_or_update_file`, `push_files`,
+  `create_branch`, `create_release`, `create_repository`, `create_merge_request`
+  and `update_merge_request`. The profile is now an explicit closed list instead
+  of "daily plus extras"; its only writes are thread, reply, resolve, approve and
+  merge. The daily set (41) and the default catalog are unchanged, so the tools
+  stay available there. Clients of `go-gitlab-review` that used a removed tool
+  must switch to the in-thread tools or to the daily server.
+- In the review profile `merge_merge_request` refuses unless the merge request is
+  authored by the current user (`merge_not_permitted: MR is not authored by the
+  current user`, nothing written; one MR read and one user lookup before the
+  merge). Other profiles keep today's behaviour. `get_server_info` reports
+  `tool_count` 47 for the review profile (RVG-178).
+
 ### Added
 
 - `create_merge_request_thread`, `create_merge_request_discussion_note` (reply)
