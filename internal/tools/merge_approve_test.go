@@ -509,3 +509,21 @@ func TestMerge_descriptionMentionsOwnMRRuleInReviewProfile(t *testing.T) {
 		t.Fatalf("default description must not mention the rule: %q", d)
 	}
 }
+
+// The comparison is against whoever the token belongs to, not a fixed id.
+func TestMerge_reviewProfileComparesWithTheCurrentUser(t *testing.T) {
+	for _, tc := range []struct {
+		author  int
+		allowed bool
+	}{{9, true}, {7, false}} {
+		cs, f := mgSession(t, review(), map[string][]mgResp{
+			"GET ":       {{mgOK, mgMRBy(tc.author, "opened")}, {mgOK, mgMRBy(tc.author, "merged")}},
+			mgUser:       {{mgOK, `{"id":9,"username":"other"}`}},
+			"PUT /merge": {{mgOK, mgMRBy(tc.author, "merged")}},
+		})
+		_, text, isErr := mgCall(t, cs, "merge_merge_request", map[string]any{})
+		if isErr == tc.allowed || (f.count("PUT /merge") == 1) != tc.allowed {
+			t.Fatalf("author %d as user 9: isErr=%v text=%q PUTs=%d", tc.author, isErr, text, f.count("PUT /merge"))
+		}
+	}
+}
