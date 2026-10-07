@@ -124,15 +124,16 @@ var (
 func (f *rtFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	raw, _ := io.ReadAll(r.Body)
-	f.mu.Lock()
-	locked := true
-	unlock := func() {
-		if locked {
-			locked = false
-			f.mu.Unlock()
-		}
+	if f.serve(w, r, raw) {
+		<-r.Context().Done() // hang mode: the lock is already released, nothing is written
 	}
-	defer unlock()
+}
+
+// serve runs the whole critical section under a deferred unlock and reports
+// whether the request must hang (wait for the client to give up) afterwards.
+func (f *rtFixture) serve(w http.ResponseWriter, r *http.Request, raw []byte) (hang bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	p, m := r.URL.Path, r.Method
 	reply := func(key string, status int, body string) {
 		if s := f.forced[key]; s != 0 {
@@ -142,12 +143,8 @@ func (f *rtFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeFixture(w, body)
 	}
 	hold := func() bool {
-		if !f.hang {
-			return false
-		}
-		unlock()
-		<-r.Context().Done()
-		return true
+		hang = f.hang
+		return hang
 	}
 	var in struct {
 		Body     string `json:"body"`
@@ -267,6 +264,7 @@ func (f *rtFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(404)
 		writeFixture(w, `{"message":"unexpected `+m+" "+p+`"}`)
 	}
+	return false
 }
 
 func rtDeps(t *testing.T, f *rtFixture, cfg *config.Config) Deps {
