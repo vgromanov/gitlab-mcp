@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Security
 
+- `execute_graphql` is query-only in the `review` tool profile, independent of
+  `--read-only`: a document is run only if every top-level definition is a
+  `query`, a `fragment` or an anonymous `{ ... }`; a mutation, a subscription or
+  anything the allow-list cannot judge is refused before any request with
+  `graphql_mutations_not_permitted: this profile allows queries only`. Daily and
+  default profiles are unchanged (RVG-175).
 - Project outputs are allowlisted (default-deny): `get_project`, `list_projects`,
   `list_group_projects`, `search_repositories`, `create_repository` and
   `fork_repository` return only identity, location and state fields (`id`,

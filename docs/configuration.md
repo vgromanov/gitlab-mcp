@@ -86,8 +86,23 @@ The raw writers of the daily set are **not** in the review profile:
 `create_branch`, `create_release`, `create_repository`, `create_merge_request`
 and `update_merge_request` (a raw body or description runs quick actions as the
 token's user, and the rest change code, refs or releases). They stay in the daily
-set and the default catalog. `execute_graphql` stays (read-only GraphQL; its
-server-side mutation block is a separate ticket).
+set and the default catalog. `execute_graphql` stays (read-only GraphQL), but in
+this profile it is **query-only**, whatever `GITLAB_READ_ONLY_MODE` says.
+
+In the review profile `execute_graphql` runs a document only if every top-level
+definition is an anonymous selection set (`{ ... }`), a `query` or a `fragment`.
+Anything else (mutation, subscription, type-system definitions, stray tokens) and
+any document the check cannot judge (unterminated string, comment or bracket,
+mismatched brackets, a string with a raw line break, non-ASCII or control
+characters outside strings and comments such as a BOM, a document over 256 KiB
+or nested deeper than 64) is refused with the single line
+`graphql_mutations_not_permitted: this profile allows queries only` before any
+request is sent. The check is an allow-list and deterministic: a variant of a
+refused document is refused the same way. A field, alias or operation merely
+named `mutation` inside a query is a query and runs. The tool takes only `query`
+and `variables`: there is no `operationName` or `extensions` (persisted query)
+input. Other profiles are unchanged (mutations are refused only under
+`GITLAB_READ_ONLY_MODE`).
 
 In the review profile `merge_merge_request` refuses unless the merge request is
 authored by the current user (`merge_not_permitted: MR is not authored by the

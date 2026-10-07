@@ -257,7 +257,7 @@ Also:
 
 ## GraphQL / work items
 
-- `execute_graphql` — arbitrary GraphQL query/mutation (in the daily set)
+- `execute_graphql` — arbitrary GraphQL query/mutation (in the daily set; query-only in the `review` profile)
 - `get_work_item` / `list_work_items` / `create_work_item` / `update_work_item`
 - `convert_work_item_type` / `list_work_item_statuses` /
   `list_custom_field_definitions` / `move_work_item`
