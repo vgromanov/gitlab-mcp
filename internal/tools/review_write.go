@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -189,7 +190,8 @@ func guardedNoteWrite(ctx context.Context, d Deps, req guardedWriteReq) (*guarde
 	}
 	noteID, discID, werr := req.Write(ctx, body)
 	if werr != nil {
-		if req.OpKey != "" {
+		var nw interface{ NothingWritten() bool } // a refusal before the POST wrote nothing
+		if req.OpKey != "" && !errors.As(werr, &nw) {
 			werr = fmt.Errorf("%w (the write may have been applied; retrying with the same op_key will not duplicate it)", werr)
 		}
 		return nil, werr

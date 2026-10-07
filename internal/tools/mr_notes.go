@@ -10,14 +10,14 @@ import (
 // RegisterMRNotes registers MR/issue note and discussion tools.
 func RegisterMRNotes(s *mcp.Server, d Deps) {
 	AddTool(s, d, true, "", &mcp.Tool{Name: "create_note", Description: "Add a note to an issue or merge request"}, createNote)
-	AddTool(s, d, true, "", &mcp.Tool{Name: "create_merge_request_thread", Description: "Start a new MR discussion thread (optionally on a diff line)"}, createMergeRequestThread)
+	AddTool(s, d, true, "", &mcp.Tool{Name: "create_merge_request_thread", Description: threadDescription(d)}, createMergeRequestThread)
 	AddTool(s, d, false, "", &mcp.Tool{Name: "mr_discussions", Description: "List MR discussions"}, mrDiscussions)
-	AddTool(s, d, true, "", &mcp.Tool{Name: "resolve_merge_request_thread", Description: "Resolve or unresolve an MR discussion"}, resolveMergeRequestThread)
+	AddTool(s, d, true, "", &mcp.Tool{Name: "resolve_merge_request_thread", Description: resolveDescription(d)}, resolveMergeRequestThread)
 	AddTool(s, d, true, "", &mcp.Tool{Name: "update_merge_request_note", Description: "Edit a top-level MR note"}, updateMergeRequestNote)
 	AddTool(s, d, true, "", &mcp.Tool{Name: "create_merge_request_note", Description: "Add a top-level MR note"}, createMergeRequestNote)
 	AddTool(s, d, true, "", &mcp.Tool{Name: "delete_merge_request_discussion_note", Description: "Delete a note inside an MR discussion"}, deleteMergeRequestDiscussionNote)
 	AddTool(s, d, true, "", &mcp.Tool{Name: "update_merge_request_discussion_note", Description: "Edit a note inside an MR discussion"}, updateMergeRequestDiscussionNote)
-	AddTool(s, d, true, "", &mcp.Tool{Name: "create_merge_request_discussion_note", Description: "Reply in an MR discussion thread"}, createMergeRequestDiscussionNote)
+	AddTool(s, d, true, "", &mcp.Tool{Name: "create_merge_request_discussion_note", Description: replyDescription(d)}, createMergeRequestDiscussionNote)
 	AddTool(s, d, true, "", &mcp.Tool{Name: "delete_merge_request_note", Description: "Delete a top-level MR note"}, deleteMergeRequestNote)
 	AddTool(s, d, false, "", &mcp.Tool{Name: "get_merge_request_note", Description: "Get a single MR note"}, getMergeRequestNote)
 	AddTool(s, d, false, "", &mcp.Tool{Name: "get_merge_request_notes", Description: "List MR notes"}, getMergeRequestNotes)
@@ -68,14 +68,19 @@ func createNote(ctx context.Context, _ *mcp.CallToolRequest, in createNoteIn, d 
 
 type createMergeRequestThreadIn struct {
 	pidMR
-	Body     string                  `json:"body"`
-	Position *gitlab.PositionOptions `json:"position,omitempty"`
+	Body        string                  `json:"body"`
+	Position    *gitlab.PositionOptions `json:"position,omitempty"`
+	ExpectedSHA *string                 `json:"expected_sha,omitempty" jsonschema:"Review profile: REQUIRED, the full head SHA you reviewed. Ignored in other profiles"`
+	OpKey       *string                 `json:"op_key,omitempty" jsonschema:"Review profile: optional idempotency key; a retry with the same key does not write twice"`
 }
 
 func createMergeRequestThread(ctx context.Context, _ *mcp.CallToolRequest, in createMergeRequestThreadIn, d Deps) (*mcp.CallToolResult, any, error) {
 	pid, err := in.resolve(d)
 	if err != nil {
 		return nil, nil, err
+	}
+	if reviewProfile(d) {
+		return guardedThread(ctx, d, pid, in)
 	}
 	opt := &gitlab.CreateMergeRequestDiscussionOptions{Body: gitlab.Ptr(in.Body)}
 	if in.Position != nil {
@@ -110,14 +115,18 @@ func mrDiscussions(ctx context.Context, _ *mcp.CallToolRequest, in mrDiscussions
 
 type resolveMergeRequestThreadIn struct {
 	pidMR
-	DiscussionID string `json:"discussion_id"`
-	Resolved     bool   `json:"resolved"`
+	DiscussionID string  `json:"discussion_id"`
+	Resolved     bool    `json:"resolved"`
+	ExpectedSHA  *string `json:"expected_sha,omitempty" jsonschema:"Review profile: REQUIRED, the full head SHA you reviewed. Ignored in other profiles"`
 }
 
 func resolveMergeRequestThread(ctx context.Context, _ *mcp.CallToolRequest, in resolveMergeRequestThreadIn, d Deps) (*mcp.CallToolResult, any, error) {
 	pid, err := in.resolve(d)
 	if err != nil {
 		return nil, nil, err
+	}
+	if reviewProfile(d) {
+		return guardedResolve(ctx, d, pid, in)
 	}
 	disc, _, err := d.Client.Discussions.ResolveMergeRequestDiscussion(pid, in.MergeRequestIID, in.DiscussionID, &gitlab.ResolveMergeRequestDiscussionOptions{
 		Resolved: gitlab.Ptr(in.Resolved),
@@ -208,14 +217,19 @@ func updateMergeRequestDiscussionNote(ctx context.Context, _ *mcp.CallToolReques
 
 type createMergeRequestDiscussionNoteIn struct {
 	pidMR
-	DiscussionID string `json:"discussion_id"`
-	Body         string `json:"body"`
+	DiscussionID string  `json:"discussion_id"`
+	Body         string  `json:"body"`
+	ExpectedSHA  *string `json:"expected_sha,omitempty" jsonschema:"Review profile: REQUIRED, the full head SHA you reviewed. Ignored in other profiles"`
+	OpKey        *string `json:"op_key,omitempty" jsonschema:"Review profile: optional idempotency key; a retry with the same key does not write twice"`
 }
 
 func createMergeRequestDiscussionNote(ctx context.Context, _ *mcp.CallToolRequest, in createMergeRequestDiscussionNoteIn, d Deps) (*mcp.CallToolResult, any, error) {
 	pid, err := in.resolve(d)
 	if err != nil {
 		return nil, nil, err
+	}
+	if reviewProfile(d) {
+		return guardedReply(ctx, d, pid, in)
 	}
 	n, _, err := d.Client.Discussions.AddMergeRequestDiscussionNote(pid, in.MergeRequestIID, in.DiscussionID, &gitlab.AddMergeRequestDiscussionNoteOptions{
 		Body: gitlab.Ptr(in.Body),

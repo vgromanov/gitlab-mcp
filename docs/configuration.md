@@ -81,6 +81,17 @@ reviewed): GitLab refuses the approval when the head moved, and the result
 carries the approval state read back after the write. Outside the review
 profile `sha` stays optional.
 
+In the review profile `create_merge_request_thread`,
+`create_merge_request_discussion_note` and `resolve_merge_request_thread`
+require `expected_sha` (the head SHA you reviewed) and refuse with
+`head_changed` when the head moved. Thread and reply accept an optional
+`op_key`: a retry after a timeout returns the existing note
+(`deduplicated: true`) instead of writing twice. A thread `position` must carry
+the MR's current `diff_refs` and a path and line that are in the diff; otherwise
+nothing is written (`anchor_stale`, `anchor_not_in_diff`, `anchor_unverifiable`,
+`anchor_invalid`). Resolve does not write when the thread is already in the
+requested state. Other profiles keep today's behaviour.
+
 ```json
 {
   "mcpServers": {
