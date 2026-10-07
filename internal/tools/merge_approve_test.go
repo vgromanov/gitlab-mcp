@@ -396,3 +396,116 @@ func TestRefusal_passesThroughOtherErrors(t *testing.T) {
 		t.Fatalf("unmapped status must pass through unchanged: %q", text)
 	}
 }
+
+// RVG-178: in the review profile merge_merge_request refuses unless the MR's
+// author is the current user (one MR read + one user lookup, before the PUT).
+
+const mgUser = "GET /api/v4/user"
+
+func mgMRBy(authorID int, state string) string {
+	b, _ := json.Marshal(map[string]any{
+		"iid": 3, "state": state, "sha": mgHead, "author": map[string]any{"id": authorID, "username": "someone"},
+		"web_url": "https://gitlab.example/mr/3",
+	})
+	return string(b)
+}
+
+const mgMeBody = `{"id":7,"username":"me"}`
+
+func TestMerge_reviewProfileMergesOwnMR(t *testing.T) {
+	cs, f := mgSession(t, review(), map[string][]mgResp{
+		"GET ":       {{mgOK, mgMRBy(7, "opened")}, {mgOK, mgMRBy(7, "merged")}},
+		mgUser:       {{mgOK, mgMeBody}},
+		"PUT /merge": {{mgOK, mgMRBy(7, "merged")}},
+	})
+	out, text, isErr := mgCall(t, cs, "merge_merge_request", map[string]any{"sha": mgHead})
+	if isErr || out["result"] != "merged" {
+		t.Fatalf("own MR must merge: isErr=%v out=%v text=%q", isErr, out, text)
+	}
+	// Upstream cost of the guard: one MR read + one user lookup, then the single PUT.
+	if f.count("GET ") != 1 || f.count(mgUser) != 1 || f.count("PUT /merge") != 1 || f.total != 3 {
+		t.Fatalf("requests %v, want 1 MR read + 1 user lookup + 1 PUT", f.hits)
+	}
+}
+
+func TestMerge_reviewProfileRefusesOthersMR(t *testing.T) {
+	tests := []struct {
+		name   string
+		routes map[string][]mgResp
+		want   string // prefix of the error text
+		exact  bool
+	}{
+		{"other author", map[string][]mgResp{"GET ": {{mgOK, mgMRBy(8, "opened")}}, mgUser: {{mgOK, mgMeBody}}},
+			"merge_not_permitted: MR is not authored by the current user", true},
+		{"no author in the MR", map[string][]mgResp{"GET ": {{mgOK, mgMR("opened", mgHead, false, "")}}, mgUser: {{mgOK, mgMeBody}}},
+			"merge_not_permitted: MR is not authored by the current user", true},
+		{"user lookup fails", map[string][]mgResp{"GET ": {{mgOK, mgMRBy(7, "opened")}}, mgUser: {{401, `{"message":"401 Unauthorized"}`}}},
+			"resolve current user", false},
+		{"MR read fails", map[string][]mgResp{"GET ": {{404, `{"message":"404 Not found"}`}}, mgUser: {{mgOK, mgMeBody}}},
+			"not_found: GitLab answered 404", false},
+		{"MR read forbidden", map[string][]mgResp{"GET ": {{403, `{"message":"403 Forbidden"}`}}, mgUser: {{mgOK, mgMeBody}}},
+			"merge_not_permitted: GitLab answered 403", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.routes["PUT /merge"] = []mgResp{{mgOK, mgMRBy(7, "merged")}}
+			cs, f := mgSession(t, review(), tc.routes)
+			_, text, isErr := mgCall(t, cs, "merge_merge_request", map[string]any{"sha": mgHead})
+			if !isErr || !strings.HasPrefix(text, tc.want) {
+				t.Fatalf("isErr=%v text=%q, want prefix %q", isErr, text, tc.want)
+			}
+			if tc.exact && text != tc.want {
+				t.Fatalf("refusal must be flat, got %q", text) // no author name or id
+			}
+			if f.count("PUT /merge") != 0 {
+				t.Fatalf("a refused merge wrote %d time(s)", f.count("PUT /merge"))
+			}
+		})
+	}
+}
+
+// Other profiles keep today's merge: no MR read before the write, no user
+// lookup, an MR of another author merges.
+func TestMerge_otherProfilesDoNotCheckTheAuthor(t *testing.T) {
+	for name, cfg := range map[string]*config.Config{
+		"default": {}, "daily": {UseDailyTools: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cs, f := mgSession(t, cfg, map[string][]mgResp{
+				"GET ":       {{mgOK, mgMRBy(8, "merged")}},
+				mgUser:       {{mgOK, mgMeBody}},
+				"PUT /merge": {{mgOK, mgMRBy(8, "merged")}},
+			})
+			out, text, isErr := mgCall(t, cs, "merge_merge_request", map[string]any{})
+			if isErr || out["result"] != "merged" {
+				t.Fatalf("isErr=%v out=%v text=%q", isErr, out, text)
+			}
+			if f.count(mgUser) != 0 || f.count("GET ") != 0 || f.total != 1 {
+				t.Fatalf("requests %v, want the single PUT only", f.hits)
+			}
+		})
+	}
+}
+
+func TestMerge_descriptionMentionsOwnMRRuleInReviewProfile(t *testing.T) {
+	desc := func(cfg *config.Config) string {
+		cs, _ := mgSession(t, cfg, nil)
+		lt, err := cs.ListTools(context.Background(), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, x := range lt.Tools {
+			if x.Name == "merge_merge_request" {
+				return x.Description
+			}
+		}
+		t.Fatal("merge_merge_request not registered")
+		return ""
+	}
+	if d := desc(review()); !strings.Contains(d, "authored by the current user") {
+		t.Fatalf("review description: %q", d)
+	}
+	if d := desc(&config.Config{}); strings.Contains(d, "authored by the current user") {
+		t.Fatalf("default description must not mention the rule: %q", d)
+	}
+}

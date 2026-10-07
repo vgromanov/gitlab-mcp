@@ -33,8 +33,8 @@ func TestServerInfo_builder(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			tc.want.Profile, tc.want.ToolCount = "review", 55
-			if got := serverInfo(tc.in, "review", 55); got != tc.want {
+			tc.want.Profile, tc.want.ToolCount = "review", 47
+			if got := serverInfo(tc.in, "review", 47); got != tc.want {
 				t.Fatalf("serverInfo = %+v, want %+v", got, tc.want)
 			}
 		})
@@ -69,8 +69,8 @@ func TestGetServerInfo_noGitLabRequestAndCountsItself(t *testing.T) {
 	// An invalid token and a stub that records every request: the tool must
 	// answer from the binary alone. The test binary carries no vcs.* settings.
 	got, listed := callServerInfo(t, &config.Config{Token: "invalid", ToolProfile: config.ProfileReview})
-	if got["profile"] != "review" || int(got["tool_count"].(float64)) != 55 || listed != 55 {
-		t.Fatalf("profile/tool_count = %v/%v (tools/list %d), want review/55/55", got["profile"], got["tool_count"], listed)
+	if got["profile"] != "review" || int(got["tool_count"].(float64)) != 47 || listed != 47 {
+		t.Fatalf("profile/tool_count = %v/%v (tools/list %d), want review/47/47", got["profile"], got["tool_count"], listed)
 	}
 	if got["version"] != version.String() || got["revision_short"] != version.Build().Short() {
 		t.Fatalf("version/revision_short = %v/%v, build says %q/%q", got["version"], got["revision_short"], version.String(), version.Build().Short())
@@ -92,7 +92,7 @@ func TestGetServerInfo_toolCountMatchesRegisteredTools(t *testing.T) {
 		profile string
 		want    int // 0: only compare with tools/list
 	}{
-		{"review", &config.Config{Token: "x", ToolProfile: config.ProfileReview}, "review", 55},
+		{"review", &config.Config{Token: "x", ToolProfile: config.ProfileReview}, "review", 47},
 		{"review read-only and disabled", &config.Config{
 			Token: "x", ToolProfile: config.ProfileReview, ReadOnly: true,
 			DisabledTools: []string{"get_pipeline_job_output", "get_review_queue"}}, "review", 0},
