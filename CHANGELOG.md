@@ -36,6 +36,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `create_merge_request_thread`, `create_merge_request_discussion_note` (reply)
+  and `resolve_merge_request_thread` are guarded in the review profile.
+  `expected_sha` (the head you reviewed) is required (a missing one is an input
+  error before any request; a stale one is refused as `head_changed` with the
+  current head, nothing written); thread and reply take an optional `op_key`
+  (a retry with the same key returns the existing note, `deduplicated: true`).
+  Results carry `written`, `deduplicated`, `note_id`, `discussion_id`,
+  `head_sha`, `head_changed_after_write`, `body_modified`, `lines_changed` and
+  `error` (set, with IsError, when a readback fails). An inline `position` is
+  checked before the write: its `base_sha` / `start_sha` / `head_sha` must equal
+  the MR's current `diff_refs` (`anchor_stale`), its path must be a changed file
+  (`anchor_not_in_diff`; `anchor_unverifiable` when the diff pages cap is hit)
+  and its line must be on the side of the diff it names; GitLab's 400
+  `line_code` is `anchor_invalid` and a 5xx on the POST is `gitlab_error`. A bad
+  anchor is never turned into a general note. Resolve reads the thread, writes
+  nothing when it already is in the requested state, otherwise writes and reads
+  the state back. Other profiles keep today's behaviour and output. No tool or
+  profile count changes (RVG-171).
 - `approve_merge_request`: in the review profile `sha` is required (a missing or
   blank `sha` is an input error before any request) and GitLab refuses a stale
   one (`head_changed`, with the current head in the message). The result is read
