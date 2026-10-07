@@ -36,6 +36,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Shared write guard for review-profile note writes (`internal/tools/review_write.go`;
+  not wired to any tool yet, RVG-171/172 call it, so tool counts are unchanged).
+  `expected_sha` is required and a stale head is refused with `head_changed`
+  (current SHA included) before anything is written; an optional `op_key` is
+  appended as an invisible `<!-- gitlab-mcp:op=KEY -->` marker and a retry finds
+  the existing note (`deduplicated: true`, no second write), counting only notes
+  written by the current user and never system notes; if the search hits its page
+  cap the write is refused (`dedupe_incomplete`, `complete=false`) rather than
+  risk a duplicate; after the write the note and the MR head are read back
+  (`head_changed_after_write`, and a failed readback is reported, never taken as
+  success). Note bodies are sanitised before they are sent and the result says
+  only `body_modified` / `lines_changed`. The RVG-168 spike showed GitLab does not
+  reject a stale head on notes, so passing `expected_sha` on as
+  `merge_request_diff_head_sha` (ticket step 4) is deliberately not implemented
+  (RVG-169).
 - `get_server_info`: a read-only, idempotent tool that returns the serving
   build, `{version, revision, revision_short, vcs_time, modified, profile,
   tool_count}`, for clients that cannot read `serverInfo` (the mcp-wrapper bridge

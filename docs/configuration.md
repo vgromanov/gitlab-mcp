@@ -74,6 +74,8 @@ and `GITLAB_READ_ONLY_MODE` still subtract (read-only also hides the reply and
 resolve tools). An unknown profile value stops the server at startup. Unset
 means today's behavior; `USE_DAILY_TOOLS` is unchanged.
 
+Note bodies are sanitised before posting (review-profile writes).
+
 ```json
 {
   "mcpServers": {
