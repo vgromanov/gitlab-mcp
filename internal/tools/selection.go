@@ -62,23 +62,65 @@ var dailyTools = []string{
 	"push_files",
 }
 
-// reviewExtraTools are added to dailyTools by GITLAB_TOOL_PROFILE=review.
-// Pipeline reads only: create/retry/cancel/play stay out of the profile.
-var reviewExtraTools = []string{
+// reviewTools is the closed GITLAB_TOOL_PROFILE=review catalog (RVG-178): the
+// explicit list of what the review job may call, not "daily plus extras".
+// Writes: thread, reply, resolve, approve and merge only (merge is restricted to
+// the current user's own MRs, see requireOwnMR). The raw writers of the daily set
+// (create_merge_request_note, create_or_update_file, push_files, create_branch,
+// create_release, create_repository, create_merge_request, update_merge_request)
+// are deliberately absent. Pipeline reads only: create/retry/cancel/play stay out.
+var reviewTools = []string{
+	// Review extras (not in the daily set).
 	"get_review_queue",
 	"get_review_snapshot",
 	"get_pipeline_status",
 	"batch_get_file_contents",
 	"get_server_info",
 	"get_merge_request_discussion",
-	"create_merge_request_discussion_note",
-	"resolve_merge_request_thread",
 	"list_pipelines",
 	"get_pipeline",
 	"list_pipeline_jobs",
 	"list_pipeline_trigger_jobs",
 	"get_pipeline_job",
 	"get_pipeline_job_output",
+	// Guarded writes.
+	"create_merge_request_thread",
+	"create_merge_request_discussion_note",
+	"resolve_merge_request_thread",
+	"approve_merge_request",
+	"merge_merge_request",
+	// Reads shared with the daily set (execute_graphql: read-only use; its
+	// server-side mutation block is RVG-175).
+	"execute_graphql",
+	"search_repositories",
+	"get_file_contents",
+	"get_project",
+	"get_merge_request",
+	"list_group_projects",
+	"list_project_members",
+	"search_code",
+	"list_merge_requests",
+	"list_projects",
+	"get_namespace",
+	"get_repository_tree",
+	"search_group_code",
+	"search_project_code",
+	"get_users",
+	"get_commit",
+	"get_merge_request_approval_state",
+	"get_project_events",
+	"list_commits",
+	"mr_discussions",
+	"get_merge_request_notes",
+	"get_merge_request_conflicts",
+	"list_namespaces",
+	"list_releases",
+	"get_merge_request_file_diff",
+	"list_merge_request_changed_files",
+	"get_commit_diff",
+	"get_merge_request_diffs",
+	"get_merge_request_version",
+	"list_merge_request_versions",
 }
 
 // familyTools maps gated family ids to their tool names (mirrors AddTool tags).
@@ -152,9 +194,9 @@ func DailyTools() []string {
 	return slices.Clone(dailyTools)
 }
 
-// ReviewTools returns the full GITLAB_TOOL_PROFILE=review catalog (daily + review extras).
+// ReviewTools returns the closed GITLAB_TOOL_PROFILE=review catalog.
 func ReviewTools() []string {
-	return append(slices.Clone(dailyTools), reviewExtraTools...)
+	return slices.Clone(reviewTools)
 }
 
 // FamilyTools returns tool names tagged with the given family id.
@@ -195,7 +237,7 @@ func ShouldRegister(cfg *config.Config, toolName, family string) bool {
 
 	// The review profile is a closed, pinned set: other enable sources never widen it.
 	if cfg.ToolProfile == config.ProfileReview {
-		return toolNameInList(dailyTools, toolName) || toolNameInList(reviewExtraTools, toolName)
+		return toolNameInList(reviewTools, toolName)
 	}
 
 	// Restricted: empty base, then union of enable sources.

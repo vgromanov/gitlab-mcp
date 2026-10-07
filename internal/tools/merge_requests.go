@@ -16,7 +16,7 @@ import (
 
 // RegisterMergeRequests registers merge request tools.
 func RegisterMergeRequests(s *mcp.Server, d Deps) {
-	AddTool(s, d, true, "", &mcp.Tool{Name: "merge_merge_request", Description: "Accept / merge a merge request with ONE request, never retried. Optional: sha (full head SHA; GitLab refuses with head_changed when the head moved), squash, should_remove_source_branch, auto_merge (merge when the pipeline succeeds), merge_commit_message. Returns the merge request plus result: merged (its state is merged) or pending (state not merged yet, e.g. auto-merge scheduled; pending_reason says which, readback_error if the re-read failed). On pending NEVER merge again: poll get_merge_request. Refusals are errors: head_changed, not_mergeable (detailed_merge_status in the message), merge_not_permitted, not_found"}, mergeMergeRequest)
+	AddTool(s, d, true, "", &mcp.Tool{Name: "merge_merge_request", Description: mergeDescription(d)}, mergeMergeRequest)
 	AddTool(s, d, true, "", &mcp.Tool{Name: "create_merge_request", Description: "Create a merge request"}, createMergeRequest)
 	AddTool(s, d, false, "", &mcp.Tool{Name: "get_merge_request", Description: "Get merge request details"}, getMergeRequest)
 	AddTool(s, d, false, "", &mcp.Tool{Name: "get_merge_request_diffs", Description: "Get one page of MR diffs (default 100 per page); pagination.complete is false when more pages exist"}, getMergeRequestDiffs)
@@ -68,6 +68,11 @@ func mergeMergeRequest(ctx context.Context, _ *mcp.CallToolRequest, in mergeMerg
 	pid, err := in.resolve(d)
 	if err != nil {
 		return nil, nil, err
+	}
+	if d.Config != nil && d.Config.ToolProfile == config.ProfileReview { // RVG-178: the single call site; delete it to lift the own-MR rule
+		if err := requireOwnMR(ctx, d, pid, in.MergeRequestIID); err != nil {
+			return nil, nil, err
+		}
 	}
 	opt := &gitlab.AcceptMergeRequestOptions{
 		MergeCommitMessage: in.MergeCommitMessage, ShouldRemoveSourceBranch: in.ShouldRemoveSourceBranch,

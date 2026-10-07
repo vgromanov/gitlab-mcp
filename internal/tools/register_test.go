@@ -145,38 +145,88 @@ func sortedKeys(m map[string]bool) []string {
 	return out
 }
 
-func TestRegisterAll_reviewProfileExactSet(t *testing.T) {
-	want := []string{
-		"get_merge_request_discussion", "create_merge_request_discussion_note", "resolve_merge_request_thread",
-		"list_pipelines", "get_pipeline", "list_pipeline_jobs", "list_pipeline_trigger_jobs",
-		"get_pipeline_job", "get_pipeline_job_output", "get_review_queue", "get_review_snapshot",
-		"batch_get_file_contents", "get_pipeline_status", "get_server_info",
-	}
-	want = append(want, DailyTools()...)
-	sort.Strings(want)
+// reviewWant is the closed review catalog, written out literally (RVG-178) so a
+// change to the list in code cannot silently change what the test expects.
+var reviewWant = []string{
+	"approve_merge_request", "batch_get_file_contents", "create_merge_request_discussion_note",
+	"create_merge_request_thread", "execute_graphql", "get_commit", "get_commit_diff", "get_file_contents",
+	"get_merge_request", "get_merge_request_approval_state", "get_merge_request_conflicts",
+	"get_merge_request_diffs", "get_merge_request_discussion", "get_merge_request_file_diff",
+	"get_merge_request_notes", "get_merge_request_version", "get_namespace", "get_pipeline",
+	"get_pipeline_job", "get_pipeline_job_output", "get_pipeline_status", "get_project",
+	"get_project_events", "get_repository_tree", "get_review_queue", "get_review_snapshot",
+	"get_server_info", "get_users", "list_commits", "list_group_projects",
+	"list_merge_request_changed_files", "list_merge_request_versions", "list_merge_requests",
+	"list_namespaces", "list_pipeline_jobs", "list_pipeline_trigger_jobs", "list_pipelines",
+	"list_project_members", "list_projects", "list_releases", "merge_merge_request", "mr_discussions",
+	"resolve_merge_request_thread", "search_code", "search_group_code", "search_project_code",
+	"search_repositories",
+}
 
+// reviewRemoved are the daily-set writers RVG-178 took out of the review profile.
+var reviewRemoved = []string{
+	"create_merge_request_note", "create_or_update_file", "push_files", "create_branch",
+	"create_release", "create_repository", "create_merge_request", "update_merge_request",
+}
+
+func TestRegisterAll_reviewProfileExactSet(t *testing.T) {
 	// Other enable sources must not widen the closed profile.
 	cfg := &config.Config{
 		Token: "x", ToolProfile: config.ProfileReview,
-		Pipeline: true, Issues: true, EnabledTools: []string{"create_pipeline", "list_issues"},
-	}
-	got := sortedKeys(registerNames(t, cfg))
-	if !slices.Equal(got, want) {
-		t.Fatalf("review tools/list mismatch\n got: %v\nwant: %v", got, want)
-	}
-	if len(got) != 55 {
-		t.Fatalf("review catalog size = %d, want 55", len(got))
-	}
-	if !slices.Equal(sortedKeysOf(ReviewTools()), want) {
-		t.Fatal("ReviewTools() must match the registered review set")
+		Pipeline: true, Issues: true, EnabledTools: []string{"create_pipeline", "list_issues", "push_files", "create_merge_request_note"},
 	}
 	names := registerNames(t, cfg)
-	for _, w := range []string{
+	got := sortedKeys(names)
+	if !slices.Equal(got, reviewWant) {
+		t.Fatalf("review tools/list mismatch\n got: %v\nwant: %v", got, reviewWant)
+	}
+	if len(got) != 47 {
+		t.Fatalf("review catalog size = %d, want 47", len(got))
+	}
+	if !slices.Equal(sortedKeysOf(ReviewTools()), reviewWant) {
+		t.Fatal("ReviewTools() must match the registered review set")
+	}
+	for _, w := range append([]string{
 		"create_pipeline", "retry_pipeline", "cancel_pipeline", "play_pipeline_job",
 		"retry_pipeline_job", "cancel_pipeline_job",
-	} {
+	}, reviewRemoved...) {
 		if names[w] {
-			t.Fatalf("pipeline write tool %q exposed in review profile", w)
+			t.Fatalf("write tool %q exposed in review profile", w)
+		}
+	}
+}
+
+// The only registry-mutating tools of the review profile are the five guarded
+// writes; derived from the real registration (read-only mode drops mutating tools).
+func TestRegisterAll_reviewProfileWritesAreTheGuardedFive(t *testing.T) {
+	all := registerNames(t, &config.Config{Token: "x", ToolProfile: config.ProfileReview})
+	ro := registerNames(t, &config.Config{Token: "x", ToolProfile: config.ProfileReview, ReadOnly: true})
+	var writes []string
+	for n := range all {
+		if !ro[n] {
+			writes = append(writes, n)
+		}
+	}
+	sort.Strings(writes)
+	want := []string{
+		"approve_merge_request", "create_merge_request_discussion_note", "create_merge_request_thread",
+		"merge_merge_request", "resolve_merge_request_thread",
+	}
+	if !slices.Equal(writes, want) {
+		t.Fatalf("review write tools = %v, want %v", writes, want)
+	}
+}
+
+// The trim is review-only: the daily set (41) and the default catalog keep the writers.
+func TestRegisterAll_removedWritersStayInDailyAndDefault(t *testing.T) {
+	daily := registerNames(t, &config.Config{Token: "x", UseDailyTools: true})
+	def := registerNames(t, &config.Config{Token: "x"})
+	if len(daily) != 41 {
+		t.Fatalf("daily set = %d tools, want 41", len(daily))
+	}
+	for _, n := range reviewRemoved {
+		if !daily[n] || !def[n] {
+			t.Fatalf("%q must stay in the daily set (%v) and the default catalog (%v)", n, daily[n], def[n])
 		}
 	}
 }
@@ -207,7 +257,7 @@ func TestRegisterAll_dailyAndDefaultUnchangedByProfileWork(t *testing.T) {
 	if !slices.Equal(sortedKeys(daily), sortedKeysOf(DailyTools())) {
 		t.Fatal("USE_DAILY_TOOLS must register exactly DailyTools()")
 	}
-	for _, n := range reviewExtraTools {
+	for _, n := range []string{"get_review_queue", "get_review_snapshot", "get_pipeline_status", "batch_get_file_contents", "get_server_info", "get_merge_request_discussion", "list_pipelines"} {
 		if daily[n] {
 			t.Fatalf("review-only tool %q leaked into daily set", n)
 		}

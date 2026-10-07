@@ -18,11 +18,14 @@ This document describes the tool surface currently registered by
   `USE_WORK_ITEMS`, `USE_LABELS`, `USE_DRAFTS`, `USE_WEBHOOKS`, `USE_TIMELINE`.
 - `USE_DAILY_TOOLS=true` registers the pinned 41-tool daily census set
   (includes all four search tools below).
-- `GITLAB_TOOL_PROFILE=review` registers the closed 55-tool review set (daily +
-  discussion get/reply/resolve + six pipeline reads + `get_review_queue` +
-  `get_review_snapshot` + `batch_get_file_contents` + `get_pipeline_status` +
-  `get_server_info`,
-  no pipeline writes); see
+- `GITLAB_TOOL_PROFILE=review` registers the closed 47-tool review set: an
+  explicit list (not "daily + extras") of reads, discussion get/reply/resolve,
+  thread, approve, merge (own MRs only), six pipeline reads, `get_review_queue`,
+  `get_review_snapshot`, `batch_get_file_contents`, `get_pipeline_status` and
+  `get_server_info`. No pipeline writes and none of `create_merge_request_note`,
+  `create_or_update_file`, `push_files`, `create_branch`, `create_release`,
+  `create_repository`, `create_merge_request`, `update_merge_request` (all of
+  which stay in the daily set); see
   [`docs/configuration.md`](configuration.md#review-profile-gitlab_tool_profilereview).
 
 ## Projects / namespaces / users

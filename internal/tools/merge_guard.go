@@ -42,6 +42,36 @@ func refusal(err error, codes map[int]string) error {
 	return fmt.Errorf("%s: GitLab answered %d %s", code, status, msg)
 }
 
+// mergeDescription is the merge tool text; the review profile adds the own-MR rule.
+func mergeDescription(d Deps) string {
+	base := mergeDescriptionBase
+	if d.Config != nil && d.Config.ToolProfile == config.ProfileReview {
+		base += ". In this profile only merge requests authored by the current user can be merged (merge_not_permitted otherwise, nothing written)"
+	}
+	return base
+}
+
+const mergeDescriptionBase = "Accept / merge a merge request with ONE request, never retried. Optional: sha (full head SHA; GitLab refuses with head_changed when the head moved), squash, should_remove_source_branch, auto_merge (merge when the pipeline succeeds), merge_commit_message. Returns the merge request plus result: merged (its state is merged) or pending (state not merged yet, e.g. auto-merge scheduled; pending_reason says which, readback_error if the re-read failed). On pending NEVER merge again: poll get_merge_request. Refusals are errors: head_changed, not_mergeable (detailed_merge_status in the message), merge_not_permitted, not_found"
+
+// requireOwnMR (RVG-178, review profile only, proposed by the controller from the
+// stated workflow: the review job merges MRs authored by its user, teammates merge
+// theirs) refuses before any write unless the MR's author is the current user:
+// one MR read and one user lookup. A failed read or lookup refuses too (fail closed).
+func requireOwnMR(ctx context.Context, d Deps, pid string, iid int64) error {
+	mr, _, err := d.Client.MergeRequests.GetMergeRequest(pid, iid, nil, gitlab.WithContext(ctx))
+	if err != nil {
+		return refusal(err, mergeCodes)
+	}
+	me, _, err := d.Client.Users.CurrentUser(gitlab.WithContext(ctx))
+	if err != nil {
+		return fmt.Errorf("resolve current user: %w", err)
+	}
+	if mr.Author == nil || mr.Author.ID != me.ID {
+		return errors.New("merge_not_permitted: MR is not authored by the current user")
+	}
+	return nil
+}
+
 // mergeRefusal maps a rejected merge; for "not mergeable" it adds the reason
 // GitLab reports on the MR (best effort, one read).
 func mergeRefusal(ctx context.Context, d Deps, pid string, iid int64, err error) error {
