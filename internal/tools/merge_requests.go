@@ -10,11 +10,13 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	gitlab "gitlab.com/gitlab-org/api/client-go/v2"
+
+	"gitlabci.raiffeisen.ru/skunk-works/tools/gitlab-mcp/internal/config"
 )
 
 // RegisterMergeRequests registers merge request tools.
 func RegisterMergeRequests(s *mcp.Server, d Deps) {
-	AddTool(s, d, true, "", &mcp.Tool{Name: "merge_merge_request", Description: "Accept / merge a merge request"}, mergeMergeRequest)
+	AddTool(s, d, true, "", &mcp.Tool{Name: "merge_merge_request", Description: "Accept / merge a merge request with ONE request, never retried. Optional: sha (full head SHA; GitLab refuses with head_changed when the head moved), squash, should_remove_source_branch, auto_merge (merge when the pipeline succeeds), merge_commit_message. Returns the merge request plus result: merged (its state is merged) or pending (state not merged yet, e.g. auto-merge scheduled; pending_reason says which, readback_error if the re-read failed). On pending NEVER merge again: poll get_merge_request. Refusals are errors: head_changed, not_mergeable (detailed_merge_status in the message), merge_not_permitted, not_found"}, mergeMergeRequest)
 	AddTool(s, d, true, "", &mcp.Tool{Name: "create_merge_request", Description: "Create a merge request"}, createMergeRequest)
 	AddTool(s, d, false, "", &mcp.Tool{Name: "get_merge_request", Description: "Get merge request details"}, getMergeRequest)
 	AddTool(s, d, false, "", &mcp.Tool{Name: "get_merge_request_diffs", Description: "Get one page of MR diffs (default 100 per page); pagination.complete is false when more pages exist"}, getMergeRequestDiffs)
@@ -29,7 +31,7 @@ func RegisterMergeRequests(s *mcp.Server, d Deps) {
 	AddTool(s, d, false, "", &mcp.Tool{Name: "get_review_queue", Description: "List the current user's MR review queue in a group: open MRs where they are reviewer and/or author, deduplicated into one row per MR with its roles. Reads up to max_pages pages per role; complete is false (with truncated_reason) when the cap is hit. The row sha is a list hint only: get_review_snapshot is the authority for the head SHA"}, getReviewQueue)
 	AddTool(s, d, false, "", &mcp.Tool{Name: "get_review_snapshot", Description: "Read up to 10 MRs in one call for review: metadata (title, author, reviewers, state, draft, branches, head sha, diff_refs, detailed_merge_status, updated_at) plus the include sections changes (changed files, no patches; complete/truncated_reason/next_page), approvals and discussions (all pages up to discussions_max_pages, compacted to {id, resolvable, resolved, notes[]}; system notes only with include_system; unresolved_count, complete/truncated_reason/next_page). sha is the head-SHA authority (queue shas are hints) and the head the sections were read for; after the sections the head is read again: head_changed is true when it moved meanwhile (current_sha = the new head) or when expected_sha differs from sha. A failing MR or section returns an error entry, the rest of the batch still returns. pipeline (opt-in: only read when listed in include, because it costs several requests per MR) is the same read as get_pipeline_status (jobs=problems) for the MR's head pipeline"}, getReviewSnapshot)
 	AddTool(s, d, false, "", &mcp.Tool{Name: "get_pipeline_status", Description: "CI status of a commit or of a merge request head pipeline in ONE call (compact; use this instead of get_pipeline + list_pipeline_jobs + list_pipeline_trigger_jobs). Give project_id and exactly one of sha (full 40-char; optional ref, e.g. main for a post-merge watch) or mr_iid; jobs=problems (recommended for polling) lists only jobs that are not success plus job_counts per pipeline, jobs=all (default) lists every job. Reads the pipelines, ALL their jobs and bridges (paged), and follows each bridge to its downstream pipeline two levels deep, other projects included. Returns overall_status (failed > canceled > running > pending > manual > skipped/success; none when no pipeline exists yet; unknown when the tree is incomplete and would otherwise be success), complete + truncated_reason (null when complete: an inaccessible/disallowed child, the depth limit or max_requests makes it false and the call never reports success then), pipelines[{id, project_id, sha, status, source, depth?, parent_pipeline_id?, jobs[{id, name, stage, status, allow_failure?, manual?, bridge?}], incomplete?}] (allow_failure, manual and bridge appear only when true), failed_jobs (blocking failures), allowed_failed_jobs (allow_failure failures), manual_jobs (manual gates, allow_failure=false blocks the pipeline) and requests (upstream requests used)"}, getPipelineStatus)
-	AddTool(s, d, true, "", &mcp.Tool{Name: "approve_merge_request", Description: "Approve a merge request"}, approveMergeRequest)
+	AddTool(s, d, true, "", &mcp.Tool{Name: "approve_merge_request", Description: approveDescription(d)}, approveMergeRequest)
 	AddTool(s, d, true, "", &mcp.Tool{Name: "unapprove_merge_request", Description: "Remove your approval from an MR"}, unapproveMergeRequest)
 	AddTool(s, d, false, "", &mcp.Tool{Name: "get_merge_request_approval_state", Description: "Get MR approval state"}, getMergeRequestApprovalState)
 }
@@ -57,6 +59,9 @@ type mergeMergeRequestIn struct {
 	pidMR
 	MergeCommitMessage       *string `json:"merge_commit_message,omitempty"`
 	ShouldRemoveSourceBranch *bool   `json:"should_remove_source_branch,omitempty"`
+	SHA                      *string `json:"sha,omitempty"`
+	Squash                   *bool   `json:"squash,omitempty"`
+	AutoMerge                *bool   `json:"auto_merge,omitempty"`
 }
 
 func mergeMergeRequest(ctx context.Context, _ *mcp.CallToolRequest, in mergeMergeRequestIn, d Deps) (*mcp.CallToolResult, any, error) {
@@ -64,18 +69,16 @@ func mergeMergeRequest(ctx context.Context, _ *mcp.CallToolRequest, in mergeMerg
 	if err != nil {
 		return nil, nil, err
 	}
-	opt := &gitlab.AcceptMergeRequestOptions{}
-	if in.MergeCommitMessage != nil {
-		opt.MergeCommitMessage = in.MergeCommitMessage
+	opt := &gitlab.AcceptMergeRequestOptions{
+		MergeCommitMessage: in.MergeCommitMessage, ShouldRemoveSourceBranch: in.ShouldRemoveSourceBranch,
+		SHA: in.SHA, Squash: in.Squash, AutoMerge: in.AutoMerge,
 	}
-	if in.ShouldRemoveSourceBranch != nil {
-		opt.ShouldRemoveSourceBranch = in.ShouldRemoveSourceBranch
-	}
+	// One PUT, never retried (RVG-160) and never repeated on pending.
 	mr, _, err := d.Client.MergeRequests.AcceptMergeRequest(pid, in.MergeRequestIID, opt, gitlab.WithContext(ctx))
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, mergeRefusal(ctx, d, pid, in.MergeRequestIID, err)
 	}
-	return nil, Out(mr), nil
+	return nil, mergeOutcome(ctx, d, pid, in.MergeRequestIID, mr), nil
 }
 
 type createMergeRequestIn struct {
@@ -504,15 +507,26 @@ func approveMergeRequest(ctx context.Context, _ *mcp.CallToolRequest, in approve
 	if err != nil {
 		return nil, nil, err
 	}
+	review := d.Config.ToolProfile == config.ProfileReview
+	if review && (in.SHA == nil || strings.TrimSpace(*in.SHA) == "") {
+		return nil, nil, errInvalid("sha is required: the full head SHA you reviewed")
+	}
 	opt := &gitlab.ApproveMergeRequestOptions{}
 	if in.SHA != nil {
 		opt.SHA = in.SHA
 	}
 	a, _, err := d.Client.MergeRequestApprovals.ApproveMergeRequest(pid, in.MergeRequestIID, opt, gitlab.WithContext(ctx))
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, refusal(err, approveCodes)
 	}
-	return nil, Out(a), nil
+	if !review {
+		return nil, Out(a), nil
+	}
+	res := approvalReadBack(ctx, d, pid, in.MergeRequestIID, *in.SHA, a)
+	if res.Error != "" {
+		return &mcp.CallToolResult{IsError: true}, res, nil
+	}
+	return nil, res, nil
 }
 
 type unapproveMergeRequestIn struct {

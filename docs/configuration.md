@@ -76,6 +76,11 @@ means today's behavior; `USE_DAILY_TOOLS` is unchanged.
 
 Note bodies are sanitised before posting (review-profile writes).
 
+In the review profile `approve_merge_request` requires `sha` (the head SHA you
+reviewed): GitLab refuses the approval when the head moved, and the result
+carries the approval state read back after the write. Outside the review
+profile `sha` stays optional.
+
 ```json
 {
   "mcpServers": {
