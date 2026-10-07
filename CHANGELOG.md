@@ -49,7 +49,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the MR's current `diff_refs` (`anchor_stale`), its path must be a changed file
   (`anchor_not_in_diff`; `anchor_unverifiable` when the diff pages cap is hit)
   and its line must be on the side of the diff it names; GitLab's 400
-  `line_code` is `anchor_invalid` and a 5xx on the POST is `gitlab_error`. A bad
+  `line_code` is `anchor_invalid`, a 5xx on the POST is `gitlab_error` and an
+  unknown discussion is `not_found`. A bad
   anchor is never turned into a general note. Resolve reads the thread, writes
   nothing when it already is in the requested state, otherwise writes and reads
   the state back. Other profiles keep today's behaviour and output. No tool or

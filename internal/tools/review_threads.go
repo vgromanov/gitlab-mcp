@@ -25,11 +25,11 @@ func reviewProfile(d Deps) bool {
 	return d.Config != nil && d.Config.ToolProfile == config.ProfileReview
 }
 
-// anchorError refuses an inline position before anything is written.
-type anchorError struct{ code, msg string }
+// refusedError is a refusal before anything is written (a bad anchor, an unknown discussion).
+type refusedError struct{ code, msg string }
 
-func (e *anchorError) Error() string        { return e.code + ": " + e.msg + "; nothing was written" }
-func (e *anchorError) NothingWritten() bool { return true }
+func (e *refusedError) Error() string        { return e.code + ": " + e.msg + "; nothing was written" }
+func (e *refusedError) NothingWritten() bool { return true }
 
 func deref[T any](p *T) (v T) {
 	if p != nil {
@@ -48,11 +48,11 @@ func checkAnchor(ctx context.Context, d Deps, pid string, iid int64, pos *gitlab
 	}
 	cur := mr.DiffRefs
 	if deref(pos.BaseSHA) != cur.BaseSha || deref(pos.StartSHA) != cur.StartSha || deref(pos.HeadSHA) != cur.HeadSha {
-		return &anchorError{"anchor_stale", fmt.Sprintf("position base_sha/start_sha/head_sha must all equal the merge request's current diff_refs (base_sha %s, start_sha %s, head_sha %s); re-read the diff and anchor against it", cur.BaseSha, cur.StartSha, cur.HeadSha)}
+		return &refusedError{"anchor_stale", fmt.Sprintf("position base_sha/start_sha/head_sha must all equal the merge request's current diff_refs (base_sha %s, start_sha %s, head_sha %s); re-read the diff and anchor against it", cur.BaseSha, cur.StartSha, cur.HeadSha)}
 	}
 	paths := slices.DeleteFunc([]string{deref(pos.NewPath), deref(pos.OldPath)}, func(s string) bool { return s == "" })
 	if len(paths) == 0 {
-		return &anchorError{"anchor_invalid", "position needs new_path or old_path"}
+		return &refusedError{"anchor_invalid", "position needs new_path or old_path"}
 	}
 	for page := int64(1); page <= anchorScanPages; page++ {
 		diffs, resp, lerr := d.Client.MergeRequests.ListMergeRequestDiffs(pid, iid, &gitlab.ListMergeRequestDiffsOptions{
@@ -68,15 +68,15 @@ func checkAnchor(ctx context.Context, d Deps, pid string, iid int64, pos *gitlab
 			text := deref(pos.PositionType) == "" || deref(pos.PositionType) == "text"
 			if text && (pos.NewLine != nil || pos.OldLine != nil) && !df.Collapsed && !df.TooLarge && df.Diff != "" &&
 				!lineInDiff(df.Diff, deref(pos.OldLine), deref(pos.NewLine)) {
-				return &anchorError{"anchor_not_in_diff", fmt.Sprintf("old_line %d / new_line %d is not a line of the diff of %s on the side given (new_line alone: an added line; old_line alone: a removed line; both: an unchanged line)", deref(pos.OldLine), deref(pos.NewLine), paths[0])}
+				return &refusedError{"anchor_not_in_diff", fmt.Sprintf("old_line %d / new_line %d is not a line of the diff of %s on the side given (new_line alone: an added line; old_line alone: a removed line; both: an unchanged line)", deref(pos.OldLine), deref(pos.NewLine), paths[0])}
 			}
 			return nil
 		}
 		if resp.NextPage == 0 {
-			return &anchorError{"anchor_not_in_diff", fmt.Sprintf("%s is not among the changed files of the merge request", paths[0])}
+			return &refusedError{"anchor_not_in_diff", fmt.Sprintf("%s is not among the changed files of the merge request", paths[0])}
 		}
 	}
-	return &anchorError{"anchor_unverifiable", fmt.Sprintf("%s was not found in the first %d pages of the merge request's diffs and more exist", paths[0], anchorScanPages)}
+	return &refusedError{"anchor_unverifiable", fmt.Sprintf("%s was not found in the first %d pages of the merge request's diffs and more exist", paths[0], anchorScanPages)}
 }
 
 var hunkRe = regexp.MustCompile(`^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@`)
@@ -120,11 +120,19 @@ func threadWriteError(err error) error {
 	}
 	switch s := er.Response.StatusCode; {
 	case s == 400 && strings.Contains(er.Message, "line_code"):
-		return &anchorError{"anchor_invalid", "GitLab rejected the position: the path or line is not valid in the diff"}
+		return &refusedError{"anchor_invalid", "GitLab rejected the position: the path or line is not valid in the diff"}
 	case s >= 500:
 		return fmt.Errorf("gitlab_error: GitLab answered %d; for a thread with a position this is how GitLab refuses a position it cannot resolve, and nothing was created in the measured cases; list the discussions before retrying", s)
 	}
 	return err
+}
+
+// notFound turns a 404 (the SDK reports every one as ErrNotFound) into not_found.
+func notFound(err error, what string) error {
+	if errors.Is(err, gitlab.ErrNotFound) {
+		return &refusedError{"not_found", what + ": the discussion does not exist or is not visible"}
+	}
+	return fmt.Errorf("%s: %w", what, err)
 }
 
 func guardedOutcome(res *guardedResult, err error) (*mcp.CallToolResult, any, error) {
@@ -165,7 +173,7 @@ func guardedReply(ctx context.Context, d Deps, pid string, in createMergeRequest
 		Write: func(ctx context.Context, body string) (int64, string, error) {
 			n, _, err := d.Client.Discussions.AddMergeRequestDiscussionNote(pid, in.MergeRequestIID, in.DiscussionID, &gitlab.AddMergeRequestDiscussionNoteOptions{Body: gitlab.Ptr(body)}, gitlab.WithContext(ctx))
 			if err != nil {
-				return 0, "", err
+				return 0, "", notFound(err, "reply")
 			}
 			return n.ID, in.DiscussionID, nil
 		},
@@ -205,7 +213,7 @@ func guardedResolve(ctx context.Context, d Deps, pid string, in resolveMergeRequ
 	}
 	disc, _, err := d.Client.Discussions.GetMergeRequestDiscussion(pid, in.MergeRequestIID, in.DiscussionID, gitlab.WithContext(ctx))
 	if err != nil {
-		return nil, nil, fmt.Errorf("read discussion: %w", err)
+		return nil, nil, notFound(err, "read discussion")
 	}
 	cur, resolvable := threadState(disc)
 	if !resolvable {
@@ -261,5 +269,5 @@ func resolveDescription(d Deps) string {
 	if !reviewProfile(d) {
 		return "Resolve or unresolve an MR discussion"
 	}
-	return "Resolve or unresolve an MR discussion." + reviewWriteDoc + " Idempotent: a thread already in the requested state is not written (written: false, already_in_state: true). Returns discussion_id, resolved (read back), written, already_in_state, head_sha, head_changed_after_write and error (readback_failed / state_differs). not_resolvable: the discussion has no resolvable note"
+	return "Resolve or unresolve an MR discussion." + reviewWriteDoc + " Idempotent: a thread already in the requested state is not written (written: false, already_in_state: true). Returns discussion_id, resolved (read back), written, already_in_state, head_sha, head_changed_after_write and error (readback_failed / state_differs). not_resolvable: the discussion has no resolvable note; not_found: no such discussion"
 }

@@ -643,8 +643,12 @@ func TestResolve_failuresAreSurfaced(t *testing.T) {
 	}
 	// Unknown discussion: GitLab's 404 comes back, nothing is written.
 	_, text, isErr = rtCall(t, cs, "resolve_merge_request_thread", map[string]any{"discussion_id": "nope", "resolved": true, "expected_sha": rtHead})
-	if !isErr || f.count("PUT discussion") != 0 {
+	if !isErr || !strings.Contains(text, "not_found") || f.count("PUT discussion") != 0 {
 		t.Fatalf("404: isErr=%v %q", isErr, text)
+	}
+	_, text, isErr = rtCall(t, cs, "create_merge_request_discussion_note", map[string]any{"discussion_id": "nope", "body": "x", "expected_sha": rtHead, "op_key": "k"})
+	if !isErr || !strings.Contains(text, "not_found") || strings.Contains(text, "may have been applied") || f.count("POST reply") != 0 {
+		t.Fatalf("reply 404: isErr=%v %q", isErr, text)
 	}
 	// The head moves after the write.
 	f = newRT()
