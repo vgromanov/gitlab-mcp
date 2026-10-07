@@ -36,6 +36,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `approve_merge_request`: in the review profile `sha` is required (a missing or
+  blank `sha` is an input error before any request) and GitLab refuses a stale
+  one (`head_changed`, with the current head in the message). The result is read
+  back: `{approved, sha, head_sha, head_changed_after_write, approvals_left,
+  approval_state}`; a failed readback sets `error` and is never reported as
+  success. Self-approval and other rejections come back as `approval_not_allowed`
+  (401/403) or `not_found`. Other profiles keep `sha` optional and the raw
+  approvals object. No tool or profile count changes (RVG-172).
+- `merge_merge_request` accepts `sha`, `squash` and `auto_merge` (merge when the
+  pipeline succeeds) next to `should_remove_source_branch`; each maps to the
+  GitLab merge parameter and is sent only when given. One request, never retried
+  and never repeated: the result is the merge request as before plus `result`
+  (`merged` only when its state is merged, from the response or one re-read;
+  otherwise `pending` with `pending_reason` `auto_merge_scheduled` or
+  `not_merged_yet`, and `readback_error` if the re-read failed). Refusals are
+  errors: `head_changed` (stale `sha`, 409), `not_mergeable` (405/406/422, with
+  the MR `state` and `detailed_merge_status`), `merge_not_permitted` (401/403),
+  `not_found`. The tool is still in the daily set and, through it, the review
+  profile (RVG-172).
+
 - Shared write guard for review-profile note writes (`internal/tools/review_write.go`;
   not wired to any tool yet, RVG-171/172 call it, so tool counts are unchanged).
   `expected_sha` is required and a stale head is refused with `head_changed`
