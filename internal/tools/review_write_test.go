@@ -64,15 +64,16 @@ var rwNotePath = regexp.MustCompile(`^/api/v4/projects/1/merge_requests/5/notes/
 
 func (f *rwFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	f.mu.Lock()
-	locked := true
-	unlock := func() {
-		if locked {
-			locked = false
-			f.mu.Unlock()
-		}
+	if f.serve(w, r) {
+		<-r.Context().Done() // hang mode: the lock is already released, nothing is written
 	}
-	defer unlock()
+}
+
+// serve runs the whole critical section under a deferred unlock and reports
+// whether the request must hang (wait for the client to give up) afterwards.
+func (f *rwFixture) serve(w http.ResponseWriter, r *http.Request) (hang bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	p := r.URL.Path
 	switch {
 	case r.Method == http.MethodGet && p == "/api/v4/user":
@@ -117,9 +118,7 @@ func (f *rwFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		n := rwNote{id: int64(1000 + f.posts), author: rwMe, body: body}
 		f.notes = append(f.notes, n)
 		if f.hang {
-			unlock()
-			<-r.Context().Done()
-			return
+			return true
 		}
 		w.WriteHeader(http.StatusCreated)
 		writeFixture(w, f.noteJSON(n))
@@ -142,6 +141,7 @@ func (f *rwFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 		writeFixture(w, `{"message":"unexpected `+p+`"}`)
 	}
+	return false
 }
 
 func (f *rwFixture) postCount() int {

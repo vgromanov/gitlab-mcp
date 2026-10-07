@@ -87,6 +87,23 @@ the race detector (`make race`).
   scoped to `GITLAB_TEST_PROJECT_ID` / `GITLAB_TEST_NAMESPACE`.
 - **Schema**: `internal/tools/schema_test.go` validates that every registered
   tool's input schema round-trips and matches expectations. Keep it green.
+- **Semgrep replay** (before a delivery): the corporate AppSec gate forks public
+  registry rules and scans `_test.go` files, which a default semgrep run skips.
+  Replay them locally on a scratch copy (needs `uvx`; nothing is installed):
+
+  ```bash
+  R=$(mktemp -d) && S=$(mktemp -d)
+  for r in go.lang.security.audit.xss.no-fprintf-to-responsewriter \
+           go.lang.security.audit.xss.no-io-writestring-to-responsewriter \
+           go.lang.security.audit.xss.no-direct-write-to-responsewriter \
+           trailofbits.go.missing-unlock-before-return; do
+    curl -fsS "https://semgrep.dev/c/r/$r.${r##*.}" -o "$R/${r##*.}.yaml"
+  done                      # registry id = <rule>.<rule name>
+  cp -R cmd internal "$S" && : > "$S/.semgrepignore"   # empty file: do not skip *_test.go
+  (cd "$S" && uvx semgrep --metrics=off --config "$R" .)   # expect 0 findings
+  ```
+
+  Broader, informational: add `--config p/trailofbits --config p/golang`.
 
 ## Commit & PR conventions
 
